@@ -80,9 +80,19 @@ def test_feedback_freshness_gates_posture_and_stop_reset():
 
     assert "_STATE_TIMEOUT_S = 0.50" in source
     assert "measured posture feedback is stale" in source
+    assert "measured posture feedback is unsynchronized" in source
+    assert "cannot verify reached posture" in source
     assert "fresh, detail = self._fresh_feedback()" in source
     assert "cannot release Full Stop" in source
     assert "Full Stop is always" not in source  # NUC reset is still feedback gated.
+
+
+def test_posture_commands_require_an_explicit_zero_ack():
+    source = SOURCE.read_text(encoding="utf-8")
+
+    assert "result.success = code == 0" in source
+    assert "if self._last_code != 0:" in source
+    assert "code in (0, None)" not in source
 
 
 def test_launcher_routes_move_through_guard_only_in_live_mode():

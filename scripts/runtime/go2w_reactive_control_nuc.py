@@ -73,6 +73,7 @@ class _StatusNode(Node):
     _MAX_PITCH_RAD = math.radians(12.0)
     _MAX_YAW_RAD = math.radians(8.0)
     _STATE_TIMEOUT_S = 0.50
+    _FEEDBACK_SYNC_TOLERANCE_S = 0.30
     _HEIGHT_QUERY_TIMEOUT_S = 0.50
     _QUIET_LINEAR_MPS = 0.035
     _QUIET_YAW_RPS = 0.05
@@ -154,6 +155,10 @@ class _StatusNode(Node):
             return False, "measured posture feedback is unavailable"
         if age_s > self._STATE_TIMEOUT_S:
             return False, f"measured posture feedback is stale ({age_s:.3f}s)"
+        assert self._sport_state_received_s is not None
+        skew_s = abs(self._sport_state_received_s - self._height_query_received_s)
+        if skew_s > self._FEEDBACK_SYNC_TOLERANCE_S:
+            return False, f"measured posture feedback is unsynchronized ({skew_s:.3f}s)"
         return True, "SPORT state and GetBodyHeight feedback are fresh"
 
     def _base_quiet(self) -> tuple[bool, str]:
@@ -197,6 +202,12 @@ class _StatusNode(Node):
             or self._height_query_offset_m is None
             or self._stop_latched
         ):
+            return
+        fresh, detail = self._fresh_feedback()
+        if not fresh:
+            if self._phase not in {"stopped", "fault"}:
+                self._phase = "blocked"
+                self._detail = f"cannot verify reached posture: {detail}"
             return
         offset, roll, pitch, yaw = self._target
         measured_rpy = self._sport_state["rpy"]
@@ -412,7 +423,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             )
             response = future.result(timeout=2.0)
             code = _status_code(response)
-            result.success = code in (0, None)
+            result.success = code == 0
             result.message = f"{command_name} robot response code={code}"
         except Exception as error:  # noqa: BLE001
             result.success = False
@@ -549,7 +560,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                     if generation != self._posture_generation or self._stop_latched:
                         return
                     self._last_code = await self._request_sport(name, parameter)
-                    if self._last_code not in (0, None):
+                    if self._last_code != 0:
                         self._phase = "fault"
                         self._detail = f"{name} refused by robot (code={self._last_code})"
                         return
