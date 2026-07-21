@@ -221,11 +221,27 @@ def test_handoff_requires_3d_arm_corridor_and_explicit_ik_probe():
         ik_feasible=True,
     )
 
-    assert unknown.phase is rejected.phase is ReactivePhase.BASE_APPROACH
+    assert unknown.phase is rejected.phase is ReactivePhase.HANDOFF_PROBE
+    assert unknown.needs_ik_probe
+    assert not rejected.needs_ik_probe
+    assert unknown.base.linear_x_mps == rejected.base.linear_x_mps == 0.0
     assert not unknown.handoff_ready and not rejected.handoff_ready
     assert accepted.phase is ReactivePhase.HANDOFF_READY
     assert accepted.handoff_ready
     assert accepted.base.linear_x_mps == accepted.base.angular_z_rps == 0.0
+
+
+def test_from_frames_accepts_external_tf_results_without_reinterpreting_axes():
+    geometry = TargetGeometry.from_frames(
+        (0.1, 0.2, 0.8),
+        base_xyz_m=(0.6, -0.8, -0.3),
+        arm_xyz_m=(0.3, 0.4, 0.5),
+    )
+
+    assert geometry.base_planar_distance_m == pytest.approx(1.0)
+    assert geometry.base_bearing_rad == pytest.approx(math.atan2(-0.8, 0.6))
+    assert geometry.target_height_m == pytest.approx(-0.3)
+    assert geometry.arm_range_m == pytest.approx(math.sqrt(0.5))
 
 
 def test_configuration_rejects_overlapping_or_inverted_corridors():

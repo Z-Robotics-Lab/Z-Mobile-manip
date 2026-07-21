@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 from pathlib import Path
 import sys
 
@@ -36,7 +37,51 @@ def _core(*, mode: str = "live"):
             yaw_deadband_rad=0.10471975511965978,
             target_timeout_s=0.25,
             tracking_loss_grace_s=0.75,
+            allow_legacy_optical_depth_for_tests=True,
         )
+    )
+
+
+def _reactive_core(
+    *,
+    mode: str = "live",
+    target_timeout_s: float = 0.25,
+    transform_timeout_s: float = 0.25,
+):
+    return SERVO.DepthServoCore(
+        SERVO.DepthServoSettings(
+            mode=mode,
+            desired_depth_m=0.50,
+            handoff_depth_m=0.62,
+            target_timeout_s=target_timeout_s,
+            tracking_loss_grace_s=max(0.75, target_timeout_s),
+            transform_timeout_s=transform_timeout_s,
+        )
+    )
+
+
+def _observe_in_frames(
+    core,
+    *,
+    camera_xyz,
+    base_xyz,
+    arm_xyz,
+    stamp_s,
+):
+    import numpy as np
+
+    camera = np.asarray(camera_xyz, dtype=float)
+    base_from_camera = np.eye(4)
+    base_from_camera[:3, 3] = np.asarray(base_xyz) - camera
+    arm_from_camera = np.eye(4)
+    arm_from_camera[:3, 3] = np.asarray(arm_xyz) - camera
+    return core.observe_target(
+        x_m=float(camera[0]),
+        y_m=float(camera[1]),
+        z_m=float(camera[2]),
+        stamp_s=stamp_s,
+        T_base_camera=base_from_camera,
+        T_arm_camera=arm_from_camera,
     )
 
 
@@ -151,6 +196,31 @@ def test_target_jump_filter_uses_full_3d_euclidean_distance():
     assert core.filter_stats["rejected_outliers"] == 1
 
 
+def test_persistent_coherent_outlier_cluster_rebases_stale_filter():
+    core = _core()
+    assert core.observe_target(x_m=0.0, y_m=0.0, z_m=0.80, stamp_s=1.0)
+
+    assert not core.observe_target(x_m=0.01, y_m=0.0, z_m=0.55, stamp_s=1.1)
+    assert not core.observe_target(x_m=0.00, y_m=0.01, z_m=0.54, stamp_s=1.2)
+    assert core.observe_target(x_m=-0.01, y_m=0.0, z_m=0.56, stamp_s=1.3)
+
+    assert core.target == pytest.approx((0.0, 0.0, 0.55), abs=0.011)
+    assert core.filter_stats["rebases"] == 1
+    assert core.filter_stats["outlier_cluster_samples"] == 0
+
+
+def test_incoherent_outliers_never_rebase_the_filter():
+    core = _core()
+    assert core.observe_target(x_m=0.0, y_m=0.0, z_m=0.80, stamp_s=1.0)
+
+    assert not core.observe_target(x_m=0.30, y_m=0.0, z_m=0.40, stamp_s=1.1)
+    assert not core.observe_target(x_m=-0.30, y_m=0.0, z_m=0.40, stamp_s=1.2)
+    assert not core.observe_target(x_m=0.0, y_m=0.30, z_m=0.40, stamp_s=1.3)
+
+    assert core.target == pytest.approx((0.0, 0.0, 0.80))
+    assert core.filter_stats["rebases"] == 0
+
+
 def test_legged_handoff_accepts_coarse_near_field_alignment_immediately():
     core = _core()
     core.observe_target(x_m=0.09, z_m=0.515, stamp_s=5.0)
@@ -203,6 +273,189 @@ def test_far_field_approach_uses_brisk_cruise_limit():
     output = core.tick(now_s=9.01, tracking=True)
 
     assert output.proposed_linear_x == 0.18
+
+
+def test_deployed_core_missing_tf_is_explicitly_zero_speed():
+    core = _reactive_core()
+    core.observe_target(
+        x_m=0.0,
+        y_m=0.1,
+        z_m=0.90,
+        stamp_s=1.0,
+        transform_error="base_link TF unavailable",
+    )
+
+    output = core.tick(now_s=1.05, tracking=True)
+
+    assert output.phase == "transform_unavailable"
+    assert output.published_linear_x == output.published_angular_z == 0.0
+    assert output.reactive_phase == "transform_unavailable"
+    assert "base_link TF unavailable" in output.reason
+
+
+def test_reactive_runtime_uses_transformed_ground_plane_range_not_optical_z():
+    core = _reactive_core()
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.0, 0.45),
+        base_xyz=(0.90, 0.0, -0.10),
+        arm_xyz=(0.75, 0.0, 0.10),
+        stamp_s=2.0,
+    )
+
+    output = core.tick(now_s=2.05, tracking=True)
+
+    assert output.phase == "approach"
+    assert output.reactive_phase == "base_approach"
+    assert output.proposed_linear_x > 0.0
+    assert output.depth_error_m == pytest.approx(0.40)
+    assert core.geometry is not None
+    assert core.geometry.base_planar_distance_m == pytest.approx(0.90)
+
+
+def test_reactive_runtime_stops_for_downstream_ik_probe_in_3d_corridor():
+    core = _reactive_core()
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.0, 0.55),
+        base_xyz=(0.55, 0.0, -0.10),
+        arm_xyz=(0.50, 0.0, 0.10),
+        stamp_s=3.0,
+    )
+
+    probe = core.tick(now_s=3.05, tracking=True)
+
+    assert probe.phase == "handoff_probe"
+    assert probe.needs_ik_probe
+    assert probe.published_linear_x == probe.published_angular_z == 0.0
+    assert core.reactive_status is not None
+    assert core.reactive_status["needs_ik_probe"] is True
+
+    core.set_ik_probe_result(True)
+    reached = core.tick(now_s=3.10, tracking=True)
+    assert reached.phase == "reached"
+    assert reached.done
+
+
+def test_stale_synchronized_transform_never_reuses_old_geometry_for_motion():
+    core = _reactive_core(target_timeout_s=1.0, transform_timeout_s=0.25)
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.0, 0.80),
+        base_xyz=(0.90, 0.0, -0.10),
+        arm_xyz=(0.75, 0.0, 0.10),
+        stamp_s=4.0,
+    )
+    output = core.tick(now_s=4.30, tracking=True)
+
+    assert output.phase == "transform_unavailable"
+    assert output.published_linear_x == output.published_angular_z == 0.0
+    assert "stale" in output.reason
+
+
+def test_tracking_loss_with_stale_tf_reports_transform_block_not_old_view_intent():
+    core = _reactive_core(target_timeout_s=1.0, transform_timeout_s=0.25)
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.20, 0.80),
+        base_xyz=(0.75, 0.0, -0.30),
+        arm_xyz=(0.60, 0.0, -0.15),
+        stamp_s=5.0,
+    )
+
+    output = core.tick(now_s=5.30, tracking=False)
+
+    assert output.phase == "transform_unavailable"
+    assert output.published_linear_x == output.published_angular_z == 0.0
+    assert core.reactive_status is not None
+    assert core.reactive_status["phase"] == "transform_unavailable"
+
+
+def test_ros_style_quaternion_transform_builder_rotates_and_translates():
+    matrix = SERVO._rigid_transform_matrix(
+        (1.0, 2.0, 3.0),
+        (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)),
+    )
+    transformed = matrix @ (1.0, 0.0, 0.0, 1.0)
+
+    assert transformed == pytest.approx((1.0, 3.0, 3.0, 1.0))
+
+
+def test_live_posture_reached_requires_fresh_feedback_to_settle():
+    document = {
+        "schema": "z_manip.go2w_posture_status.v1",
+        "mode": "live",
+        "phase": "reached",
+        "stop_latched": False,
+        "feedback": {"fresh": True, "source": "sport_state"},
+        "detail": "measured pose reached",
+    }
+
+    settled, blocked, shadow, detail = SERVO._posture_feedback_state(
+        document,
+        age_s=0.10,
+    )
+
+    assert settled is True
+    assert blocked is False
+    assert shadow is False
+    assert detail == "measured pose reached"
+
+
+def test_shadow_posture_is_diagnostic_and_never_counts_as_settled():
+    document = {
+        "schema": "z_manip.go2w_posture_status.v1",
+        "mode": "shadow",
+        "phase": "shadow",
+        "stop_latched": False,
+        "feedback": {"fresh": True},
+    }
+
+    settled, blocked, shadow, _ = SERVO._posture_feedback_state(
+        document,
+        age_s=0.10,
+    )
+
+    assert settled is False
+    assert blocked is False
+    assert shadow is True
+
+
+@pytest.mark.parametrize(
+    ("document", "age_s"),
+    [
+        (
+            {
+                "schema": "z_manip.go2w_posture_status.v1",
+                "mode": "live",
+                "phase": "reached",
+                "stop_latched": False,
+                "feedback": {"fresh": True},
+            },
+            1.0,
+        ),
+        (
+            {
+                "schema": "z_manip.go2w_posture_status.v1",
+                "mode": "live",
+                "phase": "stopped",
+                "stop_latched": True,
+                "feedback": {"fresh": True},
+            },
+            0.1,
+        ),
+    ],
+)
+def test_stale_or_stop_latched_posture_never_unlocks_handoff(document, age_s):
+    settled, blocked, shadow, _ = SERVO._posture_feedback_state(
+        document,
+        age_s=age_s,
+    )
+
+    assert settled is False
+    assert shadow is False
+    if age_s <= 0.75:
+        assert blocked is True
 
 
 def test_launcher_uses_fixed_cyclonedds_runtime_for_pc_to_nuc_commands():

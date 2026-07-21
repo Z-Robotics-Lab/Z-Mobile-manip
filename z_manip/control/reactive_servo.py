@@ -71,6 +71,35 @@ class TargetGeometry:
     arm_range_m: float
 
     @classmethod
+    def from_frames(
+        cls,
+        camera_xyz_m: Sequence[float],
+        *,
+        base_xyz_m: Sequence[float],
+        arm_xyz_m: Sequence[float],
+    ) -> "TargetGeometry":
+        """Build synchronized metrics from already transformed points."""
+
+        camera = _point3(camera_xyz_m, label="camera target")
+        base = _point3(base_xyz_m, label="base target")
+        arm = _point3(arm_xyz_m, label="arm target")
+        if camera[2] <= 0.0:
+            raise ValueError("camera target must be in front of the optical frame")
+        planar = float(np.hypot(base[0], base[1]))
+        return cls(
+            camera_xyz_m=tuple(float(value) for value in camera),
+            base_xyz_m=tuple(float(value) for value in base),
+            arm_xyz_m=tuple(float(value) for value in arm),
+            camera_range_m=float(np.linalg.norm(camera)),
+            camera_elevation_rad=math.atan2(-float(camera[1]), float(camera[2])),
+            base_planar_distance_m=planar,
+            base_range_m=float(np.linalg.norm(base)),
+            base_bearing_rad=math.atan2(float(base[1]), float(base[0])),
+            target_height_m=float(base[2]),
+            arm_range_m=float(np.linalg.norm(arm)),
+        )
+
+    @classmethod
     def from_camera(
         cls,
         camera_xyz_m: Sequence[float],
@@ -81,32 +110,22 @@ class TargetGeometry:
         camera = _point3(camera_xyz_m, label="camera target")
         if camera[2] <= 0.0:
             raise ValueError("camera target must be in front of the optical frame")
-        base = np.asarray(transform_point(T_base_camera, camera), dtype=float)
-        arm = np.asarray(transform_point(T_arm_camera, camera), dtype=float)
-        planar = float(np.hypot(base[0], base[1]))
-        return cls(
-            camera_xyz_m=tuple(float(value) for value in camera),
-            base_xyz_m=tuple(float(value) for value in base),
-            arm_xyz_m=tuple(float(value) for value in arm),
-            camera_range_m=float(np.linalg.norm(camera)),
-            # Positive elevation means above the optical axis.  Optical y is
-            # down, hence the minus sign.
-            camera_elevation_rad=math.atan2(-float(camera[1]), float(camera[2])),
-            base_planar_distance_m=planar,
-            base_range_m=float(np.linalg.norm(base)),
-            base_bearing_rad=math.atan2(float(base[1]), float(base[0])),
-            target_height_m=float(base[2]),
-            arm_range_m=float(np.linalg.norm(arm)),
+        return cls.from_frames(
+            camera,
+            base_xyz_m=transform_point(T_base_camera, camera),
+            arm_xyz_m=transform_point(T_arm_camera, camera),
         )
 
 
 class ReactivePhase(str, Enum):
     WAITING_TARGET = "waiting_target"
+    TRANSFORM_UNAVAILABLE = "transform_unavailable"
     BASE_APPROACH = "base_approach"
     POSTURE_ADJUST = "posture_adjust"
     REACQUIRE = "reacquire"
     VIEW_RECOVERY = "view_recovery"
     SEARCH_REQUIRED = "search_required"
+    HANDOFF_PROBE = "handoff_probe"
     HANDOFF_READY = "handoff_ready"
 
 
@@ -150,6 +169,7 @@ class ReactiveServoDecision:
     arm_view: ArmViewIntent
     geometry: TargetGeometry | None
     handoff_ready: bool = False
+    needs_ik_probe: bool = False
     reason: str = ""
 
 
@@ -394,16 +414,31 @@ class ReactiveTargetController:
                 reason="target height/elevation risks leaving the wrist-camera view",
             )
 
-        if self._handoff_geometry_ok(geometry) and ik_feasible is True:
-            self.phase = ReactivePhase.HANDOFF_READY
+        if self._handoff_geometry_ok(geometry):
+            if ik_feasible is True:
+                self.phase = ReactivePhase.HANDOFF_READY
+                return ReactiveServoDecision(
+                    phase=self.phase,
+                    base=BaseMotionIntent(),
+                    posture=PostureIntent(),
+                    arm_view=arm_view,
+                    geometry=geometry,
+                    handoff_ready=True,
+                    reason="3-D arm corridor and explicit IK probe both passed",
+                )
+            self.phase = ReactivePhase.HANDOFF_PROBE
             return ReactiveServoDecision(
                 phase=self.phase,
                 base=BaseMotionIntent(),
                 posture=PostureIntent(),
                 arm_view=arm_view,
                 geometry=geometry,
-                handoff_ready=True,
-                reason="3-D arm corridor and explicit IK probe both passed",
+                needs_ik_probe=ik_feasible is None,
+                reason=(
+                    "3-D corridor reached; waiting for downstream IK probe"
+                    if ik_feasible is None
+                    else "IK probe rejected this work pose; base remains stopped"
+                ),
             )
 
         self.phase = ReactivePhase.BASE_APPROACH

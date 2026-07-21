@@ -22,6 +22,18 @@ import threading
 import time
 from typing import Any
 
+import numpy as np
+
+from z_manip.control.reactive_servo import (
+    ArmViewIntent,
+    BaseMotionIntent,
+    PostureIntent,
+    ReactivePhase,
+    ReactiveServoConfig,
+    ReactiveServoDecision,
+    ReactiveTargetController,
+    TargetGeometry,
+)
 from z_manip.control.visual_servo import VisualServoConfig, VisualServoController
 
 
@@ -57,6 +69,14 @@ class DepthServoSettings:
     target_filter_window: int = 5
     target_filter_alpha: float = 0.55
     max_target_jump_m: float = 0.20
+    outlier_rebase_samples: int = 3
+    outlier_rebase_spread_m: float = 0.05
+    base_frame: str = "base_link"
+    arm_base_frame: str = "piper_base_link"
+    transform_timeout_s: float = 0.25
+    # Explicit test-only compatibility seam. Deployed ROS construction always
+    # leaves this false: missing transforms must never fall back to optical z.
+    allow_legacy_optical_depth_for_tests: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in {"shadow", "live"}:
@@ -71,6 +91,17 @@ class DepthServoSettings:
             raise ValueError("target filter alpha must be in (0, 1]")
         if not math.isfinite(self.max_target_jump_m) or self.max_target_jump_m <= 0.0:
             raise ValueError("maximum target jump must be finite and positive")
+        if self.outlier_rebase_samples < 2:
+            raise ValueError("outlier rebase requires at least two samples")
+        if (
+            not math.isfinite(self.outlier_rebase_spread_m)
+            or self.outlier_rebase_spread_m <= 0.0
+        ):
+            raise ValueError("outlier rebase spread must be finite and positive")
+        if not self.base_frame.strip() or not self.arm_base_frame.strip():
+            raise ValueError("base and arm-base frames must be non-empty")
+        if not math.isfinite(self.transform_timeout_s) or self.transform_timeout_s <= 0.0:
+            raise ValueError("transform timeout must be finite and positive")
         if not math.isfinite(self.handoff_depth_m) or self.handoff_depth_m <= 0.0:
             raise ValueError("handoff depth must be finite and positive")
         if (
@@ -96,6 +127,79 @@ class DepthServoOutput:
     yaw_error_rad: float | None
     target_age_s: float | None
     done: bool = False
+    reason: str = ""
+    reactive_phase: str | None = None
+    needs_ik_probe: bool = False
+
+
+def _rigid_transform_matrix(
+    translation_xyz: tuple[float, float, float],
+    quaternion_xyzw: tuple[float, float, float, float],
+) -> np.ndarray:
+    """Build a target-from-source transform from a ROS-style transform."""
+
+    translation = np.asarray(translation_xyz, dtype=float)
+    quaternion = np.asarray(quaternion_xyzw, dtype=float)
+    if (
+        translation.shape != (3,)
+        or quaternion.shape != (4,)
+        or not np.isfinite(translation).all()
+        or not np.isfinite(quaternion).all()
+    ):
+        raise ValueError("transform components must be finite xyz and xyzw values")
+    norm = float(np.linalg.norm(quaternion))
+    if norm <= 1e-12:
+        raise ValueError("transform quaternion must have non-zero norm")
+    x, y, z, w = quaternion / norm
+    rotation = np.asarray((
+        (1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)),
+        (2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)),
+        (2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)),
+    ))
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = translation
+    return transform
+
+
+def _posture_feedback_state(
+    document: dict[str, Any] | None,
+    *,
+    age_s: float,
+    timeout_s: float = 0.75,
+) -> tuple[bool, bool, bool, str]:
+    """Reduce posture-adapter telemetry to the reactive-controller contract.
+
+    Shadow verification is deliberately distinct from measured settling: it
+    is useful diagnostic evidence, but can never unlock manipulation handoff.
+    """
+
+    if document is None or not math.isfinite(age_s) or age_s > timeout_s:
+        return False, False, False, "posture status unavailable or stale"
+    if document.get("schema") != "z_manip.go2w_posture_status.v1":
+        return False, False, False, "posture status schema is invalid"
+    phase = str(document.get("phase", ""))
+    mode = str(document.get("mode", ""))
+    detail = str(document.get("detail", ""))
+    stop_latched = document.get("stop_latched") is True
+    blocked = stop_latched or phase in {
+        "blocked",
+        "fault",
+        "stopped",
+        "stopping",
+    }
+    feedback = document.get("feedback")
+    feedback_fresh = (
+        isinstance(feedback, dict) and feedback.get("fresh") is True
+    )
+    settled = (
+        mode == "live"
+        and phase == "reached"
+        and feedback_fresh
+        and not stop_latched
+    )
+    shadow_verified = mode == "shadow" and phase == "shadow" and not blocked
+    return settled, blocked, shadow_verified, detail
 
 
 class DepthServoCore:
@@ -116,14 +220,34 @@ class DepthServoCore:
             rotate_only_bearing_rad=settings.rotate_only_bearing_rad,
             yaw_deadband_rad=settings.yaw_deadband_rad,
         ))
+        self.reactive = ReactiveTargetController(ReactiveServoConfig(
+            desired_planar_standoff_m=settings.desired_depth_m,
+            posture_entry_planar_m=max(settings.handoff_depth_m + 0.20, 0.80),
+            handoff_planar_max_m=settings.handoff_depth_m,
+            linear_gain=settings.linear_gain,
+            yaw_gain=settings.yaw_gain,
+            max_forward_mps=settings.max_forward_mps,
+            max_yaw_rps=settings.max_yaw_rps,
+            yaw_deadband_rad=settings.yaw_deadband_rad,
+            tracking_loss_grace_s=settings.tracking_loss_grace_s,
+        ))
         self._target: tuple[float, float, float] | None = None
         self._raw_target: tuple[float, float, float] | None = None
         self._target_received_s: float | None = None
         self._samples: deque[tuple[float, float, float]] = deque(
             maxlen=settings.target_filter_window,
         )
+        self._outlier_samples: deque[tuple[float, float, float]] = deque(
+            maxlen=settings.outlier_rebase_samples,
+        )
         self._accepted_observations = 0
         self._rejected_observations = 0
+        self._rebases = 0
+        self._geometry: TargetGeometry | None = None
+        self._transforms_received_s: float | None = None
+        self._transform_error: str | None = "no synchronized target transforms"
+        self._ik_feasible: bool | None = None
+        self._last_decision: ReactiveServoDecision | None = None
         self._done = False
 
     @property
@@ -143,11 +267,47 @@ class DepthServoCore:
         }
 
     @property
+    def geometry(self) -> TargetGeometry | None:
+        return self._geometry
+
+    @property
+    def reactive_status(self) -> dict[str, Any] | None:
+        decision = self._last_decision
+        if decision is None:
+            return None
+        return {
+            "phase": decision.phase.value,
+            "reason": decision.reason,
+            "handoff_ready": decision.handoff_ready,
+            "needs_ik_probe": decision.needs_ik_probe,
+            "posture": asdict(decision.posture),
+            "arm_view": {
+                **asdict(decision.arm_view),
+                "mode": decision.arm_view.mode.value,
+            },
+        }
+
+    @property
+    def transform_status(self) -> dict[str, Any]:
+        return {
+            "valid": self._geometry is not None,
+            "error": self._transform_error,
+            "received_monotonic_s": self._transforms_received_s,
+        }
+
+    def set_ik_probe_result(self, feasible: bool | None) -> None:
+        """Record a downstream read-only IK probe result for handoff gating."""
+
+        self._ik_feasible = None if feasible is None else bool(feasible)
+
+    @property
     def filter_stats(self) -> dict[str, int | float | None]:
         return {
             "window_samples": len(self._samples),
             "accepted": self._accepted_observations,
             "rejected_outliers": self._rejected_observations,
+            "outlier_cluster_samples": len(self._outlier_samples),
+            "rebases": self._rebases,
             "raw_x_m": None if self._raw_target is None else self._raw_target[0],
             "raw_y_m": None if self._raw_target is None else self._raw_target[1],
             "raw_z_m": None if self._raw_target is None else self._raw_target[2],
@@ -160,6 +320,9 @@ class DepthServoCore:
         z_m: float,
         stamp_s: float,
         y_m: float = 0.0,
+        T_base_camera: np.ndarray | None = None,
+        T_arm_camera: np.ndarray | None = None,
+        transform_error: str | None = None,
     ) -> bool:
         """Observe a complete optical-frame target centroid.
 
@@ -170,6 +333,15 @@ class DepthServoCore:
         values = (float(x_m), float(y_m), float(z_m), float(stamp_s))
         if not all(math.isfinite(value) for value in values) or z_m <= 0.0:
             return False
+        transforms_available = T_base_camera is not None and T_arm_camera is not None
+        # A fresh camera observation accompanied by failed TF must stop motion
+        # instead of silently retaining older valid target geometry.
+        if not transforms_available:
+            self._geometry = None
+            self._transforms_received_s = None
+            self._transform_error = (
+                transform_error or "synchronized transforms unavailable"
+            )
         raw = (float(x_m), float(y_m), float(z_m))
         self._raw_target = raw
         if self._target is not None:
@@ -177,9 +349,35 @@ class DepthServoCore:
                 (raw[index] - self._target[index]) ** 2 for index in range(3)
             ))
             if jump_m > self.settings.max_target_jump_m:
+                self._outlier_samples.append(raw)
                 self._rejected_observations += 1
-                return False
-        self._samples.append(raw)
+                if len(self._outlier_samples) < self.settings.outlier_rebase_samples:
+                    return False
+                cluster_median = tuple(
+                    statistics.median(sample[index] for sample in self._outlier_samples)
+                    for index in range(3)
+                )
+                cluster_spread = max(
+                    math.sqrt(sum(
+                        (sample[index] - cluster_median[index]) ** 2
+                        for index in range(3)
+                    ))
+                    for sample in self._outlier_samples
+                )
+                if cluster_spread > self.settings.outlier_rebase_spread_m:
+                    return False
+                # A coherent replacement cluster is a real target relocation,
+                # not isolated depth noise. Rebase the filter so the old EMA
+                # cannot reject the new stable track forever.
+                self._samples.clear()
+                self._samples.extend(self._outlier_samples)
+                self._outlier_samples.clear()
+                self._target = None
+                self._rebases += 1
+            else:
+                self._outlier_samples.clear()
+        if self._target is not None or not self._samples:
+            self._samples.append(raw)
         median = (
             statistics.median(sample[0] for sample in self._samples),
             statistics.median(sample[1] for sample in self._samples),
@@ -196,6 +394,14 @@ class DepthServoCore:
             )
         self._target_received_s = float(stamp_s)
         self._accepted_observations += 1
+        if transforms_available:
+            self._geometry = TargetGeometry.from_camera(
+                self._target,
+                T_base_camera=T_base_camera,
+                T_arm_camera=T_arm_camera,
+            )
+            self._transforms_received_s = float(stamp_s)
+            self._transform_error = None
         return True
 
     def reset(self) -> None:
@@ -203,10 +409,18 @@ class DepthServoCore:
         self._raw_target = None
         self._target_received_s = None
         self._samples.clear()
+        self._outlier_samples.clear()
         self._accepted_observations = 0
         self._rejected_observations = 0
+        self._rebases = 0
+        self._geometry = None
+        self._transforms_received_s = None
+        self._transform_error = "no synchronized target transforms"
+        self._ik_feasible = None
+        self._last_decision = None
         self._done = False
         self.controller.reset()
+        self.reactive.reset()
 
     def _zero(self, phase: str, age_s: float | None) -> DepthServoOutput:
         self.controller.reset()
@@ -220,15 +434,141 @@ class DepthServoCore:
             yaw_error_rad=None,
             target_age_s=age_s,
             done=self._done,
+            reason=self._transform_error or "",
         )
 
-    def tick(self, *, now_s: float, tracking: bool | None) -> DepthServoOutput:
+    def _reactive_tick(
+        self,
+        *,
+        now_s: float,
+        age_s: float,
+        tracking: bool | None,
+        body_settled: bool,
+        posture_blocked: bool,
+        posture_shadow_verified: bool,
+        posture_detail: str,
+    ) -> DepthServoOutput:
+        fresh_tracking = (
+            tracking is True and age_s <= self.settings.target_timeout_s
+        )
+        transform_age_s = (
+            None
+            if self._transforms_received_s is None
+            else max(0.0, now_s - self._transforms_received_s)
+        )
+        transform_fresh = (
+            self._geometry is not None
+            and transform_age_s is not None
+            and transform_age_s <= self.settings.transform_timeout_s
+        )
+        if not transform_fresh:
+            reason = self._transform_error or (
+                f"synchronized transforms are stale ({transform_age_s:.3f}s)"
+                if transform_age_s is not None
+                else "synchronized transforms unavailable"
+            )
+            self._last_decision = ReactiveServoDecision(
+                phase=ReactivePhase.TRANSFORM_UNAVAILABLE,
+                base=BaseMotionIntent(),
+                posture=PostureIntent(),
+                arm_view=ArmViewIntent(),
+                geometry=None,
+                reason=reason,
+            )
+            output = self._zero("transform_unavailable", age_s)
+            return DepthServoOutput(
+                **{
+                    **asdict(output),
+                    "reason": reason,
+                    "reactive_phase": ReactivePhase.TRANSFORM_UNAVAILABLE.value,
+                },
+            )
+        if posture_blocked and self._last_decision is not None and (
+            self._last_decision.phase is ReactivePhase.POSTURE_ADJUST
+        ):
+            output = self._zero("posture_blocked", age_s)
+            return DepthServoOutput(
+                **{
+                    **asdict(output),
+                    "reason": posture_detail or "posture adapter blocked the intent",
+                    "reactive_phase": ReactivePhase.POSTURE_ADJUST.value,
+                },
+            )
+        decision = self.reactive.update(
+            self._geometry if fresh_tracking and transform_fresh else None,
+            now_s=now_s,
+            tracking=fresh_tracking,
+            # The depth-servo runtime does not own posture hardware. A posture
+            # adapter may later feed measured settling; exposing intents here
+            # must never manufacture an active body command.
+            body_settled=body_settled,
+            ik_feasible=self._ik_feasible,
+        )
+        self._last_decision = decision
+        phase = decision.phase.value
+        if decision.phase is ReactivePhase.HANDOFF_READY:
+            self._done = True
+            phase = "reached"
+        elif decision.phase is ReactivePhase.BASE_APPROACH:
+            phase = "approach"
+        elif (
+            posture_shadow_verified
+            and decision.phase is ReactivePhase.POSTURE_ADJUST
+        ):
+            phase = "posture_shadow_verified"
+        linear_x = decision.base.linear_x_mps
+        angular_z = decision.base.angular_z_rps
+        live = self.settings.mode == "live"
+        geometry = decision.geometry
+        depth_error = None
+        yaw_error = None
+        if geometry is not None:
+            depth_error = (
+                geometry.base_planar_distance_m
+                - self.settings.desired_depth_m
+            )
+            yaw_error = geometry.base_bearing_rad
+        return DepthServoOutput(
+            phase=phase,
+            proposed_linear_x=linear_x,
+            proposed_angular_z=angular_z,
+            published_linear_x=linear_x if live else 0.0,
+            published_angular_z=angular_z if live else 0.0,
+            depth_error_m=depth_error,
+            yaw_error_rad=yaw_error,
+            target_age_s=age_s,
+            done=self._done,
+            reason=decision.reason,
+            reactive_phase=decision.phase.value,
+            needs_ik_probe=decision.needs_ik_probe,
+        )
+
+    def tick(
+        self,
+        *,
+        now_s: float,
+        tracking: bool | None,
+        body_settled: bool = False,
+        posture_blocked: bool = False,
+        posture_shadow_verified: bool = False,
+        posture_detail: str = "",
+    ) -> DepthServoOutput:
         now = float(now_s)
         if self._done:
             return self._zero("reached", 0.0)
         if self._target is None or self._target_received_s is None:
             return self._zero("waiting_target", None)
         age_s = max(0.0, now - self._target_received_s)
+        if not self.settings.allow_legacy_optical_depth_for_tests:
+            return self._reactive_tick(
+                now_s=now,
+                age_s=age_s,
+                tracking=tracking,
+                body_settled=body_settled,
+                posture_blocked=posture_blocked,
+                posture_shadow_verified=posture_shadow_verified,
+                posture_detail=posture_detail,
+            )
         if tracking is not True or age_s > self.settings.target_timeout_s:
             phase = (
                 "reacquiring"
@@ -322,6 +662,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--target-topic", default="/track_3d/selected_target_pointcloud")
     parser.add_argument("--tracking-topic", default="/track_3d/is_tracking")
     parser.add_argument("--velocity-topic", default="/cmd_vel")
+    parser.add_argument("--base-frame", default="base_link")
+    parser.add_argument("--arm-base-frame", default="piper_base_link")
     parser.add_argument("--desired-depth-m", type=float, default=0.50)
     parser.add_argument("--handoff-depth-m", type=float, default=0.52)
     parser.add_argument("--handoff-bearing-deg", type=float, default=20.0)
@@ -330,6 +672,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--max-yaw-rps", type=float, default=0.12)
     parser.add_argument("--target-timeout-s", type=float, default=0.25)
     parser.add_argument("--tracking-loss-grace-s", type=float, default=0.75)
+    parser.add_argument("--transform-timeout-s", type=float, default=0.25)
     parser.add_argument("--rate-hz", type=float, default=20.0)
     return parser.parse_args()
 
@@ -337,11 +680,14 @@ def _arguments() -> argparse.Namespace:
 def _run_ros(args: argparse.Namespace) -> int:
     import rclpy
     from geometry_msgs.msg import TwistStamped
+    from rclpy.duration import Duration
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.time import Time
     from sensor_msgs.msg import PointCloud2
     from sensor_msgs_py import point_cloud2
-    from std_msgs.msg import Bool
+    from std_msgs.msg import Bool, String
+    from tf2_ros import Buffer, TransformException, TransformListener
 
     if not math.isfinite(args.rate_hz) or args.rate_hz <= 0.0:
         raise ValueError("rate must be finite and positive")
@@ -355,6 +701,9 @@ def _run_ros(args: argparse.Namespace) -> int:
         max_yaw_rps=args.max_yaw_rps,
         target_timeout_s=args.target_timeout_s,
         tracking_loss_grace_s=args.tracking_loss_grace_s,
+        base_frame=args.base_frame,
+        arm_base_frame=args.arm_base_frame,
+        transform_timeout_s=args.transform_timeout_s,
     )
 
     class DepthServoNode(Node):
@@ -364,15 +713,90 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.tracking: bool | None = None
             self.last_source_stamp_ns: int | None = None
             self.last_source_frame: str | None = None
+            self.last_transform_error: str | None = "no target transforms received"
+            self.last_transform_success_s: float | None = None
+            self.last_transform_stamps_ns: dict[str, int | None] = {
+                settings.base_frame: None,
+                settings.arm_base_frame: None,
+            }
+            self.posture_status: dict[str, Any] | None = None
+            self.posture_status_received_s: float | None = None
+            self.last_posture_intent: tuple[float, float] | None = None
+            self.last_posture_intent_s = 0.0
             self.last_output = self.core.tick(now_s=time.monotonic(), tracking=False)
             self.last_trace_phase: str | None = None
             self.last_trace_s = 0.0
             qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
             self.publisher = self.create_publisher(TwistStamped, args.velocity_topic, 1)
+            self.posture_intent_publisher = self.create_publisher(
+                String,
+                "/z_manip/reactive/posture_intent",
+                qos,
+            )
             self.create_subscription(PointCloud2, args.target_topic, self._target, qos)
             self.create_subscription(Bool, args.tracking_topic, self._tracking, qos)
+            self.create_subscription(
+                String,
+                "/go2w/posture_state",
+                self._posture_state,
+                qos,
+            )
             self.create_timer(1.0 / args.rate_hz, self._tick)
             self._write_status("starting")
+
+        @staticmethod
+        def _matrix(transform_stamped: Any) -> np.ndarray:
+            transform = transform_stamped.transform
+            return _rigid_transform_matrix(
+                (
+                    float(transform.translation.x),
+                    float(transform.translation.y),
+                    float(transform.translation.z),
+                ),
+                (
+                    float(transform.rotation.x),
+                    float(transform.rotation.y),
+                    float(transform.rotation.z),
+                    float(transform.rotation.w),
+                ),
+            )
+
+        @staticmethod
+        def _stamp_ns(transform_stamped: Any) -> int:
+            stamp = transform_stamped.header.stamp
+            return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+        def _target_transforms(
+            self,
+            *,
+            source_frame: str,
+            source_stamp: Any,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            if not source_frame:
+                raise ValueError("target point cloud has an empty frame_id")
+            query_time = Time.from_msg(source_stamp)
+            timeout = Duration(seconds=settings.transform_timeout_s)
+            base = self.tf_buffer.lookup_transform(
+                settings.base_frame,
+                source_frame,
+                query_time,
+                timeout=timeout,
+            )
+            arm = self.tf_buffer.lookup_transform(
+                settings.arm_base_frame,
+                source_frame,
+                query_time,
+                timeout=timeout,
+            )
+            self.last_transform_stamps_ns = {
+                settings.base_frame: self._stamp_ns(base),
+                settings.arm_base_frame: self._stamp_ns(arm),
+            }
+            self.last_transform_success_s = time.monotonic()
+            self.last_transform_error = None
+            return self._matrix(base), self._matrix(arm)
 
         def _target(self, message: PointCloud2) -> None:
             xs: list[float] = []
@@ -392,14 +816,32 @@ def _run_ros(args: argparse.Namespace) -> int:
                     break
             if not xs:
                 return
+            source_frame = str(message.header.frame_id or "")
+            transform_error: str | None = None
+            T_base_camera: np.ndarray | None = None
+            T_arm_camera: np.ndarray | None = None
+            try:
+                T_base_camera, T_arm_camera = self._target_transforms(
+                    source_frame=source_frame,
+                    source_stamp=message.header.stamp,
+                )
+            except (TransformException, ValueError) as error:
+                transform_error = (
+                    f"TF {source_frame or '<empty>'} -> "
+                    f"({settings.base_frame}, {settings.arm_base_frame}) unavailable: {error}"
+                )
+                self.last_transform_error = transform_error
             accepted = self.core.observe_target(
                 x_m=statistics.median(xs),
                 y_m=statistics.median(ys),
                 z_m=statistics.median(zs),
                 stamp_s=time.monotonic(),
+                T_base_camera=T_base_camera,
+                T_arm_camera=T_arm_camera,
+                transform_error=transform_error,
             )
             if accepted:
-                self.last_source_frame = str(message.header.frame_id or "") or None
+                self.last_source_frame = source_frame or None
                 self.last_source_stamp_ns = (
                     int(message.header.stamp.sec) * 1_000_000_000
                     + int(message.header.stamp.nanosec)
@@ -407,6 +849,65 @@ def _run_ros(args: argparse.Namespace) -> int:
 
         def _tracking(self, message: Bool) -> None:
             self.tracking = bool(message.data)
+
+        def _posture_state(self, message: String) -> None:
+            try:
+                document = json.loads(message.data)
+            except json.JSONDecodeError:
+                return
+            if (
+                isinstance(document, dict)
+                and document.get("schema") == "z_manip.go2w_posture_status.v1"
+            ):
+                self.posture_status = document
+                self.posture_status_received_s = time.monotonic()
+
+        def _posture_feedback(self) -> tuple[bool, bool, bool, str]:
+            age_s = (
+                math.inf
+                if self.posture_status_received_s is None
+                else time.monotonic() - self.posture_status_received_s
+            )
+            return _posture_feedback_state(
+                self.posture_status,
+                age_s=age_s,
+            )
+
+        def _publish_posture_intent(self, *, blocked: bool = False) -> None:
+            if blocked:
+                return
+            status = self.core.reactive_status
+            if status is None or status.get("phase") not in {
+                ReactivePhase.POSTURE_ADJUST.value,
+                ReactivePhase.VIEW_RECOVERY.value,
+            }:
+                return
+            posture = status.get("posture")
+            if not isinstance(posture, dict):
+                return
+            target = (
+                float(posture.get("body_height_delta_m", 0.0)),
+                float(posture.get("pitch_delta_rad", 0.0)),
+            )
+            now_s = time.monotonic()
+            if (
+                self.last_posture_intent == target
+                and now_s - self.last_posture_intent_s < 0.25
+            ):
+                return
+            message = String()
+            message.data = json.dumps(
+                {
+                    "schema": "z_manip.go2w_posture_intent.v1",
+                    "body_height_delta_m": target[0],
+                    "pitch_delta_rad": target[1],
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            self.posture_intent_publisher.publish(message)
+            self.last_posture_intent = target
+            self.last_posture_intent_s = now_s
 
         def _publish(self, linear_x: float, angular_z: float) -> None:
             message = TwistStamped()
@@ -418,6 +919,30 @@ def _run_ros(args: argparse.Namespace) -> int:
 
         def _write_status(self, state: str | None = None, *, running: bool = True) -> None:
             target = self.core.target
+            geometry = self.core.geometry
+            transform_received_s = self.core.transform_status[
+                "received_monotonic_s"
+            ]
+            geometry_age_s = (
+                None
+                if transform_received_s is None
+                else max(0.0, time.monotonic() - transform_received_s)
+            )
+            lookup_age_s = (
+                None
+                if self.last_transform_success_s is None
+                else max(0.0, time.monotonic() - self.last_transform_success_s)
+            )
+            transform_fresh = (
+                geometry is not None
+                and geometry_age_s is not None
+                and geometry_age_s <= settings.transform_timeout_s
+            )
+            posture_age_s = (
+                None
+                if self.posture_status_received_s is None
+                else max(0.0, time.monotonic() - self.posture_status_received_s)
+            )
             document = {
                 "schema": STATUS_SCHEMA,
                 "running": running,
@@ -430,7 +955,37 @@ def _run_ros(args: argparse.Namespace) -> int:
                     "z_m": target[2],
                     "frame_id": self.last_source_frame,
                 },
-                "geometry": self.core.camera_geometry,
+                "geometry": (
+                    asdict(geometry)
+                    if geometry is not None
+                    else self.core.camera_geometry
+                ),
+                "reactive": self.core.reactive_status,
+                "transforms": {
+                    "valid": transform_fresh,
+                    "error": (
+                        self.last_transform_error
+                        or self.core.transform_status["error"]
+                        or (
+                            "synchronized transforms are stale"
+                            if not transform_fresh else None
+                        )
+                    ),
+                    "geometry_age_s": geometry_age_s,
+                    "lookup_age_s": lookup_age_s,
+                    "source_frame": self.last_source_frame,
+                    "base_frame": settings.base_frame,
+                    "arm_base_frame": settings.arm_base_frame,
+                    "stamps_ns": self.last_transform_stamps_ns,
+                },
+                "posture_status": {
+                    "age_s": posture_age_s,
+                    "document": self.posture_status,
+                    "last_intent": None if self.last_posture_intent is None else {
+                        "body_height_delta_m": self.last_posture_intent[0],
+                        "pitch_delta_rad": self.last_posture_intent[1],
+                    },
+                },
                 "source_stamp_ns": self.last_source_stamp_ns,
                 "output": asdict(self.last_output),
                 "filter": self.core.filter_stats,
@@ -459,10 +1014,16 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self.last_trace_s = now_s
 
         def _tick(self) -> None:
+            settled, blocked, shadow_verified, detail = self._posture_feedback()
             self.last_output = self.core.tick(
                 now_s=time.monotonic(),
                 tracking=self.tracking,
+                body_settled=settled,
+                posture_blocked=blocked,
+                posture_shadow_verified=shadow_verified,
+                posture_detail=detail,
             )
+            self._publish_posture_intent(blocked=blocked)
             if settings.mode == "live":
                 self._publish(
                     self.last_output.published_linear_x,
