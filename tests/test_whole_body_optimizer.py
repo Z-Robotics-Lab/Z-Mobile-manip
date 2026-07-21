@@ -12,11 +12,13 @@ from z_manip.control.whole_body_model import (
     ReducedWholeBodyVelocity,
 )
 from z_manip.control.whole_body_optimizer import (
+    CAMERA_DEPTH_BELOW_MINIMUM,
     CasadiBoxQP,
     ScipyReferenceBoxQP,
     WholeBodyOptimizerConfig,
     WholeBodyShadowOptimizer,
     WholeBodyTask,
+    WholeBodyVisibilityError,
 )
 
 
@@ -165,6 +167,47 @@ def test_near_low_target_couples_body_and_arm_without_blocking_phase():
     assert result.velocity.body_height_mps < 0.0
     assert np.linalg.norm(result.velocity.arm_joint_velocity_rps) > 0.01
     assert result.objective_after < result.objective_before
+
+
+@pytest.mark.parametrize(
+    "target_x_m",
+    (
+        0.05,  # Behind the camera origin (camera is at base x + 0.12 m).
+        0.17,  # In front, but only 0.05 m deep and below the 0.10 m gate.
+    ),
+)
+def test_target_behind_or_too_close_fails_closed_with_stationary_intent(
+    target_x_m,
+):
+    optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
+    state = _state()
+    task = WholeBodyTask(target_world_xyz_m=(target_x_m, 0.0, 0.0))
+
+    result = optimizer.solve(state, task)
+    status = result.status_document()
+
+    assert result.success is False
+    assert result.failure_code == CAMERA_DEPTH_BELOW_MINIMUM
+    assert result.camera_depth_m <= optimizer.config.camera_min_depth_m
+    assert result.velocity.as_vector() == pytest.approx(np.zeros(CONTROL_DOF))
+    assert result.predicted_state == state
+    assert status["executable_intent"] is False
+    assert status["failure_code"] == CAMERA_DEPTH_BELOW_MINIMUM
+    assert status["schedule"]["camera_depth_valid"] is False
+    assert set(status["intent"].values()) == {0.0}
+
+
+@pytest.mark.parametrize("target_x_m", (0.05, 0.17))
+def test_invalid_camera_depth_cannot_be_linearized(target_x_m):
+    optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
+
+    with pytest.raises(WholeBodyVisibilityError) as caught:
+        optimizer.linearize(
+            _state(),
+            WholeBodyTask(target_world_xyz_m=(target_x_m, 0.0, 0.0)),
+        )
+
+    assert caught.value.camera_depth_m <= optimizer.config.camera_min_depth_m
 
 
 def test_box_qp_respects_velocity_and_one_step_joint_position_bounds():

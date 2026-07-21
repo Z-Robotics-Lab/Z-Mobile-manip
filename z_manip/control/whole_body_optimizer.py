@@ -30,10 +30,23 @@ from .whole_body_model import (
 
 
 WHOLE_BODY_RESULT_SCHEMA = "z_manip.whole_body_shadow_result.v1"
+CAMERA_DEPTH_BELOW_MINIMUM = "CAMERA_DEPTH_BELOW_MINIMUM"
 
 
 class CasadiWholeBodyUnavailable(RuntimeError):
     """The optional CasADi runtime or requested QP plugin is unavailable."""
+
+
+class WholeBodyVisibilityError(ValueError):
+    """The synchronized target cannot be projected into the camera image."""
+
+    def __init__(self, *, camera_depth_m: float, minimum_depth_m: float) -> None:
+        self.camera_depth_m = float(camera_depth_m)
+        self.minimum_depth_m = float(minimum_depth_m)
+        super().__init__(
+            f"target camera depth {self.camera_depth_m:.6f} m is not above "
+            f"the minimum {self.minimum_depth_m:.6f} m",
+        )
 
 
 def _point3(value: Sequence[float], *, label: str) -> np.ndarray:
@@ -175,6 +188,8 @@ class WholeBodyOptimizationResult:
     manipulability: float
     success: bool
     reason: str
+    failure_code: str | None
+    minimum_camera_depth_m: float
 
     def status_document(self) -> dict[str, object]:
         velocity = self.velocity.as_vector()
@@ -186,6 +201,8 @@ class WholeBodyOptimizationResult:
             "backend": self.backend,
             "success": self.success,
             "reason": self.reason,
+            "failure_code": self.failure_code,
+            "executable_intent": self.success,
             "objective": {
                 "before": self.objective_before,
                 "after": self.objective_after,
@@ -194,6 +211,10 @@ class WholeBodyOptimizationResult:
                 "near_weight": self.near_weight,
                 "planar_distance_m": self.planar_distance_m,
                 "camera_depth_m": self.camera_depth_m,
+                "minimum_camera_depth_m": self.minimum_camera_depth_m,
+                "camera_depth_valid": (
+                    self.camera_depth_m > self.minimum_camera_depth_m
+                ),
                 "arm_manipulability": self.manipulability,
             },
             "residuals": {
@@ -354,14 +375,18 @@ class WholeBodyShadowOptimizer:
         task: WholeBodyTask,
     ) -> tuple[np.ndarray, float, float, float]:
         camera_target, tool_position, planar, depth = self._geometry(state, task)
-        safe_depth = max(depth, self.config.camera_min_depth_m)
+        if depth <= self.config.camera_min_depth_m:
+            raise WholeBodyVisibilityError(
+                camera_depth_m=depth,
+                minimum_depth_m=self.config.camera_min_depth_m,
+            )
         target = _point3(task.target_world_xyz_m, label="world target")
         offset = _point3(task.tool_target_offset_world_m, label="tool target offset")
         desired_tool = target + offset
         residual = np.asarray(
             (
-                camera_target[0] / safe_depth - task.desired_image_u,
-                camera_target[1] / safe_depth - task.desired_image_v,
+                camera_target[0] / depth - task.desired_image_u,
+                camera_target[1] / depth - task.desired_image_v,
                 planar - task.desired_planar_standoff_m,
                 target[2] - state.body_height_m - task.desired_target_height_in_body_m,
                 *(tool_position - desired_tool),
@@ -531,6 +556,16 @@ class WholeBodyShadowOptimizer:
         *,
         previous_velocity: ReducedWholeBodyVelocity | None = None,
     ) -> WholeBodyOptimizationResult:
+        _camera_target, _tool_position, planar, camera_depth = self._geometry(
+            state,
+            task,
+        )
+        if camera_depth <= self.config.camera_min_depth_m:
+            return self._visibility_failure(
+                state,
+                planar_distance_m=planar,
+                camera_depth_m=camera_depth,
+            )
         problem = self.linearize(
             state,
             task,
@@ -542,7 +577,14 @@ class WholeBodyShadowOptimizer:
         value = np.clip(value, problem.lower, problem.upper)
         velocity = ReducedWholeBodyVelocity.from_vector(value)
         predicted = self.model.integrate(state, velocity, self.config.horizon_dt_s)
-        residual_after, _planar, _depth, _near = self._residual(predicted, task)
+        try:
+            residual_after, _planar, _depth, _near = self._residual(predicted, task)
+        except WholeBodyVisibilityError as error:
+            return self._visibility_failure(
+                state,
+                planar_distance_m=planar,
+                camera_depth_m=error.camera_depth_m,
+            )
         weights = self._weights(problem.near_weight)
         objective_before = float(0.5 * np.sum(weights * problem.residual**2))
         objective_after = float(0.5 * np.sum(weights * residual_after**2))
@@ -565,11 +607,53 @@ class WholeBodyShadowOptimizer:
                 if objective_after <= objective_before + 1e-9
                 else "linearized intent did not lower the nonlinear replay objective"
             ),
+            failure_code=(
+                None
+                if objective_after <= objective_before + 1e-9
+                else "NONLINEAR_OBJECTIVE_NOT_LOWERED"
+            ),
+            minimum_camera_depth_m=self.config.camera_min_depth_m,
+        )
+
+    def _visibility_failure(
+        self,
+        state: ReducedWholeBodyState,
+        *,
+        planar_distance_m: float,
+        camera_depth_m: float,
+    ) -> WholeBodyOptimizationResult:
+        """Return a stationary, explicitly non-executable shadow result."""
+
+        zero_velocity = ReducedWholeBodyVelocity.from_vector(
+            np.zeros(CONTROL_DOF),
+        )
+        return WholeBodyOptimizationResult(
+            velocity=zero_velocity,
+            predicted_state=state,
+            backend="visibility-gate",
+            objective_before=0.0,
+            objective_after=0.0,
+            residual_before=(),
+            residual_after=(),
+            residual_names=(),
+            near_weight=self._near_weight(planar_distance_m),
+            planar_distance_m=planar_distance_m,
+            camera_depth_m=camera_depth_m,
+            manipulability=float(self.model.arm_manipulability(state)),
+            success=False,
+            reason=(
+                f"target camera depth {camera_depth_m:.6f} m is not above "
+                f"the minimum {self.config.camera_min_depth_m:.6f} m; "
+                "stationary intent returned"
+            ),
+            failure_code=CAMERA_DEPTH_BELOW_MINIMUM,
+            minimum_camera_depth_m=self.config.camera_min_depth_m,
         )
 
 
 __all__ = [
     "WHOLE_BODY_RESULT_SCHEMA",
+    "CAMERA_DEPTH_BELOW_MINIMUM",
     "CasadiBoxQP",
     "CasadiWholeBodyUnavailable",
     "LinearizedWholeBodyProblem",
@@ -579,4 +663,5 @@ __all__ = [
     "WholeBodyQPSolver",
     "WholeBodyShadowOptimizer",
     "WholeBodyTask",
+    "WholeBodyVisibilityError",
 ]

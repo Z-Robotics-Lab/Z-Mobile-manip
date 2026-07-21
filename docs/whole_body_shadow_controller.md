@@ -35,6 +35,13 @@ target, ground approach dominates. Body, camera and arm weights rise
 continuously near the handoff zone. There is no discrete "posture must settle"
 phase that can block approach.
 
+Camera projection is fail-closed. A synchronized target whose optical-frame
+depth is behind the camera or at/below `camera_min_depth_m` is never clamped to
+a synthetic positive depth. `linearize()` rejects that geometry, while
+`solve()` returns a zero-velocity result with `success=false`,
+`executable_intent=false`, and `failure_code=CAMERA_DEPTH_BELOW_MINIMUM`.
+This prevents an invalid image projection from becoming a nominal QP command.
+
 This code currently emits intents only. It contains no ROS, WebRTC, CAN or SDK
 transport. A report always includes `transport_opened=false` and
 `motion_commands_sent=0`.
