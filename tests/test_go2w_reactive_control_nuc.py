@@ -50,6 +50,8 @@ def test_live_bridge_is_one_owner_with_serialized_stop_move_and_posture():
     assert "class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode)" in source
     assert "self._sport_request_lock = asyncio.Lock()" in source
     assert "async with self._sport_request_lock" in source
+    assert "def _execute_sport_command(" in source
+    assert source.count("publish_request_new(") == 1
     assert '"GetBodyHeight", {}, timeout_s=self._HEIGHT_QUERY_TIMEOUT_S' in source
     assert "get_body_height_from_response(response)" in source
     assert '"Move", {"x": x, "y": y, "z": yaw}' in source

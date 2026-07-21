@@ -766,6 +766,23 @@ def _servo_phase_sequence_script(path: Path, phases: list[str]) -> Path:
     return path
 
 
+def _servo_posture_stall_script(path: Path) -> Path:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+        "'schema':'z_manip.depth_servo_status.v1',"
+        "'running':True,'phase':'posture_adjust',"
+        "'reactive':{'arm_view':{'mode':'track'}},"
+        "'posture_status':{'age_s':9.0,'document':None},"
+        "'output':{'published_linear_x':0.0,'published_angular_z':0.0}}))\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 def test_depth_servo_server_hands_reached_target_to_grasp(tmp_path):
     grasp = _FakeGraspRunner()
     runner = CONTROL.DepthServoRunner(
@@ -985,6 +1002,32 @@ def test_depth_servo_full_stop_is_idempotent_when_already_stopped(tmp_path):
     assert result["approach"]["running"] is False
     assert result["approach"]["phase"] == "idle"
     assert not status_path.exists()
+
+
+def test_depth_servo_posture_wait_degrades_instead_of_waiting_forever(tmp_path):
+    grasp = _FakeGraspRunner()
+    runner = CONTROL.DepthServoRunner(
+        _servo_posture_stall_script(tmp_path / "servo.py"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=_FakeInteractiveService(),
+        grasp_runner=grasp,
+        posture_wait_timeout_s=0.15,
+    )
+
+    result = runner.start("shadow", target="charger")
+    deadline = time.monotonic() + 3.0
+    while runner.status()["phase"] != "degraded" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    status = runner.status()
+
+    assert result["started"] is True
+    assert status["running"] is False
+    assert status["phase"] == "degraded"
+    assert status["supervision"]["code"] == "POSTURE_FEEDBACK_TIMEOUT"
+    assert status["supervision"]["owners"]["arm_view"] == "intent_only"
+    assert runner._process is not None and runner._process.poll() is not None
+    assert grasp.starts == 0
 
 
 def test_interactive_session_post_security_and_fields_fail_closed(tmp_path):

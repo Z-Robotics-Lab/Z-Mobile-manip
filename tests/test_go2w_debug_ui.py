@@ -360,6 +360,9 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert 'id="approach-base-range"' in lowered
     assert 'id="approach-arm-range"' in lowered
     assert 'id="approach-posture"' in lowered
+    assert 'id="approach-feedback-age"' in lowered
+    assert 'id="approach-owner"' in lowered
+    assert 'id="approach-optimizer"' in lowered
     assert 'id="approach-handoff"' in lowered
     assert 'id="approach-reactive"' in lowered
     assert "geometry.base_planar_distance_m" in lowered
@@ -369,6 +372,9 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert "reactive.handoff_ready" in lowered
     assert "posturestatus.body_height" in lowered
     assert "posturestatus.attitude" in lowered
+    assert "postureenvelope.document" in lowered
+    assert "supervision.feedback?.age_s" in lowered
+    assert "optimizer.primal_residual" in lowered
     assert 'data-approach-phase="posture"' in lowered
     assert 'data-approach-phase="reacquire"' in lowered
     assert 'data-approach-phase="handoff"' in lowered

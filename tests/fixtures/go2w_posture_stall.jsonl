@@ -1,0 +1,4 @@
+{"updated_unix_ns":0,"phase":"posture_adjust","output":{"published_linear_x":0.0,"published_angular_z":0.0,"reason":"target risks leaving the camera view"}}
+{"updated_unix_ns":1000000000,"phase":"posture_adjust","output":{"published_linear_x":0.0,"published_angular_z":0.0,"reason":"waiting for measured body/arm viewing pose to settle"}}
+{"updated_unix_ns":6000000000,"phase":"posture_adjust","output":{"published_linear_x":0.0,"published_angular_z":0.0,"reason":"waiting for measured body/arm viewing pose to settle"}}
+{"updated_unix_ns":118600000000,"phase":"posture_adjust","output":{"published_linear_x":0.0,"published_angular_z":0.0,"reason":"waiting for measured body/arm viewing pose to settle"}}

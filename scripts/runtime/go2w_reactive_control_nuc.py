@@ -29,6 +29,7 @@ from geometry_msgs.msg import TwistStamped
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Empty, String
+from std_srvs.srv import Trigger
 
 from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
 from unitree_webrtc_ros.unitree_control import UnitreeControlNode
@@ -357,9 +358,9 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             return
         UnitreeControlNode.cmd_vel_callback(self, message)
 
-    async def _request_sport_response(
+    async def _request_sport_api_response(
         self,
-        name: str,
+        api_id: int,
         parameter: dict[str, float],
         *,
         timeout_s: float = 1.0,
@@ -368,14 +369,55 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             return await asyncio.wait_for(
                 self.conn.datachannel.pub_sub.publish_request_new(
                     RTC_TOPIC["SPORT_MOD"],
-                    {"api_id": SPORT_CMD[name], "parameter": parameter},
+                    {"api_id": api_id, "parameter": parameter},
                 ),
                 timeout=timeout_s,
             )
 
+    async def _request_sport_response(
+        self,
+        name: str,
+        parameter: dict[str, float],
+        *,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        return await self._request_sport_api_response(
+            SPORT_CMD[name], parameter, timeout_s=timeout_s,
+        )
+
     async def _request_sport(self, name: str, parameter: dict[str, float]) -> int | None:
         response = await self._request_sport_response(name, parameter)
         return _status_code(response)
+
+    def _execute_sport_command(
+        self,
+        command_name: str,
+        api_id: int,
+        parameter: dict[str, float] | None = None,
+    ) -> Trigger.Response:
+        """Route inherited Trigger services through the shared SPORT lock."""
+        result = Trigger.Response()
+        if not self.conn or not self.loop:
+            result.success = False
+            result.message = "connection is not ready"
+            return result
+        if self._stop_latched and api_id != SPORT_CMD["StopMove"]:
+            result.success = False
+            result.message = "Full Stop is latched"
+            return result
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._request_sport_api_response(api_id, parameter or {}),
+                self.loop,
+            )
+            response = future.result(timeout=2.0)
+            code = _status_code(response)
+            result.success = code in (0, None)
+            result.message = f"{command_name} robot response code={code}"
+        except Exception as error:  # noqa: BLE001
+            result.success = False
+            result.message = f"{command_name} failed: {type(error).__name__}: {error}"
+        return result
 
     async def _poll_body_height_feedback(self) -> None:
         """Poll API 1024 through the same serialized SPORT request owner.

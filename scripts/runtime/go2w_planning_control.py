@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 import go2w_debug_ui
 import go2w_interactive_sessions
+import go2w_reactive_supervision
 import go2w_wrist_search
 from go2w_live_perception import LivePerceptionRenderer
 
@@ -1387,6 +1388,7 @@ class DepthServoRunner:
         grasp_runner: Any | None = None,
         wrist_search: Any | None = None,
         max_reacquisitions: int = 3,
+        posture_wait_timeout_s: float = 12.0,
     ) -> None:
         self.script = script.expanduser().resolve()
         if not self.script.is_file():
@@ -1409,6 +1411,11 @@ class DepthServoRunner:
         self._grasp_runner = grasp_runner
         self._wrist_search = wrist_search
         self._max_reacquisitions = max(0, int(max_reacquisitions))
+        self._reactive_watchdog = go2w_reactive_supervision.ReactivePhaseWatchdog(
+            go2w_reactive_supervision.ReactiveWatchdogConfig(
+                posture_wait_timeout_s=posture_wait_timeout_s,
+            )
+        )
         self._cancel = threading.Event()
         self._workflow: dict[str, Any] = {
             "active": False,
@@ -1449,18 +1456,23 @@ class DepthServoRunner:
         wrist_search = (
             None if self._wrist_search is None else self._wrist_search.status()
         )
+        workflow_phase = str(workflow.get("phase", "idle"))
+        terminal_workflow = workflow_phase in {"blocked", "degraded"}
         return {
             "schema": "z_manip.depth_servo_action.v1",
             "available": True,
             "running": running or workflow_active,
             "mode": mode,
-            "phase": workflow.get("phase") if workflow_active else runtime.get(
-                "phase", "starting" if running else "idle",
+            "phase": (
+                workflow_phase
+                if workflow_active or terminal_workflow
+                else runtime.get("phase", "starting" if running else "idle")
             ),
             "revision": revision,
             "message": message,
             "exit_code": exit_code,
             "runtime": runtime,
+            "supervision": self._reactive_watchdog.last.document(),
             "workflow": workflow,
             "wrist_search": wrist_search,
         }
@@ -1539,6 +1551,7 @@ class DepthServoRunner:
                 return {"started": False, "approach": self.status()}
             self._mode = mode
             self._cancel = threading.Event()
+            self._reactive_watchdog.reset()
             self._workflow = {
                 "active": bool(acquire_target or target is not None),
                 "phase": "detecting" if acquire_target else "starting",
@@ -1792,6 +1805,24 @@ class DepthServoRunner:
                 return
             runtime = self._runtime_status()
             phase = runtime.get("phase")
+            supervision = self._reactive_watchdog.observe(
+                runtime,
+                now_s=time.monotonic(),
+            )
+            if supervision.timed_out:
+                self._terminate_process(process, keep_status=True)
+                self._set_workflow(
+                    active=False,
+                    phase="degraded",
+                    failure=supervision.message,
+                    supervision=supervision.document(),
+                )
+                with self._lock:
+                    self._message = (
+                        f"{supervision.code}: {supervision.message}. "
+                        "Base is stopped; inspect feedback age and actuator owners."
+                    )
+                return
             if phase in {"reached", "handoff_probe", "handoff_ready"}:
                 self._handoff_after_base_stop(
                     process,
@@ -1870,6 +1901,7 @@ class DepthServoRunner:
     def stop(self) -> dict[str, Any]:
         with self._lock:
             self._cancel.set()
+            self._reactive_watchdog.reset()
             if self._wrist_search is not None:
                 self._wrist_search.stop()
             self._workflow.update(active=False, phase="stopped", failure=None)

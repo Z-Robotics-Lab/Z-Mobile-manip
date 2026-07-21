@@ -858,6 +858,9 @@
           <div class="approach-metric"><span>Planar / base 3D</span><strong id="approach-base-range">—</strong></div>
           <div class="approach-metric"><span>Target height / arm 3D</span><strong id="approach-arm-range">—</strong></div>
           <div class="approach-metric"><span>Body height / pitch target</span><strong id="approach-posture">—</strong></div>
+          <div class="approach-metric"><span>Posture feedback age</span><strong id="approach-feedback-age">—</strong></div>
+          <div class="approach-metric"><span>Control owner</span><strong id="approach-owner">—</strong></div>
+          <div class="approach-metric"><span>Optimizer phase / residual</span><strong id="approach-optimizer">—</strong></div>
           <div class="approach-metric"><span>FOV / IK handoff</span><strong id="approach-handoff">—</strong></div>
           <div class="approach-metric"><span>Range / bearing error</span><strong id="approach-errors">—</strong></div>
           <div class="approach-metric"><span>Command vx / wz</span><strong id="approach-command">—</strong></div>
@@ -2298,10 +2301,17 @@
       const reactive = runtime.reactive || {};
       const visibility = reactive.visibility || {};
       const reactivePosture = reactive.posture || {};
-      const postureStatus = runtime.posture_status || runtime.posture || state.approach?.posture || {};
+      const postureEnvelope = runtime.posture_status || runtime.posture || state.approach?.posture || {};
+      const postureStatus = postureEnvelope.document && typeof postureEnvelope.document === "object"
+        ? postureEnvelope.document : postureEnvelope;
+      const supervision = state.approach?.supervision || state.approachWorkflow?.supervision || {};
+      const ownership = supervision.owners || runtime.ownership || {};
+      const optimizer = runtime.optimizer || reactive.optimizer || supervision.optimizer || {};
       const armView = reactive.arm_view || {};
       const search = state.approach?.wrist_search || {};
-      const workflowPhase = String(reactive.phase || runtime.phase || state.approachWorkflow?.phase || state.approach?.phase || "idle");
+      const terminalPhase = ["degraded", "blocked", "stopped"].includes(String(state.approach?.phase))
+        ? String(state.approach.phase) : null;
+      const workflowPhase = String(terminalPhase || reactive.phase || runtime.phase || state.approachWorkflow?.phase || state.approach?.phase || "idle");
       const otherBusy = state.sessions?.busy === true
         || state.home?.running === true
         || state.grasp?.running === true;
@@ -2359,6 +2369,37 @@
       const postureText = formatPostureTarget(postureStatus, reactivePosture);
       setApproachMetric("approach-posture", postureText,
         postureText === "— / —" ? "unavailable" : postureStatus.phase === "reached" ? "ready" : "");
+      const feedbackAge = firstFinite(
+        postureEnvelope.age_s,
+        postureStatus.feedback_age_s,
+        postureStatus.body_height?.feedback_age_s,
+        supervision.feedback?.age_s,
+      );
+      const feedbackFresh = postureStatus.feedback?.fresh === true || supervision.feedback?.fresh === true;
+      const feedbackPhase = postureStatus.phase || supervision.feedback?.phase || "unavailable";
+      setApproachMetric("approach-feedback-age",
+        `${finiteNumber(feedbackAge) ? `${feedbackAge.toFixed(2)} s` : "—"} · ${feedbackPhase} · ${feedbackFresh ? "fresh" : "stale/unavailable"}`,
+        feedbackFresh ? "ready" : "waiting");
+      const ownerText = [
+        `base ${ownership.base || "—"}`,
+        `body ${ownership.body || "—"}`,
+        `arm ${ownership.arm_view || "—"}`,
+      ].join(" · ");
+      setApproachMetric("approach-owner", ownerText,
+        supervision.timed_out === true ? "waiting" : "");
+      const optimizerResidual = firstFinite(
+        optimizer.residual,
+        optimizer.objective_residual,
+        optimizer.primal_residual,
+        optimizer.kkt_residual,
+      );
+      const optimizerText = [
+        optimizer.phase || "—",
+        finiteNumber(optimizerResidual) ? optimizerResidual.toExponential(2) : "res —",
+        optimizer.owner || ownership.optimizer || "owner —",
+      ].join(" · ");
+      setApproachMetric("approach-optimizer", optimizerText,
+        optimizer.converged === false || supervision.timed_out === true ? "waiting" : "");
       const fov = typeof visibility.in_fov === "boolean" ? visibility.in_fov
         : typeof visibility.predicted_in_fov === "boolean" ? visibility.predicted_in_fov
           : typeof reactive.fov_visible === "boolean" ? reactive.fov_visible : null;
@@ -2396,6 +2437,7 @@
         seeding_tracker: "track", waiting_for_track: "track", tracking: "track",
         align: "approach", approach: "approach", approaching: "approach", base_approach: "approach",
         posture_adjust: "posture", waiting_base_quiet: "posture", commanding: "posture", settling: "posture",
+        degraded: "posture", blocked: "posture",
         reacquire: "reacquire", reacquiring: "reacquire", view_recovery: "reacquire",
         search_required: "search", reached: "handoff", handoff_ready: "handoff", handoff_to_grasp: "handoff",
         grasp_started: "grasp"
