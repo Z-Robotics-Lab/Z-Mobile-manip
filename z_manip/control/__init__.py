@@ -31,6 +31,20 @@ from .reactive_servo import (
     TargetGeometry,
     transform_point,
 )
+from .go2w_posture import (
+    CommandEvidence,
+    CommandOwner,
+    Go2WPostureAdapter,
+    PostureFeedback,
+    PostureLimits,
+    PostureOutput,
+    PosturePhase,
+    PostureTarget,
+    SportCommand,
+    SportCommandArbiter,
+    SportRequest,
+    feedback_from_mapping,
+)
 
 __all__ = [
     "ApproachInput",
@@ -56,4 +70,16 @@ __all__ = [
     "ReactiveTargetController",
     "TargetGeometry",
     "transform_point",
+    "CommandEvidence",
+    "CommandOwner",
+    "Go2WPostureAdapter",
+    "PostureFeedback",
+    "PostureLimits",
+    "PostureOutput",
+    "PosturePhase",
+    "PostureTarget",
+    "SportCommand",
+    "SportCommandArbiter",
+    "SportRequest",
+    "feedback_from_mapping",
 ]
