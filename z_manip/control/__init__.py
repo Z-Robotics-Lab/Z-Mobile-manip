@@ -83,3 +83,26 @@ __all__ = [
     "SportRequest",
     "feedback_from_mapping",
 ]
+from .whole_body_model import (
+    PinocchioReducedWholeBodyModel,
+    PinocchioWholeBodyFrames,
+    ReducedWholeBodyState,
+    ReducedWholeBodyVelocity,
+)
+from .whole_body_optimizer import (
+    CasadiBoxQP,
+    WholeBodyOptimizerConfig,
+    WholeBodyShadowOptimizer,
+    WholeBodyTask,
+)
+
+__all__ += [
+    "CasadiBoxQP",
+    "PinocchioReducedWholeBodyModel",
+    "PinocchioWholeBodyFrames",
+    "ReducedWholeBodyState",
+    "ReducedWholeBodyVelocity",
+    "WholeBodyOptimizerConfig",
+    "WholeBodyShadowOptimizer",
+    "WholeBodyTask",
+]
