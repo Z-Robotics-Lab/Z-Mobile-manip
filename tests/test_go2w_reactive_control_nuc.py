@@ -73,6 +73,7 @@ def test_get_body_height_feedback_is_raw_observable_and_freshness_gated():
     assert "self._height_query_received_s = time.monotonic()" in source
     assert "Never continue against a previous query" in source
     assert '"sport_mode_state+GetBodyHeight"' in source
+    assert 'self._phase not in {"fault", "stopped", "stopping"}' in source
 
 
 def test_feedback_freshness_gates_posture_and_stop_reset():

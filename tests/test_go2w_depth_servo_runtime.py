@@ -487,6 +487,32 @@ def test_shadow_posture_is_diagnostic_and_never_counts_as_settled():
     assert shadow is True
 
 
+def test_whole_body_posture_convergence_uses_velocity_not_tiny_pose_step():
+    command = SERVO.WholeBodyRuntimeCommand(
+        base_forward_mps=0.0,
+        base_yaw_rps=0.0,
+        body_height_target_m=0.007,
+        body_roll_target_rad=0.0,
+        body_pitch_target_rad=math.radians(0.8),
+        arm_joint_velocity_rps=(0.0,) * 6,
+        executable=True,
+        document={
+            "intent": {
+                "body_height_mps": 0.035,
+                "body_roll_rps": 0.0,
+                "body_pitch_rps": math.radians(1.5),
+            }
+        },
+    )
+
+    assert not SERVO._whole_body_posture_rate_converged(command)
+    command.document["intent"].update({
+        "body_height_mps": 0.002,
+        "body_pitch_rps": math.radians(0.3),
+    })
+    assert SERVO._whole_body_posture_rate_converged(command)
+
+
 @pytest.mark.parametrize(
     ("document", "age_s"),
     [

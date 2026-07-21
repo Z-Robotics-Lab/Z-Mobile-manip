@@ -162,6 +162,7 @@ class WholeBodyRuntimeController:
         posture_status: dict[str, Any] | None,
         runtime_state_path: Path,
         mode: str,
+        freeze_base: bool = False,
     ) -> WholeBodyRuntimeCommand:
         camera_target = np.asarray(camera_target_xyz_m, dtype=float)
         if camera_target.shape != (3,) or not np.isfinite(camera_target).all() or camera_target[2] <= 0.0:
@@ -187,6 +188,15 @@ class WholeBodyRuntimeController:
             state,
             task,
             previous_velocity=self.previous_velocity,
+            # PiPER qdot remains diagnostic in the first live integration.
+            # Locking those variables prevents the QP from satisfying the
+            # task with arm motion that is never sent to the robot.  Once the
+            # base enters the handoff zone, freeze it as well so the solver
+            # must close the measured BodyHeight/Euler loop.
+            locked_control_indices=(
+                *((0, 1) if freeze_base else ()),
+                *((5, 6, 7, 8, 9, 10) if mode == "live" else ()),
+            ),
         )
         self.previous_velocity = result.velocity if result.success else None
         velocity = result.velocity

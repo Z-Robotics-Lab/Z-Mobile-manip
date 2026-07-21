@@ -169,6 +169,29 @@ def test_near_low_target_couples_body_and_arm_without_blocking_phase():
     assert result.objective_after < result.objective_before
 
 
+def test_locked_untransported_controls_remain_exactly_stationary():
+    optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
+    result = optimizer.solve(
+        _state(),
+        WholeBodyTask(target_world_xyz_m=(0.56, 0.0, -0.12)),
+        locked_control_indices=(0, 1, 5, 6, 7, 8, 9, 10),
+    )
+
+    velocity = result.velocity.as_vector()
+    assert velocity[(0, 1, 5, 6, 7, 8, 9, 10),] == pytest.approx(0.0)
+    assert np.linalg.norm(velocity[2:5]) > 0.0
+
+
+def test_invalid_locked_control_index_is_rejected():
+    optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
+    with pytest.raises(ValueError, match="out of range"):
+        optimizer.solve(
+            _state(),
+            WholeBodyTask(target_world_xyz_m=(0.80, 0.0, 0.0)),
+            locked_control_indices=(CONTROL_DOF,),
+        )
+
+
 @pytest.mark.parametrize(
     "target_x_m",
     (

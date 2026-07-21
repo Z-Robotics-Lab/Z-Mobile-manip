@@ -539,10 +539,14 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                     self._height_query_parse_path = "api_1013_command_ack_estimate"
                     if self._phase == "blocked":
                         self._phase = "idle"
-                    self._detail = (
-                        "GetBodyHeight unsupported; using labelled API-1013 "
-                        "command-ack estimate plus measured lowstate IMU"
-                    )
+                    # Do not hide a BodyHeight/Euler transport refusal with
+                    # the lower-priority height-query fallback message.  The
+                    # original fault code must remain visible in UI and logs.
+                    if self._phase not in {"fault", "stopped", "stopping"}:
+                        self._detail = (
+                            "GetBodyHeight unsupported; using labelled API-1013 "
+                            "command-ack estimate plus measured lowstate IMU"
+                        )
                 else:
                     # Never continue against a previous query after an
                     # ordinary transport or parse failure.

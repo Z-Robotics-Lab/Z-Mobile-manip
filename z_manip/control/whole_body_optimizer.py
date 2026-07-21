@@ -12,7 +12,7 @@ cannot open ROS, WebRTC, SocketCAN, or a Unitree/PiPER connection.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import math
 from typing import Protocol, Sequence
 
@@ -555,6 +555,7 @@ class WholeBodyShadowOptimizer:
         task: WholeBodyTask,
         *,
         previous_velocity: ReducedWholeBodyVelocity | None = None,
+        locked_control_indices: Sequence[int] = (),
     ) -> WholeBodyOptimizationResult:
         _camera_target, _tool_position, planar, camera_depth = self._geometry(
             state,
@@ -571,6 +572,16 @@ class WholeBodyShadowOptimizer:
             task,
             previous_velocity=previous_velocity,
         )
+        if locked_control_indices:
+            lower = problem.lower.copy()
+            upper = problem.upper.copy()
+            for raw_index in locked_control_indices:
+                index = int(raw_index)
+                if index < 0 or index >= CONTROL_DOF:
+                    raise ValueError(f"locked control index is out of range: {index}")
+                lower[index] = 0.0
+                upper[index] = 0.0
+            problem = replace(problem, lower=lower, upper=upper)
         value = np.asarray(self.solver.solve(problem), dtype=float)
         if value.shape != (CONTROL_DOF,) or not np.isfinite(value).all():
             raise RuntimeError("whole-body QP backend returned an invalid velocity")

@@ -42,6 +42,9 @@ from z_manip.control.whole_body_runtime import (
 
 
 STATUS_SCHEMA = "z_manip.depth_servo_status.v1"
+POSTURE_SETTLE_TICKS = 5
+POSTURE_HEIGHT_RATE_SETTLED_MPS = 0.006
+POSTURE_ANGLE_RATE_SETTLED_RPS = math.radians(0.75)
 
 
 @dataclass(frozen=True)
@@ -134,6 +137,26 @@ class DepthServoOutput:
     reason: str = ""
     reactive_phase: str | None = None
     needs_ik_probe: bool = False
+
+
+def _whole_body_posture_rate_converged(
+    command: WholeBodyRuntimeCommand,
+) -> bool:
+    """Return true only when the QP no longer requests meaningful body motion."""
+
+    try:
+        intent = command.document["intent"]
+        height_rate = float(intent["body_height_mps"])
+        roll_rate = float(intent["body_roll_rps"])
+        pitch_rate = float(intent["body_pitch_rps"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        all(math.isfinite(value) for value in (height_rate, roll_rate, pitch_rate))
+        and abs(height_rate) <= POSTURE_HEIGHT_RATE_SETTLED_MPS
+        and abs(roll_rate) <= POSTURE_ANGLE_RATE_SETTLED_RPS
+        and abs(pitch_rate) <= POSTURE_ANGLE_RATE_SETTLED_RPS
+    )
 
 
 def _rigid_transform_matrix(
@@ -816,6 +839,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.whole_body: WholeBodyRuntimeController | None = None
             self.whole_body_command: WholeBodyRuntimeCommand | None = None
             self.whole_body_error: str | None = None
+            self.whole_body_handoff_settle_cycles = 0
             if args.whole_body == "casadi":
                 if args.whole_body_urdf is None or args.whole_body_calibration is None:
                     self.whole_body_error = (
@@ -1181,11 +1205,18 @@ def _run_ros(args: argparse.Namespace) -> int:
                     "source_stamp_ns": self.last_source_stamp_ns,
                     "output": document["output"],
                     "filter": document["filter"],
+                    "posture_status": document["posture_status"],
+                    "whole_body": document["whole_body"],
                 })
                 self.last_trace_phase = self.last_output.phase
                 self.last_trace_s = now_s
 
-        def _whole_body_output(self, fallback: DepthServoOutput) -> DepthServoOutput:
+        def _whole_body_output(
+            self,
+            fallback: DepthServoOutput,
+            *,
+            posture_settled: bool,
+        ) -> DepthServoOutput:
             self.whole_body_command = None
             if self.whole_body is None:
                 if args.whole_body == "casadi":
@@ -1213,26 +1244,12 @@ def _run_ros(args: argparse.Namespace) -> int:
                     "waiting_target", "posture_blocked",
                 }
             ):
+                self.whole_body_handoff_settle_cycles = 0
                 return fallback
-            if (
+            inside_handoff = (
                 geometry.base_planar_distance_m <= settings.handoff_depth_m
                 and abs(geometry.base_bearing_rad) <= settings.handoff_bearing_rad
-            ):
-                if self.whole_body is not None:
-                    self.whole_body.reset()
-                return DepthServoOutput(
-                    phase="reached",
-                    proposed_linear_x=0.0,
-                    proposed_angular_z=0.0,
-                    published_linear_x=0.0,
-                    published_angular_z=0.0,
-                    depth_error_m=geometry.base_planar_distance_m - settings.desired_depth_m,
-                    yaw_error_rad=geometry.base_bearing_rad,
-                    target_age_s=fallback.target_age_s,
-                    done=True,
-                    reason="whole-body controller entered the coarse manipulation handoff zone",
-                    reactive_phase="handoff_ready",
-                )
+            )
             if args.runtime_state is None:
                 self.whole_body_error = "whole-body controller requires runtime state"
                 return fallback
@@ -1242,6 +1259,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     posture_status=self.posture_status,
                     runtime_state_path=args.runtime_state,
                     mode=settings.mode,
+                    freeze_base=inside_handoff,
                 )
             except Exception as error:
                 self.whole_body_error = f"whole-body solve failed: {error}"
@@ -1259,6 +1277,70 @@ def _run_ros(args: argparse.Namespace) -> int:
                 )
             self.whole_body_command = command
             self.whole_body_error = None
+            posture_rate_converged = _whole_body_posture_rate_converged(command)
+            if inside_handoff:
+                if command.executable and posture_settled and posture_rate_converged:
+                    self.whole_body_handoff_settle_cycles += 1
+                else:
+                    self.whole_body_handoff_settle_cycles = 0
+
+                if self.whole_body_handoff_settle_cycles >= POSTURE_SETTLE_TICKS:
+                    # Preserve the reactive controller's explicit IK probe.
+                    # Distance and posture alone are not sufficient handoff
+                    # evidence for manipulation.
+                    if fallback.needs_ik_probe:
+                        return DepthServoOutput(
+                            **{
+                                **asdict(fallback),
+                                "reason": "body loop converged; waiting for close-range IK probe",
+                            },
+                        )
+                    if fallback.done:
+                        self.whole_body.reset()
+                        return DepthServoOutput(
+                            phase="reached",
+                            proposed_linear_x=0.0,
+                            proposed_angular_z=0.0,
+                            published_linear_x=0.0,
+                            published_angular_z=0.0,
+                            depth_error_m=(
+                                geometry.base_planar_distance_m
+                                - settings.desired_depth_m
+                            ),
+                            yaw_error_rad=geometry.base_bearing_rad,
+                            target_age_s=fallback.target_age_s,
+                            done=True,
+                            reason="measured body loop and close-range IK handoff converged",
+                            reactive_phase="handoff_ready",
+                        )
+
+                return DepthServoOutput(
+                    phase=(
+                        "whole_body_posture"
+                        if command.executable
+                        else "whole_body_shadow"
+                    ),
+                    proposed_linear_x=0.0,
+                    proposed_angular_z=0.0,
+                    published_linear_x=0.0,
+                    published_angular_z=0.0,
+                    depth_error_m=(
+                        geometry.base_planar_distance_m - settings.desired_depth_m
+                    ),
+                    yaw_error_rad=geometry.base_bearing_rad,
+                    target_age_s=fallback.target_age_s,
+                    done=False,
+                    reason=(
+                        "base parked; closing measured BodyHeight/Euler loop "
+                        f"({self.whole_body_handoff_settle_cycles}/"
+                        f"{POSTURE_SETTLE_TICKS} stable ticks)"
+                        if command.executable
+                        else "whole-body posture intent gated by stale measured state"
+                    ),
+                    reactive_phase="posture_adjust",
+                )
+
+            self.whole_body_handoff_settle_cycles = 0
             linear = float(np.clip(command.base_forward_mps, 0.0, settings.max_forward_mps))
             # Maintain Go2W's gait above its observed dead zone while outside
             # the handoff; CasADi still chooses whether forward motion helps.
@@ -1297,7 +1379,10 @@ def _run_ros(args: argparse.Namespace) -> int:
                 posture_shadow_verified=shadow_verified,
                 posture_detail=detail,
             )
-            self.last_output = self._whole_body_output(fallback)
+            self.last_output = self._whole_body_output(
+                fallback,
+                posture_settled=settled,
+            )
             self._publish_posture_intent(blocked=blocked)
             if settings.mode == "live":
                 self._publish(
