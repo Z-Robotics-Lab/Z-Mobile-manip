@@ -12,6 +12,7 @@ fi
 MODE="$1"
 STATUS_PATH="$2"
 TRACE_PATH="${STATUS_PATH%.json}.trace.jsonl"
+RUNTIME_STATE_PATH="$(dirname -- "$STATUS_PATH")/runtime-observer.json"
 case "$MODE" in
   shadow|live) ;;
   *) printf 'mode must be shadow or live\n' >&2; exit 2 ;;
@@ -71,6 +72,8 @@ exec docker run --rm \
   --target-topic /track_3d/selected_target_pointcloud \
   --tracking-topic /track_3d/is_tracking \
   --velocity-topic /cmd_vel \
+  --runtime-state "$RUNTIME_STATE_PATH" \
+  --runtime-transform-timeout-s 0.50 \
   --desired-depth-m 0.50 \
   --handoff-depth-m 0.52 \
   --handoff-bearing-deg 20 \

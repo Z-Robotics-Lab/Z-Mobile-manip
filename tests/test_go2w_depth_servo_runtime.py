@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 from pathlib import Path
 import sys
 
+import numpy as np
 import pytest
 
 
@@ -83,6 +85,70 @@ def _observe_in_frames(
         T_base_camera=base_from_camera,
         T_arm_camera=arm_from_camera,
     )
+
+
+def _runtime_transform_artifact(path: Path, *, stamp_ns: int) -> None:
+    base = np.eye(4)
+    base[:3, 3] = (0.06, 0.0, 0.067)
+    arm = np.eye(4)
+    path.write_text(json.dumps({
+        "schema": "z_manip.runtime_state.v1",
+        "kinematic_transforms": {
+            "schema": "z_manip.kinematic_transforms.v1",
+            "verified": True,
+            "calibration_synthetic": False,
+            "source_timestamp_ns": stamp_ns,
+            "camera_frame": "camera_color_optical_frame",
+            "platform_base_frame": "base_link",
+            "arm_base_frame": "piper_base_link",
+            "platform_base_from_camera": base.tolist(),
+            "arm_base_from_camera": arm.tolist(),
+        },
+    }), encoding="utf-8")
+
+
+def test_runtime_observer_kinematic_transform_is_accepted_when_fresh(tmp_path):
+    artifact = tmp_path / "runtime-observer.json"
+    now_ns = 1_700_000_000_000_000_000
+    _runtime_transform_artifact(artifact, stamp_ns=now_ns - 100_000_000)
+
+    base, arm, stamp = SERVO._runtime_state_transforms(
+        artifact,
+        source_frame="camera_color_optical_frame",
+        base_frame="base_link",
+        arm_base_frame="piper_base_link",
+        now_unix_ns=now_ns,
+        max_age_s=0.5,
+    )
+
+    assert stamp == now_ns - 100_000_000
+    assert base[:3, 3] == pytest.approx((0.06, 0.0, 0.067))
+    assert arm == pytest.approx(np.eye(4))
+
+
+def test_runtime_observer_transform_rejects_stale_or_wrong_frame(tmp_path):
+    artifact = tmp_path / "runtime-observer.json"
+    now_ns = 1_700_000_000_000_000_000
+    _runtime_transform_artifact(artifact, stamp_ns=now_ns - 600_000_000)
+    with pytest.raises(ValueError, match="stale"):
+        SERVO._runtime_state_transforms(
+            artifact,
+            source_frame="camera_color_optical_frame",
+            base_frame="base_link",
+            arm_base_frame="piper_base_link",
+            now_unix_ns=now_ns,
+            max_age_s=0.5,
+        )
+    _runtime_transform_artifact(artifact, stamp_ns=now_ns)
+    with pytest.raises(ValueError, match="camera frame"):
+        SERVO._runtime_state_transforms(
+            artifact,
+            source_frame="camera_depth_optical_frame",
+            base_frame="base_link",
+            arm_base_frame="piper_base_link",
+            now_unix_ns=now_ns,
+            max_age_s=0.5,
+        )
 
 
 def test_live_mode_drives_toward_a_fresh_target():

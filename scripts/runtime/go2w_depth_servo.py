@@ -162,6 +162,77 @@ def _rigid_transform_matrix(
     return transform
 
 
+def _validated_matrix(value: object, *, name: str) -> np.ndarray:
+    """Accept only a finite right-handed rigid 4x4 transform."""
+
+    matrix = np.asarray(value, dtype=float)
+    if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"{name} must be a finite 4x4 matrix")
+    if not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8):
+        raise ValueError(f"{name} has an invalid homogeneous row")
+    rotation = matrix[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=2e-4):
+        raise ValueError(f"{name} rotation is not orthonormal")
+    if not math.isclose(float(np.linalg.det(rotation)), 1.0, abs_tol=2e-4):
+        raise ValueError(f"{name} rotation is not right-handed")
+    return matrix
+
+
+def _runtime_state_transforms(
+    path: Path,
+    *,
+    source_frame: str,
+    base_frame: str,
+    arm_base_frame: str,
+    now_unix_ns: int,
+    max_age_s: float,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Read fresh verified model transforms from the subscribe-only observer.
+
+    This is the deployed fallback for ROS graphs that publish RealSense TF but
+    not the combined Go2W/PiPER model frames.  It is deliberately stricter
+    than ordinary JSON loading: an old artifact, synthetic calibration, frame
+    mismatch, or malformed rigid transform stops the base.
+    """
+
+    artifact = path.expanduser().resolve()
+    if not artifact.is_file():
+        raise ValueError(f"runtime observer state is missing: {artifact}")
+    if artifact.stat().st_size > 2_000_000:
+        raise ValueError("runtime observer state exceeds the bounded size")
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or document.get("schema") != "z_manip.runtime_state.v1":
+        raise ValueError("runtime observer state schema is invalid")
+    transforms = document.get("kinematic_transforms")
+    if not isinstance(transforms, dict):
+        raise ValueError("runtime observer has no kinematic transforms")
+    if (
+        transforms.get("schema") != "z_manip.kinematic_transforms.v1"
+        or transforms.get("verified") is not True
+        or transforms.get("calibration_synthetic") is not False
+    ):
+        raise ValueError("runtime kinematic transform evidence is not verified")
+    if str(transforms.get("camera_frame", "")) != source_frame:
+        raise ValueError("runtime camera frame does not match the target cloud")
+    if str(transforms.get("platform_base_frame", "")) != base_frame:
+        raise ValueError("runtime platform frame does not match the servo base frame")
+    if str(transforms.get("arm_base_frame", "")) != arm_base_frame:
+        raise ValueError("runtime arm frame does not match the servo arm frame")
+    timestamp_ns = int(transforms.get("source_timestamp_ns", 0))
+    age_s = (int(now_unix_ns) - timestamp_ns) / 1e9
+    if age_s < -0.50 or age_s > max_age_s:
+        raise ValueError(f"runtime kinematic transforms are stale ({age_s:.3f}s)")
+    base = _validated_matrix(
+        transforms.get("platform_base_from_camera"),
+        name="platform_base_from_camera",
+    )
+    arm = _validated_matrix(
+        transforms.get("arm_base_from_camera"),
+        name="arm_base_from_camera",
+    )
+    return base, arm, timestamp_ns
+
+
 def _posture_feedback_state(
     document: dict[str, Any] | None,
     *,
@@ -664,6 +735,12 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--velocity-topic", default="/cmd_vel")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--arm-base-frame", default="piper_base_link")
+    parser.add_argument(
+        "--runtime-state",
+        type=Path,
+        help="fresh subscribe-only runtime-observer.json transform source",
+    )
+    parser.add_argument("--runtime-transform-timeout-s", type=float, default=0.50)
     parser.add_argument("--desired-depth-m", type=float, default=0.50)
     parser.add_argument("--handoff-depth-m", type=float, default=0.52)
     parser.add_argument("--handoff-bearing-deg", type=float, default=20.0)
@@ -691,6 +768,11 @@ def _run_ros(args: argparse.Namespace) -> int:
 
     if not math.isfinite(args.rate_hz) or args.rate_hz <= 0.0:
         raise ValueError("rate must be finite and positive")
+    if (
+        not math.isfinite(args.runtime_transform_timeout_s)
+        or args.runtime_transform_timeout_s <= 0.0
+    ):
+        raise ValueError("runtime transform timeout must be finite and positive")
     settings = DepthServoSettings(
         mode=args.mode,
         desired_depth_m=args.desired_depth_m,
@@ -715,6 +797,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_source_frame: str | None = None
             self.last_transform_error: str | None = "no target transforms received"
             self.last_transform_success_s: float | None = None
+            self.last_transform_source: str | None = None
             self.last_transform_stamps_ns: dict[str, int | None] = {
                 settings.base_frame: None,
                 settings.arm_base_frame: None,
@@ -778,25 +861,53 @@ def _run_ros(args: argparse.Namespace) -> int:
                 raise ValueError("target point cloud has an empty frame_id")
             query_time = Time.from_msg(source_stamp)
             timeout = Duration(seconds=settings.transform_timeout_s)
-            base = self.tf_buffer.lookup_transform(
-                settings.base_frame,
-                source_frame,
-                query_time,
-                timeout=timeout,
-            )
-            arm = self.tf_buffer.lookup_transform(
-                settings.arm_base_frame,
-                source_frame,
-                query_time,
-                timeout=timeout,
-            )
+            tf_error: Exception | None = None
+            try:
+                base = self.tf_buffer.lookup_transform(
+                    settings.base_frame,
+                    source_frame,
+                    query_time,
+                    timeout=timeout,
+                )
+                arm = self.tf_buffer.lookup_transform(
+                    settings.arm_base_frame,
+                    source_frame,
+                    query_time,
+                    timeout=timeout,
+                )
+                self.last_transform_stamps_ns = {
+                    settings.base_frame: self._stamp_ns(base),
+                    settings.arm_base_frame: self._stamp_ns(arm),
+                }
+                self.last_transform_success_s = time.monotonic()
+                self.last_transform_source = "tf2"
+                self.last_transform_error = None
+                return self._matrix(base), self._matrix(arm)
+            except TransformException as error:
+                tf_error = error
+            if args.runtime_state is None:
+                raise ValueError(f"TF lookup failed and no runtime state is configured: {tf_error}")
+            try:
+                base_matrix, arm_matrix, stamp_ns = _runtime_state_transforms(
+                    args.runtime_state,
+                    source_frame=source_frame,
+                    base_frame=settings.base_frame,
+                    arm_base_frame=settings.arm_base_frame,
+                    now_unix_ns=time.time_ns(),
+                    max_age_s=args.runtime_transform_timeout_s,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as runtime_error:
+                raise ValueError(
+                    f"TF lookup failed ({tf_error}); runtime model failed ({runtime_error})",
+                ) from runtime_error
             self.last_transform_stamps_ns = {
-                settings.base_frame: self._stamp_ns(base),
-                settings.arm_base_frame: self._stamp_ns(arm),
+                settings.base_frame: stamp_ns,
+                settings.arm_base_frame: stamp_ns,
             }
             self.last_transform_success_s = time.monotonic()
+            self.last_transform_source = "runtime_observer_kinematics"
             self.last_transform_error = None
-            return self._matrix(base), self._matrix(arm)
+            return base_matrix, arm_matrix
 
         def _target(self, message: PointCloud2) -> None:
             xs: list[float] = []
@@ -977,6 +1088,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     "base_frame": settings.base_frame,
                     "arm_base_frame": settings.arm_base_frame,
                     "stamps_ns": self.last_transform_stamps_ns,
+                    "source": self.last_transform_source,
                 },
                 "posture_status": {
                     "age_s": posture_age_s,

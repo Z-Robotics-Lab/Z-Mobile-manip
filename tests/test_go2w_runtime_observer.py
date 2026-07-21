@@ -294,6 +294,68 @@ def test_atomic_snapshot_replaces_valid_json(tmp_path):
     assert list(tmp_path.glob(".*.tmp")) == []
 
 
+def test_runtime_state_exports_verified_platform_and_arm_camera_transforms():
+    class Chain:
+        base_link = "piper_base_link"
+        tip_link = "piper_gripper_base"
+
+        @staticmethod
+        def forward(_values):
+            transform = np.eye(4)
+            transform[:3, 3] = (0.30, -0.10, 0.20)
+            return transform
+
+        @staticmethod
+        def link_transforms(_values):
+            return {"piper_base_link": np.eye(4)}
+
+    diagnostic = {
+        "generated_unix_ns": 1_700_000_000_000_000_000,
+        "sequence": 7,
+        "joint_state": {
+            "available": True,
+            "positions_rad": [0.0] * 6,
+            "source_stamp_ns": 1_699_999_999_990_000_000,
+            "topic": "/piper/state",
+            "publisher_count": 1,
+        },
+        "summary": {},
+        "observer": {"read_only": True, "motion_commands_published": 0},
+        "topics": {},
+    }
+    calibration = {
+        "calibrated": True,
+        "synthetic": False,
+        "mount_type": "eye_in_hand",
+        "tip_link": "piper_gripper_base",
+        "camera_frame": "camera_color_optical_frame",
+        "calibration_id": "measured-test",
+        "tip_from_camera": np.eye(4).tolist(),
+    }
+    platform_from_arm = np.eye(4)
+    platform_from_arm[:3, 3] = (0.06, 0.0, 0.067)
+
+    runtime = OBSERVER.build_runtime_state(
+        diagnostic,
+        chain=Chain(),
+        calibration=calibration,
+        platform_from_arm_base=platform_from_arm,
+        platform_frame="base_link",
+    )
+
+    transforms = runtime["kinematic_transforms"]
+    assert transforms["verified"] is True
+    assert transforms["camera_frame"] == "camera_color_optical_frame"
+    assert transforms["arm_base_frame"] == "piper_base_link"
+    assert transforms["platform_base_frame"] == "base_link"
+    assert np.asarray(transforms["arm_base_from_camera"])[:3, 3] == pytest.approx(
+        (0.30, -0.10, 0.20),
+    )
+    assert np.asarray(transforms["platform_base_from_camera"])[:3, 3] == pytest.approx(
+        (0.36, -0.10, 0.267),
+    )
+
+
 def test_observer_restart_recovers_sequence_and_advances(tmp_path, monkeypatch):
     output = tmp_path / "runtime.json"
     output.write_text(

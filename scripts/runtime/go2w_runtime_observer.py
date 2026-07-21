@@ -695,6 +695,8 @@ def build_runtime_state(
     *,
     chain: object | None = None,
     calibration: dict[str, object] | None = None,
+    platform_from_arm_base: object | None = None,
+    platform_frame: str = "base_link",
 ) -> dict[str, object]:
     """Convert diagnostics into the bounded dashboard runtime contract."""
 
@@ -768,6 +770,32 @@ def build_runtime_state(
         return document
     base_from_camera = np.asarray(chain.forward(values), dtype=float) @ tip_from_camera
     camera_frame = str(calibration.get("camera_frame", ""))
+    platform_transform = None
+    if platform_from_arm_base is not None:
+        candidate = np.asarray(platform_from_arm_base, dtype=float)
+        if candidate.shape == (4, 4) and np.all(np.isfinite(candidate)):
+            platform_transform = candidate @ base_from_camera
+    # This is the transform source consumed by the mobile depth servo when
+    # the ROS graph does not publish the PiPER/Go2W model frames.  It is
+    # reconstructed from fresh passive joints, the deployed URDF, the
+    # measured eye-in-hand calibration, and the fixed arm mount.  Keeping the
+    # provenance in the artifact prevents a camera-z compatibility fallback
+    # from being mistaken for base-frame geometry.
+    if platform_transform is not None and camera_frame:
+        document["kinematic_transforms"] = {
+            "schema": "z_manip.kinematic_transforms.v1",
+            "verified": True,
+            "source": "passive_joints+deployed_urdf+measured_hand_eye",
+            "source_timestamp_ns": generated_ns,
+            "joint_source_timestamp_ns": joint.get("source_stamp_ns"),
+            "camera_frame": camera_frame,
+            "arm_base_frame": str(chain.base_link),
+            "platform_base_frame": str(platform_frame),
+            "arm_base_from_camera": base_from_camera.tolist(),
+            "platform_base_from_camera": platform_transform.tolist(),
+            "calibration_id": calibration.get("calibration_id"),
+            "calibration_synthetic": calibration.get("synthetic"),
+        }
     clouds: dict[str, object] = {}
     for output_name, topic_name in (("scene", "scene_cloud"), ("target", "target_cloud")):
         topic = topics.get(topic_name)
@@ -888,13 +916,19 @@ def run_ros_observer(args: argparse.Namespace) -> int:
 
     chain = None
     calibration = None
+    platform_from_arm_base = None
     if args.urdf is not None:
-        from z_manip.kinematics import KinematicChain
+        from z_manip.kinematics import KinematicChain, fixed_transform_from_urdf
 
         chain = KinematicChain.from_urdf(
             args.urdf.expanduser().resolve(),
             args.base_link,
             args.tip_link,
+        )
+        platform_from_arm_base = fixed_transform_from_urdf(
+            args.urdf.expanduser().resolve(),
+            args.platform_urdf_link,
+            args.base_link,
         )
     if args.calibration is not None:
         calibration = json.loads(
@@ -1039,6 +1073,8 @@ def run_ros_observer(args: argparse.Namespace) -> int:
                     diagnostic,
                     chain=chain,
                     calibration=calibration,
+                    platform_from_arm_base=platform_from_arm_base,
+                    platform_frame=args.platform_frame,
                 ),
             )
             next_write = now + args.write_period_s
@@ -1054,6 +1090,8 @@ def run_ros_observer(args: argparse.Namespace) -> int:
                 diagnostic,
                 chain=chain,
                 calibration=calibration,
+                platform_from_arm_base=platform_from_arm_base,
+                platform_frame=args.platform_frame,
             ),
         )
         node.destroy_node()
@@ -1091,6 +1129,16 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--calibration", type=Path)
     parser.add_argument("--base-link", default="piper_base_link")
     parser.add_argument("--tip-link", default="piper_gripper_base")
+    parser.add_argument(
+        "--platform-urdf-link",
+        default="base",
+        help="URDF body link that is the fixed parent of the arm mount",
+    )
+    parser.add_argument(
+        "--platform-frame",
+        default="base_link",
+        help="runtime frame name represented by platform-urdf-link",
+    )
     parser.add_argument("--write-period-s", type=float, default=0.10)
     parser.add_argument("--joint-age-s", type=float, default=0.50)
     parser.add_argument("--camera-age-s", type=float, default=1.00)

@@ -56,6 +56,8 @@ run_observer() {
         --calibration /model/camera-calibration.json \
         --base-link piper_base_link \
         --tip-link piper_gripper_base \
+        --platform-urdf-link base \
+        --platform-frame base_link \
         --write-period-s 0.10
 }
 
