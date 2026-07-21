@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+import time
 from typing import Any, Iterable, Mapping
 
 
@@ -20,6 +21,21 @@ POSTURE_WAIT_PHASES = frozenset({
     "posture_shadow_verified",
     "posture_blocked",
 })
+
+# The child process is expected to rewrite its status document on every
+# control tick, including while it is waiting for a target or asking the
+# supervisor to reacquire/search.  A live PID is not evidence that this loop
+# is alive: a wedged ROS executor leaves the process running and the last
+# velocity command latched.  Only genuinely terminal, non-motion phases are
+# exempt from the state heartbeat contract.
+HEARTBEAT_EXEMPT_PHASES = frozenset({
+    "idle",
+    "stopped",
+    "blocked",
+    "degraded",
+    "grasp_started",
+})
+HANDOFF_PHASES = frozenset({"reached", "handoff_probe", "handoff_ready"})
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -103,6 +119,8 @@ def ownership_snapshot(runtime: Mapping[str, Any]) -> dict[str, str]:
 class ReactiveWatchdogConfig:
     posture_wait_timeout_s: float = 12.0
     feedback_freshness_s: float = 0.75
+    state_heartbeat_timeout_s: float = 1.5
+    max_state_future_s: float = 0.25
 
     def __post_init__(self) -> None:
         if (
@@ -115,6 +133,13 @@ class ReactiveWatchdogConfig:
             or self.feedback_freshness_s <= 0
         ):
             raise ValueError("feedback freshness must be finite and positive")
+        if (
+            not math.isfinite(self.state_heartbeat_timeout_s)
+            or self.state_heartbeat_timeout_s <= 0
+        ):
+            raise ValueError("state heartbeat timeout must be finite and positive")
+        if not math.isfinite(self.max_state_future_s) or self.max_state_future_s < 0:
+            raise ValueError("maximum state future allowance must be finite and non-negative")
 
 
 @dataclass(frozen=True)
@@ -127,6 +152,12 @@ class ReactiveWatchdogDecision:
     message: str
     feedback: dict[str, Any]
     owners: dict[str, str]
+    heartbeat_required: bool
+    heartbeat_valid: bool
+    heartbeat_updated_unix_ns: int | None
+    heartbeat_age_s: float | None
+    heartbeat_elapsed_s: float
+    heartbeat_deadline_s: float | None
 
     def document(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,6 +173,8 @@ class ReactivePhaseWatchdog:
     def reset(self) -> None:
         self._phase: str | None = None
         self._phase_started_s: float | None = None
+        self._heartbeat_stamp_ns: int | None = None
+        self._heartbeat_progress_s: float | None = None
         self._last = ReactiveWatchdogDecision(
             phase="idle",
             phase_elapsed_s=0.0,
@@ -151,6 +184,12 @@ class ReactivePhaseWatchdog:
             message="idle",
             feedback={},
             owners={},
+            heartbeat_required=False,
+            heartbeat_valid=False,
+            heartbeat_updated_unix_ns=None,
+            heartbeat_age_s=None,
+            heartbeat_elapsed_s=0.0,
+            heartbeat_deadline_s=None,
         )
 
     @property
@@ -162,6 +201,7 @@ class ReactivePhaseWatchdog:
         runtime: Mapping[str, Any],
         *,
         now_s: float,
+        now_unix_ns: int | None = None,
     ) -> ReactiveWatchdogDecision:
         now = float(now_s)
         if not math.isfinite(now):
@@ -179,10 +219,70 @@ class ReactivePhaseWatchdog:
         elapsed = max(0.0, now - self._phase_started_s)
         feedback = posture_feedback_snapshot(runtime)
         owners = ownership_snapshot(runtime)
-        timed_out = phase in POSTURE_WAIT_PHASES and elapsed >= self.config.posture_wait_timeout_s
+        posture_timed_out = (
+            phase in POSTURE_WAIT_PHASES
+            and elapsed >= self.config.posture_wait_timeout_s
+        )
+
+        wall_ns = time.time_ns() if now_unix_ns is None else now_unix_ns
+        if isinstance(wall_ns, bool) or not isinstance(wall_ns, int) or wall_ns <= 0:
+            raise ValueError("watchdog wall timestamp must be a positive integer")
+        raw_stamp = runtime.get("updated_unix_ns")
+        stamp_ns = (
+            raw_stamp
+            if isinstance(raw_stamp, int) and not isinstance(raw_stamp, bool) and raw_stamp > 0
+            else None
+        )
+        heartbeat_required = phase not in HEARTBEAT_EXEMPT_PHASES
+        heartbeat_valid = False
+        heartbeat_age_s: float | None = None
+        heartbeat_invalid_reason: str | None = None
+        if stamp_ns is not None:
+            heartbeat_age_s = (wall_ns - stamp_ns) / 1e9
+            if heartbeat_age_s < -self.config.max_state_future_s:
+                heartbeat_invalid_reason = "state heartbeat timestamp is in the future"
+            elif (
+                self._heartbeat_stamp_ns is not None
+                and stamp_ns < self._heartbeat_stamp_ns
+            ):
+                heartbeat_invalid_reason = "state heartbeat timestamp moved backwards"
+            else:
+                heartbeat_valid = True
+                if self._heartbeat_stamp_ns != stamp_ns:
+                    self._heartbeat_stamp_ns = stamp_ns
+                    self._heartbeat_progress_s = now
+        else:
+            heartbeat_invalid_reason = "state document has no updated_unix_ns heartbeat"
+        if self._heartbeat_progress_s is None:
+            self._heartbeat_progress_s = now
+        heartbeat_elapsed_s = max(0.0, now - self._heartbeat_progress_s)
+        heartbeat_timed_out = False
+        if heartbeat_required:
+            if heartbeat_invalid_reason is not None:
+                # A handoff may start an arm/gripper transaction, so it is
+                # never accepted from an unverified status document. Other
+                # active phases receive one bounded startup grace period.
+                heartbeat_timed_out = (
+                    phase in HANDOFF_PHASES
+                    or heartbeat_elapsed_s >= self.config.state_heartbeat_timeout_s
+                )
+            elif (
+                heartbeat_age_s is not None
+                and heartbeat_age_s > self.config.state_heartbeat_timeout_s
+            ):
+                heartbeat_timed_out = True
+                heartbeat_invalid_reason = "state heartbeat is older than its deadline"
+            elif heartbeat_elapsed_s >= self.config.state_heartbeat_timeout_s:
+                heartbeat_timed_out = True
+                heartbeat_invalid_reason = "state heartbeat stopped advancing"
+
+        timed_out = posture_timed_out or heartbeat_timed_out
         code: str | None = None
         message = "phase is progressing within its bounded wait"
-        if timed_out:
+        # Keep the more specific posture diagnosis when both deadlines expire
+        # on the same observation; the state heartbeat deadline still causes
+        # the same stationary terminal transition.
+        if posture_timed_out:
             age_s = feedback.get("age_s")
             feedback_stale = (
                 not feedback.get("available")
@@ -208,6 +308,12 @@ class ReactivePhaseWatchdog:
                     "measured posture did not settle before the bounded deadline; "
                     "reactive control degraded to a stationary terminal state"
                 )
+        elif heartbeat_timed_out:
+            code = "REACTIVE_STATE_HEARTBEAT_TIMEOUT"
+            message = (
+                f"{heartbeat_invalid_reason or 'state heartbeat deadline expired'}; "
+                "reactive control degraded to a stationary terminal state"
+            )
         self._last = ReactiveWatchdogDecision(
             phase=phase,
             phase_elapsed_s=elapsed,
@@ -220,6 +326,15 @@ class ReactivePhaseWatchdog:
             message=message,
             feedback=feedback,
             owners=owners,
+            heartbeat_required=heartbeat_required,
+            heartbeat_valid=heartbeat_valid,
+            heartbeat_updated_unix_ns=stamp_ns,
+            heartbeat_age_s=heartbeat_age_s,
+            heartbeat_elapsed_s=heartbeat_elapsed_s,
+            heartbeat_deadline_s=(
+                self.config.state_heartbeat_timeout_s
+                if heartbeat_required else None
+            ),
         )
         return self._last
 

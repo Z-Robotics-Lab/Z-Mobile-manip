@@ -739,7 +739,8 @@ def _servo_status_script(path: Path, phase: str) -> Path:
         "import json, pathlib, sys, time\n"
         f"phase = {phase!r}\n"
         "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
-        "'schema':'z_manip.depth_servo_status.v1','running':True,'phase':phase}))\n"
+        "'schema':'z_manip.depth_servo_status.v1','running':True,'phase':phase,"
+        "'updated_unix_ns':time.time_ns()}))\n"
         "time.sleep(10)\n",
         encoding="utf-8",
     )
@@ -758,7 +759,8 @@ def _servo_phase_sequence_script(path: Path, phases: list[str]) -> Path:
         "counter.write_text(str(count + 1))\n"
         "phase = phases[min(count, len(phases) - 1)]\n"
         "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
-        "'schema':'z_manip.depth_servo_status.v1','running':True,'phase':phase}))\n"
+        "'schema':'z_manip.depth_servo_status.v1','running':True,'phase':phase,"
+        "'updated_unix_ns':time.time_ns()}))\n"
         "time.sleep(10)\n",
         encoding="utf-8",
     )
@@ -776,6 +778,21 @@ def _servo_posture_stall_script(path: Path) -> Path:
         "'reactive':{'arm_view':{'mode':'track'}},"
         "'posture_status':{'age_s':9.0,'document':None},"
         "'output':{'published_linear_x':0.0,'published_angular_z':0.0}}))\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _servo_frozen_heartbeat_script(path: Path, phase: str) -> Path:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        f"phase = {phase!r}\n"
+        "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+        "'schema':'z_manip.depth_servo_status.v1','running':True,'phase':phase,"
+        "'updated_unix_ns':time.time_ns()}))\n"
         "time.sleep(10)\n",
         encoding="utf-8",
     )
@@ -1027,6 +1044,69 @@ def test_depth_servo_posture_wait_degrades_instead_of_waiting_forever(tmp_path):
     assert status["supervision"]["code"] == "POSTURE_FEEDBACK_TIMEOUT"
     assert status["supervision"]["owners"]["arm_view"] == "intent_only"
     assert runner._process is not None and runner._process.poll() is not None
+    assert grasp.starts == 0
+
+
+def test_live_depth_servo_process_with_frozen_status_is_terminated(tmp_path):
+    grasp = _FakeGraspRunner()
+    runner = CONTROL.DepthServoRunner(
+        _servo_frozen_heartbeat_script(tmp_path / "servo.py", "base_approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=_FakeInteractiveService(),
+        grasp_runner=grasp,
+        state_heartbeat_timeout_s=0.15,
+    )
+
+    result = runner.start("live", target="charger", auto_handoff=True)
+    deadline = time.monotonic() + 3.0
+    while runner.status()["phase"] != "degraded" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    status = runner.status()
+
+    assert result["started"] is True
+    assert status["running"] is False
+    assert status["phase"] == "degraded"
+    assert status["supervision"]["code"] == "REACTIVE_STATE_HEARTBEAT_TIMEOUT"
+    assert (
+        status["supervision"]["heartbeat_elapsed_s"] >= 0.15
+        or status["supervision"]["heartbeat_age_s"] >= 0.15
+    )
+    assert runner._process is not None and runner._process.poll() is not None
+    assert grasp.starts == 0
+
+
+def test_stale_handoff_status_can_never_start_grasp(tmp_path):
+    grasp = _FakeGraspRunner()
+    script = tmp_path / "servo.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+        "'schema':'z_manip.depth_servo_status.v1','running':True,"
+        "'phase':'handoff_ready','updated_unix_ns':1}))\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    runner = CONTROL.DepthServoRunner(
+        script,
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=_FakeInteractiveService(),
+        grasp_runner=grasp,
+        state_heartbeat_timeout_s=0.15,
+    )
+
+    result = runner.start("live", target="charger", auto_handoff=True)
+    deadline = time.monotonic() + 3.0
+    while runner.status()["phase"] != "degraded" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    status = runner.status()
+
+    assert result["started"] is True
+    assert status["phase"] == "degraded"
+    assert status["supervision"]["code"] == "REACTIVE_STATE_HEARTBEAT_TIMEOUT"
     assert grasp.starts == 0
 
 

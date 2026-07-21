@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,3 +108,101 @@ def test_posture_subphase_changes_do_not_reset_the_wait_budget():
 
     assert decision.timed_out is True
     assert decision.phase == "posture_shadow_verified"
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "waiting_target",
+        "approach",
+        "base_approach",
+        "tracking_lost",
+        "reacquiring",
+        "view_recovery",
+        "search_required",
+    ),
+)
+def test_all_active_servo_phases_require_an_advancing_state_heartbeat(phase):
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=0.5)
+    )
+    runtime = {"phase": phase, "updated_unix_ns": 10_000_000_000}
+
+    first = watchdog.observe(
+        runtime,
+        now_s=1.0,
+        now_unix_ns=10_100_000_000,
+    )
+    frozen = watchdog.observe(
+        runtime,
+        now_s=1.5,
+        now_unix_ns=10_600_000_000,
+    )
+
+    assert first.timed_out is False
+    assert frozen.timed_out is True
+    assert frozen.code == "REACTIVE_STATE_HEARTBEAT_TIMEOUT"
+    assert frozen.heartbeat_updated_unix_ns == 10_000_000_000
+    assert frozen.heartbeat_elapsed_s == pytest.approx(0.5)
+
+
+def test_phase_changes_do_not_hide_a_frozen_state_heartbeat():
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=0.6)
+    )
+    runtime = {"phase": "approach", "updated_unix_ns": 20_000_000_000}
+    watchdog.observe(runtime, now_s=4.0, now_unix_ns=20_050_000_000)
+    runtime["phase"] = "tracking_lost"
+    watchdog.observe(runtime, now_s=4.3, now_unix_ns=20_350_000_000)
+    runtime["phase"] = "reacquiring"
+
+    decision = watchdog.observe(
+        runtime,
+        now_s=4.6,
+        now_unix_ns=20_650_000_000,
+    )
+
+    assert decision.timed_out is True
+    assert decision.code == "REACTIVE_STATE_HEARTBEAT_TIMEOUT"
+
+
+def test_advancing_state_heartbeat_refreshes_deadline():
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=0.5)
+    )
+    for index in range(6):
+        decision = watchdog.observe(
+            {
+                "phase": "base_approach",
+                "updated_unix_ns": 30_000_000_000 + index * 100_000_000,
+            },
+            now_s=7.0 + index * 0.1,
+            now_unix_ns=30_050_000_000 + index * 100_000_000,
+        )
+        assert decision.timed_out is False
+        assert decision.heartbeat_valid is True
+
+
+@pytest.mark.parametrize("phase", ("reached", "handoff_probe", "handoff_ready"))
+def test_grasp_handoff_rejects_missing_or_stale_state_heartbeat(phase):
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=0.5)
+    )
+
+    missing = watchdog.observe(
+        {"phase": phase},
+        now_s=1.0,
+        now_unix_ns=40_000_000_000,
+    )
+
+    assert missing.timed_out is True
+    assert missing.code == "REACTIVE_STATE_HEARTBEAT_TIMEOUT"
+
+    watchdog.reset()
+    stale = watchdog.observe(
+        {"phase": phase, "updated_unix_ns": 40_000_000_000},
+        now_s=2.0,
+        now_unix_ns=41_000_000_000,
+    )
+    assert stale.timed_out is True
+    assert stale.code == "REACTIVE_STATE_HEARTBEAT_TIMEOUT"

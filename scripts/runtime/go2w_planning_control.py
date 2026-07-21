@@ -1389,6 +1389,7 @@ class DepthServoRunner:
         wrist_search: Any | None = None,
         max_reacquisitions: int = 3,
         posture_wait_timeout_s: float = 12.0,
+        state_heartbeat_timeout_s: float = 1.5,
     ) -> None:
         self.script = script.expanduser().resolve()
         if not self.script.is_file():
@@ -1414,6 +1415,7 @@ class DepthServoRunner:
         self._reactive_watchdog = go2w_reactive_supervision.ReactivePhaseWatchdog(
             go2w_reactive_supervision.ReactiveWatchdogConfig(
                 posture_wait_timeout_s=posture_wait_timeout_s,
+                state_heartbeat_timeout_s=state_heartbeat_timeout_s,
             )
         )
         self._cancel = threading.Event()
@@ -1808,6 +1810,7 @@ class DepthServoRunner:
             supervision = self._reactive_watchdog.observe(
                 runtime,
                 now_s=time.monotonic(),
+                now_unix_ns=time.time_ns(),
             )
             if supervision.timed_out:
                 self._terminate_process(process, keep_status=True)

@@ -108,3 +108,19 @@ Keep the live unit disabled until API-1024 parsing and the physical command
 envelope have been inspected in shadow/log replay. Live status retains the raw
 GetBodyHeight response, parse path/error, robot code, sample age, and query
 count so an unsupported firmware response cannot masquerade as feedback.
+
+## State heartbeat supervision
+
+The loopback supervisor does not treat a live depth-servo PID as proof that
+the control loop is healthy. Every active status document must advance
+`updated_unix_ns` within 1.5 seconds. This applies across target waiting,
+tracking, base approach, posture adjustment, tracking loss, reacquisition, and
+view-search requests; changing phase does not reset the heartbeat deadline.
+
+A missing, stale, frozen, future, or backwards heartbeat terminates the servo
+process and latches a stationary `degraded` workflow with
+`REACTIVE_STATE_HEARTBEAT_TIMEOUT`. A `reached`, `handoff_probe`, or
+`handoff_ready` document is accepted only with a currently valid heartbeat,
+so stale state can never launch the grasp transaction. The status API exposes
+the heartbeat source stamp, age, elapsed time without progress, and deadline
+under `supervision` for replay and UI diagnosis.
