@@ -43,8 +43,13 @@ from z_manip.control.whole_body_runtime import (
 
 STATUS_SCHEMA = "z_manip.depth_servo_status.v1"
 POSTURE_SETTLE_TICKS = 5
-POSTURE_HEIGHT_RATE_SETTLED_MPS = 0.006
 POSTURE_ANGLE_RATE_SETTLED_RPS = math.radians(0.75)
+ARM_RATE_SETTLED_RPS = math.radians(0.75)
+ARM_TARGET_ERROR_SETTLED_RAD = math.radians(1.0)
+ARM_STATUS_TIMEOUT_S = 0.50
+ARM_INTENT_TTL_NS = 250_000_000
+ARM_INTENT_SCHEMA = "z_manip.piper_reactive_view_intent.v1"
+ARM_STATUS_SCHEMA = "z_manip.piper_reactive_view_status.v1"
 
 
 @dataclass(frozen=True)
@@ -146,17 +151,93 @@ def _whole_body_posture_rate_converged(
 
     try:
         intent = command.document["intent"]
-        height_rate = float(intent["body_height_mps"])
         roll_rate = float(intent["body_roll_rps"])
         pitch_rate = float(intent["body_pitch_rps"])
     except (KeyError, TypeError, ValueError):
         return False
     return (
-        all(math.isfinite(value) for value in (height_rate, roll_rate, pitch_rate))
-        and abs(height_rate) <= POSTURE_HEIGHT_RATE_SETTLED_MPS
+        all(math.isfinite(value) for value in (roll_rate, pitch_rate))
         and abs(roll_rate) <= POSTURE_ANGLE_RATE_SETTLED_RPS
         and abs(pitch_rate) <= POSTURE_ANGLE_RATE_SETTLED_RPS
     )
+
+
+def _whole_body_arm_rate_converged(command: WholeBodyRuntimeCommand) -> bool:
+    rates = tuple(float(value) for value in command.arm_joint_velocity_rps)
+    return (
+        len(rates) == 6
+        and all(math.isfinite(value) for value in rates)
+        and max(abs(value) for value in rates) <= ARM_RATE_SETTLED_RPS
+    )
+
+
+def _arm_feedback_state(
+    document: dict[str, Any] | None,
+    *,
+    age_s: float,
+    required_seq: int | None,
+) -> tuple[bool, bool, bool, str]:
+    """Reduce the measured PiPER executor status to ready/reached gates."""
+
+    if document is None or not math.isfinite(age_s) or age_s > ARM_STATUS_TIMEOUT_S:
+        return False, False, False, "PiPER reactive executor status unavailable or stale"
+    if document.get("schema") != ARM_STATUS_SCHEMA:
+        return False, False, False, "PiPER reactive executor status schema is invalid"
+    if document.get("owner") != "piper_reactive_view_executor":
+        return False, False, True, "PiPER reactive CAN owner is not confirmed"
+    fault = document.get("fault")
+    stopped = document.get("stop_latched") is True
+    blocked = stopped or fault not in (None, "")
+    ready = document.get("ready") is True and not blocked
+    try:
+        accepted_seq = int(document.get("accepted_seq", -1))
+        max_error_rad = float(document["max_error_rad"])
+        feedback_age_s = float(document.get("feedback_age_s", 0.0))
+    except (KeyError, TypeError, ValueError):
+        return ready, False, blocked, "PiPER measured target evidence is incomplete"
+    acknowledged = required_seq is None or accepted_seq >= required_seq
+    reached = (
+        ready
+        and acknowledged
+        and math.isfinite(max_error_rad)
+        and math.isfinite(feedback_age_s)
+        and 0.0 <= feedback_age_s <= ARM_STATUS_TIMEOUT_S
+        and max_error_rad <= ARM_TARGET_ERROR_SETTLED_RAD
+    )
+    if blocked:
+        detail = str(fault or "PiPER reactive executor is stop-latched")
+    elif not acknowledged:
+        detail = f"waiting for PiPER intent seq {required_seq}; accepted {accepted_seq}"
+    elif reached:
+        detail = f"PiPER measured target reached ({max_error_rad:.4f} rad max error)"
+    else:
+        detail = f"PiPER target error {max_error_rad:.4f} rad"
+    return ready, reached, blocked, detail
+
+
+def _arm_view_intent_document(
+    command: WholeBodyRuntimeCommand,
+    *,
+    seq: int,
+    now_unix_ns: int,
+    target_source_timestamp_ns: int | None,
+) -> dict[str, Any]:
+    rates = tuple(float(value) for value in command.arm_joint_velocity_rps)
+    if len(rates) != 6 or not all(math.isfinite(value) for value in rates):
+        raise ValueError("whole-body arm intent must contain six finite velocities")
+    if seq < 0 or now_unix_ns <= 0:
+        raise ValueError("arm intent sequence and timestamp are invalid")
+    return {
+        "schema": ARM_INTENT_SCHEMA,
+        "seq": int(seq),
+        # This timestamp is the command-generation time used by the NUC lease.
+        "source_timestamp_ns": int(now_unix_ns),
+        "deadline_unix_ns": int(now_unix_ns) + ARM_INTENT_TTL_NS,
+        # Keep the synchronized perception stamp separately for traceability;
+        # it may use the ROS clock and must not be used as a lease clock.
+        "target_source_timestamp_ns": target_source_timestamp_ns,
+        "joint_velocity_rps": list(rates),
+    }
 
 
 def _rigid_transform_matrix(
@@ -836,6 +917,10 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.posture_status_received_s: float | None = None
             self.last_posture_intent: tuple[float, float] | None = None
             self.last_posture_intent_s = 0.0
+            self.arm_view_status: dict[str, Any] | None = None
+            self.arm_view_status_received_s: float | None = None
+            self.arm_view_intent_seq = 0
+            self.last_arm_view_intent: dict[str, Any] | None = None
             self.whole_body: WholeBodyRuntimeController | None = None
             self.whole_body_command: WholeBodyRuntimeCommand | None = None
             self.whole_body_error: str | None = None
@@ -866,12 +951,23 @@ def _run_ros(args: argparse.Namespace) -> int:
                 "/z_manip/reactive/posture_intent",
                 qos,
             )
+            self.arm_view_intent_publisher = self.create_publisher(
+                String,
+                "/z_manip/reactive/arm_view_intent",
+                qos,
+            )
             self.create_subscription(PointCloud2, args.target_topic, self._target, qos)
             self.create_subscription(Bool, args.tracking_topic, self._tracking, qos)
             self.create_subscription(
                 String,
                 "/go2w/posture_state",
                 self._posture_state,
+                qos,
+            )
+            self.create_subscription(
+                String,
+                "/z_manip/reactive/arm_view_status",
+                self._arm_view_state,
                 qos,
             )
             self.create_timer(1.0 / args.rate_hz, self._tick)
@@ -1026,6 +1122,18 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self.posture_status = document
                 self.posture_status_received_s = time.monotonic()
 
+        def _arm_view_state(self, message: String) -> None:
+            try:
+                document = json.loads(message.data)
+            except json.JSONDecodeError:
+                return
+            if (
+                isinstance(document, dict)
+                and document.get("schema") == ARM_STATUS_SCHEMA
+            ):
+                self.arm_view_status = document
+                self.arm_view_status_received_s = time.monotonic()
+
         def _posture_feedback(self) -> tuple[bool, bool, bool, str]:
             age_s = (
                 math.inf
@@ -1035,6 +1143,23 @@ def _run_ros(args: argparse.Namespace) -> int:
             return _posture_feedback_state(
                 self.posture_status,
                 age_s=age_s,
+            )
+
+        def _arm_feedback(self) -> tuple[bool, bool, bool, str]:
+            age_s = (
+                math.inf
+                if self.arm_view_status_received_s is None
+                else time.monotonic() - self.arm_view_status_received_s
+            )
+            required_seq = (
+                None
+                if self.last_arm_view_intent is None
+                else int(self.last_arm_view_intent["seq"])
+            )
+            return _arm_feedback_state(
+                self.arm_view_status,
+                age_s=age_s,
+                required_seq=required_seq,
             )
 
         def _publish_posture_intent(self, *, blocked: bool = False) -> None:
@@ -1048,11 +1173,8 @@ def _run_ros(args: argparse.Namespace) -> int:
                 # remains completely transport-free.
                 if not self.whole_body_command.executable:
                     return
-                target = (
-                    self.whole_body_command.body_height_target_m,
-                    self.whole_body_command.body_pitch_target_rad,
-                )
                 roll = self.whole_body_command.body_roll_target_rad
+                target = (roll, self.whole_body_command.body_pitch_target_rad)
             else:
                 status = self.core.reactive_status
                 if status is None or status.get("phase") not in {
@@ -1063,10 +1185,8 @@ def _run_ros(args: argparse.Namespace) -> int:
                 posture = status.get("posture")
                 if not isinstance(posture, dict):
                     return
-                target = (
-                    float(posture.get("body_height_delta_m", 0.0)),
-                    float(posture.get("pitch_delta_rad", 0.0)),
-                )
+                roll = float(posture.get("roll_delta_rad", 0.0))
+                target = (roll, float(posture.get("pitch_delta_rad", 0.0)))
             now_s = time.monotonic()
             if (
                 self.last_posture_intent == target
@@ -1077,7 +1197,6 @@ def _run_ros(args: argparse.Namespace) -> int:
             message.data = json.dumps(
                 {
                     "schema": "z_manip.go2w_posture_intent.v1",
-                    "body_height_delta_m": target[0],
                     "roll_delta_rad": roll,
                     "pitch_delta_rad": target[1],
                     "yaw_delta_rad": yaw,
@@ -1088,6 +1207,49 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.posture_intent_publisher.publish(message)
             self.last_posture_intent = target
             self.last_posture_intent_s = now_s
+
+        def _publish_arm_view_intent(self, *, blocked: bool = False) -> None:
+            command = self.whole_body_command
+            if blocked or settings.mode != "live" or command is None:
+                return
+            transport = command.document.get("transport")
+            if (
+                not command.executable
+                or not isinstance(transport, dict)
+                or transport.get("arm_enabled") is not True
+            ):
+                return
+            _ready, reached, _blocked, _detail = self._arm_feedback()
+            # Once the optimizer asks for negligible arm motion and the NUC
+            # has measured the last target, stop advancing sequence numbers.
+            # This gives the handoff gate a stable acknowledged window while
+            # the executor's own stale-intent behavior continues to hold pose.
+            if _whole_body_arm_rate_converged(command) and reached:
+                return
+            sequence = self.arm_view_intent_seq
+            if self.last_arm_view_intent is not None:
+                previous = int(self.last_arm_view_intent["seq"])
+                accepted = -1
+                if isinstance(self.arm_view_status, dict):
+                    try:
+                        accepted = int(self.arm_view_status.get("accepted_seq", -1))
+                    except (TypeError, ValueError):
+                        accepted = -1
+                # Retransmit a missed sequence with a fresh lease instead of
+                # outrunning a 20 Hz executor with an ever-growing backlog.
+                sequence = previous if accepted < previous else sequence
+            now_ns = time.time_ns()
+            document = _arm_view_intent_document(
+                command,
+                seq=sequence,
+                now_unix_ns=now_ns,
+                target_source_timestamp_ns=self.last_source_stamp_ns,
+            )
+            message = String()
+            message.data = json.dumps(document, separators=(",", ":"), allow_nan=False)
+            self.arm_view_intent_publisher.publish(message)
+            self.last_arm_view_intent = document
+            self.arm_view_intent_seq = max(self.arm_view_intent_seq, sequence + 1)
 
         def _publish(self, linear_x: float, angular_z: float) -> None:
             message = TwistStamped()
@@ -1122,6 +1284,11 @@ def _run_ros(args: argparse.Namespace) -> int:
                 None
                 if self.posture_status_received_s is None
                 else max(0.0, time.monotonic() - self.posture_status_received_s)
+            )
+            arm_view_age_s = (
+                None
+                if self.arm_view_status_received_s is None
+                else max(0.0, time.monotonic() - self.arm_view_status_received_s)
             )
             document = {
                 "schema": STATUS_SCHEMA,
@@ -1163,9 +1330,14 @@ def _run_ros(args: argparse.Namespace) -> int:
                     "age_s": posture_age_s,
                     "document": self.posture_status,
                     "last_intent": None if self.last_posture_intent is None else {
-                        "body_height_delta_m": self.last_posture_intent[0],
+                        "roll_delta_rad": self.last_posture_intent[0],
                         "pitch_delta_rad": self.last_posture_intent[1],
                     },
+                },
+                "arm_view_status": {
+                    "age_s": arm_view_age_s,
+                    "document": self.arm_view_status,
+                    "last_intent": self.last_arm_view_intent,
                 },
                 "whole_body": (
                     {
@@ -1206,6 +1378,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     "output": document["output"],
                     "filter": document["filter"],
                     "posture_status": document["posture_status"],
+                    "arm_view_status": document["arm_view_status"],
                     "whole_body": document["whole_body"],
                 })
                 self.last_trace_phase = self.last_output.phase
@@ -1257,6 +1430,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 command = self.whole_body.solve(
                     camera_target_xyz_m=target,
                     posture_status=self.posture_status,
+                    arm_view_status=self.arm_view_status,
                     runtime_state_path=args.runtime_state,
                     mode=settings.mode,
                     freeze_base=inside_handoff,
@@ -1278,8 +1452,18 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.whole_body_command = command
             self.whole_body_error = None
             posture_rate_converged = _whole_body_posture_rate_converged(command)
+            arm_rate_converged = _whole_body_arm_rate_converged(command)
+            arm_ready, arm_reached, arm_blocked, arm_detail = self._arm_feedback()
             if inside_handoff:
-                if command.executable and posture_settled and posture_rate_converged:
+                if (
+                    command.executable
+                    and posture_settled
+                    and posture_rate_converged
+                    and arm_ready
+                    and arm_reached
+                    and arm_rate_converged
+                    and not arm_blocked
+                ):
                     self.whole_body_handoff_settle_cycles += 1
                 else:
                     self.whole_body_handoff_settle_cycles = 0
@@ -1310,7 +1494,10 @@ def _run_ros(args: argparse.Namespace) -> int:
                             yaw_error_rad=geometry.base_bearing_rad,
                             target_age_s=fallback.target_age_s,
                             done=True,
-                            reason="measured body loop and close-range IK handoff converged",
+                            reason=(
+                                "measured Euler and PiPER view loops plus close-range "
+                                "IK handoff converged"
+                            ),
                             reactive_phase="handoff_ready",
                         )
 
@@ -1331,9 +1518,9 @@ def _run_ros(args: argparse.Namespace) -> int:
                     target_age_s=fallback.target_age_s,
                     done=False,
                     reason=(
-                        "base parked; closing measured BodyHeight/Euler loop "
+                        "base parked; closing measured Euler and PiPER view loops "
                         f"({self.whole_body_handoff_settle_cycles}/"
-                        f"{POSTURE_SETTLE_TICKS} stable ticks)"
+                        f"{POSTURE_SETTLE_TICKS} stable ticks; {arm_detail})"
                         if command.executable
                         else "whole-body posture intent gated by stale measured state"
                     ),
@@ -1384,6 +1571,8 @@ def _run_ros(args: argparse.Namespace) -> int:
                 posture_settled=settled,
             )
             self._publish_posture_intent(blocked=blocked)
+            _arm_ready, _arm_reached, arm_blocked, _arm_detail = self._arm_feedback()
+            self._publish_arm_view_intent(blocked=arm_blocked)
             if settings.mode == "live":
                 self._publish(
                     self.last_output.published_linear_x,

@@ -36,6 +36,11 @@ def _ry(pitch):
     return np.asarray(((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c)))
 
 
+def _rx(roll):
+    c, s = math.cos(roll), math.sin(roll)
+    return np.asarray(((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c)))
+
+
 class ReplayKinematics:
     """Deterministic reduced geometry; no actuator or middleware imports."""
 
@@ -78,13 +83,30 @@ class ReplayKinematics:
         value[0] += math.cos(state.base_yaw_rad) * control[0] * dt_s
         value[1] += math.sin(state.base_yaw_rad) * control[0] * dt_s
         value[2] += control[1] * dt_s
-        value[3:6] += control[2:5] * dt_s
+        # Current Go2W firmware exposes Euler but not BodyHeight as a
+        # commandable DOF.  Keep the observed height fixed and integrate the
+        # roll/pitch controls into state indices 4/5.
+        value[4] += control[2] * dt_s
+        value[5] += control[3] * dt_s
         value[6:] = np.clip(
-            value[6:] + control[5:] * dt_s,
+            value[6:] + control[4:] * dt_s,
             self.arm_lower_limits,
             self.arm_upper_limits,
         )
         return ReducedWholeBodyState.from_vector(value)
+
+    def target_in_body(self, state, target_world_xyz_m):
+        target = np.asarray(target_world_xyz_m, dtype=float)
+        rotation = (
+            _rz(state.base_yaw_rad)
+            @ _ry(state.body_pitch_rad)
+            @ _rx(state.body_roll_rad)
+        )
+        translation = np.asarray(
+            (state.base_x_m, state.base_y_m, state.body_height_m),
+            dtype=float,
+        )
+        return rotation.T @ (target - translation)
 
     def frame_jacobian(self, state, frame):
         pose = self.frame_pose(state, frame)
@@ -127,14 +149,15 @@ def test_reduced_state_has_nonholonomic_integration_and_six_arm_joints():
     model = ReplayKinematics()
     state = _state(base_yaw_rad=math.pi / 2)
     velocity = ReducedWholeBodyVelocity.from_vector(
-        (0.2, 0.1, -0.02, 0.0, 0.03, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.2, 0.1, 0.0, 0.03, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
     )
     moved = model.integrate(state, velocity, 0.5)
 
     assert moved.base_x_m == pytest.approx(0.0, abs=1e-12)
     assert moved.base_y_m == pytest.approx(0.1)
     assert moved.base_yaw_rad == pytest.approx(math.pi / 2 + 0.05)
-    assert moved.body_height_m == pytest.approx(-0.01)
+    assert moved.body_height_m == pytest.approx(0.0)
+    assert moved.body_pitch_rad == pytest.approx(0.015)
     assert len(moved.arm_joints_rad) == 6
 
 
@@ -164,7 +187,7 @@ def test_near_low_target_couples_body_and_arm_without_blocking_phase():
     result = optimizer.solve(state, task)
 
     assert result.near_weight > 0.9
-    assert result.velocity.body_height_mps < 0.0
+    assert abs(result.velocity.body_pitch_rps) > math.radians(0.1)
     assert np.linalg.norm(result.velocity.arm_joint_velocity_rps) > 0.01
     assert result.objective_after < result.objective_before
 
@@ -174,12 +197,12 @@ def test_locked_untransported_controls_remain_exactly_stationary():
     result = optimizer.solve(
         _state(),
         WholeBodyTask(target_world_xyz_m=(0.56, 0.0, -0.12)),
-        locked_control_indices=(0, 1, 5, 6, 7, 8, 9, 10),
+        locked_control_indices=(0, 1, 4, 5, 6, 7, 8, 9),
     )
 
     velocity = result.velocity.as_vector()
-    assert velocity[(0, 1, 5, 6, 7, 8, 9, 10),] == pytest.approx(0.0)
-    assert np.linalg.norm(velocity[2:5]) > 0.0
+    assert velocity[(0, 1, 4, 5, 6, 7, 8, 9),] == pytest.approx(0.0)
+    assert np.linalg.norm(velocity[2:4]) > 0.0
 
 
 def test_invalid_locked_control_index_is_rejected():
@@ -245,13 +268,13 @@ def test_box_qp_respects_velocity_and_one_step_joint_position_bounds():
         WholeBodyTask(target_world_xyz_m=(0.60, 0.20, 0.0)),
     )
 
-    assert problem.upper[5] <= 0.005 + 1e-12
+    assert problem.upper[4] <= 0.005 + 1e-12
     value = ScipyReferenceBoxQP().solve(problem)
     assert np.all(value >= problem.lower - 1e-9)
     assert np.all(value <= problem.upper + 1e-9)
 
 
-def test_forty_tick_shadow_replay_converges_without_a_posture_blocking_phase():
+def test_fifty_tick_shadow_replay_converges_without_a_posture_blocking_phase():
     model = ReplayKinematics()
     optimizer = WholeBodyShadowOptimizer(model)
     task = WholeBodyTask(target_world_xyz_m=(1.25, 0.25, -0.08))
@@ -262,7 +285,7 @@ def test_forty_tick_shadow_replay_converges_without_a_posture_blocking_phase():
     initial_standoff_error = None
     final_standoff_error = None
 
-    for _tick in range(40):
+    for _tick in range(50):
         result = optimizer.solve(state, task, previous_velocity=previous)
         velocity = result.velocity.as_vector()
         problem = optimizer.linearize(state, task, previous_velocity=previous)
@@ -270,8 +293,9 @@ def test_forty_tick_shadow_replay_converges_without_a_posture_blocking_phase():
         assert np.all(velocity <= problem.upper + 1e-9)
         assert result.status_document()["mode"] == "shadow"
         assert "phase" not in result.status_document()
-        assert optimizer.config.body_height_min_m - 1e-9 <= result.predicted_state.body_height_m
-        assert result.predicted_state.body_height_m <= optimizer.config.body_height_max_m + 1e-9
+        assert result.predicted_state.body_height_m == pytest.approx(
+            state.body_height_m,
+        )
         assert abs(result.predicted_state.body_roll_rad) <= optimizer.config.body_roll_abs_max_rad + 1e-9
         assert abs(result.predicted_state.body_pitch_rad) <= optimizer.config.body_pitch_abs_max_rad + 1e-9
         image_error = float(np.linalg.norm(result.residual_before[:2]))
@@ -340,6 +364,6 @@ def test_real_urdf_pinocchio_reduces_to_virtual_body_plus_piper_six():
     assert model.model.nq == 6
     assert tuple(model.model.names[1:]) == tuple(f"piper_joint{i}" for i in range(1, 7))
     assert camera.shape == tool.shape == (4, 4)
-    assert camera_jacobian.shape == (6, 11)
+    assert camera_jacobian.shape == (6, 10)
     assert np.isfinite(camera_jacobian).all()
-    assert np.count_nonzero(np.linalg.norm(camera_jacobian[:, 5:], axis=0) > 1e-8) >= 4
+    assert np.count_nonzero(np.linalg.norm(camera_jacobian[:, 4:], axis=0) > 1e-8) >= 4

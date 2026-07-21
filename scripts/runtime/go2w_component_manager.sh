@@ -181,7 +181,7 @@ status_one() {
     reactive-control)
       if remote_service_active "$REACTIVE_NUC_UNIT"; then
         state="healthy"
-        summary="NUC single WebRTC owner active; Move + BodyHeight + Euler"
+        summary="NUC single WebRTC owner active; Move + Euler (BodyHeight unsupported)"
       else
         summary="NUC reactive WebRTC owner inactive"
       fi

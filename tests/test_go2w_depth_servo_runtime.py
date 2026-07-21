@@ -491,14 +491,13 @@ def test_whole_body_posture_convergence_uses_velocity_not_tiny_pose_step():
     command = SERVO.WholeBodyRuntimeCommand(
         base_forward_mps=0.0,
         base_yaw_rps=0.0,
-        body_height_target_m=0.007,
+        body_height_target_m=None,
         body_roll_target_rad=0.0,
         body_pitch_target_rad=math.radians(0.8),
         arm_joint_velocity_rps=(0.0,) * 6,
         executable=True,
         document={
             "intent": {
-                "body_height_mps": 0.035,
                 "body_roll_rps": 0.0,
                 "body_pitch_rps": math.radians(1.5),
             }
@@ -507,10 +506,97 @@ def test_whole_body_posture_convergence_uses_velocity_not_tiny_pose_step():
 
     assert not SERVO._whole_body_posture_rate_converged(command)
     command.document["intent"].update({
-        "body_height_mps": 0.002,
         "body_pitch_rps": math.radians(0.3),
     })
     assert SERVO._whole_body_posture_rate_converged(command)
+
+
+def test_arm_intent_has_a_bounded_wall_clock_lease_and_synchronized_source():
+    command = SERVO.WholeBodyRuntimeCommand(
+        base_forward_mps=0.0,
+        base_yaw_rps=0.0,
+        body_height_target_m=None,
+        body_roll_target_rad=0.0,
+        body_pitch_target_rad=0.0,
+        arm_joint_velocity_rps=(0.01, -0.02, 0.03, -0.04, 0.05, -0.06),
+        executable=True,
+        document={"intent": {"body_roll_rps": 0.0, "body_pitch_rps": 0.0}},
+    )
+
+    intent = SERVO._arm_view_intent_document(
+        command,
+        seq=7,
+        now_unix_ns=1_700_000_000_000_000_000,
+        target_source_timestamp_ns=1_699_999_999_900_000_000,
+    )
+
+    assert intent["schema"] == "z_manip.piper_reactive_view_intent.v1"
+    assert intent["seq"] == 7
+    assert intent["deadline_unix_ns"] - intent["source_timestamp_ns"] == 250_000_000
+    assert intent["target_source_timestamp_ns"] == 1_699_999_999_900_000_000
+    assert intent["joint_velocity_rps"] == pytest.approx(command.arm_joint_velocity_rps)
+
+
+def test_arm_handoff_requires_fresh_acknowledged_measured_target():
+    document = {
+        "schema": "z_manip.piper_reactive_view_status.v1",
+        "owner": "piper_reactive_view_executor",
+        "ready": True,
+        "stop_latched": False,
+        "fault": None,
+        "accepted_seq": 8,
+        "max_error_rad": math.radians(0.5),
+        "feedback_age_s": 0.02,
+    }
+
+    ready, reached, blocked, detail = SERVO._arm_feedback_state(
+        document,
+        age_s=0.05,
+        required_seq=8,
+    )
+    assert ready is True
+    assert reached is True
+    assert blocked is False
+    assert "reached" in detail
+
+    _, old_reached, _, old_detail = SERVO._arm_feedback_state(
+        document,
+        age_s=0.05,
+        required_seq=9,
+    )
+    assert old_reached is False
+    assert "waiting" in old_detail
+
+
+def test_arm_stop_latch_or_large_measured_error_blocks_handoff():
+    document = {
+        "schema": "z_manip.piper_reactive_view_status.v1",
+        "owner": "piper_reactive_view_executor",
+        "ready": True,
+        "stop_latched": False,
+        "fault": None,
+        "accepted_seq": 4,
+        "max_error_rad": math.radians(2.0),
+        "feedback_age_s": 0.01,
+    }
+    ready, reached, blocked, _ = SERVO._arm_feedback_state(
+        document,
+        age_s=0.01,
+        required_seq=4,
+    )
+    assert ready is True
+    assert reached is False
+    assert blocked is False
+
+    document["stop_latched"] = True
+    ready, reached, blocked, _ = SERVO._arm_feedback_state(
+        document,
+        age_s=0.01,
+        required_seq=4,
+    )
+    assert ready is False
+    assert reached is False
+    assert blocked is True
 
 
 @pytest.mark.parametrize(

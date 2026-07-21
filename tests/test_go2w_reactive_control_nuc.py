@@ -52,28 +52,24 @@ def test_live_bridge_is_one_owner_with_serialized_stop_move_and_posture():
     assert "async with self._sport_request_lock" in source
     assert "def _execute_sport_command(" in source
     assert source.count("publish_request_new(") == 1
-    assert '"GetBodyHeight", {}, timeout_s=self._HEIGHT_QUERY_TIMEOUT_S' in source
-    assert "get_body_height_from_response(response)" in source
     assert '"Move", {"x": x, "y": y, "z": yaw}' in source
-    assert '("BodyHeight", {"data": height})' in source
     assert '("Euler", {"x": roll, "y": pitch, "z": yaw})' in source
+    assert '"GetBodyHeight"' not in source
+    assert '("BodyHeight",' not in source
     assert 'self._last_code = await self._request_sport("StopMove", {})' in source
     assert "self._stop_latched = True" in source
     assert "self._pending_move = None" in source
     assert "self._pending_posture = None" in source
 
 
-def test_get_body_height_feedback_is_raw_observable_and_freshness_gated():
+def test_body_height_is_explicitly_unsupported_and_never_queried():
     source = SOURCE.read_text(encoding="utf-8")
 
-    assert 'SPORT_CMD["GetBodyHeight"]' in source
-    assert '"raw_response": self._height_query_response' in source
-    assert '"parse_path": self._height_query_parse_path' in source
-    assert '"parse_error": self._height_query_error' in source
-    assert "self._height_query_received_s = time.monotonic()" in source
-    assert "Never continue against a previous query" in source
-    assert '"sport_mode_state+GetBodyHeight"' in source
-    assert 'self._phase not in {"fault", "stopped", "stopping"}' in source
+    assert '"body_height": False' in source
+    assert '"get_body_height": False' in source
+    assert '"source": "sport_mode_state"' in source
+    assert '"BodyHeight is unsupported; linear.z must be zero"' in source
+    assert '"api_id": None' in source
 
 
 def test_feedback_freshness_gates_posture_and_stop_reset():
@@ -81,7 +77,6 @@ def test_feedback_freshness_gates_posture_and_stop_reset():
 
     assert "_STATE_TIMEOUT_S = 0.50" in source
     assert "measured posture feedback is stale" in source
-    assert "measured posture feedback is unsynchronized" in source
     assert "cannot verify reached posture" in source
     assert "fresh, detail = self._fresh_feedback()" in source
     assert "cannot release Full Stop" in source
@@ -127,18 +122,25 @@ def test_pc_intent_conversion_is_neutral_relative_bounded_and_finite():
     target = bridge.bounded_wire_target(
         {
             "schema": bridge.INTENT_SCHEMA,
-            "body_height_delta_m": -0.5,
             "pitch_delta_rad": math.radians(30.0),
         }
     )
 
-    assert target[0] == pytest.approx(-0.12)
+    assert target[0] == pytest.approx(0.0)
     assert target[2] == pytest.approx(math.radians(12.0))
     with pytest.raises(ValueError, match="finite"):
         bridge.bounded_wire_target(
             {
                 "schema": bridge.INTENT_SCHEMA,
                 "body_height_delta_m": math.nan,
+                "pitch_delta_rad": 0.0,
+            }
+        )
+    with pytest.raises(ValueError, match="BodyHeight is unsupported"):
+        bridge.bounded_wire_target(
+            {
+                "schema": bridge.INTENT_SCHEMA,
+                "body_height_delta_m": -0.01,
                 "pitch_delta_rad": 0.0,
             }
         )
@@ -150,13 +152,12 @@ def test_pc_live_relay_requires_fresh_unlatched_nuc_feedback():
         "schema": "z_manip.go2w_posture_status.v1",
         "mode": "live",
         "stop_latched": False,
-        "feedback": {"fresh": True},
-        "body_height": {"feedback_age_s": 0.1},
+        "feedback": {"fresh": True, "sport_state_age_s": 0.1},
     }
 
     assert bridge.feedback_is_fresh(status)
     status["stop_latched"] = True
     assert not bridge.feedback_is_fresh(status)
     status["stop_latched"] = False
-    status["body_height"]["feedback_age_s"] = 0.9
+    status["feedback"]["sport_state_age_s"] = 0.9
     assert not bridge.feedback_is_fresh(status)

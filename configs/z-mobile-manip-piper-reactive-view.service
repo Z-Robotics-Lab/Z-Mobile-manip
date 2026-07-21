@@ -1,0 +1,13 @@
+[Unit]
+Description=Z-Mobile Manip PiPER reactive view executor (single CAN owner)
+After=network-online.target
+Conflicts=z-manip-piper-passive-feedback.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/z-mobile-manip/piper_reactive_view_executor.sh
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=5
+KillMode=control-group
+Environment=PYTHONUNBUFFERED=1

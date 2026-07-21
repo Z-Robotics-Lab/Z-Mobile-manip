@@ -3,7 +3,7 @@
 The Unitree controller already owns leg-level whole-body control.  The
 manipulation stack therefore optimizes only the commands it can actually send:
 
-``[base forward, base yaw, body height, body roll, body pitch, arm qdot(6)]``.
+``[base forward, base yaw, body roll, body pitch, arm qdot(6)]``.
 
 The corresponding configuration still contains planar ``x/y/yaw``, body
 height/attitude, and all six PiPER joints.  This makes the non-holonomic base
@@ -27,7 +27,7 @@ from z_manip.kinematics.chain import rotation_log
 
 ARM_DOF = 6
 STATE_DOF = 6 + ARM_DOF
-CONTROL_DOF = 5 + ARM_DOF
+CONTROL_DOF = 4 + ARM_DOF
 STATE_NAMES = (
     "base_x_m",
     "base_y_m",
@@ -40,7 +40,6 @@ STATE_NAMES = (
 CONTROL_NAMES = (
     "base_forward_mps",
     "base_yaw_rps",
-    "body_height_mps",
     "body_roll_rps",
     "body_pitch_rps",
     *(f"piper_joint{index}_rps" for index in range(1, ARM_DOF + 1)),
@@ -121,7 +120,6 @@ class ReducedWholeBodyVelocity:
 
     base_forward_mps: float
     base_yaw_rps: float
-    body_height_mps: float
     body_roll_rps: float
     body_pitch_rps: float
     arm_joint_velocity_rps: tuple[float, ...]
@@ -134,7 +132,6 @@ class ReducedWholeBodyVelocity:
             (
                 self.base_forward_mps,
                 self.base_yaw_rps,
-                self.body_height_mps,
                 self.body_roll_rps,
                 self.body_pitch_rps,
                 *self.arm_joint_velocity_rps,
@@ -148,10 +145,9 @@ class ReducedWholeBodyVelocity:
         return cls(
             base_forward_mps=float(vector[0]),
             base_yaw_rps=float(vector[1]),
-            body_height_mps=float(vector[2]),
-            body_roll_rps=float(vector[3]),
-            body_pitch_rps=float(vector[4]),
-            arm_joint_velocity_rps=tuple(float(item) for item in vector[5:]),
+            body_roll_rps=float(vector[2]),
+            body_pitch_rps=float(vector[3]),
+            arm_joint_velocity_rps=tuple(float(item) for item in vector[4:]),
         )
 
 
@@ -169,6 +165,12 @@ class WholeBodyKinematics(Protocol):
     def frame_jacobian(self, state: ReducedWholeBodyState, frame: str) -> np.ndarray: ...
 
     def arm_manipulability(self, state: ReducedWholeBodyState) -> float: ...
+
+    def target_in_body(
+        self,
+        state: ReducedWholeBodyState,
+        target_world_xyz_m: Sequence[float],
+    ) -> np.ndarray: ...
 
     def integrate(
         self,
@@ -306,14 +308,14 @@ class PinocchioReducedWholeBodyModel:
         return result
 
     def frame_jacobian(self, state: ReducedWholeBodyState, frame: str) -> np.ndarray:
-        """Return a world-aligned 6x11 geometric velocity Jacobian."""
+        """Return a world-aligned 6x10 geometric velocity Jacobian."""
 
         pose = self.frame_pose(state, frame)
         jacobian = np.zeros((6, CONTROL_DOF), dtype=float)
         zero = ReducedWholeBodyVelocity.from_vector(np.zeros(CONTROL_DOF))
         # Virtual body columns use the exact state integrator.  This avoids an
         # Euler-rate convention mismatch with SPORT API 1007.
-        for index in range(5):
+        for index in range(4):
             tangent = zero.as_vector()
             tangent[index] = 1.0
             stepped = self.integrate(
@@ -345,8 +347,8 @@ class PinocchioReducedWholeBodyModel:
             dtype=float,
         )
         world_rotation = self._world_from_root(state)[:3, :3]
-        jacobian[:3, 5:] = world_rotation @ arm[:3]
-        jacobian[3:, 5:] = world_rotation @ arm[3:]
+        jacobian[:3, 4:] = world_rotation @ arm[:3]
+        jacobian[3:, 4:] = world_rotation @ arm[3:]
         if frame == self.camera_frame:
             # Shift the Pinocchio Jacobian from the URDF/hand-eye parent frame
             # to the optical origin.  The calibrated transform is deliberately
@@ -355,7 +357,7 @@ class PinocchioReducedWholeBodyModel:
             offset_world = (
                 parent_pose[:3, :3] @ self.camera_frame_from_optical[:3, 3]
             )
-            for column in range(5, CONTROL_DOF):
+            for column in range(4, CONTROL_DOF):
                 jacobian[:3, column] += np.cross(
                     jacobian[3:, column],
                     offset_world,
@@ -363,9 +365,20 @@ class PinocchioReducedWholeBodyModel:
         return jacobian
 
     def arm_manipulability(self, state: ReducedWholeBodyState) -> float:
-        linear = self.frame_jacobian(state, self.tool_frame)[:3, 5:]
+        linear = self.frame_jacobian(state, self.tool_frame)[:3, 4:]
         singular_values = np.linalg.svd(linear, compute_uv=False)
         return float(np.prod(np.maximum(singular_values, 0.0)))
+
+    def target_in_body(
+        self,
+        state: ReducedWholeBodyState,
+        target_world_xyz_m: Sequence[float],
+    ) -> np.ndarray:
+        """Express a world target in the local Go2W/PiPER root frame."""
+
+        target = _finite_vector(target_world_xyz_m, 3, label="world target")
+        root_from_world = np.linalg.inv(self._world_from_root(state))
+        return (root_from_world @ np.append(target, 1.0))[:3]
 
     def integrate(
         self,
@@ -382,10 +395,11 @@ class PinocchioReducedWholeBodyModel:
         vector[0] += math.cos(state.base_yaw_rad) * control[0] * dt
         vector[1] += math.sin(state.base_yaw_rad) * control[0] * dt
         vector[2] += control[1] * dt
-        vector[3] += control[2] * dt
-        vector[4] += control[3] * dt
-        vector[5] += control[4] * dt
-        vector[6:] += control[5:] * dt
+        # Body height is a fixed reference/optional observation, not a SPORT
+        # commandable degree of freedom on current Go2W firmware.
+        vector[4] += control[2] * dt
+        vector[5] += control[3] * dt
+        vector[6:] += control[4:] * dt
         vector[6:] = np.clip(
             vector[6:],
             self.arm_lower_limits,

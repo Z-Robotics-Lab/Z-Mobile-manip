@@ -1,147 +1,144 @@
-# Go2W reactive posture runtime
+# Go2W reactive whole-body runtime
 
-This runtime keeps geometry policy, ROS intent routing, and Unitree transport
-ownership separate:
+The live controller uses only motion channels supported by current Go2W
+firmware:
 
 ```text
-PC reactive geometry
-  /z_manip/reactive/posture_intent (JSON, neutral-relative deltas)
-        |
-        v
-PC posture intent bridge (shadow by default)
-  /go2w/posture_cmd (bounded BodyHeight offset + absolute Euler)
-        |
-        v
-NUC reactive bridge (shadow by default; the only live WebRTC owner)
-  Move + BodyHeight + Euler + GetBodyHeight + StopMove -> one SPORT request lock
-  /go2w/posture_state -> measured, freshness-qualified status
+10-D control vector
+  [base_forward, base_yaw_rate,
+   body_roll_rate, body_pitch_rate,
+   arm_q1_dot ... arm_q6_dot]
+
+Move(vx, 0, vyaw)       -> rolling base
+Euler(roll, pitch, yaw) -> body lean
+PiPER qdot(6)           -> wrist-camera view and reach
 ```
 
-The visual-servo policy publishes this input schema:
+`BodyHeight` (SPORT API 1013) and `GetBodyHeight` (1024) are not control
+dependencies. Current Unitree SDK2 keeps `Move()` and `Euler()` but no longer
+exposes those height calls, and current Go2W EDU firmware rejects 1013/1024.
+See the official [SportClient header](https://github.com/unitreerobotics/unitree_sdk2/blob/main/include/unitree/robot/go2/sport/sport_client.hpp)
+and [Unitree ROS2 release notes](https://github.com/unitreerobotics/unitree_ros2/releases).
 
-```json
-{
-  "schema": "z_manip.go2w_posture_intent.v1",
-  "body_height_delta_m": -0.05,
-  "pitch_delta_rad": -0.10
-}
+The model may retain a fixed zero body-height state for transform compatibility,
+but height is not a QP decision variable and cannot block the controller.
+Vertical tracking uses target Z in `body`/`piper_base_link`; body pitch and the
+six arm joints reduce that error. A broadcast body-height estimate or a D435
+ground-plane estimate may be recorded as optional telemetry only.
+
+## Data and command path
+
+```text
+D435 target point in camera frame
+        |
+        v
+hand-eye calibration + Pinocchio FK
+        |
+        v
+target (x, y, z) in body / piper_base_link
+        |
+        v
+CasADi 10-D bounded QP at 20 Hz
+        |
+        +--> /cmd_vel ------------------------> NUC Move owner
+        +--> /z_manip/reactive/posture_intent -> NUC Euler owner
+        +--> /z_manip/reactive/arm_view_intent
+                                                   |
+                                                   v
+                                      NUC PiPER CAN owner
+                                      /z_manip/reactive/arm_view_status
 ```
 
-These values are API-1013 offsets. They are not accumulated on every control
-tick. The PC relay clamps them to the calibrated envelope and turns them into
-`/go2w/posture_cmd`. The NUC requires fresh `SPORT_MOD_STATE`
-attitude/velocity. On firmware that implements API 1024 it also uses measured
-`GetBodyHeight` feedback. The tested Go2W EDU firmware returns status code
-3203 for API 1024, so the bridge falls back to a bounded API-1013 command-ack
-estimate for the height offset while keeping roll/pitch/yaw measured from the
-IMU. The fallback is explicitly reported as
-`api_1013_command_ack_estimate`; it is never presented as measured height. Its
-status uses
-`z_manip.go2w_posture_status.v1` on `/go2w/posture_state`.
+The Go2W posture status is measured from SPORT state. Roll and pitch are used
+for convergence. Absolute IMU yaw is not compared with a zero-relative Euler
+command. Unsupported body-height fields are explicitly marked unsupported,
+not replaced with command-ack estimates.
+
+## PiPER CAN ownership
+
+Passive feedback and reactive arm control must never own `can0` together.
+`z-mobile-manip-piper-reactive-view.service` therefore conflicts with
+`z-manip-piper-passive-feedback.service`.
+
+An operator-started live depth-servo run performs this transaction:
+
+1. Verify the base transport and NUC SSH access.
+2. Start `z-mobile-manip-piper-reactive-view.service`; systemd stops the
+   conflicting passive listener in the same transaction.
+3. Verify the reactive service is active and the passive service is inactive.
+4. Start the PC CasADi runtime.
+5. On every normal exit, error, `SIGINT`, or `SIGTERM`, stop the reactive arm
+   service and restart/verify passive feedback.
+
+If acquisition fails after passive feedback is stopped, the launcher restores
+passive feedback before it returns an error. The installer deploys the arm
+service but explicitly disables and stops it; it is never enabled at boot.
+
+The arm executor accepts only fresh, monotonically increasing JSON intents on
+`/z_manip/reactive/arm_view_intent`. It clips joint velocity, per-cycle motion,
+and URDF joint limits; stale input holds the measured pose. Measured joints,
+target joints, ownership, accepted sequence, error, and faults are published on
+`/z_manip/reactive/arm_view_status`.
 
 ## Full Stop
 
-Publish `std_msgs/Empty` on `/z_manip/reactive/full_stop`. In live mode the PC
-relay forwards it to `/go2w/full_stop`. The NUC immediately latches stop,
-drops pending Move and posture work, then sends `StopMove` in the next shared
-SPORT request slot. The latch blocks all later motion.
+Publish `std_msgs/Empty` on `/z_manip/reactive/full_stop`. The PC stops base,
+posture, and arm intent production. The NUC base owner sends `StopMove`; the
+PiPER owner clears pending motion and holds its measured pose.
 
-Releasing the latch requires `std_msgs/Empty` on
-`/z_manip/reactive/control_reset`. The NUC releases it only when measured SPORT
-feedback is both fresh and quiet. Full Stop itself never waits for feedback.
+The latch is released only by `/z_manip/reactive/control_reset` after measured
+feedback is fresh and quiet. Full Stop itself never waits for feedback.
 
-## Shadow workflow
+## Shadow and live workflows
 
-Both launchers default to shadow:
+Shadow mode opens no motion transport and does not switch the PiPER CAN owner:
 
 ```bash
-scripts/runtime/go2w_posture_intent_bridge.sh
-scripts/runtime/go2w_reactive_control_nuc.sh
+scripts/runtime/go2w_depth_servo.sh shadow /absolute/path/depth-servo.json
 ```
 
-The NUC shadow process never constructs `UnitreeControlNode`, so it cannot open
-WebRTC. Use it to verify ROS topics and UI status without a motion-capable
-transport.
+The UI's `START SHADOW` path is the normal first check after reboot. A healthy
+solve reports the CasADi backend and advancing heartbeat while all transports
+remain closed.
 
-## Live deployment gates
-
-Do not run the legacy `z-manip-go2w-base-control.service` together with the new
-live bridge. `z-mobile-manip-go2w-reactive-live.service` declares a systemd
-conflict with that service and the shadow service, making it the single WebRTC
-owner.
-
-Before supervised live testing, create this NUC-only acknowledgement file:
+Live mode is operator-authorized:
 
 ```bash
-mkdir -p ~/.config/z-mobile-manip
-cat > ~/.config/z-mobile-manip/go2w-reactive-live.env <<'EOF'
-Z_MANIP_GO2W_LIVE_ACK=I_UNDERSTAND_GO2W_WILL_MOVE
-# Optional only after moving-posture validation:
-# Z_MANIP_GO2W_ALLOW_POSTURE_WHILE_MOVING=1
-EOF
-chmod 600 ~/.config/z-mobile-manip/go2w-reactive-live.env
+scripts/runtime/go2w_depth_servo.sh live /absolute/path/depth-servo.json
 ```
 
-The PC relay has an independent defense-in-depth gate:
+It requires the fixed NUC WebRTC bridge, ROS domain 20, the measured hand-eye
+calibration, the whole-body URDF, passwordless NUC SSH, and the on-demand PiPER
+executor installed. `FULL STOP` remains available throughout the run.
+
+## Installation
+
+From the repository root:
 
 ```bash
-export Z_MANIP_POSTURE_INTENT_LIVE_ACK=I_UNDERSTAND_POSTURE_INTENTS_REACH_NUC
-scripts/runtime/go2w_posture_intent_bridge.sh live
+scripts/runtime/install_go2w_reactive_runtime.sh
 ```
 
-The equivalent PC user units are
-`z-mobile-manip-go2w-posture-intent-shadow.service` and
-`z-mobile-manip-go2w-posture-intent-live.service`; the live unit reads its
-acknowledgement from
-`~/.config/z-mobile-manip/go2w-posture-intent-live.env`.
+The script deploys:
 
-Merely installing/enabling the shadow units cannot move the robot. This change
-does not deploy, restart, enable, or connect either service automatically.
+- the NUC Go2W reactive bridge and its live user service;
+- the PC posture relay;
+- the NUC PiPER reactive-view executor and its user service.
 
-## Installation targets
+Installation does not start or enable the PiPER reactive-view service. It does
+restart the always-on Go2W bridge and PC relay; those services do not move the
+arm. A live depth-servo run alone acquires the PiPER owner.
 
-The versioned NUC service files are:
+## Runtime supervision
 
-- `configs/z-mobile-manip-go2w-reactive-shadow.service`
-- `configs/z-mobile-manip-go2w-reactive-live.service`
-- `configs/z-mobile-manip-go2w-posture-intent-shadow.service`
-- `configs/z-mobile-manip-go2w-posture-intent-live.service`
+An active status document must advance `updated_unix_ns` within 1.5 seconds.
+Missing, stale, future, backwards, or frozen heartbeats terminate the servo and
+latch a stationary degraded workflow. Handoff is permitted only when:
 
-Install the script under `~/.local/lib/z-mobile-manip/` and the chosen unit
-under `~/.config/systemd/user/`, then use `systemctl --user daemon-reload`.
-Live status retains the raw GetBodyHeight response, parse path/error, robot
-code, sample age, fallback source and query count so an unsupported firmware
-response cannot masquerade as measured feedback.
+- target tracking and transforms are fresh;
+- SPORT roll/pitch feedback has converged;
+- the arm executor owns CAN and publishes fresh measured joint feedback;
+- the arm view error and commanded joint rates are settled;
+- the close-range IK probe succeeds.
 
-## Integrated whole-body approach
-
-`manip bringup` starts the complete chain: perception, the single NUC WebRTC
-owner, the PC posture relay, and the Pinocchio/CasADi runtime image. The depth
-servo loads the measured wrist-camera calibration and real Go2W URDF, solves a
-bounded CasADi QP at runtime, and sends base velocity plus BodyHeight/Euler
-targets through the single owner. The optimizer also computes PiPER joint
-velocity as a reachability and conditioning diagnostic. Arm motion is not
-streamed while the base walks; after the handoff distance is reached the
-existing fresh-perception Pinocchio IK and checked arm trajectory executor own
-the arm. This prevents two simultaneous PiPER command owners.
-
-Use `START SHADOW` first after a reboot. A healthy solve reports the
-`casadi-qrqp` backend and a decreasing objective without opening a motion
-transport. `FIND → APPROACH → GRASP` is the operator-authorized live path, and
-`FULL STOP` interrupts the base/posture workflow.
-
-## State heartbeat supervision
-
-The loopback supervisor does not treat a live depth-servo PID as proof that
-the control loop is healthy. Every active status document must advance
-`updated_unix_ns` within 1.5 seconds. This applies across target waiting,
-tracking, base approach, posture adjustment, tracking loss, reacquisition, and
-view-search requests; changing phase does not reset the heartbeat deadline.
-
-A missing, stale, frozen, future, or backwards heartbeat terminates the servo
-process and latches a stationary `degraded` workflow with
-`REACTIVE_STATE_HEARTBEAT_TIMEOUT`. A `reached`, `handoff_probe`, or
-`handoff_ready` document is accepted only with a currently valid heartbeat,
-so stale state can never launch the grasp transaction. The status API exposes
-the heartbeat source stamp, age, elapsed time without progress, and deadline
-under `supervision` for replay and UI diagnosis.
+No unsupported body-height measurement is part of these gates.

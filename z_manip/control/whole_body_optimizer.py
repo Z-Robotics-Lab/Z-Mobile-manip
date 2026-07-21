@@ -108,11 +108,8 @@ class WholeBodyOptimizerConfig:
     base_forward_min_mps: float = -0.05
     base_forward_max_mps: float = 0.18
     base_yaw_max_rps: float = 0.16
-    body_height_rate_max_mps: float = 0.05
     body_roll_rate_max_rps: float = math.radians(5.0)
     body_pitch_rate_max_rps: float = math.radians(7.0)
-    body_height_min_m: float = -0.12
-    body_height_max_m: float = 0.02
     body_roll_abs_max_rad: float = math.radians(8.0)
     body_pitch_abs_max_rad: float = math.radians(12.0)
     arm_velocity_scale: float = 0.35
@@ -131,7 +128,6 @@ class WholeBodyOptimizerConfig:
             self.control_weight,
             self.smooth_weight,
             self.base_yaw_max_rps,
-            self.body_height_rate_max_mps,
             self.body_roll_rate_max_rps,
             self.body_pitch_rate_max_rps,
             self.body_roll_abs_max_rad,
@@ -142,13 +138,6 @@ class WholeBodyOptimizerConfig:
             raise ValueError("optimizer weights, limits, and intervals must be positive")
         if self.base_forward_min_mps >= self.base_forward_max_mps:
             raise ValueError("base forward velocity bounds are reversed")
-        if not all(
-            math.isfinite(value)
-            for value in (self.body_height_min_m, self.body_height_max_m)
-        ):
-            raise ValueError("body height bounds must be finite")
-        if self.body_height_min_m >= self.body_height_max_m:
-            raise ValueError("body height bounds are reversed")
         if self.transition_start_m <= self.handoff_planar_m:
             raise ValueError("transition start must be outside handoff distance")
         if self.manipulability_weight < 0.0 or not math.isfinite(
@@ -381,6 +370,12 @@ class WholeBodyShadowOptimizer:
                 minimum_depth_m=self.config.camera_min_depth_m,
             )
         target = _point3(task.target_world_xyz_m, label="world target")
+        target_body = np.asarray(
+            self.model.target_in_body(state, target),
+            dtype=float,
+        )
+        if target_body.shape != (3,) or not np.isfinite(target_body).all():
+            raise ValueError("whole-body model returned an invalid local target")
         offset = _point3(task.tool_target_offset_world_m, label="tool target offset")
         desired_tool = target + offset
         residual = np.asarray(
@@ -388,7 +383,7 @@ class WholeBodyShadowOptimizer:
                 camera_target[0] / depth - task.desired_image_u,
                 camera_target[1] / depth - task.desired_image_v,
                 planar - task.desired_planar_standoff_m,
-                target[2] - state.body_height_m - task.desired_target_height_in_body_m,
+                target_body[2] - task.desired_target_height_in_body_m,
                 *(tool_position - desired_tool),
             ),
             dtype=float,
@@ -421,7 +416,6 @@ class WholeBodyShadowOptimizer:
             (
                 self.config.base_forward_min_mps,
                 -self.config.base_yaw_max_rps,
-                -self.config.body_height_rate_max_mps,
                 -self.config.body_roll_rate_max_rps,
                 -self.config.body_pitch_rate_max_rps,
                 *(-scaled_arm),
@@ -432,7 +426,6 @@ class WholeBodyShadowOptimizer:
             (
                 self.config.base_forward_max_mps,
                 self.config.base_yaw_max_rps,
-                self.config.body_height_rate_max_mps,
                 self.config.body_roll_rate_max_rps,
                 self.config.body_pitch_rate_max_rps,
                 *scaled_arm,
@@ -442,36 +435,28 @@ class WholeBodyShadowOptimizer:
         dt = self.config.horizon_dt_s
         lower[2] = max(
             lower[2],
-            (self.config.body_height_min_m - state.body_height_m) / dt,
+            (-self.config.body_roll_abs_max_rad - state.body_roll_rad) / dt,
         )
         upper[2] = min(
             upper[2],
-            (self.config.body_height_max_m - state.body_height_m) / dt,
+            (self.config.body_roll_abs_max_rad - state.body_roll_rad) / dt,
         )
         lower[3] = max(
             lower[3],
-            (-self.config.body_roll_abs_max_rad - state.body_roll_rad) / dt,
+            (-self.config.body_pitch_abs_max_rad - state.body_pitch_rad) / dt,
         )
         upper[3] = min(
             upper[3],
-            (self.config.body_roll_abs_max_rad - state.body_roll_rad) / dt,
-        )
-        lower[4] = max(
-            lower[4],
-            (-self.config.body_pitch_abs_max_rad - state.body_pitch_rad) / dt,
-        )
-        upper[4] = min(
-            upper[4],
             (self.config.body_pitch_abs_max_rad - state.body_pitch_rad) / dt,
         )
         # One-step joint-position feasibility is a hard bound.
         joints = np.asarray(state.arm_joints_rad, dtype=float)
-        lower[5:] = np.maximum(
-            lower[5:],
+        lower[4:] = np.maximum(
+            lower[4:],
             (np.asarray(self.model.arm_lower_limits, dtype=float) - joints) / dt,
         )
-        upper[5:] = np.minimum(
-            upper[5:],
+        upper[4:] = np.minimum(
+            upper[4:],
             (np.asarray(self.model.arm_upper_limits, dtype=float) - joints) / dt,
         )
         if np.any(lower > upper):
@@ -521,13 +506,13 @@ class WholeBodyShadowOptimizer:
             gradient_manip = np.zeros(CONTROL_DOF)
             for arm_index in range(ARM_DOF):
                 tangent = np.zeros(CONTROL_DOF)
-                tangent[5 + arm_index] = epsilon / self.config.horizon_dt_s
+                tangent[4 + arm_index] = epsilon / self.config.horizon_dt_s
                 stepped = self.model.integrate(
                     state,
                     ReducedWholeBodyVelocity.from_vector(tangent),
                     self.config.horizon_dt_s,
                 )
-                gradient_manip[5 + arm_index] = (
+                gradient_manip[4 + arm_index] = (
                     self.model.arm_manipulability(stepped) - manipulability
                 ) / epsilon * self.config.horizon_dt_s
             # Maximizing local manipulability is a linear reward in the QP.

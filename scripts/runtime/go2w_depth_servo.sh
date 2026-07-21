@@ -29,6 +29,51 @@ RUNTIME_IMAGE="${Z_MANIP_WHOLE_BODY_IMAGE:-z-mobile-manip-whole-body:latest}"
 WHOLE_BODY_URDF="${Z_MANIP_WHOLE_BODY_URDF:-$STACK_ROOT/../go2W_Sim/assets/urdf/go2w_sensored.urdf}"
 WHOLE_BODY_CALIBRATION="${Z_MANIP_WHOLE_BODY_CALIBRATION:-$STACK_ROOT/../artifacts/go2w_real/calibration/piper_wrist_camera_calibration.json}"
 CONTAINER_NAME="z-manip-go2w-depth-servo"
+NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
+NUC_KEY="${GO2W_NUC_SSH_KEY:-$HOME/.ssh/id_ed25519_codex_nuc}"
+ARM_OWNER_STARTED=0
+
+release_arm_owner() {
+  if [[ "$ARM_OWNER_STARTED" == 1 ]]; then
+    if ! ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST" \
+      'set -eu; systemctl --user stop z-mobile-manip-piper-reactive-view.service; systemctl --user restart z-manip-piper-passive-feedback.service; systemctl --user is-active --quiet z-manip-piper-passive-feedback.service' \
+      >/dev/null 2>&1; then
+      printf 'warning: failed to restore the passive PiPER feedback owner on the NUC\n' >&2
+    fi
+    ARM_OWNER_STARTED=0
+  fi
+}
+
+acquire_arm_owner() {
+  # The reactive service conflicts with the passive listener, so systemd stops
+  # the old CAN owner and starts the new one in one transaction. If start-up or
+  # the postcondition check fails, restore the passive owner before returning.
+  ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST" '
+    set -eu
+    restore_passive() {
+      systemctl --user stop z-mobile-manip-piper-reactive-view.service >/dev/null 2>&1 || true
+      systemctl --user restart z-manip-piper-passive-feedback.service
+    }
+    if ! systemctl --user start z-mobile-manip-piper-reactive-view.service; then
+      restore_passive
+      exit 1
+    fi
+    if ! systemctl --user is-active --quiet z-mobile-manip-piper-reactive-view.service ||
+       systemctl --user is-active --quiet z-manip-piper-passive-feedback.service; then
+      restore_passive
+      exit 1
+    fi
+  '
+  ARM_OWNER_STARTED=1
+}
+
+cleanup() {
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  release_arm_owner
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ ! -r "$DDS_CONFIG" ]]; then
   printf 'missing PC CycloneDDS profile: %s\n' "$DDS_CONFIG" >&2
@@ -58,6 +103,8 @@ fi
 # verified or restarted and reconnected. Shadow mode remains transport-free.
 if [[ "$MODE" == live ]]; then
   "$SCRIPT_DIR/go2w_base_transport_preflight.sh"
+  [[ -f "$NUC_KEY" ]] || { printf 'missing NUC SSH key: %s\n' "$NUC_KEY" >&2; exit 1; }
+  acquire_arm_owner
 fi
 
 # The workstation host currently has FastDDS only, while every long-running
@@ -67,7 +114,7 @@ fi
 # visible to local containers yet disappear from the NUC, causing the base
 # watchdog to stop a valid approach after the first short motion.
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-exec docker run --rm \
+docker run --rm \
   --name "$CONTAINER_NAME" \
   --network host \
   --user "$(id -u):$(id -g)" \

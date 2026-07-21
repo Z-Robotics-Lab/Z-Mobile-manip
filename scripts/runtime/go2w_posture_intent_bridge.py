@@ -34,20 +34,22 @@ LIVE_ACK = "I_UNDERSTAND_POSTURE_INTENTS_REACH_NUC"
 
 
 def bounded_wire_target(document: dict[str, Any]) -> tuple[float, float, float, float]:
-    """Convert one neutral-relative intent to the NUC transport contract."""
+    """Convert one neutral-relative Euler intent to the NUC wire contract."""
     if document.get("schema") != INTENT_SCHEMA:
         raise ValueError(f"intent schema must be {INTENT_SCHEMA}")
+    legacy_height = float(document.get("body_height_delta_m", 0.0))
     values = (
-        float(document["body_height_delta_m"]),
         float(document.get("roll_delta_rad", 0.0)),
         float(document["pitch_delta_rad"]),
         float(document.get("yaw_delta_rad", 0.0)),
     )
-    if not all(math.isfinite(value) for value in values):
+    if not math.isfinite(legacy_height) or not all(math.isfinite(value) for value in values):
         raise ValueError("posture intent must be finite")
-    height, roll, pitch, yaw = values
+    if abs(legacy_height) > 1e-6:
+        raise ValueError("BodyHeight is unsupported; body_height_delta_m must be zero")
+    roll, pitch, yaw = values
     return (
-        min(max(height, -0.12), 0.02),
+        0.0,
         min(max(roll, -math.radians(8.0)), math.radians(8.0)),
         min(max(pitch, -math.radians(12.0)), math.radians(12.0)),
         min(max(yaw, -math.radians(8.0)), math.radians(8.0)),
@@ -56,7 +58,7 @@ def bounded_wire_target(document: dict[str, Any]) -> tuple[float, float, float, 
 
 def feedback_is_fresh(document: dict[str, Any], *, maximum_age_s: float = 0.50) -> bool:
     try:
-        age_s = float(document["body_height"]["feedback_age_s"])
+        age_s = float(document["feedback"]["sport_state_age_s"])
         return (
             document.get("schema") == "z_manip.go2w_posture_status.v1"
             and document.get("mode") == "live"

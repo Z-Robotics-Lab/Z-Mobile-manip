@@ -2377,6 +2377,7 @@
       const feedbackAge = firstFinite(
         postureEnvelope.age_s,
         postureStatus.feedback_age_s,
+        postureStatus.feedback?.sport_state_age_s,
         postureStatus.body_height?.feedback_age_s,
         supervision.feedback?.age_s,
       );

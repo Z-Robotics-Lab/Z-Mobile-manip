@@ -37,7 +37,7 @@ RUNTIME_SCHEMA = "z_manip.whole_body_runtime.v1"
 class WholeBodyRuntimeCommand:
     base_forward_mps: float
     base_yaw_rps: float
-    body_height_target_m: float
+    body_height_target_m: float | None
     body_roll_target_rad: float
     body_pitch_target_rad: float
     arm_joint_velocity_rps: tuple[float, ...]
@@ -97,7 +97,6 @@ class WholeBodyRuntimeController:
             base_yaw_max_rps=0.12,
             # Keep the first live integration deliberately smooth.  These are
             # rates, while the NUC still enforces the absolute SPORT envelope.
-            body_height_rate_max_mps=0.035,
             body_roll_rate_max_rps=math.radians(3.0),
             body_pitch_rate_max_rps=math.radians(5.0),
             arm_velocity_scale=0.18,
@@ -111,20 +110,18 @@ class WholeBodyRuntimeController:
         self.previous_velocity: ReducedWholeBodyVelocity | None = None
 
     @staticmethod
-    def _measured_posture(document: dict[str, Any] | None) -> tuple[float, float, float, bool, str]:
+    def _measured_posture(document: dict[str, Any] | None) -> tuple[float, float, bool, str]:
         if not isinstance(document, dict):
-            return 0.0, 0.0, 0.0, False, "NUC posture state unavailable"
+            return 0.0, 0.0, False, "NUC posture state unavailable"
         feedback = document.get("feedback")
-        height = document.get("body_height")
         attitude = document.get("attitude")
         try:
             values = (
-                float(height["current_m"]),
                 float(attitude["current_roll_rad"]),
                 float(attitude["current_pitch_rad"]),
             )
         except (KeyError, TypeError, ValueError):
-            return 0.0, 0.0, 0.0, False, "NUC measured posture fields unavailable"
+            return 0.0, 0.0, False, "NUC measured Euler fields unavailable"
         fresh = (
             document.get("schema") == "z_manip.go2w_posture_status.v1"
             and isinstance(feedback, dict)
@@ -132,13 +129,33 @@ class WholeBodyRuntimeController:
             and document.get("stop_latched") is False
             and all(math.isfinite(item) for item in values)
         )
-        height_source = str(height.get("source", "unknown")) if isinstance(height, dict) else "unknown"
         detail = (
-            f"measured SPORT attitude + height source {height_source}"
+            "measured SPORT roll/pitch; BodyHeight is not a control DOF"
             if fresh
-            else "NUC posture feedback stale or latched"
+            else "NUC Euler feedback stale or latched"
         )
         return (*values, fresh, detail)
+
+    @staticmethod
+    def _arm_executor_ready(document: dict[str, Any] | None) -> tuple[bool, str]:
+        if not isinstance(document, dict):
+            return False, "PiPER reactive executor status unavailable"
+        try:
+            updated_ns = int(document["updated_unix_ns"])
+        except (KeyError, TypeError, ValueError):
+            return False, "PiPER reactive executor timestamp unavailable"
+        age_s = (time.time_ns() - updated_ns) / 1e9
+        ready = (
+            document.get("schema") == "z_manip.piper_reactive_view_status.v1"
+            and document.get("owner") == "piper_reactive_view_executor"
+            and document.get("ready") is True
+            and document.get("stop_latched") is False
+            and -0.5 <= age_s <= 0.5
+        )
+        return ready, (
+            f"PiPER reactive executor age {age_s:.3f}s"
+            if ready else f"PiPER reactive executor unavailable/stale ({age_s:.3f}s)"
+        )
 
     @staticmethod
     def _measured_joints(runtime_state: dict[str, Any]) -> tuple[tuple[float, ...], bool, str]:
@@ -160,6 +177,7 @@ class WholeBodyRuntimeController:
         *,
         camera_target_xyz_m: Sequence[float],
         posture_status: dict[str, Any] | None,
+        arm_view_status: dict[str, Any] | None = None,
         runtime_state_path: Path,
         mode: str,
         freeze_base: bool = False,
@@ -169,12 +187,15 @@ class WholeBodyRuntimeController:
             raise ValueError("camera target must be a visible finite optical-frame point")
         runtime_state = _json_document(runtime_state_path)
         joints, joints_fresh, joint_detail = self._measured_joints(runtime_state)
-        height, roll, pitch, posture_fresh, posture_detail = self._measured_posture(posture_status)
+        roll, pitch, posture_fresh, posture_detail = self._measured_posture(posture_status)
+        arm_ready, arm_detail = self._arm_executor_ready(arm_view_status)
         state = ReducedWholeBodyState(
             base_x_m=0.0,
             base_y_m=0.0,
             base_yaw_rad=0.0,
-            body_height_m=height,
+            # Current Go2W firmware exposes no commandable BodyHeight.  Keep a
+            # fixed virtual root height; all target geometry is body-relative.
+            body_height_m=0.0,
             body_roll_rad=roll,
             body_pitch_rad=pitch,
             arm_joints_rad=joints,
@@ -188,24 +209,14 @@ class WholeBodyRuntimeController:
             state,
             task,
             previous_velocity=self.previous_velocity,
-            # PiPER qdot remains diagnostic in the first live integration.
-            # Locking those variables prevents the QP from satisfying the
-            # task with arm motion that is never sent to the robot.  Once the
-            # base enters the handoff zone, freeze it as well so the solver
-            # must close the measured BodyHeight/Euler loop.
             locked_control_indices=(
                 *((0, 1) if freeze_base else ()),
-                *((5, 6, 7, 8, 9, 10) if mode == "live" else ()),
+                *((4, 5, 6, 7, 8, 9) if mode == "live" and not arm_ready else ()),
             ),
         )
         self.previous_velocity = result.velocity if result.success else None
         velocity = result.velocity
         dt = self.optimizer.config.horizon_dt_s
-        body_height = float(np.clip(
-            height + velocity.body_height_mps * dt,
-            self.optimizer.config.body_height_min_m,
-            self.optimizer.config.body_height_max_m,
-        ))
         body_roll = float(np.clip(
             roll + velocity.body_roll_rps * dt,
             -self.optimizer.config.body_roll_abs_max_rad,
@@ -219,6 +230,7 @@ class WholeBodyRuntimeController:
         executable = bool(
             mode == "live" and result.success and joints_fresh and posture_fresh
         )
+        arm_enabled = bool(executable and arm_ready)
         document = result.status_document()
         document.update({
             "schema": RUNTIME_SCHEMA,
@@ -229,15 +241,28 @@ class WholeBodyRuntimeController:
                 "posture_detail": posture_detail,
                 "joints_fresh": joints_fresh,
                 "joint_detail": joint_detail,
+                "arm_executor_fresh": arm_ready,
+                "arm_executor_detail": arm_detail,
                 "state": asdict(state),
             },
             "transport": {
                 "base_and_body_enabled": executable,
-                "arm_enabled": False,
-                "arm_reason": "first live gate: PiPER qdot remains diagnostic until base/body test passes",
+                "arm_enabled": arm_enabled,
+                "arm_reason": (
+                    "fresh measured PiPER reactive executor owns CAN"
+                    if arm_enabled else arm_detail
+                ),
+                "enabled_dofs": [
+                    "base_forward", "base_yaw", "body_roll", "body_pitch",
+                    *(list(self.model.arm_joint_names) if arm_enabled else []),
+                ],
+                "disabled_dofs": {
+                    "body_height": "unsupported by current Go2W SPORT firmware",
+                    **({"piper_arm": arm_detail} if not arm_enabled else {}),
+                },
             },
             "posture_target": {
-                "body_height_delta_m": body_height,
+                "body_height_delta_m": None,
                 "roll_delta_rad": body_roll,
                 "pitch_delta_rad": body_pitch,
                 "yaw_delta_rad": 0.0,
@@ -246,7 +271,7 @@ class WholeBodyRuntimeController:
         return WholeBodyRuntimeCommand(
             base_forward_mps=velocity.base_forward_mps,
             base_yaw_rps=velocity.base_yaw_rps,
-            body_height_target_m=body_height,
+            body_height_target_m=None,
             body_roll_target_rad=body_roll,
             body_pitch_target_rad=body_pitch,
             arm_joint_velocity_rps=velocity.arm_joint_velocity_rps,
