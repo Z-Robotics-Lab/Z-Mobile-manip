@@ -12,7 +12,14 @@ IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:pinocchio}"
 DOMAIN_ID="${ROS_DOMAIN_ID:-20}"
 NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
 NUC_KEY="${GO2W_NUC_SSH_KEY:-$HOME/.ssh/id_ed25519_codex_nuc}"
-ENV_FILE="${Z_MANIP_ENV_FILE:-$ROOT_DIR/../z-agent/.env}"
+if [[ -n "${Z_MANIP_ENV_FILE:-}" ]]; then
+  ENV_FILE="$Z_MANIP_ENV_FILE"
+elif [[ -f "$ROOT_DIR/.env" ]]; then
+  ENV_FILE="$ROOT_DIR/.env"
+else
+  # Backward-compatible fallback for the existing lab deployment.
+  ENV_FILE="$ROOT_DIR/../z-agent/.env"
+fi
 DDS_CONFIG="${Z_MANIP_DDS_CONFIG:-$ROOT_DIR/docker/runtime/cyclonedds-go2w-pc.xml}"
 EDGETAM_CACHE="${Z_MANIP_EDGETAM_CACHE:-$HOME/.cache/z-manip/huggingface}"
 EDGETAM_MAX_FRAMES_PER_SESSION="${Z_MANIP_EDGETAM_MAX_FRAMES_PER_SESSION:-18000}"

@@ -1122,7 +1122,7 @@ class OpenRouterVLM:
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "X-Title": "Z-Manipulation-Stack",
+                "X-Title": "Z-Mobile-Manip",
             }
             max_retries = max(
                 self.validation_retries,

@@ -136,7 +136,7 @@ and transport failures.
 Install the root Python package and ROS dependencies, then build this package:
 
 ```bash
-python3 -m pip install -e /path/to/Z-Manipulation-Stack
+python3 -m pip install -e /path/to/Z-Mobile-manip
 source /opt/ros/jazzy/setup.bash
 colcon build --base-paths ros2/z_manip_edgetam --symlink-install
 source install/setup.bash

@@ -113,6 +113,9 @@ def test_component_manager_is_syntax_checked_singleton_and_motion_free():
     lab = LAB.read_text(encoding="utf-8").lower()
 
     assert "flock -n" in source
+    assert "install_pc_units" in source
+    assert "daemon-reload" in source
+    assert "default.target.wants" in source
     assert "bringup)" in source
     assert "restart-edgetam" in source
     assert "restart-rgbd" in source

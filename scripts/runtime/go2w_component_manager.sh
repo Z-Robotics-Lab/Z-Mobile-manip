@@ -10,6 +10,8 @@ WORKSPACE_ROOT="$(cd -- "$STACK_ROOT/.." && pwd)"
 LAB_SCRIPT="$SCRIPT_DIR/go2w_perception_lab.sh"
 UI_UNIT="z-manip-planning-workbench.service"
 OBSERVER_UNIT="z-manip-runtime-observer.service"
+GROUNDING_UNIT="z-manip-local-grounding.service"
+USER_SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UI_PORT="${Z_MANIP_DEBUG_UI_PORT:-8766}"
 NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
 NUC_KEY="${GO2W_NUC_SSH_KEY:-$HOME/.ssh/id_ed25519_codex_nuc}"
@@ -35,11 +37,29 @@ SSH="${Z_MANIP_SSH_BIN:-ssh}"
 usage() {
   cat >&2 <<'EOF'
 usage: go2w_component_manager.sh bringup
+       go2w_component_manager.sh install
        go2w_component_manager.sh status [all|ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all]
        go2w_component_manager.sh restart {ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all}
        go2w_component_manager.sh logs {manager|ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all} [lines]
 EOF
   exit 2
+}
+
+install_pc_units() {
+  local unit source target wants
+  wants="$USER_SYSTEMD_DIR/default.target.wants"
+  mkdir -p "$USER_SYSTEMD_DIR" "$wants"
+  for unit in "$UI_UNIT" "$OBSERVER_UNIT" "$GROUNDING_UNIT"; do
+    source="$STACK_ROOT/configs/$unit"
+    target="$USER_SYSTEMD_DIR/$unit"
+    [[ -f "$source" ]] || {
+      printf 'required user unit is missing: %s\n' "$source" >&2
+      return 1
+    }
+    ln -sfnT "$source" "$target"
+    ln -sfnT "../$unit" "$wants/$unit"
+  done
+  $SYSTEMCTL --user daemon-reload
 }
 
 valid_component() {
@@ -277,6 +297,7 @@ restart_one() {
   local component="$1"
   case "$component" in
     ui)
+      install_pc_units || return 1
       $SYSTEMCTL --user restart "$UI_UNIT" || return 1
       wait_until "UI workbench" ui_ready
       ;;
@@ -294,6 +315,7 @@ restart_one() {
       wait_until "NUC passive feedback" passive_feedback_ready
       ;;
     observer)
+      install_pc_units || return 1
       $SYSTEMCTL --user restart "$OBSERVER_UNIT" || return 1
       wait_until "runtime observer" observer_ready
       ;;
@@ -328,6 +350,7 @@ restart_one() {
 
 cold_bringup_steps() {
   printf '[%s] cold bringup begin\n' "$(date --iso-8601=seconds)"
+  install_pc_units || return 1
   if ! remote_camera_device_ready; then
     printf 'D435 USB device is absent on the NUC; reconnect its USB cable before bringup\n' >&2
     return 1
@@ -374,6 +397,10 @@ action="${1:-status}"
 component="${2:-all}"
 
 case "$action" in
+  install)
+    [[ "$component" == all ]] || usage
+    install_pc_units
+    ;;
   status)
     if [[ "$component" == all ]]; then
       for item in ui nuc-camera passive-feedback observer rgbd edgetam perception perception-all; do

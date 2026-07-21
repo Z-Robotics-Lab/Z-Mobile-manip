@@ -51,7 +51,8 @@ license 与权重不包含在本仓库中。第三方说明见 [THIRD_PARTY_NOTI
 git clone https://github.com/Z-Robotics-Lab/Z-Mobile-manip.git
 cd Z-Mobile-manip
 cp .env.example .env
-install -Dm755 scripts/runtime/manip ~/.local/bin/manip
+mkdir -p ~/.local/bin
+ln -sfn "$PWD/scripts/runtime/manip" ~/.local/bin/manip
 ```
 
 编辑 `.env`，至少确认：

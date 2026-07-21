@@ -77,6 +77,7 @@ require_idle_ui() {
 }
 
 start_ui() {
+  "$COMPONENT_MANAGER" install
   "$SYSTEMCTL" --user start "$UI_UNIT"
   wait_for_ui
   printf 'Z-Manip UI is ready: %s/\n' "$UI_URL"
@@ -96,6 +97,7 @@ restart_ui() {
   if "$SYSTEMCTL" --user is-active --quiet "$UI_UNIT" 2>/dev/null; then
     require_idle_ui
   fi
+  "$COMPONENT_MANAGER" install
   "$SYSTEMCTL" --user restart "$UI_UNIT"
   wait_for_ui
   printf 'Z-Manip UI restarted: %s/\n' "$UI_URL"
@@ -117,6 +119,7 @@ case "$command" in
     ;;
   bringup)
     [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    "$COMPONENT_MANAGER" install
     "$COMPONENT_MANAGER" bringup
     printf 'Complete Z-Manip vision stack is ready: %s/\n' "$UI_URL"
     ;;

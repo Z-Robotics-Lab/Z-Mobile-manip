@@ -21,6 +21,7 @@ def test_manip_cli_is_syntax_checked_and_has_fixed_operator_surface() -> None:
     for command in ("manip start", "manip stop", "manip bringup", "manip status"):
         assert command in help_result.stdout
     assert "go2w_component_manager.sh" in source
+    assert '"$COMPONENT_MANAGER" install' in source
     assert 'SYSTEMCTL\" --user start' in source
     assert 'SYSTEMCTL\" --user stop' in source
     assert "/api/home/status" in source

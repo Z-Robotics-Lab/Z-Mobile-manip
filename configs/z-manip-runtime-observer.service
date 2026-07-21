@@ -1,13 +1,13 @@
 [Unit]
-Description=Z-Manipulation subscribe-only ROS2 runtime observer
+Description=Z-Mobile-Manip subscribe-only ROS2 runtime observer
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 Environment=ROS_DOMAIN_ID=20
-ExecStart=%h/Z-Robotics-Lab/Z-Manipulation-Stack/scripts/runtime/go2w_runtime_observer.sh run
-ExecStop=%h/Z-Robotics-Lab/Z-Manipulation-Stack/scripts/runtime/go2w_runtime_observer.sh stop
+ExecStart=%h/Z-Robotics-Lab/Z-Mobile-manip/scripts/runtime/go2w_runtime_observer.sh run
+ExecStop=%h/Z-Robotics-Lab/Z-Mobile-manip/scripts/runtime/go2w_runtime_observer.sh stop
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15

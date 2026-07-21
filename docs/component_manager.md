@@ -7,7 +7,7 @@ commands, paths, ROS topics, or target poses from the browser.
 ## After a NUC or PC reboot
 
 ```bash
-cd ~/Z-Robotics-Lab/Z-Manipulation-Stack
+cd ~/Z-Robotics-Lab/Z-Mobile-manip
 scripts/runtime/go2w_component_manager.sh bringup
 scripts/runtime/go2w_component_manager.sh status all
 ```

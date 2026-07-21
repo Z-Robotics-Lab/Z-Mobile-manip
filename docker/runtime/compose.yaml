@@ -8,7 +8,7 @@ services:
         BASE_IMAGE: ${Z_MANIP_BASE_IMAGE:-navstack:ready@sha256:7c1f317d0bfe33fbdb5067bf0266fc70c273da23bcbd767ebf3c714405118407}
     network_mode: host
     env_file:
-      - path: ${Z_MANIP_ENV_FILE:-../../../z-agent/.env}
+      - path: ${Z_MANIP_ENV_FILE:-../../.env}
         required: false
     environment:
       ROS_DOMAIN_ID: ${Z_MANIP_ROS_DOMAIN_ID:-184}

@@ -1,4 +1,4 @@
-# Z-Manipulation-Stack Plan
+# Z-Mobile-Manip Plan
 
 > 分层移动抓取栈：Go2W 轮足狗 + 背部 PiPER 6DoF 臂 + 腕部 D435i，先在 Isaac Sim 跑通感知规控，
 > 后迁真机（NUC 薄枢纽 + 场外 4090）。z-manip 仓只讲 ROS2 契约，平台差异全进 adapter。

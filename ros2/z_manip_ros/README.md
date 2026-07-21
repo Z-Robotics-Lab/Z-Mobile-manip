@@ -55,7 +55,7 @@ output is still rejected when avoid regions cover the proposed grasp part or
 placement region.
 
 ```bash
-python3 -m pip install -e /path/to/Z-Manipulation-Stack
+python3 -m pip install -e /path/to/Z-Mobile-manip
 colcon build --symlink-install --packages-select z_manip_edgetam z_manip_ros
 source install/setup.bash
 ros2 launch z_manip_ros perception.launch.py \

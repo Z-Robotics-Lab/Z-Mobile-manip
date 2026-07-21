@@ -1,4 +1,4 @@
-"""Z-Manipulation-Stack — thin orchestration for mobile grasping.
+"""Z-Mobile-Manip — thin orchestration for mobile grasping.
 
 Layered mobile-manipulation runtime for a Go2W wheel-legged base + a
 back-mounted PiPER 6-DoF arm + a wrist D435i. This package is the **thin
