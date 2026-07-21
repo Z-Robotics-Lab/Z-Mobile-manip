@@ -356,6 +356,23 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert 'id="session-go-home"' in lowered
     assert "reset + home" in lowered
     assert "state.sessions?.busy === true || speed === null" not in lowered
+    assert 'id="approach-camera-range"' in lowered
+    assert 'id="approach-base-range"' in lowered
+    assert 'id="approach-arm-range"' in lowered
+    assert 'id="approach-posture"' in lowered
+    assert 'id="approach-handoff"' in lowered
+    assert 'id="approach-reactive"' in lowered
+    assert "geometry.base_planar_distance_m" in lowered
+    assert "geometry.camera_range_m" in lowered
+    assert "geometry.target_height_m" in lowered
+    assert "geometry.arm_range_m" in lowered
+    assert "reactive.handoff_ready" in lowered
+    assert "posturestatus.body_height" in lowered
+    assert "posturestatus.attitude" in lowered
+    assert 'data-approach-phase="posture"' in lowered
+    assert 'data-approach-phase="reacquire"' in lowered
+    assert 'data-approach-phase="handoff"' in lowered
+    assert "ground-plane distance for base translation" in lowered
 
 
 def test_dashboard_explains_blocked_attempt_while_showing_last_good_bundle():

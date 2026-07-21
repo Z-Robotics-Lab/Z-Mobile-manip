@@ -306,7 +306,10 @@
     .approach-metric { border: 1px solid var(--line); border-radius: 4px; background: #10171b; padding: 6px 7px; min-width: 0; }
     .approach-metric span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
     .approach-metric strong { display: block; margin-top: 3px; color: var(--cyan); font: 10px var(--mono); overflow-wrap: anywhere; }
-    .approach-progress { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 5px; }
+    .approach-metric strong.ready { color: var(--green); }
+    .approach-metric strong.waiting { color: var(--amber); }
+    .approach-metric strong.unavailable { color: var(--muted); }
+    .approach-progress { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 5px; }
     .approach-phase { position: relative; border: 1px solid var(--line); border-radius: 999px; padding: 5px 7px; color: var(--muted); background: #0b1114; font: 700 8px var(--mono); text-align: center; text-transform: uppercase; }
     .approach-phase.active { border-color: var(--amber); color: #ffd995; background: #281d0d; }
     .approach-phase.complete { border-color: #277a57; color: var(--green); background: #10231a; }
@@ -739,6 +742,7 @@
       .approach-deck { grid-template-columns: 1fr; padding: 12px 4px 2px; }
       .approach-readout { grid-column: auto; }
       .approach-actions { grid-template-columns: 1fr; }
+      .approach-progress { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .operation-sequence { grid-template-columns: 1fr; gap: 8px; }
       .operation-sequence::before { top: 12%; bottom: 12%; left: 16px; right: auto; width: 1px; height: auto; }
       .operation-automation .perform-actions { grid-template-columns: 1fr; }
@@ -849,17 +853,25 @@
           <button class="session-button approach-stop" id="approach-stop" type="button">Full stop</button>
         </div>
         <div class="approach-readout" aria-label="Depth visual servo telemetry">
-          <div class="approach-metric"><span>Target x / z</span><strong id="approach-target">—</strong></div>
-          <div class="approach-metric"><span>Depth / yaw error</span><strong id="approach-errors">—</strong></div>
+          <div class="approach-metric"><span>Target x / y / z</span><strong id="approach-target">—</strong></div>
+          <div class="approach-metric"><span>Camera 3D / elevation</span><strong id="approach-camera-range">—</strong></div>
+          <div class="approach-metric"><span>Planar / base 3D</span><strong id="approach-base-range">—</strong></div>
+          <div class="approach-metric"><span>Target height / arm 3D</span><strong id="approach-arm-range">—</strong></div>
+          <div class="approach-metric"><span>Body height / pitch target</span><strong id="approach-posture">—</strong></div>
+          <div class="approach-metric"><span>FOV / IK handoff</span><strong id="approach-handoff">—</strong></div>
+          <div class="approach-metric"><span>Range / bearing error</span><strong id="approach-errors">—</strong></div>
           <div class="approach-metric"><span>Command vx / wz</span><strong id="approach-command">—</strong></div>
+          <div class="approach-metric"><span>Reactive view</span><strong id="approach-reactive">—</strong></div>
           <div class="approach-metric"><span>Wrist search</span><strong id="approach-search">idle</strong></div>
         </div>
         <div class="approach-progress" id="approach-progress" aria-label="Mobile grasp workflow progress">
           <span class="approach-phase" data-approach-phase="detect">Detect</span>
           <span class="approach-phase" data-approach-phase="search">Search</span>
           <span class="approach-phase" data-approach-phase="track">Track</span>
-          <span class="approach-phase" data-approach-phase="approach">Approach</span>
-          <span class="approach-phase" data-approach-phase="settle">Handoff</span>
+          <span class="approach-phase" data-approach-phase="approach">Base approach</span>
+          <span class="approach-phase" data-approach-phase="posture">Posture</span>
+          <span class="approach-phase" data-approach-phase="reacquire">Reacquire</span>
+          <span class="approach-phase" data-approach-phase="handoff">Handoff</span>
           <span class="approach-phase" data-approach-phase="grasp">Grasp</span>
         </div>
       </section>
@@ -2226,6 +2238,55 @@
       }
     }
 
+    const firstFinite = (...values) => values.find(finiteNumber);
+    const formatMeters = value => finiteNumber(value) ? `${value.toFixed(3)} m` : "—";
+    const formatDegrees = value => finiteNumber(value) ? `${(value * 180 / Math.PI).toFixed(1)}°` : "—";
+
+    function setApproachMetric(id, text, tone = "") {
+      const node = byId(id);
+      node.textContent = text || "—";
+      node.className = tone;
+    }
+
+    function formatIkProbe(reactive) {
+      const handoff = reactive.handoff || {};
+      const probe = reactive.ik_probe ?? handoff.ik_probe ?? null;
+      const passed = firstFinite(
+        probe?.passed,
+        probe?.feasible,
+        reactive.ik_probe_passed,
+        handoff.ik_probe_passed,
+      );
+      const total = firstFinite(probe?.total, reactive.ik_probe_total, handoff.ik_probe_total);
+      const feasible = typeof probe === "boolean"
+        ? probe
+        : (typeof probe?.feasible === "boolean"
+          ? probe.feasible
+          : (typeof reactive.ik_feasible === "boolean" ? reactive.ik_feasible : handoff.ik_feasible));
+      if (finiteNumber(passed) && finiteNumber(total)) return `${passed}/${total}`;
+      if (typeof feasible === "boolean") return feasible ? "PASS" : "WAIT";
+      return "—";
+    }
+
+    function formatPostureTarget(postureStatus, reactivePosture) {
+      const body = postureStatus.body_height || {};
+      const attitude = postureStatus.attitude || {};
+      const currentHeight = firstFinite(body.current_m, postureStatus.current_body_height_m);
+      const targetHeight = firstFinite(body.target_m, postureStatus.target_body_height_m);
+      const deltaHeight = firstFinite(reactivePosture.body_height_delta_m, body.error_m);
+      const currentPitch = firstFinite(attitude.current_pitch_rad, postureStatus.current_pitch_rad);
+      const targetPitch = firstFinite(attitude.target_pitch_rad, postureStatus.target_pitch_rad);
+      const deltaPitch = firstFinite(reactivePosture.pitch_delta_rad,
+        finiteNumber(currentPitch) && finiteNumber(targetPitch) ? targetPitch - currentPitch : undefined);
+      const heightText = finiteNumber(currentHeight) && finiteNumber(targetHeight)
+        ? `${currentHeight.toFixed(3)}→${targetHeight.toFixed(3)} m`
+        : finiteNumber(deltaHeight) ? `Δ${deltaHeight.toFixed(3)} m` : "—";
+      const pitchText = finiteNumber(currentPitch) && finiteNumber(targetPitch)
+        ? `${(currentPitch * 180 / Math.PI).toFixed(1)}→${(targetPitch * 180 / Math.PI).toFixed(1)}°`
+        : finiteNumber(deltaPitch) ? `Δ${(deltaPitch * 180 / Math.PI).toFixed(1)}°` : "—";
+      return `${heightText} / ${pitchText}`;
+    }
+
     function renderApproachStatus(approach = state.approach) {
       state.approach = approach || state.approach;
       state.approachWorkflow = state.approach?.workflow?.active ? state.approach.workflow : null;
@@ -2233,8 +2294,14 @@
       const runtime = state.approach?.runtime || {};
       const output = runtime.output || {};
       const target = runtime.target;
+      const geometry = runtime.geometry || {};
+      const reactive = runtime.reactive || {};
+      const visibility = reactive.visibility || {};
+      const reactivePosture = reactive.posture || {};
+      const postureStatus = runtime.posture_status || runtime.posture || state.approach?.posture || {};
+      const armView = reactive.arm_view || {};
       const search = state.approach?.wrist_search || {};
-      const workflowPhase = String(state.approachWorkflow?.phase || state.approach?.phase || runtime.phase || "idle");
+      const workflowPhase = String(reactive.phase || runtime.phase || state.approachWorkflow?.phase || state.approach?.phase || "idle");
       const otherBusy = state.sessions?.busy === true
         || state.home?.running === true
         || state.grasp?.running === true;
@@ -2260,32 +2327,78 @@
       const status = byId("approach-session-state");
       status.className = `session-state ${running ? "running" : runtime.phase === "reached" ? "succeeded" : ""}`;
       status.textContent = running
-        ? `${state.approach.mode} · ${runtime.phase || state.approach.phase || "starting"}`
+        ? `${state.approach.mode} · ${workflowPhase}${reactive.reason ? ` · ${reactive.reason}` : ""}`
         : state.approach?.message || (
         !state.taskContextActive
           ? "Approach + grasp will run the initial perception automatically."
           : "Target ready. Start Shadow first, then use Live when its command direction looks correct."
         );
-      byId("approach-target").textContent = target && finiteNumber(target.x_m) && finiteNumber(target.z_m)
-        ? `${target.x_m.toFixed(3)} / ${target.z_m.toFixed(3)} m`
+      const targetText = target && finiteNumber(target.x_m) && finiteNumber(target.z_m)
+        ? `${target.x_m.toFixed(3)} / ${finiteNumber(target.y_m) ? target.y_m.toFixed(3) : "—"} / ${target.z_m.toFixed(3)} m`
         : "—";
-      byId("approach-errors").textContent = finiteNumber(output.depth_error_m) && finiteNumber(output.yaw_error_rad)
-        ? `${output.depth_error_m.toFixed(3)} m / ${(output.yaw_error_rad * 180 / Math.PI).toFixed(1)}°`
-        : "—";
-      byId("approach-command").textContent = finiteNumber(output.proposed_linear_x) && finiteNumber(output.proposed_angular_z)
+      setApproachMetric("approach-target", targetText, target ? "" : "unavailable");
+      const cameraRange = firstFinite(geometry.camera_range_m,
+        target && finiteNumber(target.x_m) && finiteNumber(target.y_m) && finiteNumber(target.z_m)
+          ? Math.hypot(target.x_m, target.y_m, target.z_m) : undefined);
+      const cameraElevation = firstFinite(geometry.camera_elevation_rad,
+        target && finiteNumber(target.y_m) && finiteNumber(target.z_m)
+          ? Math.atan2(target.y_m, target.z_m) : undefined);
+      setApproachMetric("approach-camera-range",
+        `${formatMeters(cameraRange)} / ${formatDegrees(cameraElevation)}`,
+        finiteNumber(cameraRange) ? "" : "unavailable");
+      const planarDistance = firstFinite(geometry.base_planar_distance_m, reactive.base_planar_distance_m);
+      const baseRange = firstFinite(geometry.base_range_m, reactive.base_range_m);
+      setApproachMetric("approach-base-range",
+        `${formatMeters(planarDistance)} / ${formatMeters(baseRange)}`,
+        finiteNumber(planarDistance) ? "" : "unavailable");
+      const targetHeight = firstFinite(geometry.target_height_m, reactive.target_height_m, reactive.handoff?.target_height_m);
+      const armRange = firstFinite(geometry.arm_range_m, reactive.arm_range_m, reactive.handoff?.arm_range_m);
+      setApproachMetric("approach-arm-range",
+        `${formatMeters(targetHeight)} / ${formatMeters(armRange)}`,
+        finiteNumber(armRange) ? "" : "unavailable");
+      const postureText = formatPostureTarget(postureStatus, reactivePosture);
+      setApproachMetric("approach-posture", postureText,
+        postureText === "— / —" ? "unavailable" : postureStatus.phase === "reached" ? "ready" : "");
+      const fov = typeof visibility.in_fov === "boolean" ? visibility.in_fov
+        : typeof visibility.predicted_in_fov === "boolean" ? visibility.predicted_in_fov
+          : typeof reactive.fov_visible === "boolean" ? reactive.fov_visible : null;
+      const ikProbe = formatIkProbe(reactive);
+      const handoffReady = reactive.handoff_ready === true;
+      setApproachMetric("approach-handoff",
+        `FOV ${fov === null ? "—" : fov ? "YES" : "NO"} / IK ${ikProbe}${handoffReady ? " · READY" : ""}`,
+        handoffReady ? "ready" : fov === false ? "waiting" : "");
+      const rangeError = firstFinite(output.planar_error_m, output.depth_error_m);
+      const bearingError = firstFinite(output.bearing_error_rad, output.yaw_error_rad, geometry.base_bearing_rad);
+      setApproachMetric("approach-errors",
+        `${formatMeters(rangeError)} / ${formatDegrees(bearingError)}`,
+        finiteNumber(rangeError) ? "" : "unavailable");
+      setApproachMetric("approach-command", finiteNumber(output.proposed_linear_x) && finiteNumber(output.proposed_angular_z)
         ? `${output.proposed_linear_x.toFixed(3)} m/s / ${output.proposed_angular_z.toFixed(3)} rad/s`
-        : "—";
+        : "—", finiteNumber(output.proposed_linear_x) ? "" : "unavailable");
+      const viewYaw = firstFinite(armView.yaw_error_rad);
+      const viewPitch = firstFinite(armView.pitch_error_rad);
+      const extension = firstFinite(armView.extension_fraction);
+      const viewDetails = [
+        armView.mode || reactive.view_mode || "—",
+        finiteNumber(viewYaw) || finiteNumber(viewPitch)
+          ? `${formatDegrees(viewYaw)} / ${formatDegrees(viewPitch)}` : null,
+        finiteNumber(extension) ? `extend ${(extension * 100).toFixed(0)}%` : null,
+      ].filter(Boolean).join(" · ");
+      setApproachMetric("approach-reactive", viewDetails, viewDetails === "—" ? "unavailable" : "");
       const confidence = finiteNumber(search.confidence) ? `${(search.confidence * 100).toFixed(0)}%` : "—";
       const view = Number.isInteger(search.view_index) ? `${search.view_index + 1}/${search.view_count || "?"}` : "—";
       byId("approach-search").textContent = search.live_enabled === false
         ? `LIVE LOCKED · ${search.phase || "idle"} · view ${view} · conf ${confidence}`
         : `${search.phase || "idle"} · view ${view} · conf ${confidence}`;
-      const phaseOrder = ["detect", "search", "track", "approach", "settle", "grasp"];
+      const phaseOrder = ["detect", "search", "track", "approach", "posture", "reacquire", "handoff", "grasp"];
       const phaseAliases = {
         detecting: "detect", wrist_search: "search", shadow_view: "search", move: "search", observe: "search",
-        seeding_tracker: "track", waiting_for_track: "track", reacquiring: "track",
-        align: "approach", approach: "approach", approaching: "approach",
-        reached: "settle", handoff_to_grasp: "settle", grasp_started: "grasp"
+        seeding_tracker: "track", waiting_for_track: "track", tracking: "track",
+        align: "approach", approach: "approach", approaching: "approach", base_approach: "approach",
+        posture_adjust: "posture", waiting_base_quiet: "posture", commanding: "posture", settling: "posture",
+        reacquire: "reacquire", reacquiring: "reacquire", view_recovery: "reacquire",
+        search_required: "search", reached: "handoff", handoff_ready: "handoff", handoff_to_grasp: "handoff",
+        grasp_started: "grasp"
       };
       const activePhase = phaseAliases[workflowPhase] || null;
       const activeIndex = activePhase ? phaseOrder.indexOf(activePhase) : -1;
@@ -2321,7 +2434,7 @@
 
     async function startApproach(mode, requireConfirmation = true, options = {}) {
       if (mode === "live" && requireConfirmation && !window.confirm(
-        "Start live Go2W approach?\n\nThe robot will coarsely align and drive forward. It hands off at 0.52 m or closer when the target is within 20°; exact centering is intentionally not required for the legged base. Keep the path clear and keep Full stop / the physical emergency stop within reach."
+        "Start live Go2W reactive approach?\n\nThe robot uses ground-plane distance for base translation, then may adapt body height/pitch or the wrist-camera view to keep the target visible. Handoff occurs only after the target enters the arm workspace and the readiness probe passes. Keep the path clear and keep Full stop / the physical emergency stop within reach."
       )) return;
       renderApproachStatus({ ...state.approach, running: true, mode, phase: "starting", message: `Starting ${mode} depth approach…` });
       try {
@@ -2387,7 +2500,7 @@
       const target = byId("perception-target").value.trim();
       if (target.length < 1 || target.length > 160) return;
       if (!window.confirm(
-        `Approach and grasp “${target}”?\n\nThe Go2W will detect, coarsely align, and enter the close-range handoff zone (≤0.52 m, target within 20°). It then stops and runs fresh perception, IK, planning, and grasp; exact base orientation is intentionally left to the arm stage. Keep Full stop and the physical emergency stop within reach.`
+        `Approach and grasp “${target}”?\n\nThe Go2W will detect and track the target, approach using ground-plane range, adapt body/wrist-camera posture when needed, then stop for a fresh arm-workspace and IK handoff before grasping. Keep Full stop and the physical emergency stop within reach.`
       )) return;
       state.approachWorkflow = { active: true, phase: "detecting", target };
       renderApproachStatus(state.approach);
