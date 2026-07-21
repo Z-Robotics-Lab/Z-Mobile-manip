@@ -116,10 +116,10 @@ class DepthServoCore:
             rotate_only_bearing_rad=settings.rotate_only_bearing_rad,
             yaw_deadband_rad=settings.yaw_deadband_rad,
         ))
-        self._target: tuple[float, float] | None = None
-        self._raw_target: tuple[float, float] | None = None
+        self._target: tuple[float, float, float] | None = None
+        self._raw_target: tuple[float, float, float] | None = None
         self._target_received_s: float | None = None
-        self._samples: deque[tuple[float, float]] = deque(
+        self._samples: deque[tuple[float, float, float]] = deque(
             maxlen=settings.target_filter_window,
         )
         self._accepted_observations = 0
@@ -127,8 +127,20 @@ class DepthServoCore:
         self._done = False
 
     @property
-    def target(self) -> tuple[float, float] | None:
+    def target(self) -> tuple[float, float, float] | None:
         return self._target
+
+    @property
+    def camera_geometry(self) -> dict[str, float] | None:
+        """Return camera-frame 3-D metrics without inventing base-frame data."""
+
+        if self._target is None:
+            return None
+        x_m, y_m, z_m = self._target
+        return {
+            "camera_range_m": math.sqrt(x_m * x_m + y_m * y_m + z_m * z_m),
+            "camera_elevation_rad": math.atan2(-y_m, z_m),
+        }
 
     @property
     def filter_stats(self) -> dict[str, int | float | None]:
@@ -137,17 +149,33 @@ class DepthServoCore:
             "accepted": self._accepted_observations,
             "rejected_outliers": self._rejected_observations,
             "raw_x_m": None if self._raw_target is None else self._raw_target[0],
-            "raw_z_m": None if self._raw_target is None else self._raw_target[1],
+            "raw_y_m": None if self._raw_target is None else self._raw_target[1],
+            "raw_z_m": None if self._raw_target is None else self._raw_target[2],
         }
 
-    def observe_target(self, *, x_m: float, z_m: float, stamp_s: float) -> bool:
-        values = (float(x_m), float(z_m), float(stamp_s))
+    def observe_target(
+        self,
+        *,
+        x_m: float,
+        z_m: float,
+        stamp_s: float,
+        y_m: float = 0.0,
+    ) -> bool:
+        """Observe a complete optical-frame target centroid.
+
+        ``y_m`` defaults to zero only for backward-compatible callers.  The
+        ROS adapter always supplies the measured optical y coordinate.
+        """
+
+        values = (float(x_m), float(y_m), float(z_m), float(stamp_s))
         if not all(math.isfinite(value) for value in values) or z_m <= 0.0:
             return False
-        raw = (float(x_m), float(z_m))
+        raw = (float(x_m), float(y_m), float(z_m))
         self._raw_target = raw
         if self._target is not None:
-            jump_m = math.hypot(raw[0] - self._target[0], raw[1] - self._target[1])
+            jump_m = math.sqrt(sum(
+                (raw[index] - self._target[index]) ** 2 for index in range(3)
+            ))
             if jump_m > self.settings.max_target_jump_m:
                 self._rejected_observations += 1
                 return False
@@ -155,6 +183,7 @@ class DepthServoCore:
         median = (
             statistics.median(sample[0] for sample in self._samples),
             statistics.median(sample[1] for sample in self._samples),
+            statistics.median(sample[2] for sample in self._samples),
         )
         if self._target is None:
             self._target = median
@@ -163,6 +192,7 @@ class DepthServoCore:
             self._target = (
                 alpha * median[0] + (1.0 - alpha) * self._target[0],
                 alpha * median[1] + (1.0 - alpha) * self._target[1],
+                alpha * median[2] + (1.0 - alpha) * self._target[2],
             )
         self._target_received_s = float(stamp_s)
         self._accepted_observations += 1
@@ -206,7 +236,7 @@ class DepthServoCore:
                 else "tracking_lost"
             )
             return self._zero(phase, age_s)
-        x_m, z_m = self._target
+        x_m, y_m, z_m = self._target
         yaw_error = math.atan2(x_m, z_m)
         # A Go2W body pose is not a precision fixture: one footstep can move
         # the camera by several centimetres and degrees.  Stop the base as
@@ -234,7 +264,7 @@ class DepthServoCore:
         # is at or inside the requested standoff band, never reverse away from
         # it.  Continue yaw centering, settle, then hand off to manipulation.
         control_z_m = max(z_m, self.settings.desired_depth_m)
-        command = self.controller.update((x_m, 0.0, control_z_m), stamp_s=now)
+        command = self.controller.update((x_m, y_m, control_z_m), stamp_s=now)
         linear_x = command.linear_x
         # Keep Go2W above its observed low-speed dead zone while it is still
         # outside the manipulation handoff. If it is already near but not
@@ -333,6 +363,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.core = DepthServoCore(settings)
             self.tracking: bool | None = None
             self.last_source_stamp_ns: int | None = None
+            self.last_source_frame: str | None = None
             self.last_output = self.core.tick(now_s=time.monotonic(), tracking=False)
             self.last_trace_phase: str | None = None
             self.last_trace_s = 0.0
@@ -345,15 +376,17 @@ def _run_ros(args: argparse.Namespace) -> int:
 
         def _target(self, message: PointCloud2) -> None:
             xs: list[float] = []
+            ys: list[float] = []
             zs: list[float] = []
             for point in point_cloud2.read_points(
                 message,
-                field_names=("x", "z"),
+                field_names=("x", "y", "z"),
                 skip_nans=True,
             ):
-                x_m, z_m = float(point[0]), float(point[1])
-                if math.isfinite(x_m) and math.isfinite(z_m) and z_m > 0.0:
+                x_m, y_m, z_m = float(point[0]), float(point[1]), float(point[2])
+                if all(math.isfinite(value) for value in (x_m, y_m, z_m)) and z_m > 0.0:
                     xs.append(x_m)
+                    ys.append(y_m)
                     zs.append(z_m)
                 if len(xs) >= 5000:
                     break
@@ -361,10 +394,12 @@ def _run_ros(args: argparse.Namespace) -> int:
                 return
             accepted = self.core.observe_target(
                 x_m=statistics.median(xs),
+                y_m=statistics.median(ys),
                 z_m=statistics.median(zs),
                 stamp_s=time.monotonic(),
             )
             if accepted:
+                self.last_source_frame = str(message.header.frame_id or "") or None
                 self.last_source_stamp_ns = (
                     int(message.header.stamp.sec) * 1_000_000_000
                     + int(message.header.stamp.nanosec)
@@ -389,7 +424,13 @@ def _run_ros(args: argparse.Namespace) -> int:
                 "mode": settings.mode,
                 "phase": state or self.last_output.phase,
                 "tracking": self.tracking,
-                "target": None if target is None else {"x_m": target[0], "z_m": target[1]},
+                "target": None if target is None else {
+                    "x_m": target[0],
+                    "y_m": target[1],
+                    "z_m": target[2],
+                    "frame_id": self.last_source_frame,
+                },
+                "geometry": self.core.camera_geometry,
                 "source_stamp_ns": self.last_source_stamp_ns,
                 "output": asdict(self.last_output),
                 "filter": self.core.filter_stats,

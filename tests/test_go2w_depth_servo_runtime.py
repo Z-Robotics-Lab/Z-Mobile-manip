@@ -109,7 +109,7 @@ def test_target_filter_rejects_one_large_depth_jump():
     output = core.tick(now_s=1.10, tracking=True)
 
     assert output.phase == "approach"
-    assert core.target == pytest.approx((0.01, 0.90))
+    assert core.target == pytest.approx((0.01, 0.0, 0.90))
     assert core.filter_stats["rejected_outliers"] == 1
 
 
@@ -119,8 +119,36 @@ def test_target_filter_reduces_alternating_depth_noise():
         assert core.observe_target(x_m=0.02, z_m=depth, stamp_s=1.0 + index * 0.05)
 
     assert core.target is not None
-    assert 0.89 <= core.target[1] <= 0.92
+    assert 0.89 <= core.target[2] <= 0.92
     assert core.filter_stats["window_samples"] == 5
+
+
+def test_target_filter_preserves_vertical_coordinate_and_3d_geometry():
+    core = _core()
+    for index, y_m in enumerate((0.20, 0.22, 0.18, 0.21, 0.19)):
+        assert core.observe_target(
+            x_m=0.10,
+            y_m=y_m,
+            z_m=0.80,
+            stamp_s=1.0 + index * 0.05,
+        )
+
+    assert core.target is not None
+    assert core.target == pytest.approx((0.10, 0.20, 0.80), abs=0.01)
+    geometry = core.camera_geometry
+    assert geometry is not None
+    assert geometry["camera_range_m"] == pytest.approx(
+        (0.10 ** 2 + core.target[1] ** 2 + 0.80 ** 2) ** 0.5,
+    )
+    assert geometry["camera_elevation_rad"] < 0.0
+
+
+def test_target_jump_filter_uses_full_3d_euclidean_distance():
+    core = _core()
+    assert core.observe_target(x_m=0.0, y_m=0.0, z_m=0.80, stamp_s=1.0)
+
+    assert not core.observe_target(x_m=0.0, y_m=0.25, z_m=0.80, stamp_s=1.1)
+    assert core.filter_stats["rejected_outliers"] == 1
 
 
 def test_legged_handoff_accepts_coarse_near_field_alignment_immediately():
