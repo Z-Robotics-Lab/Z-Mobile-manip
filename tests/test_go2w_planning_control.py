@@ -717,6 +717,25 @@ def _servo_status_script(path: Path, phase: str) -> Path:
     return path
 
 
+def _servo_phase_sequence_script(path: Path, phases: list[str]) -> Path:
+    counter = path.with_suffix(".count")
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        f"phases = {phases!r}\n"
+        f"counter = pathlib.Path({str(counter)!r})\n"
+        "count = int(counter.read_text()) if counter.exists() else 0\n"
+        "counter.write_text(str(count + 1))\n"
+        "phase = phases[min(count, len(phases) - 1)]\n"
+        "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+        "'schema':'z_manip.depth_servo_status.v1','running':True,'phase':phase}))\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 def test_depth_servo_server_hands_reached_target_to_grasp(tmp_path):
     grasp = _FakeGraspRunner()
     runner = CONTROL.DepthServoRunner(
@@ -742,6 +761,36 @@ def test_depth_servo_server_hands_reached_target_to_grasp(tmp_path):
     assert grasp.target == "charger"
     assert grasp.speed_percent == 17
     assert runner.status()["workflow"]["phase"] == "grasp_started"
+
+
+def test_depth_servo_handoff_phases_stop_base_before_fresh_grasp(tmp_path):
+    for phase in ("handoff_probe", "handoff_ready"):
+        phase_dir = tmp_path / phase
+        phase_dir.mkdir()
+        grasp = _FakeGraspRunner()
+        runner = CONTROL.DepthServoRunner(
+            _servo_status_script(phase_dir / "servo.py", phase),
+            phase_dir / "status.json",
+            phase_dir / "servo.log",
+            session_service=_FakeInteractiveService(),
+            grasp_runner=grasp,
+        )
+
+        result = runner.start(
+            "live",
+            target="charger",
+            auto_handoff=True,
+            speed_percent=12,
+        )
+        deadline = time.monotonic() + 3.0
+        while grasp.starts == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert result["started"] is True
+        assert grasp.starts == 1
+        assert runner._process is not None
+        assert runner._process.poll() is not None
+        assert runner.status()["workflow"]["phase"] == "grasp_started"
 
 
 def test_depth_servo_server_reacquires_after_bounded_tracking_loss(tmp_path):
@@ -817,6 +866,71 @@ def test_depth_servo_uses_bounded_wrist_search_after_initial_detection_miss(tmp_
     assert search.calls == [("charger", "shadow", 8, False, False)]
     assert runner.status()["wrist_search"]["phase"] == "found"
     runner.stop()
+
+
+def test_depth_servo_view_recovery_stops_base_before_wrist_search(tmp_path):
+    for recovery_phase in ("view_recovery", "search_required"):
+        phase_dir = tmp_path / recovery_phase
+        phase_dir.mkdir()
+
+        class Search:
+            def __init__(self):
+                self.calls = 0
+                self.base_was_stopped = False
+
+            def run(
+                self,
+                target,
+                *,
+                mode,
+                speed_percent,
+                cancel,
+                operator_present=False,
+            ):
+                self.calls += 1
+                process = runner._process
+                self.base_was_stopped = (
+                    process is not None and process.poll() is not None
+                )
+                return True
+
+            def status(self):
+                return {"phase": "found", "failure": None}
+
+            def stop(self):
+                return None
+
+        interactive = _FakeInteractiveService()
+        search = Search()
+        runner = CONTROL.DepthServoRunner(
+            _servo_phase_sequence_script(
+                phase_dir / "servo.py",
+                [recovery_phase, "base_approach"],
+            ),
+            phase_dir / "status.json",
+            phase_dir / "servo.log",
+            session_service=interactive,
+            wrist_search=search,
+        )
+
+        result = runner.start(
+            "shadow",
+            target="charger",
+            operator_present=True,
+            speed_percent=9,
+        )
+        deadline = time.monotonic() + 3.0
+        while search.calls == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        while not interactive.perception_targets and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert result["started"] is True
+        assert search.calls == 1
+        assert search.base_was_stopped is True
+        assert interactive.perception_targets == ["charger"]
+        assert runner.status()["workflow"]["reacquisition_attempts"] == 1
+        runner.stop()
 
 
 def test_depth_servo_full_stop_is_idempotent_when_already_stopped(tmp_path):

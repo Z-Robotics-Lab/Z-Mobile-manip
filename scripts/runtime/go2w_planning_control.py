@@ -1554,6 +1554,116 @@ class DepthServoRunner:
             return False
         return attempt.get("status") == "succeeded"
 
+    def _handoff_after_base_stop(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        target: str,
+        cancel: threading.Event,
+        terminal_phase: str,
+    ) -> None:
+        """Latch zero base motion before starting the fresh grasp transaction."""
+
+        self._terminate_process(process, keep_status=True)
+        with self._lock:
+            auto_handoff = self._workflow.get("auto_handoff") is True
+            speed = int(self._workflow.get("speed_percent", 5))
+        if auto_handoff and not cancel.is_set():
+            self._set_workflow(phase="handoff_to_grasp")
+            # GraspRunner.start() owns a fresh close-range perception, IK,
+            # planning, and execution transaction; no approach artifact is
+            # reused after the base has moved.
+            result = self._grasp_runner.start(target, speed)
+            if result.get("started"):
+                self._set_workflow(active=False, phase="grasp_started", failure=None)
+                with self._lock:
+                    self._message = (
+                        "Base is stopped; fresh close-range perception, IK, "
+                        "planning, and grasp started."
+                    )
+            else:
+                self._set_workflow(
+                    active=False,
+                    phase="blocked",
+                    failure="grasp handoff was rejected",
+                )
+        else:
+            self._set_workflow(active=False, phase=terminal_phase, failure=None)
+            with self._lock:
+                self._message = "Visual approach stopped at the manipulation handoff."
+
+    def _recover_view_with_stationary_base(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        mode: str,
+        target: str,
+        cancel: threading.Event,
+    ) -> bool:
+        """Stop the base, run one bounded wrist search, then restart tracking."""
+
+        # Wrist motion and base velocity are mutually exclusive. Terminating
+        # the servo process first also invokes its zero-command cleanup.
+        self._terminate_process(process, keep_status=True)
+        if self._wrist_search is None:
+            self._set_workflow(
+                active=False,
+                phase="blocked",
+                failure="view recovery requires bounded wrist search",
+            )
+            with self._lock:
+                self._message = "Target left the camera view; base is stopped."
+            return False
+
+        self._set_workflow(phase="wrist_search", failure=None)
+        with self._lock:
+            self._message = "Base stopped; running bounded wrist search to recover the target."
+            speed = int(self._workflow.get("speed_percent", 5))
+            operator_present = self._workflow.get("operator_present") is True
+        try:
+            found = self._wrist_search.run(
+                target,
+                mode=mode,
+                speed_percent=speed,
+                cancel=cancel,
+                operator_present=operator_present,
+            )
+        except Exception as error:
+            found = False
+            self._set_workflow(failure=f"wrist search failed: {error}")
+        if not found or cancel.is_set():
+            search_status = self._wrist_search.status()
+            failure = str(
+                search_status.get("failure")
+                or self._workflow.get("failure")
+                or "target not found by bounded wrist search"
+            )
+            self._set_workflow(active=False, phase="blocked", failure=failure)
+            with self._lock:
+                self._message = "View recovery failed; arm and base are stopped."
+            return False
+
+        self._set_workflow(phase="seeding_tracker", failure=None)
+        if not self._run_perception(target, reacquisition=True) or cancel.is_set():
+            self._set_workflow(
+                active=False,
+                phase="blocked",
+                failure="wrist search found the target but tracker reseeding failed",
+            )
+            with self._lock:
+                self._message = "Target was found, but stable 3-D tracking did not restart."
+            return False
+        with self._lock:
+            try:
+                self._spawn_process_locked(mode)
+            except Exception as error:
+                self._workflow.update(active=False, phase="blocked", failure=str(error))
+                self._message = f"Could not restart depth servo: {error}"
+                return False
+            self._workflow["phase"] = "waiting_for_track"
+            self._message = "Target recovered with the base stationary; visual approach restarted."
+        return True
+
     def _supervise(self, mode: str, acquire_target: bool) -> None:
         with self._lock:
             target = self._workflow.get("target")
@@ -1625,25 +1735,39 @@ class DepthServoRunner:
                 return
             runtime = self._runtime_status()
             phase = runtime.get("phase")
-            if phase == "reached":
-                self._terminate_process(process, keep_status=True)
-                with self._lock:
-                    auto_handoff = self._workflow.get("auto_handoff") is True
-                    speed = int(self._workflow.get("speed_percent", 5))
-                if auto_handoff and not cancel.is_set():
-                    self._set_workflow(phase="handoff_to_grasp")
-                    result = self._grasp_runner.start(target, speed)
-                    if result.get("started"):
-                        self._set_workflow(active=False, phase="grasp_started", failure=None)
-                        with self._lock:
-                            self._message = "Base reached standoff and stopped; fresh close-range grasp workflow started."
-                    else:
-                        self._set_workflow(active=False, phase="blocked", failure="grasp handoff was rejected")
-                else:
-                    self._set_workflow(active=False, phase="reached", failure=None)
-                    with self._lock:
-                        self._message = "Visual approach reached the standoff and the base is stopped."
+            if phase in {"reached", "handoff_probe", "handoff_ready"}:
+                self._handoff_after_base_stop(
+                    process,
+                    target=target,
+                    cancel=cancel,
+                    terminal_phase=str(phase),
+                )
                 return
+            if phase in {"view_recovery", "search_required"}:
+                now = time.monotonic()
+                with self._lock:
+                    attempts = int(self._workflow["reacquisition_attempts"])
+                if attempts >= self._max_reacquisitions:
+                    self._terminate_process(process, keep_status=True)
+                    self._set_workflow(
+                        active=False,
+                        phase="blocked",
+                        failure="view recovery budget exhausted",
+                    )
+                    with self._lock:
+                        self._message = "Target remained outside the view; base is stopped."
+                    return
+                if now - last_reacquisition_s < 1.0:
+                    continue
+                last_reacquisition_s = now
+                if not self._recover_view_with_stationary_base(
+                    process,
+                    mode=mode,
+                    target=target,
+                    cancel=cancel,
+                ):
+                    return
+                continue
             if phase != "tracking_lost":
                 if phase:
                     self._set_workflow(phase=str(phase))

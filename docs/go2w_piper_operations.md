@@ -238,10 +238,10 @@ fresh open-vocabulary detection in the current D435 frame
 → two consecutive detections at confidence >= 0.55
 → fresh EdgeTAM seed and three depth-validated tracking updates
 → filtered target x/z at 5–10 Hz
-→ coarse legged-base alignment and curved vx/wz approach
-→ immediate handoff at depth <= 0.52 m with target bearing <= 20 deg
+→ coarse legged-base alignment, body/view adjustment, and curved vx/wz approach
+→ zero-speed `handoff_probe` / `handoff_ready` at the 3-D arm corridor
 → latched zero base command
-→ fresh Home-planned local grasp
+→ fresh close-range perception → IK → plan → grasp
 ```
 
 The base controller deliberately does not chase exact yaw. Angular correction has a
@@ -262,6 +262,14 @@ filtered with a five-sample median plus EMA. A single jump above 0.20 m is
 rejected. Tracking loss commands zero immediately, allows a stationary 0.75 s
 reacquisition window, then runs at most three fresh perception attempts. It
 never blind-drives through a missing target.
+
+`view_recovery` and `search_required` are stationary recovery phases. The
+supervisor first terminates the base-servo owner (which sends its zero-command
+cleanup), then runs the bounded wrist search and a fresh EdgeTAM seed. Only
+after a stable target is recovered does it restart base approach. Wrist search
+and base velocity therefore never run concurrently. `handoff_probe`,
+`handoff_ready`, and the legacy `reached` phase all use the same zero-speed
+fresh-grasp handoff; no far-field perception or trajectory is reused.
 
 **Full stop** cancels the server-side workflow, terminates the depth-servo
 process, clears its task context, and interrupts a pending local wrist-search
