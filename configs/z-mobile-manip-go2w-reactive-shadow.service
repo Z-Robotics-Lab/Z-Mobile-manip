@@ -1,0 +1,13 @@
+[Unit]
+Description=Z-Mobile-Manip Go2W reactive bridge (transport-free shadow)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/z-mobile-manip/go2w_reactive_control_nuc.sh shadow
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

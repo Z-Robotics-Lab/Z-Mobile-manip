@@ -84,3 +84,7 @@ settling window.
 
 FOV prediction and IK probing stay in the reactive geometry/handoff layer;
 they must not be inferred from transport ACKs.
+
+The concrete ROS/NUC wiring, Full Stop latch, systemd single-owner deployment,
+and two independent live gates are documented in
+[`go2w_reactive_runtime.md`](go2w_reactive_runtime.md).

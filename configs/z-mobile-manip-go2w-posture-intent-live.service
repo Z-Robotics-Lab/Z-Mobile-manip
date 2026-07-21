@@ -1,0 +1,15 @@
+[Unit]
+Description=Z-Mobile-Manip posture intent relay (live to NUC)
+After=network-online.target
+Wants=network-online.target
+Conflicts=z-mobile-manip-go2w-posture-intent-shadow.service
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/z-mobile-manip/go2w-posture-intent-live.env
+ExecStart=%h/Z-Robotics-Lab/Z-Mobile-manip/scripts/runtime/go2w_posture_intent_bridge.sh live
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

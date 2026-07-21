@@ -1,0 +1,15 @@
+[Unit]
+Description=Z-Mobile-Manip Go2W single-owner reactive WebRTC control
+After=network-online.target
+Wants=network-online.target
+Conflicts=z-manip-go2w-base-control.service z-mobile-manip-go2w-reactive-shadow.service
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/z-mobile-manip/go2w-reactive-live.env
+ExecStart=%h/.local/lib/z-mobile-manip/go2w_reactive_control_nuc.sh live
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

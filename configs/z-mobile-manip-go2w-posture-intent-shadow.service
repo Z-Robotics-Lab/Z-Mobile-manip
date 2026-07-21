@@ -1,0 +1,13 @@
+[Unit]
+Description=Z-Mobile-Manip posture intent relay (shadow)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Z-Robotics-Lab/Z-Mobile-manip/scripts/runtime/go2w_posture_intent_bridge.sh shadow
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
