@@ -377,6 +377,36 @@ def test_runtime_validator_preserves_strict_depth_filter_telemetry():
     assert normalized["telemetry"]["depth_filter"]["report"] == _depth_filter_report()
 
 
+def test_runtime_validator_accepts_verified_measured_kinematic_transforms():
+    state = _runtime_state(1_800_000_000_000_000_000)
+    identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+    state["kinematic_transforms"] = {
+        "schema": "z_manip.kinematic_transforms.v1",
+        "verified": True,
+        "source": "passive_joints+deployed_urdf+measured_hand_eye",
+        "source_timestamp_ns": state["source_timestamp_ns"],
+        "joint_source_timestamp_ns": state["source_timestamp_ns"] - 10_000_000,
+        "camera_frame": "camera_color_optical_frame",
+        "arm_base_frame": "piper_base_link",
+        "platform_base_frame": "base_link",
+        "arm_base_from_camera": identity,
+        "platform_base_from_camera": identity,
+        "calibration_id": "measured-hand-eye-test",
+        "calibration_synthetic": False,
+    }
+
+    normalized = CONTROL.validate_runtime_state(state)
+
+    assert normalized["kinematic_transforms"]["verified"] is True
+    assert normalized["kinematic_transforms"]["platform_base_frame"] == "base_link"
+    assert normalized["kinematic_transforms"]["platform_base_from_camera"] == identity
+
+
 def test_runtime_validator_rejects_inconsistent_or_malformed_filter_telemetry():
     state = _runtime_state(1_800_000_000_000_000_000)
     state["telemetry"] = {

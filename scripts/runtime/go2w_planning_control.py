@@ -213,6 +213,7 @@ def validate_runtime_state(document: object) -> dict[str, Any]:
         "candidates",
         "plan_overlay",
         "telemetry",
+        "kinematic_transforms",
     }
     _strict_keys(document, allowed, "runtime state")
     if document.get("schema") != RUNTIME_SCHEMA:
@@ -247,6 +248,62 @@ def validate_runtime_state(document: object) -> dict[str, Any]:
             for value in joints
         ],
     }
+
+    kinematic_transforms = document.get("kinematic_transforms")
+    if kinematic_transforms is not None:
+        if not isinstance(kinematic_transforms, dict):
+            raise RuntimeStateError("kinematic_transforms must be an object")
+        _strict_keys(
+            kinematic_transforms,
+            {
+                "schema",
+                "verified",
+                "source",
+                "source_timestamp_ns",
+                "joint_source_timestamp_ns",
+                "camera_frame",
+                "arm_base_frame",
+                "platform_base_frame",
+                "arm_base_from_camera",
+                "platform_base_from_camera",
+                "calibration_id",
+                "calibration_synthetic",
+            },
+            "kinematic_transforms",
+        )
+        if kinematic_transforms.get("schema") != "z_manip.kinematic_transforms.v1":
+            raise RuntimeStateError("unsupported kinematic transform schema")
+        if kinematic_transforms.get("verified") is not True:
+            raise RuntimeStateError("kinematic transforms must be verified")
+        if kinematic_transforms.get("calibration_synthetic") is not False:
+            raise RuntimeStateError("kinematic transforms require measured calibration")
+        normalized_transforms: dict[str, object] = {
+            "schema": "z_manip.kinematic_transforms.v1",
+            "verified": True,
+            "calibration_synthetic": False,
+        }
+        for key in (
+            "source",
+            "camera_frame",
+            "arm_base_frame",
+            "platform_base_frame",
+            "calibration_id",
+        ):
+            value = kinematic_transforms.get(key)
+            if not isinstance(value, str) or not value or len(value) > 256:
+                raise RuntimeStateError(f"kinematic_transforms {key} must be a non-empty string")
+            normalized_transforms[key] = value
+        for key in ("source_timestamp_ns", "joint_source_timestamp_ns"):
+            value = kinematic_transforms.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise RuntimeStateError(f"kinematic_transforms {key} must be a positive integer")
+            normalized_transforms[key] = value
+        for key in ("arm_base_from_camera", "platform_base_from_camera"):
+            normalized_transforms[key] = _transform(
+                kinematic_transforms.get(key),
+                f"kinematic_transforms {key}",
+            )
+        normalized["kinematic_transforms"] = normalized_transforms
 
     telemetry = document.get("telemetry")
     if telemetry is not None:
