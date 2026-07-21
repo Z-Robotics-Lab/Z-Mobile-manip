@@ -1,0 +1,24 @@
+services:
+  manipulation-runtime:
+    image: ${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:jazzy}
+    build:
+      context: ../..
+      dockerfile: docker/runtime/Dockerfile
+      args:
+        BASE_IMAGE: ${Z_MANIP_BASE_IMAGE:-navstack:ready@sha256:7c1f317d0bfe33fbdb5067bf0266fc70c273da23bcbd767ebf3c714405118407}
+    network_mode: host
+    env_file:
+      - path: ${Z_MANIP_ENV_FILE:-../../../z-agent/.env}
+        required: false
+    environment:
+      ROS_DOMAIN_ID: ${Z_MANIP_ROS_DOMAIN_ID:-184}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTDDS_BUILTIN_TRANSPORTS: UDPv4
+      Z_MANIP_STACK_CONFIG: /opt/z_manip/configs/go2w_piper.json
+      Z_MANIP_ROBOT_URDF: /robot/assets/urdf/go2w_sensored.urdf
+      Z_MANIP_ROBOT_DESCRIPTION_FILE: /robot/assets/urdf/go2w_sensored.urdf
+      Z_MANIP_COLLISION_MODEL_FILE: /opt/z_manip/configs/piper_collision_capsules.json
+    volumes:
+      - ${Z_MANIP_ROBOT_ASSETS:-../../../go2W_Sim/assets}:/robot/assets:ro
+    command: ["sleep", "infinity"]
+    init: true

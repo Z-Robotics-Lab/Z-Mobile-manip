@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "z-manip"
+version = "0.0.0.dev0"
+description = "Layered mobile-manipulation orchestration for Go2W + PiPER (ROS2-contract only; never imports Isaac)."
+readme = "README.md"
+requires-python = ">=3.10"
+# No third-party dependencies by design (M0 skeleton). Heavy deps (ROS2 rclpy,
+# perception/grasp/IK models, cuRobo, MoveIt2) enter behind the L1 Protocols /
+# ZMQ inference servers as they are wired in M1-M5 — each a CEO gate declared in
+# docs/plan.md, not pulled at skeleton time.
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+# Test extras only; kept empty at M0 so `pip install -e .` needs nothing.
+dev = []
+
+[tool.setuptools.packages.find]
+# The importable package is `z_manip` (underscore); the distribution is
+# `z-manip` (hyphen). Only ship the orchestration package; refs/ is a
+# gitignored read-only mirror and docker/ is deployment glue, neither is a
+# Python package. `tests` is dev-only, not shipped.
+include = ["z_manip*"]
+
+[tool.pytest.ini_options]
+# Contract tests (ROS2 sim==real). Live tests attach to a running chain through
+# the exec seam and skip when it is not green; collection needs no deps.
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "m0: M0 camera stream + three poses + GT (live, attach-only)",
+    "m05: M0.5 extra props (parametrized, forward-looking)",
+    "m1: M1 find + two-stage approach + tracking (spec/skeleton)",
+    "m2: M2 grasp-candidate generation (spec/skeleton)",
+    "m3: M3 plan + execute pick/place (spec/skeleton)",
+    "e2e: end-to-end smoke / staged specs (bare-cli acceptance face)",
+    "slow: runs a multi-second live probe against the chain",
+]

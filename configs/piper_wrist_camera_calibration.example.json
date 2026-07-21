@@ -1,0 +1,21 @@
+{
+  "schema": "z_manip.piper_camera_calibration.v1",
+  "calibrated": false,
+  "synthetic": false,
+  "calibration_id": "UNVERIFIED_NOMINAL_URDF_AND_REALSENSE_TF",
+  "mount_type": "eye_in_hand",
+  "tip_link": "piper_gripper_base",
+  "camera_frame": "camera_color_optical_frame",
+  "tip_from_camera": [
+    [-0.002400147026, 0.999991962951, 0.003211436959, -0.045046981593],
+    [-0.999995793747, -0.002405361095, 0.001620717672, 0.014840322547],
+    [0.001628429312, -0.003207533490, 0.999993529953, 0.019879029101],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "provenance": {
+    "warning": "Nominal CAD mount composed with the live RealSense device TF; this is not a hand-eye calibration and planning must reject it.",
+    "urdf_joint": "d435_joint",
+    "urdf_xyz_m": [-0.045, 0.0, 0.02],
+    "urdf_rpy_rad": [0.0, -1.5708, 0.0]
+  }
+}

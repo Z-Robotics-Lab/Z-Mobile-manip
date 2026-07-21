@@ -1,0 +1,15 @@
+[Unit]
+Description=PiPER receive-only CAN to ROS joint telemetry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ExecStart=/bin/bash -lc 'source %h/go2w-nuc/bringup/ros_env.sh && exec /usr/bin/python3 %h/z-manip-runtime/piper_passive_joint_state_bridge.py --interface can0 --topic /piper/state --publish-hz 20'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

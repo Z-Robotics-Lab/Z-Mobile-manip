@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<robot name="go2w_sensored">
+  <!-- The tip precedes the two finger prismatic joints, so this group is exactly 6 DoF. -->
+  <group name="piper_arm">
+    <chain base_link="piper_base_link" tip_link="piper_gripper_base"/>
+  </group>
+
+  <group_state name="stow" group="piper_arm">
+    <joint name="piper_joint1" value="0.0"/>
+    <joint name="piper_joint2" value="0.80"/>
+    <joint name="piper_joint3" value="-1.55"/>
+    <joint name="piper_joint4" value="0.0"/>
+    <joint name="piper_joint5" value="0.75"/>
+    <joint name="piper_joint6" value="0.0"/>
+  </group_state>
+
+  <disable_collisions link1="piper_base_link" link2="piper_link1" reason="Adjacent"/>
+  <disable_collisions link1="piper_link1" link2="piper_link2" reason="Adjacent"/>
+  <disable_collisions link1="piper_link2" link2="piper_link3" reason="Adjacent"/>
+  <disable_collisions link1="piper_link3" link2="piper_link4" reason="Adjacent"/>
+  <disable_collisions link1="piper_link4" link2="piper_link5" reason="Adjacent"/>
+  <disable_collisions link1="piper_link5" link2="piper_link6" reason="Adjacent"/>
+  <disable_collisions link1="piper_link6" link2="piper_gripper_base" reason="Adjacent"/>
+  <disable_collisions link1="piper_gripper_base" link2="piper_link7" reason="Adjacent"/>
+  <disable_collisions link1="piper_gripper_base" link2="piper_link8" reason="Adjacent"/>
+</robot>

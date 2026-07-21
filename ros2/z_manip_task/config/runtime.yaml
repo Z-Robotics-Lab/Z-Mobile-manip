@@ -1,0 +1,237 @@
+z_manip_task_runtime:
+  ros__parameters:
+    use_sim_time: true
+    task_topic: /z_manip/task/request
+    task_cancel_topic: /z_manip/task/cancel
+    place_region_request_topic: /z_manip/place/region_request
+    place_trajectory_topic: /z_manip/place/trajectory
+    place_contract_topic: /z_manip/place/trajectory_contract
+    place_status_topic: /z_manip/place/status
+    place_transaction_control_topic: /z_manip/place/transaction_control
+    post_release_verification_topic: /z_manip/place/post_release_verification
+    perception_valid_topic: /z_manip/perception/valid
+    target_topic: /z_manip/perception/target_3d
+    target_cloud_topic: /z_manip/perception/target_pointcloud
+    scene_cloud_topic: /z_manip/perception/scene_pointcloud
+    affordance_topic: /z_manip/perception/affordance
+    perception_status_topic: /z_manip/perception/status
+    frozen_coarse_nav_authorization_topic: >-
+      /z_manip/coarse_nav/perception_loss_authorization
+    frozen_coarse_nav_authorization_period_s: 0.05
+    visual_search_active_topic: /z_manip/visual_search/active
+    grounding_request_topic: /z_manip/grounding/request
+    grounding_reset_topic: /z_manip/grounding/reset
+    # Legacy parameter name: this must carry the platform base origin, not the
+    # raw SLAM sensor origin. Frames are checked before posture or drift use.
+    state_estimation_topic: /odom_base_link
+    platform_odometry_parent_frame: map
+    platform_odometry_child_frame: base_link
+    coarse_nav_ready_topic: /z_manip/navigation/coarse_ready
+    execution_status_topic: /piper/execution_status
+    cancel_goal_topic: /cancel_goal
+    named_pose_topic: /piper/named_pose
+    arm_cancel_topic: /piper/cancel
+    task_status_topic: /z_manip/task/status
+    debug_markers_topic: /z_manip/debug/markers
+    debug_path_topic: /z_manip/debug/arm_path
+    place_mode: observed_place
+    lookout_pose: LOOKOUT
+    # Platform-neutral default: do not assume a named manipulation viewpoint.
+    # A deployment profile may enable one only when its adapter owns that name.
+    near_view_pose: ''
+    near_view_settle_s: 3.0
+    near_view_timeout_s: 12.0
+    near_view_joint_positions: []
+    near_view_joint_tolerance_rad: 0.05
+    carry_joint_positions: [0.0, 1.0, -0.71, 0.0, 0.0, 0.0]
+    open_aperture_m: 0.070
+    close_aperture_m: 0.014
+    gripper_min_aperture_m: 0.0
+    gripper_max_aperture_m: 0.075
+    grasp_squeeze_m: 0.006
+    gripper_settle_s: 0.65
+    grasp_contact_margin_m: 0.0015
+    verification_timeout_s: 4.0
+    verification_joint_state_max_age_s: 0.35
+    # Covers the bridge's bounded 100 s two-model provider contract plus handoff.
+    semantic_reground_timeout_s: 105.0
+    execution_ack_margin_s: 2.0
+    max_trajectory_start_error_rad: 0.04
+    gripper_stable_samples: 3
+    gripper_stable_tolerance_m: 0.0008
+    release_settle_s: 0.65
+    release_min_aperture_m: 0.065
+    place_planning_timeout_s: 12.0
+    place_planning_wall_timeout_s: 30.0
+    # Completion requires independent, versioned RGB-D geometry evidence after
+    # measured retreat; these task-side gates mirror the acceptance contract.
+    post_release_verification_timeout_s: 2.0
+    # Slow simulation needs a separate monotonic cap; real robots still hit the
+    # stricter ROS-time budget first.
+    post_release_verification_wall_timeout_s: 12.0
+    post_release_min_stable_duration_s: 0.50
+    post_release_min_samples: 3
+    post_release_min_target_points: 24
+    post_release_max_target_motion_m: 0.025
+    post_release_min_region_support_fraction: 0.80
+    post_release_min_gripper_clearance_m: 0.04
+    post_release_max_rgbd_target_skew_s: 0.025
+    post_release_max_joint_target_skew_s: 0.12
+    post_release_max_target_depth_correspondence_m: 0.012
+    post_release_max_object_position_error_m: 0.04
+    post_release_max_object_orientation_error_rad: 0.35
+    post_release_max_object_upright_error_rad: 0.26
+    post_release_min_object_registration_inlier_fraction: 0.55
+    post_release_max_object_registration_rms_m: 0.025
+    # Freeze a generic PCA object frame at verified grasp time. These gates
+    # reject unobservable axes rather than substituting a class-specific pose.
+    carried_object_min_points: 40
+    carried_object_trim_mad_scale: 4.5
+    carried_object_extent_percentile: 2.0
+    carried_object_min_extent_m: 0.008
+    carried_object_min_axis_separation_ratio: 1.20
+    # Single-view RGB-D observes a partial surface. Across 286 reliable frames,
+    # the largest axial transverse ratio was 1.859; known shelf drift was >32.
+    carried_object_max_axial_transverse_ratio: 1.90
+    carried_object_max_reference_points: 512
+    carried_object_max_joint_target_skew_s: 0.12
+    # Aggregate wall-clock budgets span every downstream IK/RRT attempt and
+    # remain independent of paused or slow simulation time.
+    standoff_planning_budget_s: 20.0
+    # Freeze the exact grounding bundle used by the async work-pose planner.
+    # Replan if the tracked target moves beyond this bound before completion.
+    work_pose_target_drift_tolerance_m: 0.06
+    # Coarse navigation owns XY only; task-local visual servo closes heading and
+    # camera depth before the final grasp plan uses a new exact observation.
+    # Must cover navigation's entry tolerance plus bounded braking hysteresis.
+    work_pose_goal_tolerance_m: 0.33
+    work_pose_history_min_displacement_m: 0.03
+    # The navigation adapter emits a correlated heartbeat every 0.5 seconds.
+    coarse_navigation_status_timeout_s: 3.0
+    # READY only starts a task-owned stop. Re-ground after fresh platform
+    # odometry remains stationary for this complete, bounded interval.
+    coarse_nav_arrival_settle_s: 0.35
+    coarse_nav_arrival_stop_timeout_s: 3.0
+    # Go2W's policy reports gait-cycle twist noise up to 0.05 m/s while its
+    # measured map pose remains parked; larger braking recoil still fails closed.
+    coarse_nav_arrival_max_linear_speed_mps: 0.050
+    coarse_nav_arrival_max_angular_speed_rps: 0.05
+    coarse_nav_arrival_max_xy_excursion_m: 0.010
+    coarse_nav_arrival_max_yaw_excursion_rad: 0.010
+    coarse_nav_arrival_max_odom_gap_s: 0.15
+    # Learned gait braking can produce isolated attitude peaks. Require a
+    # continuous violation only during coarse traversal; near-field and arm
+    # phases retain the immediate fail-closed posture gate.
+    coarse_nav_posture_violation_dwell_s: 0.15
+    grasp_planning_budget_s: 15.0
+    # Execute only the provisional transit, then re-synchronize measured arm
+    # feedback with a newer exact RGB-D bundle before planning contact motion.
+    approach_planning_budget_s: 15.0
+    # After asynchronous transit validation, require new arm and platform
+    # feedback before binding the trajectory to the executor.
+    pregrasp_dispatch_feedback_wait_timeout_s: 1.0
+    pregrasp_reobserve_timeout_s: 8.0
+    pregrasp_joint_state_max_age_s: 0.25
+    pregrasp_joint_tolerance_rad: 0.05
+    pregrasp_max_observation_joint_skew_s: 0.12
+    approach_planning_target_drift_tolerance_m: 0.025
+    approach_planning_geometry_trim_mad_scale: 4.5
+    approach_planning_geometry_extent_percentile: 2.0
+    approach_planning_geometry_max_extent_change_m: 0.008
+    approach_planning_geometry_max_extent_ratio: 1.25
+    approach_planning_geometry_axis_separation_ratio: 1.25
+    approach_planning_geometry_max_orientation_change_rad: 0.3490658504
+    approach_execution_joint_state_max_age_s: 0.25
+    approach_execution_joint_wait_timeout_s: 1.0
+    execution_status_max_age_s: 0.50
+    carry_planning_budget_s: 8.0
+    arm_still_window_s: 0.20
+    arm_still_tolerance_rad: 0.01
+    lookout_settle_s: 3.0
+    # Reacquire from measured viewpoints only. Retry budgets remain in the
+    # robot stack JSON; these limits bound the physical search envelope.
+    visual_search_settle_s: 0.75
+    visual_search_yaw_step_rad: 0.3490658504
+    visual_search_max_yaw_offset_rad: 1.0471975512
+    # The learned base rebounds away from its target after parking. Its 0.06
+    # rad/s command floor cannot reliably resolve a 0.2 degree gate at this
+    # control cadence, so prefer independent XY recovery inside 0.5 degrees
+    # (or on a bounded target crossing). A measured slow turn may hand off
+    # anywhere inside the separate 2 degree settle envelope, which is verified
+    # again from a fresh stationary odometry sample before re-grounding.
+    visual_search_yaw_tolerance_rad: 0.0087266463
+    visual_search_settle_yaw_tolerance_rad: 0.0349065850
+    # Once XY recovery owns the base, retain it through small learned-policy
+    # heading rebound. The final authorization still requires the 2 degree gate.
+    visual_search_position_heading_reacquire_tolerance_rad: 0.0698131701
+    visual_search_yaw_gain: 1.5
+    visual_search_max_yaw_rate_rps: 0.30
+    # The learned base controller has a low-rate command deadband. Keep the
+    # odometry-closed turn moving until it reaches the stricter inner gate;
+    # set this to 0.0 on platforms without a deadband.
+    visual_search_min_yaw_rate_rps: 0.06
+    # Leave bounded margin to traverse the near-zero gate at minimum rate.
+    # A pure-yaw search still fails closed if measured odometry leaves its anchor.
+    visual_search_turn_timeout_s: 10.0
+    visual_search_max_turn_timeout_s: 30.0
+    visual_search_max_planar_drift_m: 0.15
+    # Close map-frame XY error in the measured base frame while yawing. The
+    # vector speed cap applies to the proportional command outside the deadband.
+    visual_search_position_hold_deadband_m: 0.01
+    # Viewpoint completion need not return exactly to a stale turn anchor. Fresh
+    # odometry and perception drive the next plan from the measured base pose.
+    visual_search_position_completion_tolerance_m: 0.06
+    # Let moderate zero-command gait rebound decay before re-exciting the base.
+    # The independent final gate above remains unchanged after it becomes quiet.
+    visual_search_moving_rebound_reacquire_m: 0.10
+    visual_search_position_hold_gain_s_inv: 1.0
+    visual_search_max_position_hold_speed_mps: 0.05
+    # Disabled in the platform-neutral profile. A learned locomotion adapter
+    # may enable a continuous slowdown band in its platform override.
+    visual_search_position_hold_slowdown_radius_m: 0.0
+    visual_search_min_position_hold_speed_mps: 0.0
+    # Begins only after measured yaw first enters tolerance. Heading and XY
+    # correction then alternate rather than commanding both through a residual.
+    visual_search_position_hold_timeout_s: 4.0
+    # A search viewpoint may authorize new perception only after the final,
+    # fresh odometry sample is independently stationary in both SI domains.
+    visual_search_settle_max_linear_speed_mps: 0.035
+    visual_search_settle_max_angular_speed_rps: 0.05
+    # Learned locomotion can coast after the task-local command reaches zero.
+    # Wait a bounded, platform-specific interval for fresh measured speeds;
+    # unknown platforms retain the node's fail-fast 0.0 s default.
+    visual_search_stationary_wait_timeout_s: 4.0
+    # One policy gait cycle can contain isolated low-speed samples before a
+    # second body-motion pulse. Require a continuous dual-clock quiet window.
+    visual_search_stationary_quiet_window_s: 0.35
+    visual_search_stationary_max_odom_gap_s: 0.15
+    # Bound all same-viewpoint yaw corrections separately from the final
+    # post-command ring-down budget. This profile is shared by Go2W sim/real.
+    # Measured Go2W parking ringdown can consume one full correction + quiet
+    # window before revealing a second pose rebound. Keep this bounded budget
+    # long enough for two closed-loop corrections plus a reserved final dwell.
+    visual_search_settle_reacquire_budget_s: 12.0
+    visual_search_odom_timeout_s: 0.50
+    # Inhibit all task-owned motion until fresh, upright platform odometry is live.
+    posture_state_max_age_s: 0.50
+    posture_state_acquisition_timeout_s: 1.0
+    visual_search_horizontal_margin_ratio: 0.08
+    visual_search_vertical_margin_ratio: 0.06
+    visual_servo_image_margin_ratio: 0.02
+    sync_slop_s: 0.000001
+    max_perception_age_s: 0.35
+    perception_loss_timeout_s: 0.60
+    # Wrist occlusion is predicted only after exact near-contact geometry and
+    # measured approach completion. The core hard-caps this value at 3.0 s;
+    # JointState receipt and ROS source clocks must both remain fresh.
+    execution_occlusion_max_duration_s: 3.0
+    execution_occlusion_joint_state_max_age_s: 0.25
+    execution_occlusion_status_max_age_s: 0.30
+    execution_occlusion_command_ack_timeout_s: 0.40
+    execution_occlusion_near_contact_tolerance_rad: 0.05
+    execution_occlusion_lift_path_tolerance_rad: 0.08
+    execution_occlusion_max_path_regression_samples: 3
+    execution_occlusion_verification_reacquire_timeout_s: 0.75
+    control_period_s: 0.05
+    tf_timeout_s: 0.12
+    semantic_min_points: 40

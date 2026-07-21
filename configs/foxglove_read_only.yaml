@@ -1,0 +1,30 @@
+foxglove_bridge:
+  ros__parameters:
+    address: "127.0.0.1"
+    port: 8765
+    num_threads: 2
+    capabilities:
+      - "connectionGraph"
+    client_topic_whitelist:
+      - "^$"
+    service_whitelist:
+      - "^$"
+    param_whitelist:
+      - "^$"
+    asset_uri_allowlist:
+      - "^$"
+    topic_whitelist:
+      - "^/(nuc/)?camera/(color/(image_raw|camera_info|metadata)|aligned_depth_to_color/(image_raw|camera_info)|depth/(image_rect_raw|camera_info|metadata)|extrinsics/.*)(/.*)?$"
+      - "^/z_manip/perception/(overlay|target_mask|target_pointcloud|scene_pointcloud|status|valid|tracked_detections_2d)$"
+      - "^/piper/state$"
+      - "^/tf$"
+      - "^/tf_static$"
+    include_hidden: false
+    publish_client_count: false
+    sysinfo: false
+    remote_access: false
+    ignore_unresponsive_param_nodes: true
+    min_qos_depth: 1
+    max_qos_depth: 10
+    send_buffer_limit: 10000000
+    message_backlog_size: 256

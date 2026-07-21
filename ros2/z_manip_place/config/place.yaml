@@ -1,0 +1,152 @@
+z_manip_observed_placement:
+  ros__parameters:
+    color_topic: /camera/color/image_raw
+    depth_topic: /camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/color/camera_info
+    scene_cloud_topic: /z_manip/perception/scene_pointcloud
+    joint_state_topic: /piper/state
+    region_request_topic: /z_manip/place/region_request
+    candidate_markers_topic: /z_manip/place/candidates
+    selected_poses_topic: /z_manip/place/selected_poses
+    trajectory_topic: /z_manip/place/trajectory
+    trajectory_contract_topic: /z_manip/place/trajectory_contract
+    post_release_verification_topic: /z_manip/place/post_release_verification
+    status_topic: /z_manip/place/status
+    plan_service: /z_manip/place/plan
+    target_cloud_topic: /z_manip/perception/target_pointcloud
+    perception_status_topic: /z_manip/perception/status
+    execution_status_topic: /piper/execution_status
+    transaction_control_topic: /z_manip/place/transaction_control
+
+    planning_frame: base
+    # Supplied by the top-level launch. Startup fails closed without this URDF.
+    robot_description_file: ''
+    # Shared with grasp/carry planning so sim and real use identical geometry.
+    collision_model_file: ''
+    kinematic_base_link: piper_base_link
+    planning_group: piper_arm
+    tool_link: piper_gripper_base
+    arm_joint_names:
+      - piper_joint1
+      - piper_joint2
+      - piper_joint3
+      - piper_joint4
+      - piper_joint5
+      - piper_joint6
+    joint_velocity_limits: [1.2, 1.2, 1.2, 1.5, 1.5, 1.5]
+    gravity: [0.0, 0.0, -1.0]
+
+    auto_plan_on_region: true
+    sync_queue_size: 20
+    planning_rgbd_cache_size: 20
+    max_sync_skew_s: 0.08
+    max_snapshot_age_s: 0.35
+    tf_timeout_s: 0.08
+    min_depth_m: 0.20
+    max_depth_m: 3.0
+
+    # Begin both deadlines when the request is accepted; pending, planning,
+    # and armed transitions never extend the executor-bound transaction.
+    # ROS time catches simulation/real-time overruns; monotonic time catches a
+    # paused simulator. Any clock rollback is terminal and unblocks a retry.
+    transaction_ros_timeout_s: 30.0
+    transaction_wall_timeout_s: 60.0
+    transaction_watchdog_period_s: 0.05
+
+    ransac_iterations: 320
+    ransac_distance_m: 0.008
+    max_plane_rms_m: 0.006
+    min_plane_points: 80
+    min_plane_inlier_ratio: 0.45
+    max_surface_tilt_rad: 0.610865238
+    max_ransac_points: 6000
+    sample_spacing_m: 0.035
+    support_neighbor_radius_m: 0.035
+    boundary_margin_m: 0.008
+    footprint_samples_per_axis: 5
+    plane_exclusion_m: 0.012
+    obstacle_height_margin_m: 0.025
+    tool_clearance_radius_m: 0.045
+    preplace_distance_m: 0.12
+    retreat_distance_m: 0.14
+    yaw_samples: 8
+    max_geometric_candidates: 24
+    seed: 7
+    support_score_weight: 0.30
+    clearance_score_weight: 0.15
+    centrality_score_weight: 0.05
+
+    motion_plan_service: /plan_kinematic_path
+    cartesian_path_service: /compute_cartesian_path
+    planning_pipeline: ompl
+    planner_id: RRTConnect
+    planning_attempts: 3
+    allowed_planning_time_s: 3.0
+    moveit_service_wait_timeout_s: 1.0
+    moveit_response_timeout_s: 5.0
+    position_tolerance_m: 0.008
+    orientation_tolerance_rad: 0.06
+    cartesian_step_m: 0.008
+    cartesian_jump_threshold: 0.0
+    min_cartesian_fraction: 0.995
+    min_waypoint_duration_s: 0.04
+    continuity_tolerance_rad: 0.04
+
+    # Every candidate is audited with the frozen grasp-time object reference
+    # before it can enter feasible ranking. No semantic size prior is used.
+    attached_collision_clearance_m: 0.02
+    attached_collision_point_radius_m: 0.005
+    attached_collision_segment_joint_step_rad: 0.025
+    attached_collision_min_scene_points: 32
+    attached_collision_max_attached_points: 512
+    attached_collision_extent_samples_per_axis: 5
+    attached_collision_carried_object_scene_exclusion_m: 0.012
+
+    # Release success is observed from exact RGB-D/target/status identity and
+    # fresh measured arm/gripper feedback. Robot geometry stays externalized.
+    post_release_min_stable_duration_s: 0.50
+    post_release_min_samples: 3
+    post_release_min_target_points: 40
+    post_release_min_current_support_points: 24
+    post_release_max_target_motion_m: 0.025
+    post_release_min_region_support_fraction: 0.80
+    post_release_min_gripper_clearance_m: 0.04
+    post_release_min_gripper_aperture_m: 0.065
+    post_release_max_sync_skew_s: 0.025
+    post_release_max_observation_age_s: 0.35
+    post_release_max_state_skew_s: 0.12
+    post_release_observation_timeout_s: 1.0
+    post_release_max_observation_gap_s: 0.30
+    post_release_plane_distance_tolerance_m: 0.015
+    post_release_region_neighbor_radius_m: 0.04
+    post_release_support_neighbor_radius_m: 0.05
+    post_release_bottom_band_m: 0.025
+    post_release_max_bottom_height_m: 0.035
+    post_release_max_plane_penetration_m: 0.012
+    post_release_target_mask_dilation_px: 2
+    post_release_max_geometry_samples: 4096
+    post_release_gripper_probe_radius_m: 0.031
+    post_release_target_depth_correspondence_tolerance_m: 0.012
+    post_release_object_position_tolerance_m: 0.04
+    post_release_object_orientation_tolerance_rad: 0.35
+    post_release_upright_tolerance_rad: 0.26
+    post_release_orientation_degeneracy_ratio: 1.20
+    post_release_max_axial_transverse_ratio: 1.90
+    post_release_max_symmetry_axis_alignment_error_rad: 0.12
+    post_release_min_signed_upright_profile_asymmetry: 0.10
+    post_release_min_signed_upright_profile_alignment: 0.60
+    post_release_max_object_orientation_motion_rad: 0.10
+    post_release_registration_distance_m: 0.035
+    post_release_min_registration_inlier_fraction: 0.55
+    post_release_max_registration_rms_m: 0.025
+    post_release_min_object_reference_points: 40
+    post_release_fk_position_tolerance_m: 0.015
+    post_release_fk_orientation_tolerance_rad: 0.10
+    post_release_max_rejection_diagnostics: 8
+    post_release_region_capture_min_points: 80
+    post_release_cache_size: 6
+    post_release_joint_cache_size: 128
+    gripper_probe_points_tool_flat:
+      [-0.00475, -0.042, 0.0315, -0.00475, 0.042, 0.0315,
+       0.0, 0.04825, 0.072, 0.0, 0.04825, 0.110,
+       0.0, -0.04825, 0.072, 0.0, -0.04825, 0.110]

@@ -1,0 +1,20 @@
+[Unit]
+Description=RealSense D435i camera node with source depth stabilization
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Keep filtering in the RealSense processing graph so every aligned-depth
+# consumer (EdgeTAM, planner artifacts, and live visualization) sees the same
+# stabilized source.  The temporal delta preserves prompt response at depth
+# discontinuities while smoothing millimetre-scale stationary-camera jitter.
+ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh && exec ros2 launch realsense2_camera rs_launch.py camera_namespace:=/nuc camera_name:=camera enable_sync:=true align_depth.enable:=true rgb_camera.color_profile:=640x480x15 depth_module.depth_profile:=640x480x15 spatial_filter.enable:=true spatial_filter.filter_magnitude:=2 spatial_filter.filter_smooth_alpha:=0.5 spatial_filter.filter_smooth_delta:=20 spatial_filter.holes_fill:=0 temporal_filter.enable:=true temporal_filter.filter_smooth_alpha:=0.4 temporal_filter.filter_smooth_delta:=20 temporal_filter.holes_fill:=3'
+# ros2 launch can exit successfully even when its child node failed during an
+# early-boot network race, so retry regardless of the launcher's exit status.
+Restart=always
+RestartSec=5
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

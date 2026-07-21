@@ -1,0 +1,20 @@
+z_manip_task_runtime:
+  ros__parameters:
+    # The go2W Isaac adapter defines this downward, open-gripper viewpoint.
+    near_view_pose: MANIP_LOOKOUT
+    near_view_settle_s: 3.0
+    near_view_timeout_s: 12.0
+    near_view_joint_positions: [0.0, 1.0, -0.71, 0.0, 0.30, 0.0]
+    near_view_joint_tolerance_rad: 0.05
+    # The learned standing policy produces noisy twist derivatives while its
+    # measured SE(2) pose remains parked.  Keep a hard pulse ceiling and require
+    # the generic 10 mm / 0.01 rad pose envelope for the full arrival dwell.
+    coarse_nav_arrival_max_linear_speed_mps: 0.080
+    coarse_nav_arrival_max_angular_speed_rps: 0.05
+    # Go2W's learned policy needs a nonzero translational command to leave its
+    # parking state. Taper continuously before the 0.125 m completion envelope
+    # and re-arm before parking recoil can reach the unchanged 0.15 m hard gate.
+    visual_search_position_completion_tolerance_m: 0.125
+    visual_search_position_hold_slowdown_radius_m: 0.14
+    visual_search_min_position_hold_speed_mps: 0.020
+    visual_search_moving_rebound_reacquire_m: 0.14

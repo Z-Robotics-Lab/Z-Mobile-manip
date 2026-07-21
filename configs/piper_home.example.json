@@ -1,0 +1,26 @@
+{
+  "schema": "z_manip.piper_software_home.v1",
+  "name": "example_only_capture_a_robot_specific_home_before_execution",
+  "joint_degrees": [
+    0.0,
+    10.0,
+    -20.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "joint_radians": [
+    0.0,
+    0.17453292519943295,
+    -0.3490658503988659,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "captured_at": null,
+  "capture_duration_s": null,
+  "capture_max_joint_range_rad": null,
+  "capture_zero_can_tx_verified": false,
+  "interface": "can0",
+  "firmware": "replace-me"
+}

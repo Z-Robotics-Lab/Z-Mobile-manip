@@ -1,0 +1,12 @@
+sensors:
+  wrist_depth:
+    sensor_plugin: occupancy_map_monitor/DepthImageOctomapUpdater
+    image_topic: /camera/aligned_depth_to_color/image_raw
+    queue_size: 5
+    near_clipping_plane_distance: 0.12
+    far_clipping_plane_distance: 2.5
+    shadow_threshold: 0.2
+    padding_scale: 1.0
+    padding_offset: 0.025
+    max_update_rate: 8.0
+    filtered_cloud_topic: /z_manip/motion/filtered_cloud

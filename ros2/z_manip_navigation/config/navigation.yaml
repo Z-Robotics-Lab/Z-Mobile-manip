@@ -1,0 +1,42 @@
+z_manip_coarse_navigation:
+  ros__parameters:
+    use_sim_time: true
+    map_frame: map
+    task_status_topic: /z_manip/task/status
+    perception_valid_topic: /z_manip/perception/valid
+    target_topic: /z_manip/perception/target_3d
+    # Work-pose goals are defined for the platform base, never the SLAM sensor
+    # origin. The node rejects any message that is not map -> base_link.
+    odometry_topic: /odom_base_link
+    platform_base_frame: base_link
+    navigation_health_topic: /state_estimation_health
+    goal_reached_topic: /goal_reached
+    waypoint_topic: /way_point
+    cancel_topic: /cancel_goal
+    coarse_ready_topic: /z_manip/navigation/coarse_ready
+    grounding_request_topic: /z_manip/grounding/request
+    status_topic: /z_manip/navigation/status
+    near_target_depth_m: 1.4
+    still_speed_mps: 0.035
+    still_settle_s: 0.35
+    target_timeout_s: 0.55
+    observation_wait_timeout_s: 12.0
+    navigation_timeout_s: 90.0
+    stall_timeout_s: 8.0
+    progress_min_net_decrease_m: 0.005
+    progress_min_slope_mps: 0.001
+    odometry_timeout_s: 0.50
+    min_displacement_m: 0.10
+    max_displacement_m: 3.0
+    goal_update_threshold_m: 0.20
+    explicit_goal_tolerance_m: 0.25
+    explicit_goal_handoff_hysteresis_m: 0.08
+    max_reacquisitions: 2
+    max_replans: 3
+    waypoint_refresh_s: 1.0
+    goal_reset_ack_timeout_s: 2.0
+    angular_speed_weight_m: 0.30
+    tf_timeout_s: 0.12
+    tf_latest_tolerance_s: 0.10
+    control_period_s: 0.05
+    status_heartbeat_s: 0.5

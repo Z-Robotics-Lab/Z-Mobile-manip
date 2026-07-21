@@ -1,0 +1,14 @@
+[Unit]
+Description=Foxglove Bridge — read-only ROS2 telemetry over Tailscale
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh; exec ros2 run foxglove_bridge foxglove_bridge --ros-args --params-file %h/go2w-nuc/bringup/foxglove_read_only.yaml'
+Restart=on-failure
+RestartSec=5
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target

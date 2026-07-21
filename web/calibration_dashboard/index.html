@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PiPER 手眼标定工作台</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1016;
+      --panel: #121a24;
+      --panel-2: #182331;
+      --line: #2b3a4b;
+      --text: #edf4fb;
+      --muted: #98a9bb;
+      --ok: #45d394;
+      --warn: #ffb454;
+      --bad: #ff6b6b;
+      --blue: #57a6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 25% -10%, #17283a 0, var(--bg) 42%);
+      color: var(--text);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    button { font: inherit; }
+    .app { max-width: 1500px; margin: 0 auto; padding: 18px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+    h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: .01em; }
+    .subtitle { color: var(--muted); margin-top: 3px; }
+    .safe-badge { border: 1px solid #256947; color: #8aefbd; background: #10291f; padding: 6px 10px; border-radius: 999px; white-space: nowrap; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(310px, .65fr); gap: 14px; }
+    .panel { background: rgba(18, 26, 36, .94); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+    .panel-head { min-height: 52px; padding: 10px 13px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .panel-head strong { font-weight: 600; }
+    .live-pill { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+    .dot.live { background: var(--ok); box-shadow: 0 0 0 4px rgba(69,211,148,.12); }
+    .video-wrap { position: relative; background: #05080c; min-height: 400px; display: grid; place-items: center; }
+    #stream { display: block; width: 100%; height: auto; max-height: 72vh; object-fit: contain; }
+    .video-empty { position: absolute; color: var(--muted); text-align: center; pointer-events: none; }
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); }
+    .metric { padding: 10px 12px; border-right: 1px solid var(--line); }
+    .metric:last-child { border-right: 0; }
+    .label { color: var(--muted); font-size: 12px; }
+    .value { margin-top: 2px; font-size: 17px; font-variant-numeric: tabular-nums; }
+    .side { display: grid; gap: 14px; align-content: start; }
+    .content { padding: 13px; }
+    .gate { border-left: 3px solid var(--warn); padding-left: 11px; }
+    .gate.ok { border-color: var(--ok); }
+    .gate.bad { border-color: var(--bad); }
+    .gate-title { font-weight: 600; margin-bottom: 4px; }
+    .message { color: var(--muted); min-height: 41px; }
+    .error { color: #ff9797; margin-top: 8px; white-space: pre-wrap; }
+    .notice { color: #ffd08a; margin-top: 8px; white-space: pre-wrap; }
+    .actions { display: grid; gap: 9px; margin-top: 12px; }
+    .btn { border: 1px solid #3b4e63; border-radius: 8px; padding: 10px 12px; background: #1b2938; color: var(--text); cursor: pointer; }
+    .btn.primary { background: #2474c9; border-color: #368be5; }
+    .btn.danger { color: #ffb1b1; border-color: #743f47; background: #2a171c; }
+    .btn:hover:not(:disabled) { filter: brightness(1.12); }
+    .btn:disabled { opacity: .42; cursor: not-allowed; }
+    .safety-note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+    .samples { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px; padding: 13px; }
+    .sample { aspect-ratio: 1; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 7px; color: #65778a; background: #0e151e; font-variant-numeric: tabular-nums; }
+    .sample.done { color: #baf4d7; border-color: #277554; background: #112a20; }
+    .sample.done.warn { color: #ffd08a; border-color: #9b6a27; background: #2a2112; }
+    .sample span { font-size: 11px; color: inherit; }
+    .coverage { padding: 4px 13px 13px; }
+    #coverage { display: block; width: 100%; min-height: 230px; background: #0d141d; border: 1px solid var(--line); border-radius: 8px; }
+    .axis { stroke: #324255; stroke-width: 1; }
+    .guide { stroke: #243243; stroke-width: 1; fill: none; }
+    .point { fill: var(--blue); stroke: #dcecff; stroke-width: 1; }
+    .point-label { fill: var(--text); font-size: 10px; }
+    .axis-label { fill: var(--muted); font-size: 10px; }
+    .calibration-quality { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+    .quality-item { padding: 8px; background: var(--panel-2); border-radius: 7px; }
+    dialog { width: min(440px, calc(100% - 30px)); color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 0; }
+    dialog::backdrop { background: rgba(2, 6, 10, .76); }
+    .dialog-content { padding: 18px; }
+    .dialog-content h2 { margin: 0 0 8px; font-size: 18px; }
+    .dialog-content p { margin: 0; color: var(--muted); }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .video-wrap { min-height: 260px; }
+      #stream { max-height: none; }
+    }
+    @media (max-width: 620px) {
+      .app { padding: 10px; }
+      header { align-items: flex-start; }
+      .metrics { grid-template-columns: 1fr 1fr; }
+      .metric:nth-child(2) { border-right: 0; }
+      .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div>
+        <h1>PiPER 手眼标定工作台</h1>
+        <div class="subtitle">腕部 D435i · ChArUco · ROS Domain 20</div>
+      </div>
+      <div class="safe-badge">只读相机 · 被动 CAN · 零运动命令</div>
+    </header>
+
+    <div class="layout">
+      <section class="panel">
+        <div class="panel-head">
+          <strong>实时检测画面</strong>
+          <span class="live-pill"><span id="live-dot" class="dot"></span><span id="live-text">等待相机</span></span>
+        </div>
+        <div class="video-wrap">
+          <div id="video-empty" class="video-empty">正在等待 D435i RGB 与 CameraInfo…</div>
+          <img id="stream" src="/api/stream.mjpg" alt="D435i 实时 ChArUco 检测画面">
+        </div>
+        <div class="metrics">
+          <div class="metric"><div class="label">角点</div><div class="value" id="corners">— / 12</div></div>
+          <div class="metric"><div class="label">标记</div><div class="value" id="markers">—</div></div>
+          <div class="metric"><div class="label">重投影误差</div><div class="value" id="rmse">— px</div></div>
+          <div class="metric"><div class="label">相机距离</div><div class="value" id="distance">— m</div></div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="panel">
+          <div class="panel-head"><strong>当前姿态</strong><span id="gate-state">等待</span></div>
+          <div class="content">
+            <div id="gate" class="gate">
+              <div id="gate-title" class="gate-title">等待实时图像</div>
+              <div id="guidance" class="message">棋盘完整进入画面后，系统会显示角点与 XYZ 坐标轴。</div>
+            </div>
+            <div id="operation-message" class="notice" hidden></div>
+            <div id="operation-error" class="error" hidden></div>
+            <div class="actions">
+              <button id="capture" class="btn primary" type="button" disabled>采集当前姿态</button>
+              <button id="solve" class="btn" type="button" disabled>求解手眼标定</button>
+              <button id="reset" class="btn danger" type="button" disabled>清空并重新标定</button>
+            </div>
+            <div class="safety-note">采集按钮只启动 8 秒接收型 CAN 探针并保存当前相机观测。它没有机械臂控制接口。</div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><strong>样本进度</strong><span id="sample-count">0 / 12</span></div>
+          <div id="samples" class="samples" aria-label="标定样本进度"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><strong>姿态覆盖</strong><span>Yaw × Pitch</span></div>
+          <div class="coverage">
+            <svg id="coverage" viewBox="0 0 360 230" role="img" aria-label="已采集标定姿态的偏航和俯仰分布">
+              <line class="axis" x1="180" y1="16" x2="180" y2="205"></line>
+              <line class="axis" x1="24" y1="110" x2="336" y2="110"></line>
+              <rect class="guide" x="76" y="47" width="208" height="126" rx="6"></rect>
+              <text class="axis-label" x="300" y="104">Yaw +</text>
+              <text class="axis-label" x="184" y="27">Pitch +</text>
+              <g id="coverage-points"></g>
+            </svg>
+            <div class="safety-note">让样本分布覆盖中心四周，而不是聚在同一个姿态；标定板和机器狗底座必须始终固定。</div>
+          </div>
+        </section>
+
+        <section id="quality-panel" class="panel" hidden>
+          <div class="panel-head"><strong>标定质量</strong><span id="calibrated-state">未通过</span></div>
+          <div class="content">
+            <div class="calibration-quality">
+              <div class="quality-item"><div class="label">平移 RMSE</div><div id="translation-rmse">—</div></div>
+              <div class="quality-item"><div class="label">旋转 RMSE</div><div id="rotation-rmse">—</div></div>
+              <div class="quality-item"><div class="label">旋转跨度</div><div id="rotation-span">—</div></div>
+              <div class="quality-item"><div class="label">旋转轴秩</div><div id="axis-rank">—</div></div>
+            </div>
+          </div>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <dialog id="reset-dialog" aria-labelledby="reset-title">
+    <div class="dialog-content">
+      <h2 id="reset-title">重新开始手眼标定？</h2>
+      <p id="reset-description">当前样本和标定结果会移入可恢复的时间戳归档，样本进度将回到 0 / 12。相机、感知数据和机械臂配置不会被修改。</p>
+      <div class="dialog-actions">
+        <button id="reset-cancel" class="btn" type="button">取消</button>
+        <button id="reset-confirm" class="btn danger" type="button">确认清空并重新开始</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let lastStatus = null;
+
+    function format(value, digits = 2) {
+      return Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "—";
+    }
+
+    function guidance(status) {
+      const d = status.detection || {};
+      if (!status.live) return ["等待实时图像", "检查 D435i、RGB-D bridge 和 ROS Domain 20。", "bad"];
+      if (!d.found) return ["尚未识别棋盘", "把完整棋盘移入画面，正对相机并减少反光。", "bad"];
+      if ((d.corner_count || 0) < 12) return ["角点不足", `当前 ${d.corner_count || 0} 个；请靠近、居中并确保棋盘没有出框。`, ""];
+      if ((d.reprojection_rmse_px || 99) > 1) return ["图像质量不足", "保持静止、减小倾斜并改善照明，目标 RMSE ≤ 1 px。", ""];
+      if (status.busy === "capture") return ["正在同步采集", "保持机械臂、棋盘和机器狗完全静止 8 秒。", "ok"];
+      return ["可以采集", "角点与误差已通过。采集后移动机械臂到新的相机姿态。", "ok"];
+    }
+
+    function renderSamples(samples) {
+      const root = $("samples");
+      root.replaceChildren();
+      for (let i = 1; i <= 12; i += 1) {
+        const sample = samples[i - 1];
+        const warnings = Array.isArray(sample?.planning_limit_violations) ? sample.planning_limit_violations : [];
+        const item = document.createElement("div");
+        item.className = `sample${sample ? " done" : ""}${warnings.length ? " warn" : ""}`;
+        item.innerHTML = sample ? `<div>${i}${warnings.length ? " ⚠" : ""}<br><span>${format(sample.distance_m, 2)}m</span></div>` : String(i);
+        const warningText = warnings.map((entry) => `J${entry.joint_index} ${format(entry.position_deg, 2)}deg，超出规划限位 ${format(entry.excess_deg, 2)}deg`).join("；");
+        item.title = warningText;
+        item.setAttribute("aria-label", sample ? `样本 ${i} 已采集${warningText ? `，规划限位提示：${warningText}` : ""}` : `样本 ${i} 未采集`);
+        root.append(item);
+      }
+    }
+
+    function renderCoverage(samples) {
+      const root = $("coverage-points");
+      root.replaceChildren();
+      for (const sample of samples) {
+        const yaw = Math.max(-45, Math.min(45, Number(sample.yaw_deg) || 0));
+        const pitch = Math.max(-35, Math.min(35, Number(sample.pitch_deg) || 0));
+        const x = 180 + yaw / 45 * 145;
+        const y = 110 - pitch / 35 * 84;
+        const point = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        point.setAttribute("class", "point");
+        point.setAttribute("cx", x);
+        point.setAttribute("cy", y);
+        point.setAttribute("r", 6);
+        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        label.setAttribute("class", "point-label");
+        label.setAttribute("x", x + 8);
+        label.setAttribute("y", y + 3);
+        label.textContent = sample.index;
+        root.append(point, label);
+      }
+    }
+
+    function renderCalibration(calibration) {
+      $("quality-panel").hidden = !calibration;
+      if (!calibration) return;
+      const q = calibration.quality || {};
+      $("calibrated-state").textContent = calibration.calibrated ? "已通过" : "未通过";
+      $("calibrated-state").style.color = calibration.calibrated ? "var(--ok)" : "var(--bad)";
+      $("translation-rmse").textContent = `${format(Number(q.translation_rmse_m) * 1000, 1)} mm`;
+      $("rotation-rmse").textContent = `${format(Number(q.rotation_rmse_rad) * 180 / Math.PI, 2)}°`;
+      $("rotation-span").textContent = `${format(Number(q.max_pair_rotation_rad) * 180 / Math.PI, 1)}°`;
+      $("axis-rank").textContent = q.rotation_axis_rank ?? "—";
+    }
+
+    function render(status) {
+      lastStatus = status;
+      const d = status.detection || {};
+      $("live-dot").className = `dot${status.live ? " live" : ""}`;
+      $("live-text").textContent = status.live ? "LIVE" : "等待相机";
+      $("video-empty").hidden = status.live;
+      $("corners").textContent = `${d.corner_count ?? "—"} / 12`;
+      $("markers").textContent = d.marker_count ?? "—";
+      $("rmse").textContent = `${format(d.reprojection_rmse_px)} px`;
+      $("distance").textContent = `${format(d.distance_m)} m`;
+      const [title, detail, gateClass] = guidance(status);
+      $("gate").className = `gate ${gateClass}`;
+      $("gate-title").textContent = title;
+      $("guidance").textContent = status.busy ? status.operation_message : detail;
+      $("gate-state").textContent = d.accepted ? "PASS" : "BLOCKED";
+      $("gate-state").style.color = d.accepted ? "var(--ok)" : "var(--warn)";
+      const operationMessage = status.operation_message && status.operation_message !== "Ready for live preview" ? status.operation_message : "";
+      $("operation-message").hidden = !operationMessage;
+      $("operation-message").textContent = operationMessage;
+      $("operation-error").hidden = !status.operation_error;
+      $("operation-error").textContent = status.operation_error || "";
+      $("capture").disabled = !d.accepted || Boolean(status.busy);
+      $("capture").textContent = status.busy === "capture" ? "采集中，请保持静止…" : "采集当前姿态";
+      $("solve").disabled = status.capture_only || status.sample_count < 8 || Boolean(status.busy);
+      $("solve").textContent = status.capture_only
+        ? "安装外参模式 · 仅采样"
+        : (status.busy === "solve" ? "正在求解…" : "求解手眼标定");
+      $("reset").disabled = !status.reset_available || Boolean(status.busy);
+      $("reset").textContent = status.busy === "reset" ? "正在归档…" : "清空并重新标定";
+      $("sample-count").textContent = `${status.sample_count} / 12`;
+      renderSamples(status.samples || []);
+      renderCoverage(status.samples || []);
+      renderCalibration(status.calibration);
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/status", { cache: "no-store" });
+        if (!response.ok) throw new Error(`status ${response.status}`);
+        render(await response.json());
+      } catch (error) {
+        render({ live: false, detection: {}, samples: [], sample_count: 0, operation_error: String(error) });
+      }
+    }
+
+    async function operate(path) {
+      const response = await fetch(path, { method: "POST" });
+      const result = await response.json();
+      if (!response.ok && lastStatus) {
+        lastStatus.operation_error = result.message || "操作被拒绝";
+        render(lastStatus);
+      }
+      await refresh();
+    }
+
+    $("capture").addEventListener("click", () => operate("/api/capture"));
+    $("solve").addEventListener("click", () => operate("/api/solve"));
+    $("reset").addEventListener("click", () => {
+      $("reset-description").textContent = `当前 ${lastStatus?.sample_count || 0} 个样本和标定结果会移入可恢复的时间戳归档，进度将回到 0 / 12。相机、感知数据和机械臂配置不会被修改。`;
+      $("reset-dialog").showModal();
+    });
+    $("reset-cancel").addEventListener("click", () => $("reset-dialog").close());
+    $("reset-confirm").addEventListener("click", () => {
+      $("reset-dialog").close();
+      operate("/api/reset");
+    });
+    refresh();
+    setInterval(refresh, 600);
+  </script>
+</body>
+</html>

@@ -1,0 +1,3023 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Z-Manip Debug Dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070b0d;
+      --panel: #0d1418;
+      --panel-2: #121b20;
+      --panel-raised: #162126;
+      --line: #233138;
+      --line-strong: #3b5059;
+      --text: #edf4f6;
+      --muted: #91a3ab;
+      --cyan: #52dbe3;
+      --green: #62dda0;
+      --amber: #f2b958;
+      --red: #ff6d78;
+      --blue: #72a7ff;
+      --violet: #b899ff;
+      --radius: 6px;
+      --radius-sm: 5px;
+      --shadow: 0 12px 36px rgba(0, 0, 0, .22);
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    button, select { font: inherit; }
+
+    .shell {
+      width: min(1880px, 100%);
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: 18px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      /* topbar, workflow, component console, stages, workspace, errors */
+      grid-template-rows: auto auto auto auto minmax(620px, 1fr) auto;
+      gap: 12px;
+    }
+
+    .topbar {
+      min-height: 76px;
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border-radius: var(--radius);
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 13px 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .brand { min-width: 230px; }
+    .brand h1 { margin: 0; font-size: 20px; line-height: 1.1; letter-spacing: -.01em; font-weight: 720; }
+    .brand p { margin: 5px 0 0; color: var(--muted); font: 11px var(--mono); }
+
+    .mode-flags { display: flex; gap: 7px; flex-wrap: wrap; }
+    .flag {
+      border: 1px solid var(--green);
+      color: var(--green);
+      padding: 6px 9px;
+      border-radius: 4px;
+      font: 700 11px var(--mono);
+      letter-spacing: .06em;
+    }
+    .flag.bad { border-color: var(--red); color: var(--red); }
+    .runtime-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 112px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      padding: 6px 9px;
+      color: var(--muted);
+      font: 700 10px var(--mono);
+      letter-spacing: .05em;
+      white-space: nowrap;
+    }
+    .runtime-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 16%, transparent); }
+    .runtime-badge.live { border-color: #277a57; color: var(--green); }
+    .runtime-badge.stale { border-color: #8a672d; color: var(--amber); }
+    .runtime-badge.offline { border-color: #71333a; color: var(--red); }
+
+    .run-control {
+      min-width: 280px;
+      display: grid;
+      grid-template-columns: minmax(158px, auto) 1fr;
+      gap: 4px 9px;
+      align-items: center;
+    }
+    .run-button {
+      grid-row: 1 / span 2;
+      border: 1px solid var(--cyan);
+      border-radius: 4px;
+      background: #102126;
+      color: #8df3f4;
+      padding: 8px 11px;
+      font: 700 10px var(--mono);
+      letter-spacing: .045em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    .run-button:hover, .run-button:focus-visible { background: #153039; outline: 1px solid var(--cyan); }
+    .run-button:disabled { border-color: var(--line-strong); background: #11171a; color: var(--muted); cursor: not-allowed; }
+    .run-state { color: var(--muted); font: 700 10px var(--mono); text-transform: uppercase; }
+    .run-state.running { color: var(--cyan); }
+    .run-state.passed { color: var(--green); }
+    .run-state.blocked, .run-state.error { color: var(--amber); }
+    .run-note { color: var(--muted); font: 9px var(--mono); white-space: nowrap; }
+
+    .session-console {
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 94%, transparent);
+      border-radius: var(--radius);
+      padding: 11px;
+      display: grid;
+      grid-template-columns: minmax(180px, .62fr) minmax(360px, 1.4fr) minmax(230px, .8fr) minmax(230px, .85fr);
+      gap: 10px;
+      align-items: stretch;
+      box-shadow: var(--shadow);
+    }
+    .session-step {
+      min-width: 0;
+      border: 0;
+      border-right: 1px solid var(--line);
+      border-radius: 0;
+      background: transparent;
+      padding: 9px 12px 9px 7px;
+      display: grid;
+      gap: 9px;
+    }
+    .session-step:nth-child(4) { border-right: 0; }
+    .session-step-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .session-step-title { color: #d9e3e7; font: 700 11px var(--sans); letter-spacing: .065em; text-transform: uppercase; }
+    .session-step-index {
+      display: inline-grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      margin-right: 5px;
+      border: 1px solid color-mix(in srgb, var(--cyan) 72%, transparent);
+      border-radius: 50%;
+      color: var(--cyan);
+      font: 700 10px var(--mono);
+    }
+    .session-button.home { border-color: var(--green); color: var(--green); background: #10231a; }
+    .session-button.home:hover, .session-button.home:focus-visible { background: #163426; outline-color: var(--green); }
+    .session-state.passed { color: var(--green); }
+    .session-state.blocked { color: var(--amber); }
+    .target-row { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 7px; }
+    .target-input {
+      width: 100%;
+      min-width: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: #080d10;
+      color: var(--text);
+      padding: 8px 9px;
+      font: 11px var(--mono);
+    }
+    .target-input:focus-visible { border-color: var(--cyan); outline: 1px solid color-mix(in srgb, var(--cyan) 45%, transparent); }
+    .session-button {
+      border: 1px solid var(--cyan);
+      border-radius: var(--radius-sm);
+      background: #102126;
+      color: #8df3f4;
+      min-height: 36px;
+      padding: 8px 12px;
+      font: 750 10px var(--sans);
+      letter-spacing: .075em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    .session-button:hover, .session-button:focus-visible { background: #153039; outline: 1px solid var(--cyan); }
+    .session-button:disabled { border-color: var(--line-strong); background: #11171a; color: var(--muted); cursor: not-allowed; outline: none; }
+    .session-button.plan { border-color: var(--blue); color: #a9c6ff; background: #101927; }
+    .session-button.perform { border-color: var(--amber); color: #ffd995; background: #281d0d; }
+    .session-button.perform:hover, .session-button.perform:focus-visible { background: #382713; outline-color: var(--amber); }
+    .perform-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+    .session-button.perform-direct { border-color: var(--green); color: #9df5c6; background: #10231a; }
+    .session-button.perform-direct:hover, .session-button.perform-direct:focus-visible { background: #163426; outline-color: var(--green); }
+    .session-state { min-height: 15px; color: var(--muted); font: 10px/1.45 var(--mono); overflow-wrap: anywhere; }
+    .session-state.running { color: var(--cyan); }
+    .session-state.succeeded { color: var(--green); }
+    .session-state.failed, .session-state.blocked, .session-state.error { color: var(--amber); }
+    .session-selection { color: var(--muted); font: 9px var(--mono); overflow-wrap: anywhere; }
+    .session-safety { display: flex; flex-direction: column; justify-content: center; gap: 7px; }
+    .session-safety strong { color: var(--green); font: 700 11px var(--mono); }
+    .session-safety span { color: var(--muted); font: 9px var(--mono); }
+    .speed-control { display: grid; grid-template-columns: auto minmax(54px, 1fr) auto; align-items: center; gap: 6px; color: var(--muted); font: 9px var(--mono); }
+    .speed-input { width: 100%; min-width: 54px; border: 1px solid var(--line-strong); border-radius: 4px; background: #080d10; color: #ffd995; padding: 6px; font: 700 11px var(--mono); }
+    .speed-input:focus-visible { border-color: var(--amber); outline: 1px solid var(--amber); }
+    .maintenance-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 3px; }
+    .session-button.maintenance { min-height: 30px; padding: 6px; border-color: #7c5a29; color: #ffd995; background: #231a10; }
+
+    .operation-deck {
+      grid-column: 1 / -1;
+      border-top: 1px solid var(--line);
+      padding: 13px 7px 2px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 14px;
+      align-items: stretch;
+    }
+    .operation-intro { display: grid; align-content: center; gap: 6px; min-width: 0; }
+    .operation-intro h2 { margin: 0; font-size: 15px; font-weight: 720; letter-spacing: -.01em; }
+    .operation-intro p { margin: 0; max-width: 34ch; color: var(--muted); font: 10px/1.5 var(--mono); }
+    .operation-sequence { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+    .operation-sequence::before {
+      content: "";
+      position: absolute;
+      z-index: 0;
+      top: 50%;
+      left: 15%;
+      right: 15%;
+      height: 1px;
+      background: var(--cyan);
+      opacity: .35;
+    }
+    .operation-button {
+      position: relative;
+      z-index: 1;
+      min-width: 0;
+      min-height: 62px;
+      border: 1px solid var(--line-strong);
+      border-radius: 7px;
+      background: var(--panel-raised);
+      color: var(--text);
+      padding: 10px 12px;
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      text-align: left;
+      cursor: pointer;
+      transition: border-color .16s ease, background .16s ease, transform .16s ease;
+    }
+    .operation-button:hover:not(:disabled), .operation-button:focus-visible:not(:disabled) {
+      border-color: var(--cyan);
+      background: #18272d;
+      outline: 2px solid color-mix(in srgb, var(--cyan) 24%, transparent);
+      outline-offset: 2px;
+      transform: translateY(-1px);
+    }
+    .operation-button:disabled { cursor: not-allowed; opacity: .42; }
+    .operation-button.ready { border-color: color-mix(in srgb, var(--cyan) 66%, var(--line)); }
+    .operation-button.complete { border-color: var(--green); background: #11241c; }
+    .operation-button.running { border-color: var(--amber); background: #281f10; }
+    .operation-icon { width: 32px; height: 32px; color: var(--cyan); }
+    .operation-button.complete .operation-icon { color: var(--green); }
+    .operation-button.running .operation-icon { color: var(--amber); }
+    .operation-copy { min-width: 0; display: grid; gap: 3px; }
+    .operation-copy strong { font: 750 11px var(--sans); letter-spacing: .065em; text-transform: uppercase; }
+    .operation-copy span { color: var(--muted); font: 9px/1.35 var(--mono); white-space: normal; }
+    .operation-automation { display: grid; align-content: center; gap: 7px; min-width: 0; }
+    .operation-automation .perform-actions { grid-template-columns: 1fr 1fr; }
+    .operation-state { min-height: 30px; }
+    .approach-deck {
+      grid-column: 1 / -1;
+      border-top: 1px solid var(--line);
+      padding: 12px 7px 2px;
+      display: grid;
+      grid-template-columns: minmax(220px, .75fr) minmax(330px, 1fr) minmax(320px, 1.1fr);
+      gap: 12px;
+      align-items: center;
+    }
+    .approach-copy { display: grid; gap: 5px; }
+    .approach-copy strong { color: #d9e3e7; font: 720 12px var(--sans); letter-spacing: .055em; text-transform: uppercase; }
+    .approach-copy span { color: var(--muted); font: 9px/1.45 var(--mono); }
+    .approach-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 7px; }
+    .session-button.approach-live { border-color: var(--amber); color: #ffd995; background: #281d0d; }
+    .session-button.approach-stop { border-color: var(--red); color: #ff9ba6; background: #291216; }
+    .approach-readout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+    .approach-metric { border: 1px solid var(--line); border-radius: 4px; background: #10171b; padding: 6px 7px; min-width: 0; }
+    .approach-metric span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
+    .approach-metric strong { display: block; margin-top: 3px; color: var(--cyan); font: 10px var(--mono); overflow-wrap: anywhere; }
+    .approach-progress { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 5px; }
+    .approach-phase { position: relative; border: 1px solid var(--line); border-radius: 999px; padding: 5px 7px; color: var(--muted); background: #0b1114; font: 700 8px var(--mono); text-align: center; text-transform: uppercase; }
+    .approach-phase.active { border-color: var(--amber); color: #ffd995; background: #281d0d; }
+    .approach-phase.complete { border-color: #277a57; color: var(--green); background: #10231a; }
+    .approach-phase.blocked { border-color: #71333a; color: var(--red); background: #291216; }
+    .component-console { border: 1px solid var(--line); border-radius: var(--radius); background: #0d1215; }
+    .component-console > summary { cursor: pointer; padding: 8px 11px; color: #b9c7cc; font: 700 10px var(--mono); letter-spacing: .055em; text-transform: uppercase; }
+    .component-console-body { padding: 0 10px 10px; display: grid; gap: 8px; }
+    .component-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font: 9px var(--mono); }
+    .component-toolbar .component-button { min-width: 190px; border-color: #2c7560; background: #10231c; color: var(--green); }
+    .component-grid { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 7px; }
+    .component-card { border: 1px solid var(--line); border-radius: 4px; background: var(--panel); padding: 7px; display: grid; gap: 6px; min-width: 0; }
+    .component-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: #cbd7dc; font: 700 9px var(--mono); text-transform: uppercase; }
+    .component-state { color: var(--muted); font: 9px var(--mono); overflow-wrap: anywhere; min-height: 22px; }
+    .component-state.healthy { color: var(--green); }
+    .component-state.degraded { color: var(--amber); }
+    .component-state.offline { color: var(--red); }
+    .component-actions { display: grid; grid-template-columns: 1fr auto; gap: 5px; }
+    .component-button { border: 1px solid #315765; border-radius: 3px; background: #102027; color: var(--cyan); min-height: 27px; padding: 5px 7px; font: 700 9px var(--mono); cursor: pointer; text-transform: uppercase; }
+    .component-button.log { border-color: var(--line-strong); background: #11181c; color: var(--muted); }
+    .component-button:disabled { cursor: not-allowed; opacity: .45; }
+    .component-log { margin: 0; max-height: 190px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; background: #080c0f; padding: 8px; color: #aebcc2; font: 9px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+    .run-meta {
+      margin-left: auto;
+      display: grid;
+      grid-template-columns: repeat(3, auto);
+      gap: 9px 22px;
+      align-items: center;
+    }
+    .meta { min-width: 115px; }
+    .meta span { display: block; color: var(--muted); font: 10px var(--mono); text-transform: uppercase; }
+    .meta strong { display: block; margin-top: 2px; font: 12px var(--mono); overflow-wrap: anywhere; }
+
+    .stage-rail {
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 96%, transparent);
+      border-radius: var(--radius);
+      min-height: 64px;
+      padding: 8px 10px;
+      display: grid;
+      grid-template-columns: repeat(10, minmax(84px, 1fr));
+      gap: 4px;
+      overflow-x: auto;
+    }
+
+    .stage {
+      position: relative;
+      min-width: 84px;
+      border-bottom: 2px solid var(--line-strong);
+      padding: 4px 8px 9px 20px;
+      color: var(--muted);
+      font: 10px var(--mono);
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .stage::before {
+      content: "";
+      position: absolute;
+      left: 6px;
+      top: 7px;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--line-strong);
+    }
+    .stage strong { display: block; margin-top: 5px; color: var(--text); font-size: 10px; }
+    .stage.ok { border-color: var(--green); }
+    .stage.ok::before { background: var(--green); }
+    .stage.failed { border-color: var(--red); }
+    .stage.failed::before { background: var(--red); }
+    .stage.blocked { border-color: var(--amber); }
+    .stage.blocked::before { background: var(--amber); }
+
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(270px, 21%) minmax(560px, 1fr) minmax(300px, 21%);
+      gap: 12px;
+    }
+
+    .panel {
+      min-width: 0;
+      min-height: 0;
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 97%, transparent);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, .16);
+    }
+
+    .panel-title {
+      height: 37px;
+      padding: 0 11px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: #bcc8cd;
+      font: 700 11px var(--sans);
+      letter-spacing: .075em;
+      text-transform: uppercase;
+    }
+
+    .panel-title .subtle { color: var(--muted); font-weight: 400; letter-spacing: 0; text-transform: none; }
+
+    .image-stack {
+      height: 100%;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow-y: auto;
+    }
+
+    .image-frame {
+      position: relative;
+      min-height: 0;
+      border: 1px solid var(--line);
+      background: #06090b;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .image-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .image-frame img[hidden], .empty-image[hidden] { display: none; }
+    .image-frame.recorded { flex: 0 0 clamp(170px, 24vh, 240px); }
+    #recorded-image-stack { display: contents; }
+    .image-frame.live-camera {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      flex: 0 0 clamp(190px, 28vh, 275px);
+      border-color: #31505a;
+      box-shadow: 0 5px 12px rgba(0, 0, 0, .34);
+    }
+    .image-frame-toolbar {
+      position: absolute;
+      z-index: 3;
+      top: 7px;
+      left: 7px;
+      right: 7px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 7px;
+      pointer-events: none;
+    }
+    .image-label {
+      padding: 3px 6px;
+      background: rgba(6, 9, 11, .84);
+      border: 1px solid #34434b;
+      border-radius: 3px;
+      font: 10px var(--mono);
+      color: #d9e3e7;
+      pointer-events: auto;
+    }
+    .image-frame-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      pointer-events: auto;
+    }
+    .image-reorder-button {
+      min-width: 26px;
+      min-height: 24px;
+      border: 1px solid #34434b;
+      border-radius: 3px;
+      background: rgba(6, 9, 11, .9);
+      color: #d9e3e7;
+      font: 700 12px var(--mono);
+      line-height: 1;
+      cursor: pointer;
+    }
+    .image-reorder-button:hover, .image-reorder-button:focus-visible {
+      border-color: var(--cyan);
+      color: var(--cyan);
+      outline: 2px solid color-mix(in srgb, var(--cyan) 36%, transparent);
+      outline-offset: 1px;
+    }
+    .image-reorder-button:disabled {
+      border-color: #28343a;
+      color: #56646a;
+      cursor: not-allowed;
+      opacity: .68;
+    }
+    .camera-state {
+      padding: 3px 6px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      background: rgba(6, 9, 11, .88);
+      color: var(--muted);
+      font: 700 9px var(--mono);
+      letter-spacing: .05em;
+    }
+    .camera-state.live, .camera-state.fresh { border-color: #277a57; color: var(--green); }
+    .camera-state.tracked { border-color: #247782; color: var(--cyan); }
+    .camera-state.stale { border-color: #8a672d; color: var(--amber); }
+    .camera-state.offline, .camera-state.invalid { border-color: #71333a; color: var(--red); }
+    .empty-image { height: 100%; display: grid; place-items: center; color: var(--muted); font: 11px var(--mono); }
+
+    .viewport-panel { display: grid; grid-template-rows: 37px minmax(0, 1fr) auto; }
+    .viewport-toolbar { display: flex; align-items: center; gap: 8px; }
+    .candidate-picker {
+      max-width: 220px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: #111a1f;
+      color: var(--text);
+      padding: 4px 24px 4px 7px;
+      font: 10px var(--mono);
+    }
+    .candidate-toggle { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font: 10px var(--mono); text-transform: none; white-space: nowrap; }
+    .candidate-toggle input { accent-color: var(--cyan); }
+    .tool-button {
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      color: var(--text);
+      background: #131a1e;
+      padding: 4px 8px;
+      font: 10px var(--mono);
+      cursor: pointer;
+    }
+    .tool-button:hover, .tool-button:focus-visible { border-color: var(--cyan); outline: none; }
+
+    .canvas-wrap { position: relative; min-height: 420px; background: #070b0e; overflow: hidden; }
+    #scene-canvas { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+    #scene-canvas.dragging { cursor: grabbing; }
+    .canvas-hud {
+      position: absolute;
+      left: 10px;
+      bottom: 10px;
+      display: flex;
+      gap: 10px;
+      color: var(--muted);
+      font: 10px var(--mono);
+      pointer-events: none;
+    }
+    .legend { display: inline-flex; align-items: center; gap: 4px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+    .calibration-lock {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: calc(100% - 22px);
+      padding: 7px 10px;
+      border: 1px solid var(--amber);
+      border-radius: 4px;
+      color: #ffd995;
+      background: rgba(30, 22, 8, .94);
+      font: 700 10px var(--mono);
+      text-align: center;
+      pointer-events: none;
+    }
+    .calibration-lock[hidden] { display: none; }
+
+    .trajectory-strip {
+      min-height: 48px;
+      border-top: 1px solid var(--line);
+      padding: 8px 11px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      color: var(--muted);
+      font: 10px var(--mono);
+      flex-wrap: wrap;
+    }
+    .trajectory-strip strong { color: var(--text); }
+    .segment-key { display: inline-flex; gap: 5px; align-items: center; }
+    .segment-line { width: 18px; height: 2px; background: currentColor; }
+    .joint-ribbon { width: 100%; display: grid; grid-template-columns: repeat(6, minmax(62px, 1fr)); gap: 5px; }
+    .joint-tile { position: relative; overflow: hidden; min-height: 42px; border: 1px solid var(--line); border-radius: 4px; background: #0d1418; padding: 6px 7px; }
+    .joint-tile span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
+    .joint-tile strong { display: block; margin-top: 3px; font: 11px var(--mono); }
+    .joint-bar { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--cyan); transition: width .12s linear; }
+    .runtime-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 5px; }
+    .runtime-metric { min-height: 48px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel-2); padding: 7px; }
+    .runtime-metric span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
+    .runtime-metric strong { display: block; margin-top: 4px; font: 10px var(--mono); }
+    .runtime-note { margin: 7px 0 0; color: var(--muted); font: 9px var(--mono); overflow-wrap: anywhere; }
+
+    .diagnostics { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+    .diag-scroll { min-height: 0; overflow: auto; padding: 9px; display: grid; gap: 9px; align-content: start; }
+    .section { border-bottom: 1px solid var(--line); padding-bottom: 9px; }
+    .section:last-child { border-bottom: 0; }
+    .section h2 { margin: 0 0 7px; color: #b9c6cb; font: 700 10px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+
+    .safety-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+    .safety-item { border: 1px solid var(--line); background: var(--panel-2); border-radius: 4px; padding: 7px; min-height: 48px; }
+    .safety-item span { display: block; color: var(--muted); font: 9px var(--mono); text-transform: uppercase; }
+    .safety-item strong { display: block; margin-top: 4px; font: 700 11px var(--mono); }
+    .safe { color: var(--green); }
+    .unsafe { color: var(--red); }
+    .unknown { color: var(--amber); }
+
+    .gate-box { border: 1px solid var(--line-strong); border-left-width: 3px; border-radius: 4px; padding: 8px; background: #11181c; }
+    .gate-box.ok { border-left-color: var(--green); }
+    .gate-box.failed { border-left-color: var(--red); }
+    .gate-box.blocked { border-left-color: var(--amber); }
+    .gate-box strong { font: 700 11px var(--mono); }
+    .gate-box p { margin: 5px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+
+    .collision-card { border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 4px; padding: 8px; background: #11181c; }
+    .collision-card.empty { border-left-color: var(--line-strong); color: var(--muted); font: 10px var(--mono); }
+    .collision-title { color: var(--amber); font: 700 10px var(--mono); text-transform: uppercase; }
+    .collision-metrics { margin-top: 7px; display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+    .collision-metric { border: 1px solid var(--line); border-radius: 3px; padding: 5px; }
+    .collision-metric span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
+    .collision-metric strong { display: block; margin-top: 2px; font: 10px var(--mono); }
+    .collision-note { margin: 6px 0 0; color: var(--muted); font: 9px var(--mono); overflow-wrap: anywhere; }
+
+    table { border-collapse: collapse; width: 100%; table-layout: fixed; font: 10px var(--mono); }
+    th { color: var(--muted); font-weight: 500; text-align: left; border-bottom: 1px solid var(--line); padding: 5px; }
+    td { border-bottom: 1px solid #202a30; padding: 6px 5px; vertical-align: top; overflow-wrap: anywhere; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover, tbody tr.selected { background: #172228; }
+    .stage-text { color: var(--amber); }
+    .reason { color: #b9c5ca; }
+    .empty-table { color: var(--muted); padding: 8px 2px; font: 10px var(--mono); }
+
+    .rejection-disclosure { border: 1px solid var(--line); border-radius: 5px; background: #0e1418; overflow: hidden; }
+    .rejection-disclosure > summary {
+      min-height: 38px;
+      padding: 8px 9px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      color: #c6d1d5;
+      font: 700 10px var(--mono);
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      cursor: pointer;
+      list-style: none;
+    }
+    .rejection-disclosure > summary::-webkit-details-marker { display: none; }
+    .rejection-disclosure > summary::after { content: "▾"; margin-left: auto; color: var(--cyan); transition: transform .16s ease; }
+    .rejection-disclosure[open] > summary::after { transform: rotate(180deg); }
+    .rejection-summary { min-width: 0; color: var(--muted); font-weight: 400; letter-spacing: 0; text-transform: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .rejection-body { border-top: 1px solid var(--line); padding: 8px; }
+    .rejection-controls { display: grid; grid-template-columns: 1fr 1fr auto; gap: 7px; align-items: end; margin-bottom: 8px; }
+    .rejection-controls label { display: grid; gap: 3px; color: var(--muted); font: 9px var(--mono); text-transform: uppercase; }
+    .rejection-controls select {
+      min-width: 0;
+      width: 100%;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: #111a1f;
+      color: var(--text);
+      padding: 5px 22px 5px 6px;
+      font: 10px var(--mono);
+    }
+    .rejection-controls select:focus-visible { border-color: var(--cyan); outline: none; }
+    .rejection-visible-count { color: var(--muted); font: 9px var(--mono); white-space: nowrap; padding-bottom: 6px; }
+    .rejection-scroll { max-height: min(42vh, 420px); overflow: auto; border: 1px solid var(--line); border-radius: 4px; }
+    .rejection-scroll thead { position: sticky; top: 0; z-index: 1; background: #121a1f; }
+    .rejection-scroll .reason { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+    .error-dock {
+      min-height: 48px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #0d1215;
+      display: grid;
+      grid-template-columns: 150px 1fr;
+      align-items: stretch;
+    }
+
+    button { -webkit-tap-highlight-color: transparent; }
+    button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+      outline: 2px solid color-mix(in srgb, var(--cyan) 48%, transparent);
+      outline-offset: 2px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
+    .error-label { border-right: 1px solid var(--line); padding: 10px 12px; color: var(--muted); font: 700 10px var(--mono); letter-spacing: .05em; }
+    .error-list { display: flex; gap: 8px; align-items: center; overflow-x: auto; padding: 7px 9px; }
+    .error-chip { flex: 0 0 auto; max-width: 430px; border-left: 2px solid var(--red); padding: 4px 8px; color: #d2dadd; font: 10px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .error-chip.blocked { border-color: var(--amber); }
+    .all-clear { color: var(--green); font: 10px var(--mono); }
+
+    .fatal {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 30px;
+      background: var(--bg);
+      z-index: 20;
+    }
+    .fatal[hidden] { display: none; }
+    .fatal-box { max-width: 680px; border: 1px solid var(--red); background: #171014; padding: 22px; border-radius: var(--radius); }
+    .fatal-box h2 { margin: 0 0 8px; color: var(--red); font: 700 16px var(--mono); }
+    .fatal-box pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #e7cdd1; }
+
+    @media (max-width: 1450px) {
+      .topbar { align-items: flex-start; flex-wrap: wrap; }
+      .run-meta { flex: 0 0 100%; margin-left: 0; width: 100%; grid-template-columns: repeat(6, minmax(0, 1fr)); }
+      .meta { min-width: 0; }
+    }
+
+    @media (max-width: 1180px) {
+      .shell { grid-template-rows: auto auto auto auto; }
+      .workspace { grid-template-columns: minmax(240px, .75fr) minmax(520px, 1.6fr); }
+      .diagnostics { grid-column: 1 / -1; max-height: 440px; }
+      .run-meta { grid-template-columns: repeat(2, auto); }
+      .session-console { grid-template-columns: 1fr 1fr; }
+      .session-step:nth-child(2) { border-right: 0; }
+      .session-step:nth-child(4) { border-right: 0; }
+      .session-safety { grid-column: 1 / -1; }
+      .operation-deck { grid-template-columns: 1fr; }
+      .approach-deck { grid-template-columns: 1fr 1fr; }
+      .approach-readout { grid-column: 1 / -1; }
+      .operation-intro p { max-width: none; }
+      .component-grid { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
+    }
+
+    @media (max-width: 780px) {
+      .shell { padding: 8px; overflow: hidden; }
+      .shell > *, .topbar, .stage-rail, .workspace, .error-dock { width: 100%; min-width: 0; }
+      .topbar { align-items: flex-start; flex-wrap: wrap; }
+      .run-control { width: 100%; }
+      .session-console { grid-template-columns: minmax(0, 1fr); }
+      .session-step { border-right: 0; border-bottom: 1px solid var(--line); padding: 10px 5px 12px; }
+      .session-safety { grid-column: auto; }
+      .operation-deck { padding: 12px 4px 2px; }
+      .approach-deck { grid-template-columns: 1fr; padding: 12px 4px 2px; }
+      .approach-readout { grid-column: auto; }
+      .approach-actions { grid-template-columns: 1fr; }
+      .operation-sequence { grid-template-columns: 1fr; gap: 8px; }
+      .operation-sequence::before { top: 12%; bottom: 12%; left: 16px; right: auto; width: 1px; height: auto; }
+      .operation-automation .perform-actions { grid-template-columns: 1fr; }
+      .component-grid { grid-template-columns: minmax(0, 1fr); }
+      .target-row { grid-template-columns: minmax(0, 1fr); }
+      .run-meta { margin-left: 0; width: 100%; grid-template-columns: repeat(2, 1fr); }
+      .workspace { display: flex; flex-direction: column; }
+      .panel { width: 100%; min-width: 0; min-height: 460px; }
+      .viewport-panel .panel-title { height: auto; min-height: 72px; align-items: flex-start; flex-direction: column; padding: 8px 10px; }
+      .viewport-toolbar { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; }
+      .viewport-toolbar #view-frame { grid-column: 1 / -1; }
+      .candidate-picker { width: 100%; max-width: none; min-width: 0; }
+      .image-stack { min-height: 740px; }
+      .stage-rail { grid-template-columns: repeat(10, 110px); }
+      .error-dock { grid-template-columns: 90px minmax(0, 1fr); }
+      .error-list { min-width: 0; }
+      .rejection-controls { grid-template-columns: 1fr 1fr; }
+      .rejection-visible-count { grid-column: 1 / -1; padding-bottom: 0; }
+      .joint-ribbon { grid-template-columns: repeat(3, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell" aria-label="Z-Manip debugging and fixed Home dashboard">
+    <header class="topbar">
+      <div class="brand">
+        <h1>Z-Manip Debug</h1>
+        <p id="run-id">waiting for artifact bundle</p>
+      </div>
+      <div class="mode-flags" aria-label="Safety mode">
+        <span class="flag" id="read-only-flag">READ ONLY</span>
+        <span class="flag" id="planning-only-flag">PLANNING ONLY</span>
+      </div>
+      <span class="runtime-badge offline" id="runtime-badge" aria-live="polite">RUNTIME OFFLINE</span>
+      <div class="run-meta">
+        <div class="meta"><span>Pipeline</span><strong id="pipeline-state">—</strong></div>
+        <div class="meta"><span>Perception frame</span><strong id="perception-frame">—</strong></div>
+        <div class="meta"><span>Planning frame</span><strong id="planning-frame">—</strong></div>
+        <div class="meta"><span>Source stamp</span><strong id="source-stamp">—</strong></div>
+        <div class="meta"><span>Updated</span><strong id="updated-time">—</strong></div>
+        <div class="meta"><span>Selected</span><strong id="selected-candidate">none</strong></div>
+      </div>
+    </header>
+
+    <section class="session-console" aria-label="Interactive Home, perception, planning and grasp controls">
+      <div class="session-step">
+        <div class="session-step-head">
+          <span class="session-step-title"><span class="session-step-index">0</span> Robot Home</span>
+          <span class="session-selection" id="home-selection">2% speed</span>
+        </div>
+        <button class="session-button home" id="session-go-home" type="button">Reset + Home</button>
+        <div class="session-state" id="home-session-state" aria-live="polite">Return Home before starting a new perception and grasp plan.</div>
+      </div>
+      <div class="session-step">
+        <div class="session-step-head">
+          <span class="session-step-title"><span class="session-step-index">1</span> Perception</span>
+          <span class="session-selection" id="perception-selection">no session selected</span>
+        </div>
+        <div class="target-row">
+          <input class="target-input" id="perception-target" type="text" maxlength="160" autocomplete="off" spellcheck="false" placeholder="Describe the current object, e.g. white block with red port" aria-label="Current target object description">
+          <button class="session-button" id="session-run-perception" type="button" disabled>Run perception</button>
+        </div>
+        <div class="session-state" id="perception-session-state" aria-live="polite">Enter the object currently visible in the live D435 feed.</div>
+      </div>
+      <div class="session-step">
+        <div class="session-step-head">
+          <span class="session-step-title"><span class="session-step-index">2</span> Planning</span>
+          <span class="session-selection" id="planning-selection">selected perception required</span>
+        </div>
+        <button class="session-button plan" id="session-run-planning" type="button" disabled>Run planning</button>
+        <div class="session-state" id="planning-session-state" aria-live="polite">Planning unlocks after a successful perception session.</div>
+      </div>
+      <div class="session-step session-safety" aria-label="Interactive action safety boundary">
+        <div class="session-step-head">
+          <span class="session-step-title"><span class="session-step-index">3</span> Motion limits</span>
+          <span class="session-selection" id="grasp-selection">fixed · 5%</span>
+        </div>
+        <label class="speed-control" for="motion-speed">Speed
+          <input class="speed-input" id="motion-speed" type="number" min="1" max="50" step="1" value="5" inputmode="numeric" aria-describedby="motion-speed-note">
+          <span>%</span>
+        </label>
+        <span>Home uses a server-owned measured pose; the browser cannot submit joint targets.</span>
+        <span id="motion-speed-note">1–50%. Perform plans at Home, keeps one connection, places back, then returns Home.</span>
+        <div class="maintenance-actions">
+          <button class="session-button maintenance" id="session-clear-demo" type="button">Clear demo</button>
+          <button class="session-button maintenance" id="session-restart-service" type="button">Restart UI</button>
+        </div>
+        <span id="maintenance-state" aria-live="polite">Clears current overlays or restarts only this local webpage/API.</span>
+      </div>
+      <section class="operation-deck" aria-label="Grasp execution controls">
+        <div class="operation-automation">
+          <div class="perform-actions" aria-label="Automated grasp controls">
+            <button class="session-button perform" id="session-perform-grasp" type="button" disabled>Perception + perform</button>
+            <button class="session-button perform-direct" id="session-perform-selected" type="button" disabled>Direct perform</button>
+          </div>
+          <div class="session-state operation-state" id="grasp-session-state" aria-live="polite">Plan first, then run the complete automated cycle.</div>
+        </div>
+      </section>
+      <section class="approach-deck" aria-label="Go2W depth visual approach controls">
+        <div class="approach-copy">
+          <strong>Mobile find → grasp</strong>
+          <span>Detect in the current D435 view. If absent, run a bounded J4/J5 wrist-camera search; then track, coarsely align, and walk into the close-range handoff zone before fresh perception, IK, planning, and grasp.</span>
+          <div class="session-state" id="approach-session-state" aria-live="polite">Enter the target description, then run the complete mobile grasp.</div>
+        </div>
+        <div class="approach-actions">
+          <button class="session-button approach-live" id="approach-auto" type="button" disabled>Find → approach → grasp</button>
+          <button class="session-button" id="approach-shadow" type="button" disabled>Shadow check</button>
+          <button class="session-button approach-stop" id="approach-stop" type="button">Full stop</button>
+        </div>
+        <div class="approach-readout" aria-label="Depth visual servo telemetry">
+          <div class="approach-metric"><span>Target x / z</span><strong id="approach-target">—</strong></div>
+          <div class="approach-metric"><span>Depth / yaw error</span><strong id="approach-errors">—</strong></div>
+          <div class="approach-metric"><span>Command vx / wz</span><strong id="approach-command">—</strong></div>
+          <div class="approach-metric"><span>Wrist search</span><strong id="approach-search">idle</strong></div>
+        </div>
+        <div class="approach-progress" id="approach-progress" aria-label="Mobile grasp workflow progress">
+          <span class="approach-phase" data-approach-phase="detect">Detect</span>
+          <span class="approach-phase" data-approach-phase="search">Search</span>
+          <span class="approach-phase" data-approach-phase="track">Track</span>
+          <span class="approach-phase" data-approach-phase="approach">Approach</span>
+          <span class="approach-phase" data-approach-phase="settle">Handoff</span>
+          <span class="approach-phase" data-approach-phase="grasp">Grasp</span>
+        </div>
+      </section>
+    </section>
+
+    <details class="component-console" id="component-console">
+      <summary>Vision services · status, logs and restart</summary>
+      <div class="component-console-body">
+        <div class="component-toolbar"><span>Cold start after a NUC/PC reboot. Camera and telemetry remain subscribe-only.</span><button class="component-button" id="component-bringup" type="button">Bring up all vision services</button></div>
+        <div class="component-grid" id="component-grid">
+          <div class="component-card" data-component-card="ui"><div class="component-head"><span>UI workbench</span><span data-component-badge="ui">—</span></div><div class="component-state" data-component-state="ui">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="ui">Restart</button><button class="component-button log" type="button" data-component-log="ui">Logs</button></div></div>
+          <div class="component-card" data-component-card="nuc-camera"><div class="component-head"><span>NUC D435</span><span data-component-badge="nuc-camera">—</span></div><div class="component-state" data-component-state="nuc-camera">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="nuc-camera">Restart</button><button class="component-button log" type="button" data-component-log="nuc-camera">Logs</button></div></div>
+          <div class="component-card" data-component-card="passive-feedback"><div class="component-head"><span>Passive feedback</span><span data-component-badge="passive-feedback">—</span></div><div class="component-state" data-component-state="passive-feedback">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="passive-feedback">Restart</button><button class="component-button log" type="button" data-component-log="passive-feedback">Logs</button></div></div>
+          <div class="component-card" data-component-card="observer"><div class="component-head"><span>Runtime observer</span><span data-component-badge="observer">—</span></div><div class="component-state" data-component-state="observer">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="observer">Restart</button><button class="component-button log" type="button" data-component-log="observer">Logs</button></div></div>
+          <div class="component-card" data-component-card="rgbd"><div class="component-head"><span>RGB-D bridge</span><span data-component-badge="rgbd">—</span></div><div class="component-state" data-component-state="rgbd">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="rgbd">Restart</button><button class="component-button log" type="button" data-component-log="rgbd">Logs</button></div></div>
+          <div class="component-card" data-component-card="edgetam"><div class="component-head"><span>EdgeTAM</span><span data-component-badge="edgetam">—</span></div><div class="component-state" data-component-state="edgetam">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="edgetam">Restart</button><button class="component-button log" type="button" data-component-log="edgetam">Logs</button></div></div>
+          <div class="component-card" data-component-card="perception"><div class="component-head"><span>Perception ROS</span><span data-component-badge="perception">—</span></div><div class="component-state" data-component-state="perception">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="perception">Restart</button><button class="component-button log" type="button" data-component-log="perception">Logs</button></div></div>
+          <div class="component-card" data-component-card="perception-all"><div class="component-head"><span>All perception</span><span data-component-badge="perception-all">—</span></div><div class="component-state" data-component-state="perception-all">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="perception-all">Restart all</button><button class="component-button log" type="button" data-component-log="perception-all">Logs</button></div></div>
+        </div>
+        <pre class="component-log" id="component-log" hidden aria-live="polite"></pre>
+      </div>
+    </details>
+
+    <section class="stage-rail" id="stage-rail" aria-label="Pipeline stages"></section>
+
+    <section class="workspace">
+      <section class="panel" aria-label="Live and recorded perception images">
+        <div class="panel-title"><span>Perception feed</span><span class="subtle">live + recorded</span></div>
+        <div class="image-stack" id="image-stack">
+          <div class="image-frame live-camera" data-testid="live-camera-frame" data-feed-key="live_camera">
+            <div class="image-frame-toolbar">
+              <span class="image-label">D435 RGB live</span>
+              <div class="image-frame-actions">
+                <span class="camera-state offline" id="camera-state" aria-live="polite">OFFLINE</span>
+                <button class="image-reorder-button" type="button" data-reorder="up" aria-label="Move D435 RGB live up" title="Move up">&#8593;</button>
+                <button class="image-reorder-button" type="button" data-reorder="down" aria-label="Move D435 RGB live down" title="Move down">&#8595;</button>
+              </div>
+            </div>
+            <img id="camera-image" alt="Live D435 RGB camera feed" hidden>
+            <div class="empty-image" id="camera-placeholder">Waiting for the subscribe-only camera observer.</div>
+          </div>
+          <div id="recorded-image-stack"></div>
+          <p class="sr-only" id="feed-order-status" aria-live="polite"></p>
+        </div>
+      </section>
+
+      <section class="panel viewport-panel" aria-label="Three-dimensional debug view">
+        <div class="panel-title">
+          <span>Geometry / plan view</span>
+          <div class="viewport-toolbar">
+            <span class="subtle" id="view-frame">frame: —</span>
+            <select class="candidate-picker" id="candidate-selector" data-testid="candidate-selector" aria-label="Select grasp candidate"></select>
+            <label class="candidate-toggle"><input type="checkbox" id="show-all-candidates">show all</label>
+            <button class="tool-button" type="button" id="reset-view">Reset view</button>
+          </div>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="scene-canvas" aria-label="Point cloud and grasp coordinate frames"></canvas>
+          <div class="calibration-lock" id="calibration-lock" hidden>
+            CALIBRATION INVALID — BASE-FRAME ROBOT AND TRAJECTORY OVERLAYS ARE LOCKED
+          </div>
+          <div class="canvas-hud" aria-hidden="true">
+            <span class="legend" style="color:#78868d"><i class="dot"></i>scene</span>
+            <span class="legend" style="color:#48d7de"><i class="dot"></i>target</span>
+            <span class="legend" style="color:#d8e2e6"><i class="dot"></i>actual</span>
+            <span class="legend" style="color:#659cff"><i class="dot"></i>plan ghost</span>
+            <span class="legend" style="color:#ff6673"><i class="dot"></i>X</span>
+            <span class="legend" style="color:#54d68c"><i class="dot"></i>Y</span>
+            <span class="legend" style="color:#659cff"><i class="dot"></i>Z</span>
+            <span class="legend" style="color:#f0b758"><i class="dot"></i>collision</span>
+          </div>
+        </div>
+        <div class="trajectory-strip" id="trajectory-strip"></div>
+      </section>
+
+      <aside class="panel diagnostics" aria-label="Safety and planning diagnostics">
+        <div class="panel-title"><span>Diagnostics</span><span class="subtle" id="candidate-count">0 candidates</span></div>
+        <div class="diag-scroll">
+          <section class="section">
+            <h2>Live runtime</h2>
+            <div class="runtime-grid" id="runtime-grid"></div>
+            <p class="runtime-note" id="runtime-note">Waiting for the subscribe-only ROS observer.</p>
+          </section>
+          <section class="section">
+            <h2>Safety evidence</h2>
+            <div class="safety-grid" id="safety-grid"></div>
+          </section>
+          <section class="section">
+            <h2>Frame gate</h2>
+            <div class="gate-box" id="calibration-gate"></div>
+          </section>
+          <section class="section">
+            <h2>Selected collision witness</h2>
+            <div id="collision-evidence"></div>
+          </section>
+          <section class="section rejection-section">
+            <details class="rejection-disclosure" id="rejection-disclosure" data-testid="rejection-disclosure">
+              <summary>
+                <span>Candidate rejections</span>
+                <span class="rejection-summary" id="rejection-summary">0 total</span>
+              </summary>
+              <div class="rejection-body">
+                <div class="rejection-controls">
+                  <label>Stage
+                    <select id="rejection-stage-filter" data-testid="rejection-stage-filter" aria-label="Filter rejection stage"></select>
+                  </label>
+                  <label>Candidate
+                    <select id="rejection-candidate-filter" data-testid="rejection-candidate-filter" aria-label="Filter rejection candidate"></select>
+                  </label>
+                  <span class="rejection-visible-count" id="rejection-visible-count" aria-live="polite">0 shown</span>
+                </div>
+                <div class="rejection-scroll" id="rejection-table" data-testid="rejection-scroll"></div>
+              </div>
+            </details>
+          </section>
+        </div>
+      </aside>
+    </section>
+
+    <footer class="error-dock">
+      <div class="error-label">PIPELINE ISSUES</div>
+      <div class="error-list" id="error-list"></div>
+    </footer>
+  </main>
+
+  <div class="fatal" id="fatal" hidden>
+    <div class="fatal-box">
+      <h2>Dashboard could not load the artifact bundle</h2>
+      <pre id="fatal-message"></pre>
+    </div>
+  </div>
+
+  <script src="/runtime_scene.js"></script>
+  <script>
+    "use strict";
+
+    const STAGE_LABELS = {
+      perception_bundle: "RGBD",
+      segmentation: "EdgeTAM",
+      point_cloud: "Point cloud",
+      grasp_generation: "Grasp geometry",
+      joint_state_gate: "Joint state",
+      calibration_gate: "Calibration",
+      frame_transform: "Transform",
+      ik: "IK",
+      collision_check: "Collision",
+      motion_plan: "RRT / plan",
+      safety_gate: "Safety"
+    };
+    const IMAGE_LABELS = {
+      segmentation_mask: "EdgeTAM mask",
+      segmentation_overlay: "Segmentation overlay",
+      candidate_overlay: "Grasp candidates"
+    };
+    const INTERACTIVE_IMAGE_ROUTES = {
+      segmentation_mask: "/api/sessions/perception/artifacts/mask.png",
+      segmentation_overlay: "/api/sessions/perception/artifacts/overlay.png",
+      candidate_overlay: "/api/sessions/perception/artifacts/candidates.png"
+    };
+    const LIVE_PERCEPTION_IMAGE_ROUTES = {
+      segmentation_mask: "/api/perception/live/mask.png",
+      segmentation_overlay: "/api/perception/live/overlay.jpg",
+      candidate_overlay: "/api/perception/live/candidates.jpg"
+    };
+    const FEED_ORDER_STORAGE_KEY = "z-manip.perception-feed-order.v1";
+    const DEFAULT_FEED_ORDER = ["live_camera", "segmentation_mask", "segmentation_overlay", "candidate_overlay"];
+    const HOME_JOINTS_RAD = [0.002879793265790644, 0.0783652834145454, -0.026598817800393585, -0.018779742751458987, 0.29422760530120406, 0.0];
+    // Match the server-side measured Home verifier.  A tighter UI-only gate
+    // made valid feedback at 0.361° look non-Home even though execution accepts 1°.
+    const HOME_TOLERANCE_RAD = 1.0 * Math.PI / 180;
+
+    function loadFeedOrder() {
+      try {
+        const parsed = JSON.parse(window.localStorage.getItem(FEED_ORDER_STORAGE_KEY));
+        const exactKnownOrder = Array.isArray(parsed)
+          && parsed.length === DEFAULT_FEED_ORDER.length
+          && new Set(parsed).size === DEFAULT_FEED_ORDER.length
+          && parsed.every(key => DEFAULT_FEED_ORDER.includes(key));
+        return exactKnownOrder ? parsed : [...DEFAULT_FEED_ORDER];
+      } catch (_error) {
+        return [...DEFAULT_FEED_ORDER];
+      }
+    }
+
+    const state = {
+      bundle: null,
+      selectedCandidate: null,
+      selectedRejection: null,
+      calibrationValid: false,
+      rejectionStage: "all",
+      rejectionCandidate: "all",
+      showAllCandidates: false,
+      imageKey: "candidate_overlay",
+      control: { available: false, running: false, state: "unavailable", revision: null },
+      controlTimer: null,
+      runtime: null,
+      runtimeScene: null,
+      runtimeTimer: null,
+      runtimeEtag: null,
+      runtimeSamples: [],
+      cameraTimer: null,
+      cameraEtag: null,
+      cameraHasFrame: false,
+      perceptionFeedTimer: null,
+      perceptionFeeds: {},
+      feedOrder: loadFeedOrder(),
+      sessions: null,
+      home: { available: false, running: false, at_home: null, outcome: null },
+      homeTimer: null,
+      grasp: { available: false, running: false, phase: "idle", outcome: null },
+      graspTimer: null,
+      approach: { available: false, running: false, mode: null, phase: "idle", runtime: {} },
+      approachTimer: null,
+      approachWorkflow: null,
+      components: { available: false, busy: false, components: {} },
+      componentTimer: null,
+      sessionTimer: null,
+      sessionPendingAction: null,
+      sessionMessage: null,
+      interactivePerceptionId: null,
+      interactivePlanningId: null,
+      taskContextActive: false,
+      orbit: { yaw: -0.72, pitch: -0.46, zoom: 1, panX: 0, panY: 0 },
+      drag: null
+    };
+
+    const byId = id => document.getElementById(id);
+    const clear = node => { while (node.firstChild) node.removeChild(node.firstChild); };
+    const make = (tag, className, text) => {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = String(text);
+      return node;
+    };
+    const findStage = name => (state.bundle?.stages || []).find(item => item.name === name);
+    const finiteNumber = value => typeof value === "number" && Number.isFinite(value);
+    const booleanWord = value => value === true ? "YES" : value === false ? "NO" : "UNKNOWN";
+    const safetyClass = (value, desired) => value === desired ? "safe" : value === undefined || value === null ? "unknown" : "unsafe";
+
+    function setFlag(id, enabled, label) {
+      const node = byId(id);
+      node.textContent = label;
+      node.classList.toggle("bad", !enabled);
+    }
+
+    function renderHeader() {
+      const bundle = state.bundle;
+      const mode = bundle.mode || {};
+      setFlag("read-only-flag", mode.read_only === true, mode.read_only === true ? "READ ONLY" : "READ ONLY NOT VERIFIED");
+      setFlag("planning-only-flag", mode.planning_only === true, mode.planning_only === true ? "PLANNING ONLY" : "PLANNING MODE NOT VERIFIED");
+      byId("run-id").textContent = `${bundle.run_id || "unknown run"} · ${bundle.request_id || "unknown request"}`;
+      const displayCleared = bundle.display?.cleared === true;
+      byId("pipeline-state").textContent = displayCleared ? "CLEARED" : String(bundle.status?.state || "unknown").toUpperCase();
+      byId("pipeline-state").className = displayCleared ? "unknown" : bundle.status?.ok ? "safe" : "unsafe";
+      byId("perception-frame").textContent = bundle.frames?.perception || "unknown";
+      byId("planning-frame").textContent = bundle.frames?.planning || "unavailable";
+      const stamp = bundle.inputs?.source_stamp_ns;
+      byId("source-stamp").textContent = finiteNumber(stamp) ? String(stamp) : "unknown";
+      const created = bundle.created_unix_ns;
+      byId("updated-time").textContent = finiteNumber(created) ? new Date(created / 1e6).toLocaleTimeString() : "unknown";
+      const noFeasibleCandidate = bundle.planning?.available === true
+        && bundle.planning?.plan_valid !== true;
+      byId("selected-candidate").textContent = state.selectedCandidate === null
+        ? (noFeasibleCandidate ? "No feasible candidate" : "none")
+        : `#${state.selectedCandidate}`;
+    }
+
+    function renderStages() {
+      const rail = byId("stage-rail");
+      clear(rail);
+      for (const stage of state.bundle.stages || []) {
+        const node = make("div", `stage ${stage.status || "blocked"}`);
+        node.append(make("span", "", STAGE_LABELS[stage.name] || stage.name));
+        node.append(make("strong", "", String(stage.status || "unknown").toUpperCase()));
+        if (stage.error?.message) node.title = `${stage.error.code || "ERROR"}: ${stage.error.message}`;
+        rail.append(node);
+      }
+    }
+
+    function renderImages() {
+      const stack = byId("recorded-image-stack");
+      clear(stack);
+      const imageKeys = state.bundle.visualization?.images || {};
+      const interactivePerception = state.sessions?.actions?.perception?.last_good;
+      const useInteractiveArtifacts = state.taskContextActive
+        && interactivePerception?.status === "succeeded";
+      const keys = ["segmentation_mask", "segmentation_overlay", "candidate_overlay"];
+      for (const key of keys) {
+        const frame = make("div", "image-frame recorded");
+        frame.dataset.feedKey = key;
+        const toolbar = make("div", "image-frame-toolbar");
+        toolbar.append(make("span", "image-label", IMAGE_LABELS[key]));
+        const actions = make("div", "image-frame-actions");
+        const feedState = make("span", "camera-state stale", "REFERENCE");
+        feedState.id = `perception-feed-state-${key}`;
+        feedState.title = "Recorded perception artifact; waiting for a fresh OpenCV tracking anchor.";
+        actions.append(feedState);
+        for (const direction of ["up", "down"]) {
+          const button = make("button", "image-reorder-button", direction === "up" ? "↑" : "↓");
+          button.type = "button";
+          button.dataset.reorder = direction;
+          button.setAttribute("aria-label", `Move ${IMAGE_LABELS[key]} ${direction}`);
+          button.title = direction === "up" ? "Move up" : "Move down";
+          actions.append(button);
+        }
+        toolbar.append(actions);
+        frame.append(toolbar);
+        const allowRecordedFallback = state.sessions === null;
+        if (useInteractiveArtifacts || (allowRecordedFallback && Object.prototype.hasOwnProperty.call(imageKeys, key) && state.bundle.artifacts?.[key])) {
+          const image = document.createElement("img");
+          image.alt = IMAGE_LABELS[key];
+          image.loading = "eager";
+          image.id = `perception-feed-image-${key}`;
+          image.src = useInteractiveArtifacts
+            ? INTERACTIVE_IMAGE_ROUTES[key]
+            : `/artifact/${encodeURIComponent(key)}`;
+          image.addEventListener("error", () => {
+            image.remove();
+            frame.append(make("div", "empty-image", "artifact could not be displayed"));
+          }, { once: true });
+          frame.append(image);
+        } else {
+          frame.append(make("div", "empty-image", "artifact unavailable"));
+        }
+        stack.append(frame);
+      }
+      applyFeedOrder();
+    }
+
+    function renderPerceptionFeedState(key, status, detail = "") {
+      const normalized = ["fresh", "tracked", "stale", "offline", "invalid"].includes(status) ? status : "offline";
+      const badge = byId(`perception-feed-state-${key}`);
+      if (!badge) return;
+      badge.className = `camera-state ${normalized}`;
+      badge.textContent = normalized.toUpperCase();
+      badge.title = detail;
+    }
+
+    function schedulePerceptionFeedPoll(delayMs) {
+      if (state.perceptionFeedTimer !== null) window.clearTimeout(state.perceptionFeedTimer);
+      state.perceptionFeedTimer = window.setTimeout(refreshPerceptionFeeds, delayMs);
+    }
+
+    async function refreshPerceptionFeed(key) {
+      const feed = state.perceptionFeeds[key] || { etag: null, hasLiveFrame: false };
+      state.perceptionFeeds[key] = feed;
+      const headers = {};
+      if (feed.etag) headers["If-None-Match"] = feed.etag;
+      const response = await fetch(LIVE_PERCEPTION_IMAGE_ROUTES[key], {
+        cache: "no-store",
+        credentials: "same-origin",
+        headers
+      });
+      const status = response.headers.get("X-Z-Manip-Perception-State")
+        || response.headers.get("X-Z-Manip-Camera-State")
+        || (response.ok ? "tracked" : "offline");
+      const referenceAge = response.headers.get("X-Z-Manip-Reference-Age-Ms");
+      const detail = referenceAge === null
+        ? "OpenCV display-only tracking"
+        : `OpenCV display-only tracking · anchor age ${referenceAge} ms`;
+      if (response.status === 304) {
+        renderPerceptionFeedState(key, status, detail);
+        return status;
+      }
+      if (!response.ok) {
+        let message = detail;
+        try {
+          const error = await response.json();
+          message = error.error || message;
+        } catch (_error) {
+          // Status headers remain authoritative when an error body is unavailable.
+        }
+        renderPerceptionFeedState(key, status, message);
+        return status;
+      }
+      const expected = key === "segmentation_mask" ? "image/png" : "image/jpeg";
+      if (!(response.headers.get("Content-Type") || "").startsWith(expected)) {
+        throw new Error(`${key} returned an unexpected image type`);
+      }
+      feed.etag = response.headers.get("ETag");
+      const dataUrl = await readBlobAsDataUrl(await response.blob());
+      const image = byId(`perception-feed-image-${key}`);
+      if (image) {
+        image.src = dataUrl;
+        feed.hasLiveFrame = true;
+      }
+      renderPerceptionFeedState(key, status, detail);
+      return status;
+    }
+
+    async function refreshPerceptionFeeds() {
+      const keys = Object.keys(LIVE_PERCEPTION_IMAGE_ROUTES);
+      const statuses = [];
+      try {
+        await Promise.all(keys.map(async key => {
+          try {
+            statuses.push(await refreshPerceptionFeed(key));
+          } catch (error) {
+            renderPerceptionFeedState(key, "offline", String(error));
+            statuses.push("offline");
+          }
+        }));
+      } finally {
+      // TRACKED is an active display state, not a frozen result: keep polling
+      // at a bounded 2 Hz so stable objects still follow every new RGB frame.
+      const tracking = statuses.some(status => status === "fresh" || status === "tracked");
+        const perceptionStarting = state.sessionPendingAction === "perception";
+        schedulePerceptionFeedPoll(tracking || perceptionStarting ? 500 : 1500);
+      }
+    }
+
+    function persistFeedOrder() {
+      try {
+        window.localStorage.setItem(FEED_ORDER_STORAGE_KEY, JSON.stringify(state.feedOrder));
+      } catch (_error) {
+        // Ordering remains usable for this page session when storage is unavailable.
+      }
+    }
+
+    function applyFeedOrder() {
+      for (const [index, key] of state.feedOrder.entries()) {
+        const frame = document.querySelector(`[data-feed-key="${key}"]`);
+        if (!frame) continue;
+        frame.style.order = String(index);
+        const up = frame.querySelector('[data-reorder="up"]');
+        const down = frame.querySelector('[data-reorder="down"]');
+        if (up) up.disabled = index === 0;
+        if (down) down.disabled = index === state.feedOrder.length - 1;
+      }
+      byId("feed-order-status").style.order = String(state.feedOrder.length);
+    }
+
+    function moveFeedFrame(key, direction) {
+      const currentIndex = state.feedOrder.indexOf(key);
+      const nextIndex = currentIndex + (direction === "up" ? -1 : 1);
+      if (currentIndex < 0 || nextIndex < 0 || nextIndex >= state.feedOrder.length) return;
+      const nextOrder = [...state.feedOrder];
+      [nextOrder[currentIndex], nextOrder[nextIndex]] = [nextOrder[nextIndex], nextOrder[currentIndex]];
+      state.feedOrder = nextOrder;
+      persistFeedOrder();
+      applyFeedOrder();
+      const frame = document.querySelector(`[data-feed-key="${key}"]`);
+      const requestedButton = frame?.querySelector(`[data-reorder="${direction}"]:not(:disabled)`);
+      (requestedButton || frame?.querySelector(".image-reorder-button:not(:disabled)"))?.focus();
+      byId("feed-order-status").textContent = `${frame?.querySelector(".image-label")?.textContent || key} moved to position ${nextIndex + 1} of ${state.feedOrder.length}.`;
+    }
+
+    function bindFeedOrderControls() {
+      byId("image-stack").addEventListener("click", event => {
+        const button = event.target.closest("[data-reorder]");
+        const frame = button?.closest("[data-feed-key]");
+        if (!button || !frame) return;
+        moveFeedFrame(frame.dataset.feedKey, button.dataset.reorder);
+      });
+      applyFeedOrder();
+    }
+
+    function addSafetyItem(root, label, value, desired) {
+      const item = make("div", "safety-item");
+      item.append(make("span", "", label));
+      item.append(make("strong", safetyClass(value, desired), booleanWord(value)));
+      root.append(item);
+    }
+
+    function renderSafety() {
+      const root = byId("safety-grid");
+      clear(root);
+      const safety = state.bundle.safety || {};
+      const motionZero = safety.motion_commands_published === 0;
+      const motion = make("div", "safety-item");
+      motion.append(make("span", "", "Motion commands"));
+      motion.append(make("strong", motionZero ? "safe" : "unsafe", finiteNumber(safety.motion_commands_published) ? String(safety.motion_commands_published) : "UNKNOWN"));
+      root.append(motion);
+      addSafetyItem(root, "Transport opened", safety.transport_opened, false);
+      addSafetyItem(root, "ROS imported", safety.ros_imported, false);
+      addSafetyItem(root, "CAN opened", safety.can_opened, false);
+
+      const joint = findStage("joint_state_gate");
+      const tx = joint?.metrics?.interface_tx_packet_delta;
+      const txItem = make("div", "safety-item");
+      txItem.append(make("span", "", "Passive CAN TX delta"));
+      txItem.append(make("strong", tx === 0 ? "safe" : tx === null || tx === undefined ? "unknown" : "unsafe", tx === null || tx === undefined ? "UNKNOWN" : String(tx)));
+      root.append(txItem);
+
+      const upstream = safety.upstream_reported_motion_commands_published;
+      const upstreamItem = make("div", "safety-item");
+      upstreamItem.append(make("span", "", "Upstream motion"));
+      upstreamItem.append(make("strong", upstream === 0 || upstream === null ? "safe" : upstream === undefined ? "unknown" : "unsafe", upstream === null ? "NOT REPORTED" : upstream === undefined ? "UNKNOWN" : String(upstream)));
+      root.append(upstreamItem);
+    }
+
+    function renderCalibrationGate() {
+      const calibration = findStage("calibration_gate");
+      const transform = findStage("frame_transform");
+      state.calibrationValid = calibration?.status === "ok" && transform?.status === "ok";
+      const gate = byId("calibration-gate");
+      gate.className = `gate-box ${state.calibrationValid ? "ok" : calibration?.status || "blocked"}`;
+      clear(gate);
+      gate.append(make("strong", state.calibrationValid ? "safe" : "unsafe", state.calibrationValid ? "VERIFIED BASE TRANSFORM" : "CALIBRATION INVALID / BASE OVERLAY LOCKED"));
+      const message = state.calibrationValid
+        ? `${state.bundle.frames?.perception || "camera"} → ${state.bundle.frames?.planning || "base"}`
+        : calibration?.error?.message || transform?.error?.message || "No measured non-synthetic calibration evidence.";
+      gate.append(make("p", "", message));
+      byId("calibration-lock").hidden = state.calibrationValid;
+    }
+
+    function renderRejections() {
+      const root = byId("rejection-table");
+      clear(root);
+      const candidates = state.bundle.candidates || [];
+      const rejections = state.bundle.planning?.rejections || [];
+      byId("candidate-count").textContent = `${candidates.length} candidates`;
+      const stageCounts = new Map();
+      for (const rejection of rejections) {
+        const stage = String(rejection.stage || "unknown");
+        stageCounts.set(stage, (stageCounts.get(stage) || 0) + 1);
+      }
+      const stageSummary = [...stageCounts.entries()]
+        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+        .map(([stage, count]) => `${stage.replaceAll("_", " ")} ${count}`)
+        .join(" · ");
+      byId("rejection-summary").textContent = `${rejections.length} total${stageSummary ? ` · ${stageSummary}` : ""}`;
+      byId("rejection-disclosure").title = `${rejections.length} total${stageSummary ? ` · ${stageSummary}` : ""}`;
+
+      const stageSelect = byId("rejection-stage-filter");
+      const candidateSelect = byId("rejection-candidate-filter");
+      const populateSelect = (select, options, selected) => {
+        clear(select);
+        for (const [value, label] of options) {
+          const option = make("option", "", label);
+          option.value = value;
+          select.append(option);
+        }
+        select.value = options.some(([value]) => value === selected) ? selected : "all";
+        return select.value;
+      };
+      state.rejectionStage = populateSelect(
+        stageSelect,
+        [["all", "All stages"], ...[...stageCounts.keys()].sort().map(stage => [stage, `${stage.replaceAll("_", " ")} (${stageCounts.get(stage)})`])],
+        state.rejectionStage
+      );
+      const candidateIds = [...new Set(rejections.map(item => item.candidate_index).filter(Number.isInteger))].sort((a, b) => a - b);
+      state.rejectionCandidate = populateSelect(
+        candidateSelect,
+        [["all", "All candidates"], ...candidateIds.map(id => [String(id), `Candidate #${id}`])],
+        state.rejectionCandidate
+      );
+      const visible = rejections.filter(rejection =>
+        (state.rejectionStage === "all" || String(rejection.stage || "unknown") === state.rejectionStage) &&
+        (state.rejectionCandidate === "all" || String(rejection.candidate_index) === state.rejectionCandidate)
+      );
+      byId("rejection-visible-count").textContent = `${visible.length} / ${rejections.length} shown`;
+      if (!rejections.length) {
+        root.append(make("div", "empty-table", state.bundle.planning?.available ? "No included candidate rejections." : "Planning report unavailable — IK/collision/RRT are blocked."));
+        return;
+      }
+      if (!visible.length) {
+        root.append(make("div", "empty-table", "No rejection matches the selected filters."));
+        return;
+      }
+      const table = make("table");
+      const head = make("thead");
+      const headerRow = make("tr");
+      for (const [name, width] of [["ID", "14%"], ["Sym", "14%"], ["Stage", "22%"], ["Reason", "50%"]]) {
+        const cell = make("th", "", name);
+        cell.style.width = width;
+        headerRow.append(cell);
+      }
+      head.append(headerRow);
+      table.append(head);
+      const body = make("tbody");
+      for (const rejection of visible) {
+        const row = make("tr");
+        const candidateId = rejection.candidate_index;
+        if (rejection === state.selectedRejection) row.classList.add("selected");
+        row.append(make("td", "", candidateId ?? "—"));
+        row.append(make("td", "", rejection.symmetry_index ?? "—"));
+        row.append(make("td", "stage-text", rejection.stage || "unknown"));
+        const reason = make("td", "reason", rejection.reason || "No reason recorded");
+        reason.title = rejection.reason || "";
+        row.append(reason);
+        if (Number.isInteger(candidateId)) {
+          row.addEventListener("click", () => {
+            state.selectedRejection = rejection;
+            renderHeader();
+            renderRejections();
+            renderCollisionEvidence();
+            if (state.runtimeScene) {
+              state.runtimeScene.setSelection({
+                candidateId: state.selectedCandidate,
+                rejection: state.selectedRejection,
+              });
+            }
+            drawScene();
+          });
+        }
+        body.append(row);
+      }
+      table.append(body);
+      root.append(table);
+    }
+
+    function selectedCollisionWitness() {
+      return state.selectedRejection?.collision_witness || null;
+    }
+
+    function selectCandidateRejection(candidateId) {
+      const rejections = state.bundle?.planning?.rejections || [];
+      state.selectedRejection = rejections.find(item =>
+        item.candidate_index === candidateId && item.collision_witness
+      ) || rejections.find(item => item.candidate_index === candidateId) || null;
+    }
+
+    function renderCollisionEvidence() {
+      const root = byId("collision-evidence");
+      clear(root);
+      const witness = selectedCollisionWitness();
+      if (!witness) {
+        root.append(make("div", "collision-card empty", "Select a rejection with structured collision evidence. New planning-only runs record capsule and nearest-point witnesses."));
+        return;
+      }
+      const card = make("div", "collision-card");
+      card.append(make("div", "collision-title", `${witness.kind || "collision"} · ${(witness.capsules || []).join(", ") || "unknown capsule"}`));
+      const metrics = make("div", "collision-metrics");
+      const items = [
+        ["distance", finiteNumber(witness.distance_m) ? `${(witness.distance_m * 1000).toFixed(1)} mm` : "—"],
+        ["threshold", finiteNumber(witness.threshold_m) ? `${(witness.threshold_m * 1000).toFixed(1)} mm` : "—"],
+        ["margin", finiteNumber(witness.clearance_margin_m) ? `${(witness.clearance_margin_m * 1000).toFixed(1)} mm` : "—"],
+        ["approach segment", witness.path_segment_index ?? "—"]
+      ];
+      for (const [label, value] of items) {
+        const item = make("div", "collision-metric");
+        item.append(make("span", "", label));
+        item.append(make("strong", label === "margin" && finiteNumber(witness.clearance_margin_m) && witness.clearance_margin_m <= 0 ? "unsafe" : "", value));
+        metrics.append(item);
+      }
+      card.append(metrics);
+      card.append(make("p", "collision-note", witness.replay_reason || "Offline collision replay witness."));
+      root.append(card);
+    }
+
+    function renderErrors() {
+      const root = byId("error-list");
+      clear(root);
+      const problems = (state.bundle.stages || []).filter(stage => stage.status !== "ok");
+      if (!problems.length) {
+        root.append(make("span", "all-clear", "All recorded gates passed."));
+        return;
+      }
+      for (const stage of problems) {
+        const code = stage.error?.code || String(stage.status || "ISSUE").toUpperCase();
+        const message = stage.error?.message || "No diagnostic message recorded.";
+        const chip = make("div", `error-chip ${stage.status === "blocked" ? "blocked" : ""}`, `${STAGE_LABELS[stage.name] || stage.name} · ${code} · ${message}`);
+        chip.title = `${stage.name}: ${message}`;
+        root.append(chip);
+      }
+    }
+
+    function runtimeRateHz() {
+      const samples = state.runtimeSamples;
+      if (samples.length < 2) return null;
+      const elapsed = (samples[samples.length - 1].receivedMs - samples[0].receivedMs) / 1000;
+      return elapsed > 0 ? (samples.length - 1) / elapsed : null;
+    }
+
+    function renderRuntimeStatus(runtime) {
+      state.runtime = runtime;
+      const status = runtime?.status || "offline";
+      const badge = byId("runtime-badge");
+      badge.className = `runtime-badge ${status}`;
+      const rate = runtimeRateHz();
+      badge.textContent = status === "live"
+        ? `LIVE${finiteNumber(rate) ? ` · ${rate.toFixed(1)} Hz` : ""}`
+        : status === "stale" ? "RUNTIME STALE" : "RUNTIME OFFLINE";
+      const grid = byId("runtime-grid");
+      clear(grid);
+      const telemetry = runtime?.telemetry || {};
+      const depthFilter = telemetry.depth_filter || {};
+      const depthReport = depthFilter.report || {};
+      const depthFilterFresh = depthFilter.available === true && depthFilter.fresh === true;
+      const depthFilterMode = {
+        warmup: "WARMING UP",
+        static_temporal: "STATIC / STABLE",
+        local_motion: "LOCAL MOTION",
+        camera_motion_reset: "CAMERA MOTION",
+      }[depthReport.mode] || "UNAVAILABLE";
+      const depthFilterValue = depthFilterFresh
+        ? `${depthFilterMode}${finiteNumber(depthReport.mad_p95_mm) ? ` · MAD95 ${depthReport.mad_p95_mm.toFixed(1)} mm` : ""}`
+        : "STALE";
+      const metrics = [
+        ["Joint feedback", runtime?.joint_state_available === true ? "20 Hz /piper/state" : "OFFLINE", runtime?.joint_state_available === true ? "safe" : "unsafe"],
+        ["RGB-D", telemetry.camera_rgbd_fresh === true ? "FRESH" : "STALE", telemetry.camera_rgbd_fresh === true ? "safe" : "unknown"],
+        ["Depth stabilization", depthFilterValue, depthFilterFresh ? "safe" : "unknown"],
+        ["Point clouds", telemetry.point_cloud_fresh === true ? "FRESH" : "STALE", telemetry.point_cloud_fresh === true ? "safe" : "unknown"],
+        ["Runtime sequence", Number.isInteger(runtime?.sequence) ? `#${runtime.sequence}` : "—", ""],
+      ];
+      for (const [label, value, className] of metrics) {
+        const item = make("div", "runtime-metric");
+        item.append(make("span", "", label));
+        item.append(make("strong", className, value));
+        grid.append(item);
+      }
+      const note = byId("runtime-note");
+      if (runtime?.error) {
+        note.textContent = `${runtime.error.code}: ${runtime.error.message}`;
+      } else {
+        const clouds = Object.values(runtime?.point_clouds || {}).reduce((sum, cloud) => sum + (cloud?.points_xyz_m?.length || 0), 0);
+        note.textContent = `Domain ${telemetry.ros_domain_id ?? 20} · ${clouds} transformed points · ${runtime?.robot_links?.length || 0} link frames · commands ${telemetry.motion_commands_published ?? 0}`;
+      }
+      renderTrajectoryStrip();
+      renderHomeStatus(state.home);
+      if (state.sessions) renderSessionStatus(state.sessions);
+    }
+
+    function runtimeRobotOverlay(runtime) {
+      const links = runtime?.robot_links;
+      const frame = state.bundle?.visualization?.frame;
+      if (!Array.isArray(links) || links.length < 2 || !frame) return null;
+      const joints = links.map(link => poseOrigin(link.transform)).filter(Boolean);
+      if (joints.length !== links.length) return null;
+      return {
+        frame,
+        links_xyz_m: joints.slice(1).map((point, index) => [joints[index], point]),
+        joints_xyz_m: joints,
+        joint_positions_rad: runtime.joint_positions_rad || [],
+        pose_source: "live_passive_can_fk"
+      };
+    }
+
+    function applyRuntimeScene(runtime) {
+      if (!state.runtimeScene || runtime?.status !== "live") return;
+      const update = {};
+      const robot = runtimeRobotOverlay(runtime);
+      if (robot) update.actualRobot = robot;
+      const clouds = runtime.point_clouds || {};
+      if (clouds.scene) update.sceneCloud = clouds.scene;
+      if (clouds.target) update.targetCloud = clouds.target;
+      state.runtimeScene.update(update);
+    }
+
+    function renderTrajectoryStrip() {
+      const root = byId("trajectory-strip");
+      clear(root);
+      const joints = state.runtime?.status === "live" && state.runtime?.joint_state_available === true
+        ? state.runtime.joint_positions_rad : null;
+      if (Array.isArray(joints) && joints.length === 6) {
+        root.append(make("strong", "", "Live joints"));
+        const ribbon = make("div", "joint-ribbon");
+        joints.forEach((value, index) => {
+          const tile = make("div", "joint-tile");
+          tile.append(make("span", "", `J${index + 1} actual`));
+          tile.append(make("strong", "", `${(value * 180 / Math.PI).toFixed(1)}°`));
+          const bar = make("i", "joint-bar");
+          bar.style.width = `${Math.min(100, Math.abs(value) / Math.PI * 100).toFixed(1)}%`;
+          tile.append(bar);
+          ribbon.append(tile);
+        });
+        root.append(ribbon);
+      }
+      const segments = state.bundle.selected_plan?.segments || state.bundle.visualization?.joint_trajectory;
+      if (!segments || !state.calibrationValid) {
+        if (!joints) root.append(make("span", "", state.calibrationValid ? "No selected trajectory artifact." : "Base-frame trajectory hidden until calibration and frame transform pass."));
+        return;
+      }
+      root.append(make("strong", "", "Recorded waypoints"));
+      const colors = { transit: "var(--blue)", approach: "var(--amber)", lift: "var(--green)" };
+      for (const name of ["transit", "approach", "lift"]) {
+        const segment = segments[name];
+        const item = make("span", "segment-key");
+        item.style.color = colors[name];
+        item.append(make("i", "segment-line"));
+        const duration = finiteNumber(segment?.duration_s) ? ` · ${segment.duration_s.toFixed(2)} s` : "";
+        item.append(make("span", "", `${name} ${segment?.source_waypoint_count ?? 0}${duration}`));
+        root.append(item);
+      }
+      root.append(make("span", "", "Joint-space only; 3D path appears when Cartesian debug samples exist."));
+    }
+
+    function worldToView(point, center, scale, width, height) {
+      const orbit = state.orbit;
+      const x = point[0] - center[0];
+      const y = point[1] - center[1];
+      const z = point[2] - center[2];
+      const cy = Math.cos(orbit.yaw), sy = Math.sin(orbit.yaw);
+      const cp = Math.cos(orbit.pitch), sp = Math.sin(orbit.pitch);
+      const x1 = cy * x - sy * z;
+      const z1 = sy * x + cy * z;
+      const y2 = cp * y - sp * z1;
+      const z2 = sp * y + cp * z1;
+      return {
+        x: width * .5 + orbit.panX + x1 * scale * orbit.zoom,
+        y: height * .5 + orbit.panY - y2 * scale * orbit.zoom,
+        z: z2
+      };
+    }
+
+    function validPoint(value) {
+      return Array.isArray(value) && value.length >= 3 && value.slice(0, 3).every(finiteNumber);
+    }
+
+    function poseOrigin(pose) {
+      return Array.isArray(pose) && pose.length === 4 && pose.every(row => Array.isArray(row) && row.length === 4)
+        ? [pose[0][3], pose[1][3], pose[2][3]] : null;
+    }
+
+    function sourceCandidateAxes() {
+      return (state.bundle?.candidates || []).map(candidate => ({
+        candidate_id: candidate.candidate_id,
+        rank: candidate.rank,
+        status: candidate.status,
+        pose: candidate.pose_source,
+        frame: candidate.source_frame
+      }));
+    }
+
+    function visibleCandidateAxes() {
+      const axes = !state.calibrationValid
+        ? sourceCandidateAxes()
+        : state.bundle.visualization?.candidate_axes || [];
+      if (state.showAllCandidates) return axes;
+      return axes.filter(item => item.candidate_id === state.selectedCandidate);
+    }
+
+    function renderCandidateControls() {
+      const select = byId("candidate-selector");
+      clear(select);
+      const candidates = [...(state.bundle?.candidates || [])].sort((left, right) => left.rank - right.rank);
+      const noFeasibleCandidate = state.bundle?.planning?.available === true
+        && state.bundle?.planning?.plan_valid !== true;
+      const placeholder = make(
+        "option",
+        "",
+        noFeasibleCandidate ? "No feasible candidate" : "Select candidate",
+      );
+      placeholder.value = "";
+      placeholder.selected = state.selectedCandidate === null;
+      select.append(placeholder);
+      for (const candidate of candidates) {
+        const status = candidate.status && candidate.status !== "unevaluated" ? ` · ${candidate.status}` : "";
+        const option = make("option", "", `#${candidate.candidate_id} · rank ${candidate.rank}${status}`);
+        option.value = String(candidate.candidate_id);
+        select.append(option);
+      }
+      // Rejected candidates are diagnostic witnesses, not selected plans.  On a
+      // failed run they are only activated from the rejection disclosure.
+      select.disabled = !candidates.length || noFeasibleCandidate;
+      if (state.selectedCandidate !== null) select.value = String(state.selectedCandidate);
+      byId("show-all-candidates").checked = state.showAllCandidates;
+    }
+
+    function drawLine(context, a, b, color, width) {
+      context.beginPath();
+      context.moveTo(a.x, a.y);
+      context.lineTo(b.x, b.y);
+      context.strokeStyle = color;
+      context.lineWidth = width;
+      context.stroke();
+    }
+
+    function drawRobotOverlay(context, project) {
+      // This function is called only behind the measured calibration gate.
+      const overlay = state.bundle.visualization?.robot_overlay;
+      if (!overlay || !Array.isArray(overlay.links_xyz_m)) return;
+      for (const link of overlay.links_xyz_m) {
+        if (!Array.isArray(link) || link.length !== 2 || !validPoint(link[0]) || !validPoint(link[1])) continue;
+        drawLine(context, project(link[0]), project(link[1]), "#d5dce0", 4);
+      }
+    }
+
+    function drawReferenceAxes(context, project, span) {
+      const axes = state.bundle.visualization?.reference_axes || [];
+      const colors = ["#ff6673", "#54d68c", "#659cff"];
+      for (const item of axes) {
+        if (item.frame !== state.bundle.visualization?.frame) continue;
+        const origin = poseOrigin(item.pose);
+        if (!origin) continue;
+        for (let column = 0; column < 3; column += 1) {
+          const direction = [item.pose[0][column], item.pose[1][column], item.pose[2][column]];
+          const end = origin.map((value, axis) => value + direction[axis] * span * .055);
+          drawLine(context, project(origin), project(end), colors[column], item.name === "base" ? 2.4 : 1.6);
+        }
+        const screen = project(origin);
+        context.fillStyle = item.name === "base" ? "#ffffff" : "#b899ff";
+        context.font = "10px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+        context.fillText(item.name, screen.x + 6, screen.y - 6);
+      }
+    }
+
+    function drawCollisionWitness(context, project) {
+      const witness = selectedCollisionWitness();
+      if (!witness || witness.frame !== state.bundle.visualization?.frame) return;
+      const start = witness.capsule_start_base;
+      const end = witness.capsule_end_base;
+      const scenePoint = witness.witness_scene_point_base;
+      const capsulePoint = witness.witness_capsule_point_base;
+      if (![start, end, scenePoint, capsulePoint].every(validPoint)) return;
+      drawLine(context, project(start), project(end), "#f0b758", 7);
+      drawLine(context, project(capsulePoint), project(scenePoint), "#ff6673", 2.5);
+      for (const [point, color, radius] of [[scenePoint, "#ff6673", 5], [capsulePoint, "#ffffff", 4]]) {
+        const screen = project(point);
+        context.beginPath();
+        context.arc(screen.x, screen.y, radius, 0, Math.PI * 2);
+        context.fillStyle = color;
+        context.fill();
+      }
+      const sceneScreen = project(scenePoint);
+      const capsuleScreen = project(capsulePoint);
+      context.font = "10px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+      context.fillStyle = "#ff6673";
+      context.fillText("scene nearest", sceneScreen.x + 7, sceneScreen.y - 7);
+      context.fillStyle = "#f0b758";
+      context.fillText("capsule nearest", capsuleScreen.x + 7, capsuleScreen.y + 12);
+      const pregrasp = poseOrigin(witness.pregrasp_pose_base);
+      const grasp = poseOrigin(witness.grasp_pose_base);
+      if (pregrasp && grasp) drawLine(context, project(pregrasp), project(grasp), "#f0b758", 2.5);
+    }
+
+    function drawCartesianTrajectory(context, project) {
+      // Joint-space arrays are never guessed into Cartesian space.
+      const path = state.bundle.visualization?.trajectory_xyz_m;
+      if (!Array.isArray(path)) return;
+      const colors = { transit: "#659cff", approach: "#f0b758", lift: "#54d68c" };
+      for (const name of Object.keys(colors)) {
+        const points = path[name];
+        if (!Array.isArray(points)) continue;
+        for (let index = 1; index < points.length; index += 1) {
+          if (validPoint(points[index - 1]) && validPoint(points[index])) {
+            drawLine(context, project(points[index - 1]), project(points[index]), colors[name], 2.5);
+          }
+        }
+      }
+    }
+
+    function drawLegacyScene() {
+      const canvas = byId("scene-canvas");
+      const rect = canvas.getBoundingClientRect();
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = Math.max(1, Math.round(rect.width));
+      const height = Math.max(1, Math.round(rect.height));
+      if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+        canvas.width = Math.round(width * ratio);
+        canvas.height = Math.round(height * ratio);
+      }
+      const context = canvas.getContext("2d");
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, width, height);
+      context.fillStyle = "#070b0e";
+      context.fillRect(0, 0, width, height);
+
+      const visualization = state.bundle?.visualization || {};
+      const displayFrame = visualization.frame;
+      const sceneCloud = visualization.scene_cloud;
+      const targetCloud = visualization.target_cloud;
+      const scene = sceneCloud?.frame === displayFrame ? (sceneCloud.points_xyz_m || []).filter(validPoint) : [];
+      const target = targetCloud?.frame === displayFrame ? (targetCloud.points_xyz_m || []).filter(validPoint) : [];
+      const axes = visibleCandidateAxes();
+      const consistentAxes = axes.filter(item => item.frame === displayFrame);
+      const origins = consistentAxes.map(item => poseOrigin(item.pose)).filter(Boolean);
+      const robotPoints = (visualization.robot_overlay?.frame === displayFrame ? visualization.robot_overlay?.links_xyz_m || [] : []).flat().filter(validPoint);
+      const referenceOrigins = (visualization.reference_axes || []).filter(item => item.frame === displayFrame).map(item => poseOrigin(item.pose)).filter(Boolean);
+      const witness = selectedCollisionWitness();
+      const witnessPoints = witness?.frame === displayFrame
+        ? [witness.capsule_start_base, witness.capsule_end_base, witness.witness_scene_point_base, witness.witness_capsule_point_base].filter(validPoint)
+        : [];
+      const all = [...scene, ...target, ...origins, ...robotPoints, ...referenceOrigins, ...witnessPoints];
+      if (!all.length) {
+        context.fillStyle = "#8fa0a8";
+        context.font = "12px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+        context.textAlign = "center";
+        context.fillText("No point-cloud or grasp geometry in this bundle", width / 2, height / 2);
+        return;
+      }
+      const low = [Infinity, Infinity, Infinity];
+      const high = [-Infinity, -Infinity, -Infinity];
+      for (const point of all) {
+        for (let axis = 0; axis < 3; axis += 1) {
+          low[axis] = Math.min(low[axis], point[axis]);
+          high[axis] = Math.max(high[axis], point[axis]);
+        }
+      }
+      const center = low.map((value, axis) => (value + high[axis]) / 2);
+      const span = Math.max(...low.map((value, axis) => high[axis] - value), .08);
+      const scale = Math.min(width, height) * .72 / span;
+      const project = point => worldToView(point, center, scale, width, height);
+
+      const points = [];
+      for (const point of scene) points.push({ point, color: "#64737b", radius: 1.15 });
+      for (const point of target) points.push({ point, color: "#48d7de", radius: 1.75 });
+      points.sort((a, b) => project(a.point).z - project(b.point).z);
+      for (const item of points) {
+        const screen = project(item.point);
+        context.beginPath();
+        context.arc(screen.x, screen.y, item.radius, 0, Math.PI * 2);
+        context.fillStyle = item.color;
+        context.globalAlpha = item.radius > 1.5 ? .88 : .48;
+        context.fill();
+      }
+      context.globalAlpha = 1;
+
+      const axisColors = ["#ff6673", "#54d68c", "#659cff"];
+      for (const item of consistentAxes) {
+        const pose = item.pose;
+        const origin = poseOrigin(pose);
+        if (!origin) continue;
+        const selected = item.candidate_id === state.selectedCandidate || item.status === "selected";
+        const length = span * (selected ? .075 : .048);
+        for (let column = 0; column < 3; column += 1) {
+          const direction = [pose[0][column], pose[1][column], pose[2][column]];
+          if (!direction.every(finiteNumber)) continue;
+          const end = origin.map((value, axis) => value + direction[axis] * length);
+          drawLine(context, project(origin), project(end), axisColors[column], selected ? 2.7 : 1.25);
+        }
+        if (selected) {
+          const screen = project(origin);
+          context.beginPath();
+          context.arc(screen.x, screen.y, 5, 0, Math.PI * 2);
+          context.strokeStyle = "#ffffff";
+          context.lineWidth = 1.5;
+          context.stroke();
+        }
+      }
+
+      if (state.calibrationValid) {
+        drawRobotOverlay(context, project);
+        drawReferenceAxes(context, project, span);
+        drawCartesianTrajectory(context, project);
+        drawCollisionWitness(context, project);
+      }
+
+      context.strokeStyle = "#243139";
+      context.lineWidth = 1;
+      context.strokeRect(.5, .5, width - 1, height - 1);
+    }
+
+    function ensureRuntimeScene() {
+      if (state.runtimeScene || !window.ZManipScene) return state.runtimeScene;
+      state.runtimeScene = window.ZManipScene.create(byId("scene-canvas"), {
+        maxFps: 30,
+        maxCloudPoints: 5000,
+        showAllCandidates: state.showAllCandidates,
+        onDiagnostic: diagnostic => console.warn("ZManipScene", diagnostic)
+      });
+      if (state.bundle) state.runtimeScene.setBundle(state.bundle);
+      return state.runtimeScene;
+    }
+
+    function drawScene() {
+      const scene = ensureRuntimeScene();
+      if (!scene) {
+        drawLegacyScene();
+        return;
+      }
+      scene.options.showAllCandidates = state.showAllCandidates;
+      scene.setSelection({ candidateId: state.selectedCandidate, rejection: state.selectedRejection });
+      applyRuntimeScene(state.runtime);
+      scene.flush();
+    }
+
+    function bindCanvasControls() {
+      const canvas = byId("scene-canvas");
+      byId("reset-view").addEventListener("click", () => {
+        const scene = ensureRuntimeScene();
+        if (scene) scene.resetView();
+        else {
+          state.orbit = { yaw: -0.72, pitch: -0.46, zoom: 1, panX: 0, panY: 0 };
+          drawLegacyScene();
+        }
+      });
+      byId("candidate-selector").addEventListener("change", event => {
+        state.selectedCandidate = Number.parseInt(event.target.value, 10);
+        selectCandidateRejection(state.selectedCandidate);
+        renderHeader();
+        renderRejections();
+        renderCollisionEvidence();
+        if (state.runtimeScene) state.runtimeScene.setSelection({ candidateId: state.selectedCandidate, rejection: state.selectedRejection });
+        drawScene();
+      });
+      byId("show-all-candidates").addEventListener("change", event => {
+        state.showAllCandidates = event.target.checked;
+        if (state.runtimeScene) state.runtimeScene.options.showAllCandidates = state.showAllCandidates;
+        drawScene();
+      });
+      if (!window.ZManipScene) {
+        canvas.addEventListener("pointerdown", event => {
+          canvas.setPointerCapture(event.pointerId);
+          state.drag = { x: event.clientX, y: event.clientY, button: event.button };
+          canvas.classList.add("dragging");
+        });
+        canvas.addEventListener("pointermove", event => {
+          if (!state.drag) return;
+          const dx = event.clientX - state.drag.x;
+          const dy = event.clientY - state.drag.y;
+          state.drag.x = event.clientX;
+          state.drag.y = event.clientY;
+          if (event.shiftKey || state.drag.button === 1) {
+            state.orbit.panX += dx;
+            state.orbit.panY += dy;
+          } else {
+            state.orbit.yaw += dx * .008;
+            state.orbit.pitch = Math.max(-1.45, Math.min(1.45, state.orbit.pitch + dy * .008));
+          }
+          drawLegacyScene();
+        });
+        const stopDrag = () => { state.drag = null; canvas.classList.remove("dragging"); };
+        canvas.addEventListener("pointerup", stopDrag);
+        canvas.addEventListener("pointercancel", stopDrag);
+        canvas.addEventListener("wheel", event => {
+          event.preventDefault();
+          state.orbit.zoom = Math.max(.25, Math.min(8, state.orbit.zoom * Math.exp(-event.deltaY * .001)));
+          drawLegacyScene();
+        }, { passive: false });
+        new ResizeObserver(drawLegacyScene).observe(canvas.parentElement);
+      }
+    }
+
+    function bindRejectionControls() {
+      byId("rejection-stage-filter").addEventListener("change", event => {
+        state.rejectionStage = event.target.value;
+        renderRejections();
+      });
+      byId("rejection-candidate-filter").addEventListener("change", event => {
+        state.rejectionCandidate = event.target.value;
+        renderRejections();
+      });
+    }
+
+    function renderControl(control) {
+      state.control = control;
+      const button = byId("run-planning");
+      const status = byId("run-state");
+      const available = control.available === true;
+      button.disabled = !available || control.running === true;
+      button.textContent = control.running ? "Running…" : "Run planning-only";
+      const outcome = control.outcome || (control.running ? "running" : "idle");
+      status.className = `run-state ${outcome}`;
+      if (!available) status.textContent = "control unavailable";
+      else if (control.running) status.textContent = "pipeline running";
+      else if (control.outcome === "passed") status.textContent = "last run passed";
+      else if (
+        control.outcome === "blocked"
+        && control.latest_bundle_available === true
+        && control.latest_attempt_bundle_available === true
+        && control.latest_bundle !== control.latest_attempt_bundle
+      ) status.textContent = "latest attempt blocked · showing last good";
+      else if (control.outcome === "blocked") status.textContent = "last run blocked safely";
+      else if (control.outcome === "controller_error") status.textContent = "controller error";
+      else status.textContent = "ready";
+      status.title = control.message || control.log_tail || "";
+    }
+
+    function scheduleControlPoll(delayMs) {
+      if (state.controlTimer !== null) window.clearTimeout(state.controlTimer);
+      state.controlTimer = window.setTimeout(refreshControl, delayMs);
+    }
+
+    async function refreshControl() {
+      const previous = state.control;
+      try {
+        const response = await fetch("/api/control", { cache: "no-store", credentials: "same-origin" });
+        if (response.status === 404) {
+          renderControl({ available: false, running: false, state: "unavailable", revision: null });
+          scheduleControlPoll(5000);
+          return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const control = await response.json();
+        renderControl(control);
+        if (previous.running === true && control.running !== true) await loadBundle();
+        scheduleControlPoll(control.running ? 1000 : 3000);
+      } catch (error) {
+        renderControl({ available: false, running: false, state: "error", outcome: "controller_error", message: String(error) });
+        scheduleControlPoll(5000);
+      }
+    }
+
+    function scheduleRuntimePoll(delayMs) {
+      if (state.runtimeTimer !== null) window.clearTimeout(state.runtimeTimer);
+      state.runtimeTimer = window.setTimeout(refreshRuntime, delayMs);
+    }
+
+    function renderCameraState(status, detail = "") {
+      const normalized = ["live", "stale", "offline", "invalid"].includes(status) ? status : "offline";
+      const badge = byId("camera-state");
+      badge.className = `camera-state ${normalized}`;
+      badge.textContent = normalized.toUpperCase();
+      badge.title = detail;
+      const placeholder = byId("camera-placeholder");
+      if (!state.cameraHasFrame) {
+        placeholder.hidden = false;
+        placeholder.textContent = normalized === "live"
+          ? "Loading the latest D435 RGB frame."
+          : detail || "Waiting for the subscribe-only camera observer.";
+      }
+    }
+
+    function scheduleCameraPoll(delayMs) {
+      if (state.cameraTimer !== null) window.clearTimeout(state.cameraTimer);
+      state.cameraTimer = window.setTimeout(refreshCamera, delayMs);
+    }
+
+    function readBlobAsDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.addEventListener("load", () => resolve(reader.result), { once: true });
+        reader.addEventListener("error", () => reject(reader.error || new Error("camera frame decode failed")), { once: true });
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    async function refreshCamera() {
+      try {
+        const headers = {};
+        if (state.cameraEtag) headers["If-None-Match"] = state.cameraEtag;
+        const response = await fetch("/api/camera/latest.jpg", {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers
+        });
+        const suggested = Number.parseInt(response.headers.get("X-Z-Manip-Poll-Interval-Ms") || "200", 10);
+        const delay = Number.isFinite(suggested) ? Math.max(200, suggested) : 200;
+        if (response.status === 304) {
+          renderCameraState("live", `latest frame age ${response.headers.get("X-Z-Manip-Camera-Age-Ms") || "0"} ms`);
+          scheduleCameraPoll(delay);
+          return;
+        }
+        if (!response.ok) {
+          const cameraState = response.headers.get("X-Z-Manip-Camera-State") || (response.status === 503 ? "stale" : "offline");
+          renderCameraState(cameraState, `camera endpoint HTTP ${response.status}`);
+          scheduleCameraPoll(cameraState === "stale" ? delay : 500);
+          return;
+        }
+        if (!(response.headers.get("Content-Type") || "").startsWith("image/jpeg")) {
+          throw new Error("camera endpoint returned a non-JPEG response");
+        }
+        state.cameraEtag = response.headers.get("ETag");
+        const dataUrl = await readBlobAsDataUrl(await response.blob());
+        const image = byId("camera-image");
+        image.src = dataUrl;
+        image.hidden = false;
+        byId("camera-placeholder").hidden = true;
+        state.cameraHasFrame = true;
+        renderCameraState("live", `latest frame age ${response.headers.get("X-Z-Manip-Camera-Age-Ms") || "0"} ms`);
+        scheduleCameraPoll(delay);
+      } catch (error) {
+        renderCameraState("offline", String(error));
+        scheduleCameraPoll(1000);
+      }
+    }
+
+    async function refreshRuntime() {
+      try {
+        const headers = {};
+        if (state.runtimeEtag) headers["If-None-Match"] = state.runtimeEtag;
+        const response = await fetch("/api/runtime", {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers
+        });
+        const suggested = Number.parseInt(response.headers.get("X-Z-Manip-Poll-Interval-Ms") || "200", 10);
+        if (response.status === 304) {
+          scheduleRuntimePoll(Number.isFinite(suggested) ? Math.max(200, suggested) : 200);
+          return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        state.runtimeEtag = response.headers.get("ETag");
+        const runtime = await response.json();
+        const previousSequence = state.runtime?.sequence;
+        if (Number.isInteger(runtime.sequence) && runtime.sequence !== previousSequence) {
+          state.runtimeSamples.push({ sequence: runtime.sequence, receivedMs: performance.now() });
+          state.runtimeSamples = state.runtimeSamples.filter(item => performance.now() - item.receivedMs <= 3000).slice(-40);
+        }
+        renderRuntimeStatus(runtime);
+        applyRuntimeScene(runtime);
+        scheduleRuntimePoll(Number.isFinite(suggested) ? Math.max(200, suggested) : 200);
+      } catch (error) {
+        renderRuntimeStatus({
+          schema: "z_manip.runtime_state.v1",
+          status: "offline",
+          error: { code: "RUNTIME_API_UNAVAILABLE", message: String(error) }
+        });
+        scheduleRuntimePoll(1000);
+      }
+    }
+
+    function runtimeHomeErrorRad() {
+      const joints = state.runtime?.status === "live" && state.runtime?.joint_state_available === true
+        ? state.runtime.joint_positions_rad : null;
+      if (!Array.isArray(joints) || joints.length !== HOME_JOINTS_RAD.length) return null;
+      return Math.max(...joints.map((value, index) => Math.abs(value - HOME_JOINTS_RAD[index])));
+    }
+
+    function selectedSpeedPercent() {
+      const input = byId("motion-speed");
+      const speed = Number.parseInt(input.value, 10);
+      return Number.isInteger(speed) && speed >= 1 && speed <= 50 ? speed : null;
+    }
+
+    function renderHomeStatus(home = state.home) {
+      state.home = home || state.home;
+      const button = byId("session-go-home");
+      const status = byId("home-session-state");
+      const error = runtimeHomeErrorRad();
+      const liveAtHome = finiteNumber(error) && error <= HOME_TOLERANCE_RAD;
+      const running = state.home?.running === true;
+      const speed = selectedSpeedPercent();
+      // Home is the recovery boundary, so a wedged read-only perception or
+      // planning action must never disable it. A genuinely active actuator
+      // action remains mutually exclusive with Home.
+      button.disabled = running || state.grasp?.running === true || state.approach?.running === true || speed === null;
+      button.textContent = running ? "Resetting + Returning Home…" : liveAtHome ? "Reset + Recheck Home" : `Reset + Home · ${speed || "—"}%`;
+      byId("home-selection").textContent = liveAtHome
+        ? `HOME · ${(error * 180 / Math.PI).toFixed(3)}° max error`
+        : `fixed pose · ${speed || "—"}% speed`;
+      status.className = `session-state ${running ? "running" : liveAtHome ? "passed" : state.home?.outcome || ""}`;
+      status.textContent = running
+        ? "Resetting if required, enabling torque, holding the arm, and moving through ≤5° joint steps…"
+        : liveAtHome
+          ? "Home verified from live passive joint feedback. Old tasks, locks, and display context are cleared."
+          : state.home?.message || "Reset stale task state and return Home before starting a new cycle.";
+    }
+
+    function scheduleHomePoll(delayMs) {
+      if (state.homeTimer !== null) window.clearTimeout(state.homeTimer);
+      state.homeTimer = window.setTimeout(refreshHomeStatus, delayMs);
+    }
+
+    async function refreshHomeStatus() {
+      try {
+        const response = await fetch("/api/home/status", { cache: "no-store", credentials: "same-origin" });
+        if (response.status === 404) {
+          renderHomeStatus({ available: false, running: false, at_home: null, outcome: "blocked", message: "Home control API is not enabled." });
+          byId("session-go-home").disabled = true;
+          scheduleHomePoll(3000);
+          return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const home = await response.json();
+        renderHomeStatus(home);
+        renderSessionStatus(state.sessions || { busy: false, actions: {} });
+        scheduleHomePoll(home.running ? 250 : 1000);
+      } catch (error) {
+        renderHomeStatus({ available: false, running: false, at_home: null, outcome: "blocked", message: String(error) });
+        scheduleHomePoll(2000);
+      }
+    }
+
+    async function startHomeAction() {
+      renderHomeStatus({ ...state.home, running: true, message: "Clearing stale task state and starting fixed Home recovery…" });
+      try {
+        const response = await fetch("/api/home", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Z-Manip-Action": "home" },
+          body: JSON.stringify({ speed_percent: selectedSpeedPercent() })
+        });
+        const result = await response.json();
+        if (!response.ok && response.status !== 409) throw new Error(result.error?.message || `HTTP ${response.status}`);
+        renderHomeStatus(result.home || state.home);
+        scheduleHomePoll(100);
+      } catch (error) {
+        renderHomeStatus({ ...state.home, running: false, outcome: "blocked", message: String(error) });
+        scheduleHomePoll(1500);
+      }
+    }
+
+    function renderApproachStatus(approach = state.approach) {
+      state.approach = approach || state.approach;
+      state.approachWorkflow = state.approach?.workflow?.active ? state.approach.workflow : null;
+      const running = state.approach?.running === true;
+      const runtime = state.approach?.runtime || {};
+      const output = runtime.output || {};
+      const target = runtime.target;
+      const search = state.approach?.wrist_search || {};
+      const workflowPhase = String(state.approachWorkflow?.phase || state.approach?.phase || runtime.phase || "idle");
+      const otherBusy = state.sessions?.busy === true
+        || state.home?.running === true
+        || state.grasp?.running === true;
+      const canStart = state.approach?.available !== false
+        && state.taskContextActive
+        && !running
+        && !otherBusy;
+      const targetDescription = byId("perception-target").value.trim();
+      const canAutoStart = state.approach?.available !== false
+        && targetDescription.length >= 1
+        && targetDescription.length <= 160
+        && !running
+        && !otherBusy;
+      byId("approach-auto").disabled = !canAutoStart;
+      byId("approach-shadow").disabled = !canStart;
+      // Full Stop is a recovery control, not a normal workflow action. Keep
+      // it available when browser and server state disagree about liveness.
+      byId("approach-stop").disabled = state.approach?.available === false;
+      byId("approach-shadow").textContent = running && state.approach?.mode === "shadow" ? "Shadow running…" : "Start shadow";
+      byId("approach-auto").textContent = state.approachWorkflow?.active
+        ? `${state.approachWorkflow.phase.replaceAll("_", " ")}…`
+        : "Find → approach → grasp";
+      const status = byId("approach-session-state");
+      status.className = `session-state ${running ? "running" : runtime.phase === "reached" ? "succeeded" : ""}`;
+      status.textContent = running
+        ? `${state.approach.mode} · ${runtime.phase || state.approach.phase || "starting"}`
+        : state.approach?.message || (
+        !state.taskContextActive
+          ? "Approach + grasp will run the initial perception automatically."
+          : "Target ready. Start Shadow first, then use Live when its command direction looks correct."
+        );
+      byId("approach-target").textContent = target && finiteNumber(target.x_m) && finiteNumber(target.z_m)
+        ? `${target.x_m.toFixed(3)} / ${target.z_m.toFixed(3)} m`
+        : "—";
+      byId("approach-errors").textContent = finiteNumber(output.depth_error_m) && finiteNumber(output.yaw_error_rad)
+        ? `${output.depth_error_m.toFixed(3)} m / ${(output.yaw_error_rad * 180 / Math.PI).toFixed(1)}°`
+        : "—";
+      byId("approach-command").textContent = finiteNumber(output.proposed_linear_x) && finiteNumber(output.proposed_angular_z)
+        ? `${output.proposed_linear_x.toFixed(3)} m/s / ${output.proposed_angular_z.toFixed(3)} rad/s`
+        : "—";
+      const confidence = finiteNumber(search.confidence) ? `${(search.confidence * 100).toFixed(0)}%` : "—";
+      const view = Number.isInteger(search.view_index) ? `${search.view_index + 1}/${search.view_count || "?"}` : "—";
+      byId("approach-search").textContent = search.live_enabled === false
+        ? `LIVE LOCKED · ${search.phase || "idle"} · view ${view} · conf ${confidence}`
+        : `${search.phase || "idle"} · view ${view} · conf ${confidence}`;
+      const phaseOrder = ["detect", "search", "track", "approach", "settle", "grasp"];
+      const phaseAliases = {
+        detecting: "detect", wrist_search: "search", shadow_view: "search", move: "search", observe: "search",
+        seeding_tracker: "track", waiting_for_track: "track", reacquiring: "track",
+        align: "approach", approach: "approach", approaching: "approach",
+        reached: "settle", handoff_to_grasp: "settle", grasp_started: "grasp"
+      };
+      const activePhase = phaseAliases[workflowPhase] || null;
+      const activeIndex = activePhase ? phaseOrder.indexOf(activePhase) : -1;
+      document.querySelectorAll("[data-approach-phase]").forEach(node => {
+        const index = phaseOrder.indexOf(node.dataset.approachPhase);
+        node.className = `approach-phase ${index < activeIndex ? "complete" : index === activeIndex ? "active" : ""}`;
+      });
+    }
+
+    function scheduleApproachPoll(delayMs) {
+      if (state.approachTimer !== null) window.clearTimeout(state.approachTimer);
+      state.approachTimer = window.setTimeout(refreshApproachStatus, delayMs);
+    }
+
+    async function refreshApproachStatus() {
+      try {
+        const response = await fetch("/api/approach/status", { cache: "no-store", credentials: "same-origin" });
+        if (response.status === 404) {
+          renderApproachStatus({ available: false, running: false, phase: "unavailable", message: "Depth visual approach API is not enabled." });
+          scheduleApproachPoll(3000);
+          return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const approach = await response.json();
+        renderApproachStatus(approach);
+        renderSessionStatus(state.sessions || { busy: false, actions: {} });
+        scheduleApproachPoll(approach.running ? 500 : 1000);
+      } catch (error) {
+        renderApproachStatus({ available: false, running: false, phase: "offline", message: String(error), runtime: {} });
+        scheduleApproachPoll(2000);
+      }
+    }
+
+    async function startApproach(mode, requireConfirmation = true, options = {}) {
+      if (mode === "live" && requireConfirmation && !window.confirm(
+        "Start live Go2W approach?\n\nThe robot will coarsely align and drive forward. It hands off at 0.52 m or closer when the target is within 20°; exact centering is intentionally not required for the legged base. Keep the path clear and keep Full stop / the physical emergency stop within reach."
+      )) return;
+      renderApproachStatus({ ...state.approach, running: true, mode, phase: "starting", message: `Starting ${mode} depth approach…` });
+      try {
+        const response = await fetch("/api/approach/start", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Z-Manip-Action": "approach-start" },
+          body: JSON.stringify({ mode, ...options })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error?.message || result.approach?.message || `HTTP ${response.status}`);
+        renderApproachStatus(result.approach || state.approach);
+        scheduleApproachPoll(100);
+        return true;
+      } catch (error) {
+        renderApproachStatus({ ...state.approach, running: false, phase: "blocked", message: String(error) });
+        scheduleApproachPoll(1500);
+        return false;
+      }
+    }
+
+    async function stopApproach({ preserveWorkflow = false } = {}) {
+      if (!preserveWorkflow) {
+        state.approachWorkflow = null;
+        state.interactivePerceptionId = null;
+        state.interactivePlanningId = null;
+        state.taskContextActive = false;
+      }
+      byId("approach-stop").disabled = true;
+      renderApproachStatus({
+        ...state.approach,
+        running: false,
+        phase: "stopping",
+        message: "FULL STOP: commanding zero velocity, stopping visual servo, and clearing the approach task…"
+      });
+      try {
+        const response = await fetch("/api/approach/stop", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Z-Manip-Action": "approach-stop" },
+          body: "{}"
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error?.message || `HTTP ${response.status}`);
+        const stopped = result.approach || state.approach;
+        renderApproachStatus({
+          ...stopped,
+          running: false,
+          phase: "stopped",
+          message: preserveWorkflow
+            ? "Base stopped at the grasp handoff distance."
+            : "FULL STOP complete: base is zeroed and the approach task was cleared."
+        });
+      } catch (error) {
+        renderApproachStatus({ ...state.approach, running: false, phase: "error", message: String(error) });
+      }
+      scheduleApproachPoll(200);
+    }
+
+    async function startApproachAndGrasp() {
+      const target = byId("perception-target").value.trim();
+      if (target.length < 1 || target.length > 160) return;
+      if (!window.confirm(
+        `Approach and grasp “${target}”?\n\nThe Go2W will detect, coarsely align, and enter the close-range handoff zone (≤0.52 m, target within 20°). It then stops and runs fresh perception, IK, planning, and grasp; exact base orientation is intentionally left to the arm stage. Keep Full stop and the physical emergency stop within reach.`
+      )) return;
+      state.approachWorkflow = { active: true, phase: "detecting", target };
+      renderApproachStatus(state.approach);
+      const speed = selectedSpeedPercent() || 5;
+      if (!await startApproach("live", false, {
+        target,
+        acquire_target: true,
+        auto_handoff: true,
+        operator_present: true,
+        speed_percent: speed
+      })) state.approachWorkflow = null;
+    }
+
+    function renderGraspStatus(grasp = state.grasp) {
+      state.grasp = grasp || state.grasp;
+      const freshButton = byId("session-perform-grasp");
+      const directButton = byId("session-perform-selected");
+      const status = byId("grasp-session-state");
+      const homeError = runtimeHomeErrorRad();
+      const atHome = finiteNumber(homeError) && homeError <= HOME_TOLERANCE_RAD;
+      const sessionsBusy = state.sessions?.busy === true;
+      const selectedId = state.sessions?.selected_perception_session_id || null;
+      const selectedPlan = state.sessions?.actions?.planning?.last_good || null;
+      const selectedPlanReady = selectedPlan?.status === "succeeded"
+        && selectedPlan?.selected_perception_session_id === selectedId;
+      const running = state.grasp?.running === true;
+      const target = byId("perception-target").value.trim();
+      const targetReady = target.length >= 1 && target.length <= 160;
+      const sessionFinishedMs = [
+        state.sessions?.actions?.perception?.latest_attempt?.finished_at,
+        state.sessions?.actions?.planning?.latest_attempt?.finished_at
+      ].map(value => Date.parse(value || "")).filter(Number.isFinite).reduce((latest, value) => Math.max(latest, value), 0);
+      const graspFinishedMs = finiteNumber(state.grasp?.finished_unix_ns)
+        ? state.grasp.finished_unix_ns / 1e6
+        : 0;
+      const graspResultIsCurrent = running || sessionFinishedMs === 0 || graspFinishedMs >= sessionFinishedMs;
+      const speed = selectedSpeedPercent();
+      const apiAvailable = state.grasp?.available !== false;
+      const actionBusy = !apiAvailable || running || sessionsBusy || state.home?.running === true || state.approach?.running === true || speed === null;
+      const workflow = state.grasp?.workflow || {};
+      const workflowPhase = workflow.phase || "ready_at_home";
+      // Fresh execution owns the Home transition itself.  Direct execution
+      // starts from an already-planned Home trajectory and must stay gated.
+      freshButton.disabled = actionBusy || !targetReady;
+      directButton.disabled = actionBusy || !atHome || !selectedPlanReady;
+      freshButton.textContent = running
+        ? `${String(state.grasp?.phase || "running").replaceAll("_", " ")}…`
+        : "Perception + perform";
+      directButton.textContent = running ? "Running…" : "Direct perform";
+      byId("grasp-selection").textContent = running
+        ? `phase · ${state.grasp?.phase || "running"}`
+        : workflowPhase.replaceAll("_", " ");
+      status.className = `session-state ${running ? "running" : graspResultIsCurrent ? state.grasp?.outcome || "" : ""}`;
+      status.textContent = (graspResultIsCurrent ? state.grasp?.message : "") || (
+        workflowPhase === "holding_at_lift"
+          ? "Object secured. After manual recovery, use Home to re-check the measured pose and clear this staged state."
+          : workflowPhase === "holding_at_home"
+            ? "Legacy held-object state detected. Use Reset + Home to clear it before the next cycle."
+            : workflowPhase === "placed_back_at_home"
+              ? "Legacy staged cycle is complete. Reset + Home clears it before the next cycle."
+              : atHome && selectedPlanReady
+          ? "Ready: Direct Perform executes the selected plan only; Perception + Perform captures exactly one new perception before planning."
+          : targetReady
+            ? "Perception + Perform will return Home, capture this target once, plan, execute, place back and return Home."
+            : "Enter the target description to enable the complete one-click grasp."
+      );
+    }
+
+    function scheduleGraspPoll(delayMs) {
+      if (state.graspTimer !== null) window.clearTimeout(state.graspTimer);
+      state.graspTimer = window.setTimeout(refreshGraspStatus, delayMs);
+    }
+
+    async function refreshGraspStatus() {
+      try {
+        const response = await fetch("/api/grasp/status", { cache: "no-store", credentials: "same-origin" });
+        if (response.status === 404) {
+          renderGraspStatus({ available: false, running: false, outcome: "blocked", message: "Grasp execution API is not enabled." });
+          byId("session-perform-grasp").disabled = true;
+          byId("session-perform-selected").disabled = true;
+          scheduleGraspPoll(3000);
+          return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const grasp = await response.json();
+        renderGraspStatus(grasp);
+        renderHomeStatus(state.home);
+        renderSessionStatus(state.sessions || { busy: false, actions: {} });
+        scheduleGraspPoll(grasp.running ? 250 : 1000);
+      } catch (error) {
+        renderGraspStatus({ available: false, running: false, outcome: "blocked", message: String(error) });
+        scheduleGraspPoll(2000);
+      }
+    }
+
+    async function startGraspAction(skipConfirmation = false) {
+      const target = byId("perception-target").value.trim();
+      if (target.length < 1 || target.length > 160) {
+        renderGraspStatus({ ...state.grasp, running: false, outcome: "blocked", message: "Enter a target description (1–160 characters) first." });
+        return;
+      }
+      const accepted = skipConfirmation || window.confirm(
+        `Run one complete perception + grasp for “${target}” at ${selectedSpeedPercent()}%?\n\nThe arm will verify Home, capture exactly one new perception, plan once, grasp and lift, place the object back, then return Home without disconnecting between stages. Keep the workspace clear and stay by the emergency stop.`
+      );
+      if (!accepted) return;
+      renderGraspStatus({ ...state.grasp, running: true, phase: "starting", message: `Starting one perception-to-grasp run for “${target}”…` });
+      try {
+        const response = await fetch("/api/grasp", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Z-Manip-Action": "grasp" },
+          body: JSON.stringify({ target, speed_percent: selectedSpeedPercent() })
+        });
+        const result = await response.json();
+        if (!response.ok && response.status !== 409) throw new Error(result.error?.message || `HTTP ${response.status}`);
+        if (!result.started) throw new Error(result.error?.message || result.grasp?.message || "grasp action did not start");
+        renderGraspStatus(result.grasp || state.grasp);
+        scheduleGraspPoll(100);
+      } catch (error) {
+        renderGraspStatus({ ...state.grasp, running: false, outcome: "blocked", message: String(error) });
+        scheduleGraspPoll(1500);
+      }
+    }
+
+    async function startSelectedGraspAction() {
+      const accepted = window.confirm(
+        `Directly execute the currently selected PiPER plan at ${selectedSpeedPercent()}%?\n\nThis skips Home, perception and replanning. The arm must still match the plan start; execution performs grasp, place-back and checked return Home. Keep the workspace clear and stay by the emergency stop.`
+      );
+      if (!accepted) return;
+      renderGraspStatus({ ...state.grasp, running: true, phase: "execute_selected", message: "Starting Direct Perform from the selected plan…" });
+      try {
+        const response = await fetch("/api/grasp/selected", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Z-Manip-Action": "grasp-selected" },
+          body: JSON.stringify({ speed_percent: selectedSpeedPercent() })
+        });
+        const result = await response.json();
+        if (!response.ok && response.status !== 409) throw new Error(result.error?.message || `HTTP ${response.status}`);
+        if (!result.started) throw new Error(result.error?.message || result.grasp?.message || "Direct Perform did not start");
+        renderGraspStatus(result.grasp || state.grasp);
+        scheduleGraspPoll(100);
+      } catch (error) {
+        renderGraspStatus({ ...state.grasp, running: false, outcome: "blocked", message: String(error) });
+        scheduleGraspPoll(1500);
+      }
+    }
+
+    function sessionAttemptText(action, attempt) {
+      if (!attempt) {
+        return action === "perception"
+          ? "Enter the object currently visible in the live D435 feed."
+          : "Planning unlocks after a successful perception session.";
+      }
+      const error = attempt.error;
+      if (attempt.status === "succeeded") {
+        return action === "perception"
+          ? `Perception passed for “${attempt.target || "target"}”. Recorded views now show this session.`
+          : "Planning passed. IK, collision checks, and the recorded trajectory were updated.";
+      }
+      return `${String(attempt.status || "failed").toUpperCase()} · ${error?.code || "ACTION_FAILED"} · ${error?.message || "inspect the session log"}`;
+    }
+
+    function renderSessionStatus(sessions) {
+      state.sessions = sessions;
+      const busy = sessions?.busy === true;
+      const selectedId = sessions?.selected_perception_session_id || null;
+      const perception = sessions?.actions?.perception || {};
+      const planning = sessions?.actions?.planning || {};
+      const lastGoodPerception = perception.last_good;
+      const contextActive = Boolean(
+        selectedId
+        && lastGoodPerception?.status === "succeeded"
+        && lastGoodPerception?.session_id === selectedId
+      );
+      const contextWasActive = state.taskContextActive;
+      state.taskContextActive = contextActive;
+      const activeAction = sessions?.active_action || state.sessionPendingAction;
+      const target = byId("perception-target").value.trim();
+      const perceptionButton = byId("session-run-perception");
+      const planningButton = byId("session-run-planning");
+      const homeError = runtimeHomeErrorRad();
+      const atHome = finiteNumber(homeError) && homeError <= HOME_TOLERANCE_RAD;
+      const homeRunning = state.home?.running === true;
+      const graspRunning = state.grasp?.running === true;
+      const approachRunning = state.approach?.running === true;
+      // Perception is camera-only and must remain available away from Home.
+      // Planning and execution still require the measured Home pose below.
+      perceptionButton.disabled = busy || homeRunning || graspRunning || approachRunning || target.length < 1 || target.length > 160;
+      planningButton.disabled = busy || homeRunning || graspRunning || approachRunning || !atHome || !selectedId;
+      byId("session-clear-demo").disabled = busy || homeRunning || graspRunning || approachRunning;
+      byId("session-restart-service").disabled = busy || homeRunning || graspRunning || approachRunning;
+      perceptionButton.textContent = busy && activeAction === "perception" ? "Running…" : "Run perception";
+      planningButton.textContent = busy && activeAction === "planning" ? "Planning…" : "Run planning";
+
+      const perceptionState = byId("perception-session-state");
+      const planningState = byId("planning-session-state");
+      const perceptionRunning = busy && activeAction === "perception";
+      const planningRunning = busy && activeAction === "planning";
+      const latestPerception = perception.latest_attempt;
+      const latestPlanning = planning.latest_attempt;
+      const planningMatchesSelection = Boolean(
+        selectedId
+        && latestPlanning?.selected_perception_session_id === selectedId
+      );
+      perceptionState.className = `session-state ${perceptionRunning ? "running" : latestPerception?.status || ""}`;
+      planningState.className = `session-state ${planningRunning ? "running" : latestPlanning?.status || ""}`;
+      perceptionState.textContent = perceptionRunning
+        ? "Capturing the current RGB-D frame, segmenting the target, and generating grasp candidates…"
+        : state.sessionMessage?.action === "perception"
+          ? state.sessionMessage.text
+          : sessionAttemptText("perception", latestPerception);
+      planningState.textContent = planningRunning
+        ? "Receiving passive joint feedback and running network-disabled IK / collision / RRT planning…"
+        : selectedId && !planningMatchesSelection
+          ? "Current perception has not been planned yet. Click Run Planning."
+        : state.sessionMessage?.action === "planning"
+          ? state.sessionMessage.text
+          : sessionAttemptText("planning", latestPlanning);
+      byId("perception-selection").textContent = selectedId ? `selected ${selectedId}` : "no session selected";
+      byId("planning-selection").textContent = selectedId ? `uses ${selectedId}` : "selected perception required";
+      if (contextWasActive && !contextActive) {
+        state.selectedCandidate = null;
+        state.selectedRejection = null;
+        state.perceptionFeeds = {};
+        renderImages();
+        if (state.runtimeScene) state.runtimeScene.setBundle(null);
+      }
+      renderHomeStatus(state.home);
+      renderGraspStatus(state.grasp);
+      renderApproachStatus(state.approach);
+    }
+
+    function scheduleSessionPoll(delayMs) {
+      if (state.sessionTimer !== null) window.clearTimeout(state.sessionTimer);
+      state.sessionTimer = window.setTimeout(refreshSessionStatus, delayMs);
+    }
+
+    async function refreshSessionStatus() {
+      try {
+        const response = await fetch("/api/sessions/status", { cache: "no-store", credentials: "same-origin" });
+        if (response.status === 404) {
+          const unavailable = { busy: false, selected_perception_session_id: null, actions: {} };
+          renderSessionStatus(unavailable);
+          byId("session-run-perception").disabled = true;
+          byId("session-run-planning").disabled = true;
+          byId("perception-session-state").textContent = "Interactive session API is not enabled yet.";
+          scheduleSessionPoll(3000);
+          return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        const sessions = payload.sessions || payload.session || payload;
+        const previousPerceptionId = state.interactivePerceptionId;
+        const previousPlanningId = state.interactivePlanningId;
+        const perceptionId = sessions?.actions?.perception?.last_good?.session_id || null;
+        const latestPlanning = sessions?.actions?.planning?.latest_attempt;
+        const planningId = latestPlanning?.selected_perception_session_id === perceptionId
+          ? latestPlanning?.session_id || null
+          : null;
+        if (sessions.busy !== true && state.sessionPendingAction !== null) {
+          state.sessionPendingAction = null;
+          state.sessionMessage = null;
+        }
+        renderSessionStatus(sessions);
+        if (perceptionId !== previousPerceptionId) {
+          state.interactivePerceptionId = perceptionId;
+          state.interactivePlanningId = null;
+          state.selectedCandidate = null;
+          state.selectedRejection = null;
+          state.showAllCandidates = false;
+          state.perceptionFeeds = {};
+          if (state.runtimeScene) state.runtimeScene.setBundle(null);
+          if (state.bundle) renderImages();
+          schedulePerceptionFeedPoll(25);
+        }
+        if (planningId && planningId !== previousPlanningId) {
+          state.interactivePlanningId = planningId;
+          try {
+            await loadBundle("/api/sessions/planning/bundle");
+          } catch (error) {
+            const outcome = String(latestPlanning?.status || "finished");
+            state.sessionMessage = { action: "planning", text: `Latest ${outcome} planning attempt has no verified debug bundle: ${error}` };
+            renderSessionStatus(sessions);
+          }
+        }
+        scheduleSessionPoll(sessions.busy === true ? 600 : 2500);
+      } catch (error) {
+        renderSessionStatus({ busy: false, selected_perception_session_id: null, actions: {} });
+        byId("session-run-perception").disabled = true;
+        byId("session-run-planning").disabled = true;
+        byId("perception-session-state").className = "session-state error";
+        byId("perception-session-state").textContent = `Interactive session API unavailable: ${error}`;
+        scheduleSessionPoll(3000);
+      }
+    }
+
+    async function postSessionAction(action, body) {
+      state.sessionPendingAction = action;
+      state.sessionMessage = null;
+      renderSessionStatus({ ...(state.sessions || { actions: {} }), busy: true });
+      scheduleSessionPoll(200);
+      try {
+        const response = await fetch(`/api/sessions/${action}`, {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Z-Manip-Action": action
+          },
+          body: JSON.stringify(body)
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          const detail = result.error?.message || result.attempt?.error?.message || result.error || `HTTP ${response.status}`;
+          if (result.session) state.sessions = result.session;
+          throw new Error(detail);
+        }
+        state.sessionPendingAction = null;
+        state.sessionMessage = null;
+        if (result.session) renderSessionStatus(result.session);
+        scheduleSessionPoll(50);
+        return result;
+      } catch (error) {
+        state.sessionPendingAction = null;
+        state.sessionMessage = { action, text: String(error) };
+        const current = state.sessions || { busy: false, actions: {} };
+        renderSessionStatus(current);
+        scheduleSessionPoll(1500);
+        return null;
+      }
+    }
+
+    async function runMaintenanceAction(action) {
+      const clearAction = action === "clear-demo";
+      const button = byId(clearAction ? "session-clear-demo" : "session-restart-service");
+      const status = byId("maintenance-state");
+      button.disabled = true;
+      status.textContent = clearAction ? "Clearing current demo overlays…" : "Restart scheduled; waiting for the UI service…";
+      try {
+        const response = await fetch(clearAction ? "/api/sessions/clear" : "/api/service/restart", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Z-Manip-Action": action },
+          body: "{}"
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error?.message || `HTTP ${response.status}`);
+        if (clearAction) {
+          renderSessionStatus(result.session || { busy: false, selected_perception_session_id: null, actions: {} });
+          state.interactivePerceptionId = null;
+          state.interactivePlanningId = null;
+          state.selectedCandidate = null;
+          state.selectedRejection = null;
+          state.showAllCandidates = false;
+          state.perceptionFeeds = {};
+          await loadBundle("/api/bundle");
+          status.textContent = "Demo cleared. Historical logs were retained.";
+          scheduleSessionPoll(50);
+        } else {
+          window.setTimeout(() => window.location.reload(), 3000);
+        }
+      } catch (error) {
+        status.textContent = `Maintenance action failed: ${error}`;
+        renderSessionStatus(state.sessions || { busy: false, actions: {} });
+      }
+    }
+
+    function componentActionBusy() {
+      return state.sessions?.busy === true || state.home?.running === true || state.grasp?.running === true;
+    }
+
+    function renderComponentStatus(status) {
+      state.components = status || { available: false, busy: false, components: {} };
+      const active = state.components.active_component;
+      for (const button of document.querySelectorAll("[data-component-restart]")) {
+        const component = button.dataset.componentRestart;
+        button.disabled = state.components.busy === true || componentActionBusy();
+        button.textContent = active === component ? "Restarting…" : (component === "perception-all" ? "Restart all" : "Restart");
+      }
+      byId("component-bringup").disabled = state.components.busy === true || componentActionBusy();
+      byId("component-bringup").textContent = active === "bringup" ? "Bringing services up…" : "Bring up all vision services";
+      for (const name of ["ui", "nuc-camera", "passive-feedback", "observer", "rgbd", "edgetam", "perception", "perception-all"]) {
+        const component = state.components.components?.[name] || { state: "offline", summary: "status unavailable" };
+        const badge = document.querySelector(`[data-component-badge="${name}"]`);
+        const detail = document.querySelector(`[data-component-state="${name}"]`);
+        if (badge) badge.textContent = component.state.toUpperCase();
+        if (detail) {
+          detail.className = `component-state ${component.state}`;
+          detail.textContent = component.summary;
+        }
+      }
+      if (state.components.last_result && !state.components.busy) {
+        const result = state.components.last_result;
+        const detail = document.querySelector(`[data-component-state="${result.component}"]`);
+        if (detail && result.ok !== true) {
+          detail.className = "component-state offline";
+          detail.textContent = `Restart failed · ${result.message || "open logs"}`;
+        }
+      }
+    }
+
+    function scheduleComponentPoll(delayMs) {
+      if (state.componentTimer !== null) window.clearTimeout(state.componentTimer);
+      state.componentTimer = window.setTimeout(refreshComponentStatus, delayMs);
+    }
+
+    async function refreshComponentStatus() {
+      try {
+        const response = await fetch("/api/components/status", { cache: "no-store", credentials: "same-origin" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const status = await response.json();
+        renderComponentStatus(status);
+        scheduleComponentPoll(status.busy === true ? 500 : 3000);
+      } catch (error) {
+        renderComponentStatus({ available: false, busy: false, components: {}, error: String(error) });
+        scheduleComponentPoll(5000);
+      }
+    }
+
+    async function restartComponent(component) {
+      const accepted = window.confirm(
+        `Restart ${component}?\n\nThis resets only the selected UI/vision service. It sends no robot command. Current perception overlays and plan context will be cleared.`
+      );
+      if (!accepted) return;
+      try {
+        const response = await fetch("/api/components/restart", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Z-Manip-Action": "restart-component" },
+          body: JSON.stringify({ component })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error?.message || `HTTP ${response.status}`);
+        if (component === "ui") {
+          window.setTimeout(() => window.location.reload(), 3000);
+        } else {
+          state.interactivePerceptionId = null;
+          state.interactivePlanningId = null;
+          state.selectedCandidate = null;
+          state.selectedRejection = null;
+          state.showAllCandidates = false;
+          state.perceptionFeeds = {};
+          await loadBundle("/api/bundle");
+          scheduleComponentPoll(100);
+          scheduleSessionPoll(100);
+        }
+      } catch (error) {
+        const detail = document.querySelector(`[data-component-state="${component}"]`);
+        if (detail) {
+          detail.className = "component-state offline";
+          detail.textContent = `Restart request failed · ${error}`;
+        }
+      }
+    }
+
+    async function bringupComponents() {
+      const accepted = window.confirm(
+        "Bring up all vision services after reboot?\n\nThis starts the NUC camera, passive feedback, EdgeTAM, RGB-D bridge, perception ROS, runtime observer, and UI. It sends no robot motion command."
+      );
+      if (!accepted) return;
+      try {
+        const response = await fetch("/api/components/bringup", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Z-Manip-Action": "bringup-components" },
+          body: "{}"
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error?.message || `HTTP ${response.status}`);
+        scheduleComponentPoll(100);
+        scheduleSessionPoll(100);
+      } catch (error) {
+        byId("component-log").hidden = false;
+        byId("component-log").textContent = `Bringup request failed: ${error}`;
+      }
+    }
+
+    async function loadComponentLog(component) {
+      const output = byId("component-log");
+      output.hidden = false;
+      output.textContent = `Loading ${component} logs…`;
+      try {
+        const response = await fetch(`/api/components/logs/${component}`, { cache: "no-store", credentials: "same-origin" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error?.message || `HTTP ${response.status}`);
+        output.textContent = result.text || `${component}: no log output`;
+      } catch (error) {
+        output.textContent = `${component} log unavailable: ${error}`;
+      }
+    }
+
+    function bindComponentControls() {
+      byId("component-bringup").addEventListener("click", bringupComponents);
+      for (const button of document.querySelectorAll("[data-component-restart]")) {
+        button.addEventListener("click", () => restartComponent(button.dataset.componentRestart));
+      }
+      for (const button of document.querySelectorAll("[data-component-log]")) {
+        button.addEventListener("click", () => loadComponentLog(button.dataset.componentLog));
+      }
+      renderComponentStatus(state.components);
+    }
+
+    function bindSessionControls() {
+      const input = byId("perception-target");
+      const speedInput = byId("motion-speed");
+      speedInput.addEventListener("input", () => {
+        const speed = selectedSpeedPercent();
+        speedInput.setAttribute("aria-invalid", speed === null ? "true" : "false");
+        renderHomeStatus(state.home);
+        renderGraspStatus(state.grasp);
+      });
+      input.addEventListener("input", () => renderSessionStatus(state.sessions || { busy: false, actions: {} }));
+      input.addEventListener("keydown", event => {
+        if (event.key === "Enter" && !byId("session-run-perception").disabled) {
+          event.preventDefault();
+          byId("session-run-perception").click();
+        }
+      });
+      byId("session-run-perception").addEventListener("click", () => {
+        const target = input.value.trim();
+        if (target) postSessionAction("perception", { target });
+      });
+      byId("session-run-planning").addEventListener("click", () => postSessionAction("planning", {}));
+      byId("session-go-home").addEventListener("click", startHomeAction);
+      byId("session-perform-grasp").addEventListener("click", () => startGraspAction());
+      byId("session-perform-selected").addEventListener("click", startSelectedGraspAction);
+      byId("approach-auto").addEventListener("click", startApproachAndGrasp);
+      byId("approach-shadow").addEventListener("click", () => startApproach("shadow"));
+      byId("approach-stop").addEventListener("click", () => stopApproach());
+      byId("session-clear-demo").addEventListener("click", () => runMaintenanceAction("clear-demo"));
+      byId("session-restart-service").addEventListener("click", () => runMaintenanceAction("restart-workbench"));
+      renderSessionStatus({ busy: false, selected_perception_session_id: null, actions: {} });
+    }
+
+    async function startPlanningRun() {
+      const button = byId("run-planning");
+      button.disabled = true;
+      byId("run-state").textContent = "starting…";
+      try {
+        const response = await fetch("/api/runs", {
+          method: "POST",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "X-Z-Manip-Action": "planning-only" }
+        });
+        const result = await response.json();
+        if (!response.ok && response.status !== 409) throw new Error(result.error || `HTTP ${response.status}`);
+        renderControl(result.control || result);
+        scheduleControlPoll(500);
+      } catch (error) {
+        renderControl({ available: true, running: false, state: "error", outcome: "controller_error", message: String(error) });
+        scheduleControlPoll(3000);
+      }
+    }
+
+    function bindRunControl() {
+      byId("run-planning").addEventListener("click", startPlanningRun);
+    }
+
+    function renderBundle(bundle) {
+      const changedRun = state.bundle !== null && state.bundle.run_id !== bundle.run_id;
+      if (changedRun) {
+        state.selectedCandidate = null;
+        state.selectedRejection = null;
+        state.showAllCandidates = false;
+        state.rejectionStage = "all";
+        state.rejectionCandidate = "all";
+      }
+      state.bundle = bundle;
+      if (Number.isInteger(bundle.selected_plan?.candidate_id)) {
+        state.selectedCandidate = bundle.selected_plan.candidate_id;
+      } else if (bundle.planning?.available === true && bundle.planning?.plan_valid !== true) {
+        state.selectedCandidate = null;
+        state.selectedRejection = null;
+      }
+      if (state.selectedCandidate === null) state.selectedRejection = null;
+      else if (state.selectedRejection === null) selectCandidateRejection(state.selectedCandidate);
+      renderCalibrationGate();
+      renderHeader();
+      renderCandidateControls();
+      renderStages();
+      renderImages();
+      renderSafety();
+      renderCollisionEvidence();
+      renderRejections();
+      renderTrajectoryStrip();
+      renderErrors();
+      const frame = bundle.visualization?.frame;
+      byId("view-frame").textContent = `frame: ${frame || "unknown"}`;
+      const scene = ensureRuntimeScene();
+      if (scene) scene.setBundle(bundle);
+      drawScene();
+    }
+
+    function fatal(error) {
+      byId("fatal-message").textContent = error instanceof Error ? error.message : String(error);
+      byId("fatal").hidden = false;
+    }
+
+    async function loadBundle(endpoint = "/api/bundle") {
+      const response = await fetch(endpoint, { cache: "no-store", credentials: "same-origin" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+      const bundle = await response.json();
+      if (bundle.schema !== "z_manip.debug_bundle.v1") throw new Error(`Unsupported bundle schema: ${bundle.schema}`);
+      renderBundle(bundle);
+      return bundle;
+    }
+
+    bindCanvasControls();
+    bindRejectionControls();
+    bindSessionControls();
+    bindComponentControls();
+    bindFeedOrderControls();
+    refreshHomeStatus();
+    refreshGraspStatus();
+    refreshApproachStatus();
+    refreshCamera();
+    refreshPerceptionFeeds();
+    refreshComponentStatus();
+    loadBundle().then(() => {
+      refreshSessionStatus();
+      refreshRuntime();
+    }).catch(fatal);
+  </script>
+</body>
+</html>

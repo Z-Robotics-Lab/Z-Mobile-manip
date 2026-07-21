@@ -1,0 +1,7 @@
+# patches/ —— 对 refs/ 只读参考仓的补丁集（docs/plan.md §7 铁则）。
+#
+# refs/ 是 gitignored 纯只读；任何对参考仓的改动都以 *.patch 落在这里，由
+# scripts/clone_deps.sh 在每次全新 clone 后重新套用（refs 每次 clone 都是干净的）。
+# 绝不直接编辑 refs/ 原文件。
+#
+# M0：本目录暂空（占位）。M2 接入抓取 backend 时若需改参考仓，补丁进这里。

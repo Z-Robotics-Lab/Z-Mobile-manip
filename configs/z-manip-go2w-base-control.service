@@ -1,0 +1,13 @@
+[Unit]
+Description=Z-Manip Go2W guarded WebRTC base control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/z-manip/go2w_visual_servo_base_nuc.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

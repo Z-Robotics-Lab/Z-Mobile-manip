@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Operator CLI for the Z-Manip loopback workbench. It never accepts a
+# trajectory, joint target, or arbitrary service name.
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+COMPONENT_MANAGER="${Z_MANIP_COMPONENT_MANAGER:-$SCRIPT_DIR/go2w_component_manager.sh}"
+UI_UNIT="${Z_MANIP_UI_UNIT:-z-manip-planning-workbench.service}"
+UI_URL="${Z_MANIP_UI_URL:-http://127.0.0.1:8766}"
+SYSTEMCTL="${Z_MANIP_SYSTEMCTL_BIN:-systemctl}"
+CURL="${Z_MANIP_CURL_BIN:-curl}"
+PYTHON="${Z_MANIP_PYTHON_BIN:-python3}"
+PGREP="${Z_MANIP_PGREP_BIN:-pgrep}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  manip start                    Start the local UI/API only
+  manip stop                     Safely stop the local UI/API
+  manip restart                  Safely restart the local UI/API
+  manip bringup                  Bring up the complete PC/NUC vision stack
+  manip status [component]       Show all or one component status
+  manip logs [component] [N]     Show bounded logs (default: ui, 100 lines)
+  manip component restart NAME   Restart one fixed vision component
+  manip url                      Print the UI address
+
+Components: ui, nuc-camera, passive-feedback, observer, rgbd, edgetam,
+            perception, perception-all
+
+Home and grasp are intentionally not CLI commands. Use the UI while beside
+the emergency stop for any operation that can move the arm.
+EOF
+}
+
+wait_for_ui() {
+  local deadline=$((SECONDS + 20))
+  until "$CURL" -fsS --max-time 2 "$UI_URL/api/health" >/dev/null 2>&1; do
+    if ((SECONDS >= deadline)); then
+      printf 'UI did not become healthy: %s\n' "$UI_URL" >&2
+      "$SYSTEMCTL" --user status "$UI_UNIT" --no-pager >&2 || true
+      return 1
+    fi
+    sleep 0.25
+  done
+}
+
+endpoint_flag_true() {
+  local route="$1" field="$2" payload
+  payload="$($CURL -fsS --max-time 2 "$UI_URL$route" 2>/dev/null)" || return 1
+  "$PYTHON" -c \
+    'import json,sys; value=json.load(sys.stdin).get(sys.argv[1]); raise SystemExit(0 if value is True else 1)' \
+    "$field" <<<"$payload"
+}
+
+require_idle_ui() {
+  if endpoint_flag_true /api/home/status running; then
+    printf 'Refusing: Home is running. Wait for it to finish.\n' >&2
+    return 1
+  fi
+  if endpoint_flag_true /api/grasp/status running; then
+    printf 'Refusing: grasp execution is running. Do not stop its owner.\n' >&2
+    return 1
+  fi
+  if endpoint_flag_true /api/sessions/status busy; then
+    printf 'Refusing: perception or planning is running. Wait for it to finish.\n' >&2
+    return 1
+  fi
+  # Preserve the gate even when the status endpoint itself is unavailable.
+  # Anchor the script at argv[1]; the long-lived UI process contains these
+  # paths only as command-line configuration values and is not an executor.
+  if "$PGREP" -f '(^|/)(python3|python)[[:space:]]+[^[:space:]]*/scripts/runtime/piper_full_grasp_remote\.py([[:space:]]|$)' >/dev/null 2>&1 \
+      || "$PGREP" -f '(^|/)bash[[:space:]]+[^[:space:]]*/scripts/runtime/piper_home_remote\.sh([[:space:]]|$)' >/dev/null 2>&1; then
+    printf 'Refusing: a PiPER execution process is still active.\n' >&2
+    return 1
+  fi
+}
+
+start_ui() {
+  "$SYSTEMCTL" --user start "$UI_UNIT"
+  wait_for_ui
+  printf 'Z-Manip UI is ready: %s/\n' "$UI_URL"
+}
+
+stop_ui() {
+  if ! "$SYSTEMCTL" --user is-active --quiet "$UI_UNIT" 2>/dev/null; then
+    printf 'Z-Manip UI is already stopped.\n'
+    return 0
+  fi
+  require_idle_ui
+  "$SYSTEMCTL" --user stop "$UI_UNIT"
+  printf 'Z-Manip UI stopped. Vision/telemetry components were left unchanged.\n'
+}
+
+restart_ui() {
+  if "$SYSTEMCTL" --user is-active --quiet "$UI_UNIT" 2>/dev/null; then
+    require_idle_ui
+  fi
+  "$SYSTEMCTL" --user restart "$UI_UNIT"
+  wait_for_ui
+  printf 'Z-Manip UI restarted: %s/\n' "$UI_URL"
+}
+
+command="${1:-help}"
+case "$command" in
+  start)
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    start_ui
+    ;;
+  stop)
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    stop_ui
+    ;;
+  restart)
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    restart_ui
+    ;;
+  bringup)
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    "$COMPONENT_MANAGER" bringup
+    printf 'Complete Z-Manip vision stack is ready: %s/\n' "$UI_URL"
+    ;;
+  status)
+    [[ $# -le 2 ]] || { usage >&2; exit 2; }
+    "$COMPONENT_MANAGER" status "${2:-all}"
+    ;;
+  logs)
+    [[ $# -le 3 ]] || { usage >&2; exit 2; }
+    "$COMPONENT_MANAGER" logs "${2:-ui}" "${3:-100}"
+    ;;
+  component)
+    [[ $# -eq 3 && "$2" == restart ]] || { usage >&2; exit 2; }
+    "$COMPONENT_MANAGER" restart "$3"
+    ;;
+  url)
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    printf '%s/\n' "$UI_URL"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

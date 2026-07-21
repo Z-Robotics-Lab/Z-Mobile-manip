@@ -1,0 +1,41 @@
+# 密钥（.env.example 是样板；真值手工携带，绝不入库）
+.env
+configs/piper_home.json
+configs/*_calibration.json
+*.pem
+*.key
+*.license
+*.bag
+*.db3
+*.mcap
+*.pt
+*.pth
+*.onnx
+*.engine
+*.npy
+*.npz
+*.pcd
+*.ply
+
+# 只读参考仓（clone_deps.sh 拉取，不入库）
+refs/
+
+# 运行时产物
+logs/
+log/
+var/
+outputs/
+artifacts/
+.pytest_cache/
+.coverage
+htmlcov/
+__pycache__/
+.venv/
+*.log
+
+# Python 构建产物（pip install -e . 生成，不入库）
+*.egg-info/
+*.egg
+build/
+dist/
+*.pyc

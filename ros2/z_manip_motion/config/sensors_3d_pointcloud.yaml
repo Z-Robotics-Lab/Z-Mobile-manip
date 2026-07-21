@@ -1,0 +1,10 @@
+sensors:
+  wrist_point_cloud:
+    sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
+    point_cloud_topic: /camera/depth/color/points
+    max_range: 2.5
+    point_subsample: 1
+    padding_offset: 0.025
+    padding_scale: 1.0
+    max_update_rate: 8.0
+    filtered_cloud_topic: /z_manip/motion/filtered_cloud

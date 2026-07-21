@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Static-unicast DDS profile for the 4090 development PC and Go2W NUC. -->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="wlp7s0" multicast="true"/>
+      </Interfaces>
+      <!-- Multicast is used only for lightweight participant discovery on the
+           selected Wi-Fi interface.  Endpoint discovery and RGB-D samples are
+           still unicast; fixed peers remain the cross-machine fallback. -->
+      <AllowMulticast>spdp</AllowMulticast>
+    </General>
+    <Discovery>
+      <SPDPInterval>2s</SPDPInterval>
+      <Peers>
+        <Peer address="192.168.3.5"/>
+        <Peer address="192.168.3.8"/>
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>

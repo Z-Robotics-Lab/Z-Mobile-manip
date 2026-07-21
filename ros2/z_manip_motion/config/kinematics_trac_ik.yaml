@@ -1,0 +1,7 @@
+# Default robust IK profile. kinematics.yaml remains an explicit KDL fallback.
+piper_arm:
+  kinematics_solver: trac_ik_kinematics_plugin/TRAC_IKKinematicsPlugin
+  kinematics_solver_timeout: 0.08
+  kinematics_solver_attempts: 5
+  epsilon: 0.00001
+  solve_type: Distance

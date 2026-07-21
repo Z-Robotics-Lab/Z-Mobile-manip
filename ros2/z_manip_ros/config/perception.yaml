@@ -1,0 +1,110 @@
+vlm_edgetam_bridge:
+  ros__parameters:
+    # RELIABLE + TRANSIENT_LOCAL transaction topics. Request nonce, adapter
+    # generation, offer token, timestamp, frame, and dimensions must all join.
+    edge_seed_request_topic: /track_3d/seed_request
+    edge_seed_image_topic: /track_3d/exact_seed_image
+    edge_seed_offer_manifest_topic: /track_3d/seed_offer_manifest
+    request_topic: /z_manip/grounding/request
+    reset_topic: /z_manip/grounding/reset
+
+    edge_init_bbox_topic: /track_3d/init_bbox
+    edge_tracking_topic: /track_3d/is_tracking
+    edge_failure_topic: /track_3d/failure
+    edge_frame_manifest_topic: /track_3d/frame_manifest
+    edge_detections_topic: /track_3d/detections_2d
+    edge_selected_target_topic: /track_3d/selected_target_3d
+    edge_selected_cloud_topic: /track_3d/selected_target_pointcloud
+
+    status_topic: /z_manip/perception/status
+    valid_topic: /z_manip/perception/valid
+    affordance_topic: /z_manip/perception/affordance
+    validated_detections_topic: /z_manip/perception/tracked_detections_2d
+    validated_target_topic: /z_manip/perception/target_3d
+    validated_cloud_topic: /z_manip/perception/target_pointcloud
+    stop_cmd_topic: /safety_cmd_vel
+    stop_frame_id: base_link
+    # The task runtime heartbeats this while it owns a bounded yaw-search turn.
+    # If the heartbeat expires, the perception bridge resumes zero-velocity hold.
+    motion_override_topic: /z_manip/visual_search/active
+    motion_override_timeout_s: 0.25
+    # Only this exact-identity, receive-time-fresh task heartbeat may let the
+    # bridge's initial failure zero expire during frozen-map coarse navigation.
+    frozen_coarse_nav_authorization_topic: >-
+      /z_manip/coarse_nav/perception_loss_authorization
+    # Hard-limited by the bridge to at most 0.35 s.
+    frozen_coarse_nav_authorization_timeout_s: 0.30
+
+    # The API key is never a ROS parameter. OpenRouterVLM reads only
+    # OPENROUTER_API_KEY from the inherited process environment.
+    vlm_models:
+      - qwen/qwen3-vl-8b-instruct:nitro
+    vlm_base_url: ""
+    # A GPU-resident loopback detector handles common grasp-only nouns in
+    # ~0.1 s. Unknown language or low-confidence boxes fall back to the remote
+    # structured VLM without weakening its validation contract.
+    vlm_local_grounding_url: "http://127.0.0.1:8771"
+    vlm_local_grounding_timeout_s: 1.25
+    # Each provider attempt has its own bound. The exact model and outcome are
+    # logged so a timeout cannot silently become a lower-quality seed.
+    vlm_timeout_s: 15.0
+    vlm_model_timeouts_s: [8.5]
+    # Coordinate contracts are explicit per model. Qwen3-VL and Qwen3.5 use
+    # their native relative 0..1000 grounding space; the client deterministically
+    # normalizes it before publishing any geometry.
+    vlm_model_bbox_coordinate_spaces:
+      - relative_0_1000
+    # Retry typed transient curl failures without changing models.
+    vlm_provider_retries: 1
+    vlm_timeout_retries: 0
+    # Race a duplicate only when the first request remains outstanding. This
+    # removes remote provider queue tails while retaining the same model/schema.
+    vlm_hedge_delay_s: 0.05
+    vlm_min_confidence: 0.20
+    vlm_max_target_area_ratio: 0.95
+    vlm_max_semantic_conflict_coverage_ratio: 0.95
+    jpeg_quality: 85
+    # Keep a small margin around a tight detector box. Larger margins can make
+    # box-prompted masks jump onto a touching support surface, especially near
+    # an image boundary. The semantic bbox remains the unexpanded detector box.
+    seed_bbox_padding_fraction: 0.12
+    max_camera_age_s: 0.5
+
+    frame_wait_timeout_s: 2.0
+    grounding_timeout_s: 100.0
+    tracker_acquisition_timeout_s: 8.0
+    # Covers the adapter's bounded 0.5 s result lag plus DDS bundle join time.
+    tracker_data_timeout_s: 1.0
+    min_cloud_points: 24
+    # Exact-stamp/frame cache for joining detection, target, and target cloud.
+    bundle_cache_size: 12
+    status_period_s: 0.1
+    hold_stop_until_valid: true
+
+track_3d:
+  ros__parameters:
+    camera_info_topic: /camera/color/camera_info
+    color_topic: /camera/color/image_raw
+    depth_topic: /camera/aligned_depth_to_color/image_raw
+    init_bbox_topic: /track_3d/init_bbox
+    keyboard_topic: /z_manip/disabled/edge_tam_keyboard_vlm
+    select_id_topic: /track_3d/select_id
+    model_path: ""
+    use_compressed: false
+    queue_size: 3
+    depth_scale: 1000.0
+    depth_trunc: 2.5
+    history_size: 120
+    # The bridge reacts to the first false status. A zero tracker timeout also
+    # prevents the external processor from attempting an identity-unsafe relock.
+    tracking_timeout: 0.0
+    outlier_filter_mode: statistical
+    outlier_nb_neighbors: 10
+    outlier_std_ratio: 1.0
+    mask_open_kernel_size: 5
+    mask_erode_kernel_size: 3
+    mask_erode_iterations: 1
+    normal_max_points: 2000
+    bbox_max_points: 2000
+    filter_blur: false
+    filter_edge: false
