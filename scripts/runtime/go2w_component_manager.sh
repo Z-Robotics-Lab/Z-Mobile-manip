@@ -181,7 +181,7 @@ status_one() {
     reactive-control)
       if remote_service_active "$REACTIVE_NUC_UNIT"; then
         state="healthy"
-        summary="NUC single WebRTC owner active; Move + Euler (BodyHeight unsupported)"
+        summary="NUC single WebRTC owner active; Move ready, Euler capability negotiated at runtime"
       else
         summary="NUC reactive WebRTC owner inactive"
       fi
@@ -210,7 +210,7 @@ status_one() {
       whole_body_state="$(status_state whole-body)"
       if [[ "$reactive_state" == healthy && "$posture_state" == healthy && "$whole_body_state" == healthy ]]; then
         state="healthy"
-        summary="NUC owner + posture relay + Pinocchio/CasADi ready"
+        summary="NUC owner + capability-aware posture relay + Pinocchio/CasADi ready"
       else
         state="degraded"
         summary="reactive=$reactive_state, posture=$posture_state, whole-body=$whole_body_state"

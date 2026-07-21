@@ -1,4 +1,5 @@
 import importlib.util
+import ast
 import math
 from pathlib import Path
 
@@ -20,6 +21,23 @@ def _load_pc_bridge():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_euler_classifier():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name)
+            and target.id == "RPC_ERR_SERVER_API_NOT_IMPL"
+            for target in node.targets
+        ):
+            selected.append(node)
+        if isinstance(node, ast.FunctionDef) and node.name == "_euler_response_outcome":
+            selected.append(node)
+    namespace = {}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    return namespace["_euler_response_outcome"]
 
 
 def test_shadow_path_cannot_construct_unitree_transport():
@@ -87,8 +105,22 @@ def test_posture_commands_require_an_explicit_zero_ack():
     source = SOURCE.read_text(encoding="utf-8")
 
     assert "result.success = code == 0" in source
-    assert "if self._last_code != 0:" in source
+    assert 'if code == 0:' in source
+    assert 'return "accepted"' in source
     assert "code in (0, None)" not in source
+
+
+def test_euler_api_not_implemented_degrades_instead_of_faulting_forever():
+    classify = _load_euler_classifier()
+    source = SOURCE.read_text(encoding="utf-8")
+
+    assert classify(0) == "accepted"
+    assert classify(3203) == "unsupported"
+    assert classify(-1) == "fault"
+    assert classify(None) == "fault"
+    assert 'self._phase = "unsupported"' in source
+    assert '"euler": self._euler_supported' in source
+    assert "degraded to base + arm control" in source
 
 
 def test_launcher_routes_move_through_guard_only_in_live_mode():
@@ -161,3 +193,11 @@ def test_pc_live_relay_requires_fresh_unlatched_nuc_feedback():
     status["stop_latched"] = False
     status["feedback"]["sport_state_age_s"] = 0.9
     assert not bridge.feedback_is_fresh(status)
+
+
+def test_pc_relay_suppresses_euler_after_explicit_capability_rejection():
+    bridge = _load_pc_bridge()
+
+    assert bridge.euler_is_available({})
+    assert bridge.euler_is_available({"capabilities": {"euler": True}})
+    assert not bridge.euler_is_available({"capabilities": {"euler": False}})

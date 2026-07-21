@@ -71,6 +71,15 @@ def feedback_is_fresh(document: dict[str, Any], *, maximum_age_s: float = 0.50) 
         return False
 
 
+def euler_is_available(document: dict[str, Any]) -> bool:
+    """Treat an explicit robot capability rejection as persistent this run."""
+    capabilities = document.get("capabilities")
+    return not (
+        isinstance(capabilities, dict)
+        and capabilities.get("euler") is False
+    )
+
+
 def _parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("shadow", "live"), default="shadow")
@@ -156,6 +165,13 @@ def main(args: list[str] | None = None) -> None:
                 or not feedback_is_fresh(self.nuc_status, maximum_age_s=parsed.feedback_timeout_s)
             ):
                 self._publish("blocked", "NUC posture feedback is missing/stale/latched", target=target)
+                return
+            if not euler_is_available(self.nuc_status):
+                self._publish(
+                    "degraded",
+                    "Euler is not implemented by the active Go2W service; base + arm fallback",
+                    target=target,
+                )
                 return
             command = TwistStamped()
             command.header.stamp = self.get_clock().now().to_msg()

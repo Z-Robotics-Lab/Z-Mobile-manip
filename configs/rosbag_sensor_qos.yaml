@@ -1,0 +1,35 @@
+/piper/state:
+  history: keep_last
+  depth: 20
+  reliability: best_effort
+  durability: volatile
+
+/camera/color/image_raw:
+  history: keep_last
+  depth: 5
+  reliability: best_effort
+  durability: volatile
+
+/camera/aligned_depth_to_color/image_raw:
+  history: keep_last
+  depth: 5
+  reliability: best_effort
+  durability: volatile
+
+/track_3d/selected_target_pointcloud:
+  history: keep_last
+  depth: 5
+  reliability: best_effort
+  durability: volatile
+
+/z_manip/perception/scene_pointcloud:
+  history: keep_last
+  depth: 5
+  reliability: best_effort
+  durability: volatile
+
+/z_manip/perception/target_pointcloud:
+  history: keep_last
+  depth: 5
+  reliability: best_effort
+  durability: volatile

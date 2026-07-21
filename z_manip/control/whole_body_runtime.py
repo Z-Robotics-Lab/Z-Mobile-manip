@@ -33,6 +33,40 @@ from .whole_body_optimizer import (
 RUNTIME_SCHEMA = "z_manip.whole_body_runtime.v1"
 
 
+def _euler_actuation_available(document: dict[str, Any] | None) -> bool:
+    """Return false only after the robot explicitly rejects Euler support."""
+    if not isinstance(document, dict):
+        return True
+    capabilities = document.get("capabilities")
+    return not (
+        isinstance(capabilities, dict)
+        and capabilities.get("euler") is False
+    )
+
+
+def _locked_control_indices(
+    *,
+    freeze_base: bool,
+    euler_available: bool,
+    mode: str,
+    arm_ready: bool,
+) -> tuple[int, ...]:
+    """Remove control DOFs that have no confirmed live actuator owner.
+
+    Locking the rejected body attitude DOFs is important: otherwise the QP
+    can improve its mathematical objective with roll/pitch commands that the
+    Go2W will never execute, starving the PiPER joints of the same view task.
+    """
+    locked: list[int] = []
+    if freeze_base:
+        locked.extend((0, 1))
+    if not euler_available:
+        locked.extend((2, 3))
+    if mode == "live" and not arm_ready:
+        locked.extend(range(4, 10))
+    return tuple(locked)
+
+
 @dataclass(frozen=True)
 class WholeBodyRuntimeCommand:
     base_forward_mps: float
@@ -188,6 +222,7 @@ class WholeBodyRuntimeController:
         runtime_state = _json_document(runtime_state_path)
         joints, joints_fresh, joint_detail = self._measured_joints(runtime_state)
         roll, pitch, posture_fresh, posture_detail = self._measured_posture(posture_status)
+        euler_available = _euler_actuation_available(posture_status)
         arm_ready, arm_detail = self._arm_executor_ready(arm_view_status)
         state = ReducedWholeBodyState(
             base_x_m=0.0,
@@ -209,9 +244,11 @@ class WholeBodyRuntimeController:
             state,
             task,
             previous_velocity=self.previous_velocity,
-            locked_control_indices=(
-                *((0, 1) if freeze_base else ()),
-                *((4, 5, 6, 7, 8, 9) if mode == "live" and not arm_ready else ()),
+            locked_control_indices=_locked_control_indices(
+                freeze_base=freeze_base,
+                euler_available=euler_available,
+                mode=mode,
+                arm_ready=arm_ready,
             ),
         )
         self.previous_velocity = result.velocity if result.success else None
@@ -230,6 +267,7 @@ class WholeBodyRuntimeController:
         executable = bool(
             mode == "live" and result.success and joints_fresh and posture_fresh
         )
+        body_enabled = bool(executable and euler_available)
         arm_enabled = bool(executable and arm_ready)
         document = result.status_document()
         document.update({
@@ -247,17 +285,31 @@ class WholeBodyRuntimeController:
             },
             "transport": {
                 "base_and_body_enabled": executable,
+                "base_enabled": executable,
+                "body_enabled": body_enabled,
                 "arm_enabled": arm_enabled,
+                "body_reason": (
+                    "Euler actuator accepted by the active Go2W service"
+                    if body_enabled
+                    else "Euler unavailable; view task reallocated to PiPER"
+                ),
                 "arm_reason": (
                     "fresh measured PiPER reactive executor owns CAN"
                     if arm_enabled else arm_detail
                 ),
                 "enabled_dofs": [
-                    "base_forward", "base_yaw", "body_roll", "body_pitch",
+                    "base_forward", "base_yaw",
+                    *(["body_roll", "body_pitch"] if body_enabled else []),
                     *(list(self.model.arm_joint_names) if arm_enabled else []),
                 ],
                 "disabled_dofs": {
                     "body_height": "unsupported by current Go2W SPORT firmware",
+                    **({
+                        "body_roll_pitch": (
+                            "Euler(1007) rejected with RPC_ERR_SERVER_API_NOT_IMPL; "
+                            "optimizer DOFs locked"
+                        ),
+                    } if not euler_available else {}),
                     **({"piper_arm": arm_detail} if not arm_enabled else {}),
                 },
             },

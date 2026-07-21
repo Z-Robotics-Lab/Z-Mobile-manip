@@ -82,6 +82,7 @@ manip url
 
 工作台默认地址是 <http://127.0.0.1:8766/>。`bringup` 启动 UI、相机桥、被动反馈、
 observer、EdgeTAM 与 perception；`status` 会分别报告 NUC 相机、RGB-D、跟踪和反馈状态。
+明天重新开机时仍只需运行上面三条命令；在 `manip status` 全部 healthy 前不要进入 Live。
 
 常用维护命令：
 
@@ -92,6 +93,39 @@ manip logs perception-all 100
 manip restart
 manip stop
 ```
+
+离线检查今天的最新 rosbag、API 状态和深度伺服 trace（不会导入 ROS/WebRTC/CAN，
+也不会发送运动命令）：
+
+```bash
+python3 scripts/offline/mobile_pipeline_replay_eval.py \
+  --artifacts-root ../artifacts/go2w_real \
+  --output /tmp/mobile-pipeline-eval.json
+```
+
+报告分别量化 detect、track、base、posture、arm intent/ACK 和 handoff，并检查 JSON
+完整性、时间戳单调性、必要 topic 以及 MCAP 首尾 framing。需要把缺失 ACK、损坏记录或
+姿态命令故障作为 CI 失败时追加 `--strict`。
+
+用真实 D435 目标、PiPER 关节反馈和 Go2W 姿态样本重放 Pinocchio/CasADi
+控制分配（容器禁网，不创建 ROS publisher，也不打开 WebRTC/CAN）：
+
+```bash
+docker run --rm --network none \
+  -e PYTHONPATH=/lab/Z-Mobile-manip \
+  -v "$HOME/Z-Robotics-Lab:/lab:ro" \
+  -w /lab/Z-Mobile-manip z-mobile-manip-whole-body:latest \
+  python3 scripts/offline/whole_body_bag_replay.py \
+    --bag /lab/artifacts/go2w_real/rosbags/mobile-fixed-wrapper-20260721-184115 \
+    --urdf /lab/go2W_Sim/assets/urdf/go2w_sensored.urdf \
+    --calibration /lab/artifacts/go2w_real/calibration/piper_wrist_camera_calibration.json \
+    --sample-stride 50 --max-samples 100 \
+    --output /tmp/whole-body-bag-replay.json
+```
+
+当前 Go2W motion service 若对 `Euler(1007)` 返回 3203，控制器会将机身
+roll/pitch 自由度从 QP 中锁定，并把 FOV/垂直观测任务分配给 PiPER；这时 UI 中不应期待
+机身倾斜，但底盘视觉伺服与机械臂 reactive view 会继续运行。
 
 ## UI 工作流
 

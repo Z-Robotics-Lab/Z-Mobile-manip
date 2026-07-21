@@ -152,10 +152,57 @@ def test_import_does_not_import_ros_or_hardware_transport() -> None:
     assert result.stdout.strip() == "0 0"
 
 
-def test_reactive_owner_preserves_measured_joint_state_contract() -> None:
+def test_reactive_owner_uses_sensor_data_qos_for_standard_joint_topic() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
     assert 'JOINT_STATE_TOPIC = "/piper/state"' in source
     assert 'JointState, JOINT_STATE_TOPIC, qos_profile_sensor_data' in source
-    assert 'joint_state.header.frame_id = "piper_base_link"' in source
-    assert 'joint_state.name = list(JOINT_NAMES)' in source
-    assert 'joint_state.position = [float(value) for value in self.actual]' in source
+
+
+def test_joint_state_fields_match_passive_bridge_contract() -> None:
+    measured = np.asarray([0.1, -0.2, 0.3, -0.4, 0.5, -0.6])
+    frame_id, names, positions = MODULE.joint_state_fields(measured)
+    assert frame_id == "piper_base_link"
+    assert names == [f"piper_joint{index}" for index in range(1, 7)]
+    assert positions == pytest.approx(measured.tolist())
+
+
+@pytest.mark.parametrize("measured", [np.zeros(5), np.full(6, np.nan)])
+def test_joint_state_fields_reject_invalid_feedback(measured: np.ndarray) -> None:
+    with pytest.raises(ValueError, match="finite six-vector"):
+        MODULE.joint_state_fields(measured)
+
+
+def test_validated_joint_feedback_refreshes_only_on_new_sdk_stamp() -> None:
+    measured = np.arange(6, dtype=float) / 10.0
+    actual, stamp, receipt_s, age_s = MODULE.validated_joint_feedback(
+        measured,
+        11.0,
+        previous_stamp=10.0,
+        previous_receipt_s=2.0,
+        now_s=5.0,
+    )
+    np.testing.assert_allclose(actual, measured)
+    assert stamp == 11.0
+    assert receipt_s == 5.0
+    assert age_s == 0.0
+
+    _actual, _stamp, unchanged_receipt_s, unchanged_age_s = MODULE.validated_joint_feedback(
+        measured,
+        11.0,
+        previous_stamp=11.0,
+        previous_receipt_s=receipt_s,
+        now_s=5.0 + MODULE.MAX_FEEDBACK_AGE_S,
+    )
+    assert unchanged_receipt_s == 5.0
+    assert unchanged_age_s == pytest.approx(MODULE.MAX_FEEDBACK_AGE_S)
+
+
+def test_validated_joint_feedback_rejects_stale_unchanged_sdk_sample() -> None:
+    with pytest.raises(ValueError, match="stale"):
+        MODULE.validated_joint_feedback(
+            np.zeros(6),
+            11.0,
+            previous_stamp=11.0,
+            previous_receipt_s=5.0,
+            now_s=5.0 + MODULE.MAX_FEEDBACK_AGE_S + 1e-6,
+        )

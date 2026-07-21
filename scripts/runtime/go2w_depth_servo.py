@@ -361,6 +361,11 @@ def _posture_feedback_state(
     mode = str(document.get("mode", ""))
     detail = str(document.get("detail", ""))
     stop_latched = document.get("stop_latched") is True
+    capabilities = document.get("capabilities")
+    euler_unavailable = (
+        isinstance(capabilities, dict)
+        and capabilities.get("euler") is False
+    )
     blocked = stop_latched or phase in {
         "blocked",
         "fault",
@@ -371,6 +376,13 @@ def _posture_feedback_state(
     feedback_fresh = (
         isinstance(feedback, dict) and feedback.get("fresh") is True
     )
+    if euler_unavailable and mode == "live" and feedback_fresh and not stop_latched:
+        return (
+            True,
+            False,
+            False,
+            detail or "Euler unavailable; body posture bypassed for base + arm fallback",
+        )
     settled = (
         mode == "live"
         and phase == "reached"
@@ -1172,6 +1184,12 @@ def _run_ros(args: argparse.Namespace) -> int:
                 # measured-state gate used by the solve was fresh. Shadow
                 # remains completely transport-free.
                 if not self.whole_body_command.executable:
+                    return
+                transport = self.whole_body_command.document.get("transport")
+                if (
+                    isinstance(transport, dict)
+                    and transport.get("body_enabled") is False
+                ):
                     return
                 roll = self.whole_body_command.body_roll_target_rad
                 target = (roll, self.whole_body_command.body_pitch_target_rad)

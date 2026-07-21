@@ -487,6 +487,28 @@ def test_shadow_posture_is_diagnostic_and_never_counts_as_settled():
     assert shadow is True
 
 
+def test_explicit_euler_not_implemented_uses_nonblocking_base_arm_fallback():
+    document = {
+        "schema": "z_manip.go2w_posture_status.v1",
+        "mode": "live",
+        "phase": "unsupported",
+        "stop_latched": False,
+        "feedback": {"fresh": True},
+        "capabilities": {"euler": False},
+        "detail": "Euler 1007 returned RPC 3203",
+    }
+
+    settled, blocked, shadow, detail = SERVO._posture_feedback_state(
+        document,
+        age_s=0.10,
+    )
+
+    assert settled is True
+    assert blocked is False
+    assert shadow is False
+    assert "3203" in detail
+
+
 def test_whole_body_posture_convergence_uses_velocity_not_tiny_pose_step():
     command = SERVO.WholeBodyRuntimeCommand(
         base_forward_mps=0.0,

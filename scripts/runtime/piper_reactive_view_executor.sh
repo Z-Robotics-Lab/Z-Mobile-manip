@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ROS setup scripts legitimately probe optional shell variables.  Keep
+# nounset disabled only while sourcing them; otherwise Jazzy aborts here with
+# `AMENT_TRACE_SETUP_FILES: unbound variable` before the executor can publish
+# feedback or accept a reactive-view intent.
+set +u
 source "$HOME/go2w-nuc/bringup/ros_env.sh"
+set -u
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-20}"
 export Z_MANIP_PIPER_REACTIVE_ACK=I_UNDERSTAND_PIPER_REACTIVE_VIEW_WILL_MOVE
 cd "$HOME/pyAgxArm"

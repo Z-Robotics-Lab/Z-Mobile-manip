@@ -785,6 +785,21 @@ def _servo_posture_stall_script(path: Path) -> Path:
     return path
 
 
+def _servo_with_child_script(path: Path) -> Path:
+    child_pid_path = path.with_suffix(".child-pid")
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "sleep 30 &\n"
+        "child=$!\n"
+        f"printf '%s' \"$child\" > {str(child_pid_path)!r}\n"
+        "wait \"$child\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 def _servo_frozen_heartbeat_script(path: Path, phase: str) -> Path:
     path.write_text(
         "#!/usr/bin/env python3\n"
@@ -825,6 +840,33 @@ def test_depth_servo_server_hands_reached_target_to_grasp(tmp_path):
     assert grasp.target == "charger"
     assert grasp.speed_percent == 17
     assert runner.status()["workflow"]["phase"] == "grasp_started"
+
+
+def test_depth_servo_stop_terminates_launcher_process_group(tmp_path):
+    script = _servo_with_child_script(tmp_path / "servo.sh")
+    runner = CONTROL.DepthServoRunner(
+        script,
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+    )
+
+    assert runner.start("shadow")["started"] is True
+    child_pid_path = script.with_suffix(".child-pid")
+    deadline = time.monotonic() + 2.0
+    while not child_pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    child_pid = int(child_pid_path.read_text())
+
+    assert runner.stop()["stopped"] is True
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("depth-servo child survived Full Stop")
 
 
 def test_depth_servo_handoff_phases_stop_base_before_fresh_grasp(tmp_path):

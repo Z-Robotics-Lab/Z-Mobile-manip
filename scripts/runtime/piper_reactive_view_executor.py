@@ -30,6 +30,7 @@ INTENT_TOPIC = "/z_manip/reactive/arm_view_intent"
 STATUS_TOPIC = "/z_manip/reactive/arm_view_status"
 JOINT_STATE_TOPIC = "/piper/state"
 JOINT_NAMES = tuple(f"piper_joint{index}" for index in range(1, 7))
+JOINT_STATE_FRAME = "piper_base_link"
 FULL_STOP_TOPIC = "/go2w/full_stop"
 LIVE_ACK = "I_UNDERSTAND_PIPER_REACTIVE_VIEW_WILL_MOVE"
 MAX_INTENT_AGE_S = 0.30
@@ -92,6 +93,53 @@ def bounded_target(measured: np.ndarray, qdot: np.ndarray, dt_s: float) -> np.nd
     lower_stop = np.minimum(measured, low)
     upper_stop = np.maximum(measured, high)
     return np.clip(measured + step, lower_stop, upper_stop)
+
+
+def validated_joint_feedback(
+    measured: object,
+    feedback_stamp: object,
+    *,
+    previous_stamp: float,
+    previous_receipt_s: float,
+    now_s: float,
+) -> tuple[np.ndarray, float, float, float]:
+    """Validate one SDK feedback sample and compute its local freshness.
+
+    The SDK stamp is used only as a change token: firmware variants do not all
+    expose the same clock domain.  Freshness is therefore measured from the
+    local monotonic time at which a new stamp was first observed.
+    """
+    try:
+        actual = np.asarray(measured, dtype=float)
+        stamp = float(feedback_stamp)
+        previous_stamp = float(previous_stamp)
+        receipt_s = float(previous_receipt_s)
+        now_s = float(now_s)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid PiPER joint feedback") from error
+    if actual.shape != (6,) or not np.isfinite(actual).all():
+        raise ValueError("PiPER joint feedback must be a finite six-vector")
+    if not all(math.isfinite(value) for value in (stamp, previous_stamp, receipt_s, now_s)):
+        raise ValueError("PiPER feedback timestamps must be finite")
+    if receipt_s < 0.0 or now_s < receipt_s:
+        raise ValueError("PiPER feedback receipt time is invalid")
+    if stamp != previous_stamp:
+        receipt_s = now_s
+    feedback_age_s = max(0.0, now_s - receipt_s)
+    if feedback_age_s > MAX_FEEDBACK_AGE_S:
+        raise ValueError("PiPER joint feedback is stale")
+    return actual, stamp, receipt_s, feedback_age_s
+
+
+def joint_state_fields(measured: object) -> tuple[str, list[str], list[float]]:
+    """Return the measured JointState contract shared with the passive bridge."""
+    try:
+        actual = np.asarray(measured, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid PiPER joint feedback") from error
+    if actual.shape != (6,) or not np.isfinite(actual).all():
+        raise ValueError("PiPER joint feedback must be a finite six-vector")
+    return JOINT_STATE_FRAME, list(JOINT_NAMES), [float(value) for value in actual]
 
 
 def main() -> int:
@@ -168,18 +216,24 @@ def main() -> int:
                 now = time.monotonic()
                 try:
                     actual, feedback_stamp = piper.read_joint_feedback(robot)
-                    if feedback_stamp != self.feedback_stamp:
-                        self.feedback_stamp = feedback_stamp
-                        self.feedback_receipt_s = now
-                    self.actual = actual
-                    feedback_age_s = now - self.feedback_receipt_s
-                    if feedback_age_s > MAX_FEEDBACK_AGE_S:
-                        raise piper.SafetyError("PiPER joint feedback is stale")
+                    (
+                        self.actual,
+                        self.feedback_stamp,
+                        self.feedback_receipt_s,
+                        _feedback_age_s,
+                    ) = validated_joint_feedback(
+                        actual,
+                        feedback_stamp,
+                        previous_stamp=self.feedback_stamp,
+                        previous_receipt_s=self.feedback_receipt_s,
+                        now_s=now,
+                    )
+                    frame_id, names, positions = joint_state_fields(self.actual)
                     joint_state = JointState()
                     joint_state.header.stamp = self.get_clock().now().to_msg()
-                    joint_state.header.frame_id = "piper_base_link"
-                    joint_state.name = list(JOINT_NAMES)
-                    joint_state.position = [float(value) for value in self.actual]
+                    joint_state.header.frame_id = frame_id
+                    joint_state.name = names
+                    joint_state.position = positions
                     self.joint_publisher.publish(joint_state)
                     piper.check_arm_status(robot, require_idle=False)
                     fresh_intent = (

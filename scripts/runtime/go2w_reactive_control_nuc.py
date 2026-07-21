@@ -42,6 +42,7 @@ CONTROL_RESET_TOPIC = "/go2w/control_reset"
 POSTURE_STATE_TOPIC = "/go2w/posture_state"
 STATUS_SCHEMA = "z_manip.go2w_posture_status.v1"
 LIVE_ACK = "I_UNDERSTAND_GO2W_WILL_MOVE"
+RPC_ERR_SERVER_API_NOT_IMPL = 3203
 
 
 def _status_code(response: Any) -> int | None:
@@ -60,6 +61,22 @@ def _raw_response_evidence(response: Any) -> Any:
     if len(encoded) > 8192:
         return {"json": encoded[:8192], "truncated": True}
     return response
+
+
+def _euler_response_outcome(code: int | None) -> str:
+    """Classify the robot verdict without confusing capability with transport.
+
+    Unitree's official RPC error table defines 3203 as
+    ``RPC_ERR_SERVER_API_NOT_IMPL``.  Some Go2W ``ai-w`` firmware advertises
+    SPORT state and accepts Move while its active service does not implement
+    Euler(1007).  That is a persistent capability result for this connection,
+    not a transient actuator fault.
+    """
+    if code == 0:
+        return "accepted"
+    if code == RPC_ERR_SERVER_API_NOT_IMPL:
+        return "unsupported"
+    return "fault"
 
 
 class _StatusNode(Node):
@@ -81,6 +98,8 @@ class _StatusNode(Node):
         self._sport_state: dict[str, Any] | None = None
         self._sport_state_received_s: float | None = None
         self._command_codes: dict[str, int | None] = {"Euler": None}
+        self._euler_supported = True
+        self._euler_reason = "Euler capability has not been rejected by the robot"
         self._target: tuple[float, float, float, float] | None = None
         self._phase = "idle" if mode == "live" else "shadow"
         self._detail = (
@@ -180,6 +199,7 @@ class _StatusNode(Node):
             self._target is None
             or self._sport_state is None
             or self._stop_latched
+            or not self._euler_supported
         ):
             return
         fresh, detail = self._fresh_feedback()
@@ -258,9 +278,10 @@ class _StatusNode(Node):
             },
             "capabilities": {
                 "move": True,
-                "euler": True,
+                "euler": self._euler_supported,
                 "body_height": False,
                 "get_body_height": False,
+                "euler_reason": self._euler_reason,
                 "height_reason": "Unitree current SDK/firmware removed API 1013 and 1024",
             },
             "get_body_height": {
@@ -504,6 +525,14 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             self._phase = "stopped"
             self._detail = "Full Stop is latched; publish /go2w/control_reset first"
             return
+        if not self._euler_supported:
+            self._target = target
+            self._phase = "unsupported"
+            self._detail = (
+                "Euler unavailable on the active Go2W motion service; "
+                "body posture is bypassed and base + arm remain available"
+            )
+            return
         fresh, detail = self._fresh_feedback()
         if not fresh:
             self._phase = "blocked"
@@ -543,7 +572,21 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                         return
                     self._last_code = await self._request_sport(name, parameter)
                     self._command_codes[name] = self._last_code
-                    if self._last_code != 0:
+                    outcome = _euler_response_outcome(self._last_code)
+                    if outcome == "unsupported":
+                        self._euler_supported = False
+                        self._euler_reason = (
+                            "robot returned 3203 (RPC_ERR_SERVER_API_NOT_IMPL) "
+                            "for Euler(1007)"
+                        )
+                        self._last_posture_command_s = time.monotonic()
+                        self._phase = "unsupported"
+                        self._detail = (
+                            "Euler is not implemented by the active Go2W motion "
+                            "service; degraded to base + arm control"
+                        )
+                        return
+                    if outcome == "fault":
                         self._phase = "fault"
                         self._detail = f"{name} refused by robot (code={self._last_code})"
                         return
@@ -559,6 +602,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 restart = (
                     self._pending_posture is not None
                     and not self._stop_latched
+                    and self._euler_supported
                     and generation == self._posture_generation
                 )
                 if restart:

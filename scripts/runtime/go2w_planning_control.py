@@ -1884,11 +1884,23 @@ class DepthServoRunner:
 
     def _terminate_process(self, process: subprocess.Popen[bytes], *, keep_status: bool) -> None:
         if process.poll() is None:
-            process.terminate()
+            # The fixed launcher owns a foreground ``docker run`` child and is
+            # created with ``start_new_session=True``.  Terminating only the
+            # shell can leave that child (and therefore a live velocity
+            # publisher) running after the UI reports the task stopped.  End
+            # the complete launcher process group so bash can run its cleanup
+            # trap and Docker receives the same termination signal.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                process.terminate()
             try:
                 process.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
-                process.kill()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    process.kill()
                 process.wait(timeout=2.0)
         if not keep_status:
             self.status_path.unlink(missing_ok=True)

@@ -20,6 +20,10 @@ from z_manip.control.whole_body_optimizer import (
     WholeBodyTask,
     WholeBodyVisibilityError,
 )
+from z_manip.control.whole_body_runtime import (
+    _euler_actuation_available,
+    _locked_control_indices,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -203,6 +207,30 @@ def test_locked_untransported_controls_remain_exactly_stationary():
     velocity = result.velocity.as_vector()
     assert velocity[(0, 1, 4, 5, 6, 7, 8, 9),] == pytest.approx(0.0)
     assert np.linalg.norm(velocity[2:4]) > 0.0
+
+
+def test_explicit_euler_rejection_reallocates_view_task_to_arm_controls():
+    assert _euler_actuation_available(None)
+    assert _euler_actuation_available({"capabilities": {"euler": True}})
+    assert not _euler_actuation_available({"capabilities": {"euler": False}})
+
+    locked = _locked_control_indices(
+        freeze_base=True,
+        euler_available=False,
+        mode="live",
+        arm_ready=True,
+    )
+    assert locked == (0, 1, 2, 3)
+
+    optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
+    result = optimizer.solve(
+        _state(),
+        WholeBodyTask(target_world_xyz_m=(0.56, 0.0, -0.12)),
+        locked_control_indices=locked,
+    )
+    velocity = result.velocity.as_vector()
+    assert velocity[:4] == pytest.approx(0.0)
+    assert np.linalg.norm(velocity[4:]) > 0.0
 
 
 def test_invalid_locked_control_index_is_rejected():
