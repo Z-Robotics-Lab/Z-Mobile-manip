@@ -267,6 +267,7 @@ class WholeBodyRuntimeController:
         executable = bool(
             mode == "live" and result.success and joints_fresh and posture_fresh
         )
+        base_enabled = bool(executable and not freeze_base)
         body_enabled = bool(executable and euler_available)
         arm_enabled = bool(executable and arm_ready)
         document = result.status_document()
@@ -284,33 +285,51 @@ class WholeBodyRuntimeController:
                 "state": asdict(state),
             },
             "transport": {
-                "base_and_body_enabled": executable,
-                "base_enabled": executable,
+                # Kept for older dashboard readers; true only when both
+                # transports are actually available in this solve.
+                "base_and_body_enabled": bool(base_enabled and body_enabled),
+                "base_enabled": base_enabled,
                 "body_enabled": body_enabled,
                 "arm_enabled": arm_enabled,
                 "body_reason": (
                     "Euler actuator accepted by the active Go2W service"
                     if body_enabled
-                    else "Euler unavailable; view task reallocated to PiPER"
+                    else (
+                        "Euler unavailable; view task reallocated to PiPER"
+                        if not euler_available
+                        else result.reason
+                    )
                 ),
                 "arm_reason": (
                     "fresh measured PiPER reactive executor owns CAN"
-                    if arm_enabled else arm_detail
+                    if arm_enabled else (
+                        result.reason if not result.success else arm_detail
+                    )
                 ),
                 "enabled_dofs": [
-                    "base_forward", "base_yaw",
+                    *(["base_forward", "base_yaw"] if base_enabled else []),
                     *(["body_roll", "body_pitch"] if body_enabled else []),
                     *(list(self.model.arm_joint_names) if arm_enabled else []),
                 ],
                 "disabled_dofs": {
                     "body_height": "unsupported by current Go2W SPORT firmware",
                     **({
+                        "base": (
+                            "locked in the close-range handoff zone"
+                            if freeze_base else result.reason
+                        ),
+                    } if not base_enabled else {}),
+                    **({
                         "body_roll_pitch": (
                             "Euler(1007) rejected with RPC_ERR_SERVER_API_NOT_IMPL; "
                             "optimizer DOFs locked"
                         ),
                     } if not euler_available else {}),
-                    **({"piper_arm": arm_detail} if not arm_enabled else {}),
+                    **({
+                        "piper_arm": (
+                            result.reason if not result.success else arm_detail
+                        ),
+                    } if not arm_enabled else {}),
                 },
             },
             "posture_target": {

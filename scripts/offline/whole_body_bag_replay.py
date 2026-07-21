@@ -116,6 +116,15 @@ def _write_runtime_state(path: Path, joints: tuple[float, ...]) -> None:
     path.write_text(json.dumps(document), encoding="utf-8")
 
 
+def _maximum_false_run(values: list[bool]) -> int:
+    maximum = 0
+    current = 0
+    for value in values:
+        current = 0 if value else current + 1
+        maximum = max(maximum, current)
+    return maximum
+
+
 def replay(
     *,
     bag_path: Path,
@@ -207,6 +216,11 @@ def replay(
                     "body_pitch_target_rad": moving.body_pitch_target_rad,
                     "arm_joint_velocity_rps": list(moving.arm_joint_velocity_rps),
                     "executable": moving.executable,
+                    "optimizer": {
+                        "success": moving.document.get("success"),
+                        "reason": moving.document.get("reason"),
+                        "failure_code": moving.document.get("failure_code"),
+                    },
                     "transport": moving.document.get("transport"),
                 },
                 "posture_only": {
@@ -216,6 +230,11 @@ def replay(
                     "body_pitch_target_rad": frozen.body_pitch_target_rad,
                     "arm_joint_velocity_rps": list(frozen.arm_joint_velocity_rps),
                     "executable": frozen.executable,
+                    "optimizer": {
+                        "success": frozen.document.get("success"),
+                        "reason": frozen.document.get("reason"),
+                        "failure_code": frozen.document.get("failure_code"),
+                    },
                     "transport": frozen.document.get("transport"),
                 },
             })
@@ -248,12 +267,25 @@ def replay(
             )
         )
     ]
+    posture_executable = [
+        bool(sample["posture_only"]["executable"])
+        for sample in samples
+    ]
+    posture_executable_ratio = (
+        sum(posture_executable) / len(posture_executable)
+        if posture_executable else 0.0
+    )
+    maximum_posture_failure_run = _maximum_false_run(posture_executable)
     invariants = {
         "samples_present": bool(samples),
         "all_outputs_finite": len(finite) == len(samples),
         "euler_transport_disabled_for_all_samples": len(body_disabled) == len(samples),
         "base_locked_during_posture_only_for_all_samples": len(posture_base_zero) == len(samples),
         "arm_reallocated_for_at_least_one_sample": bool(arm_active),
+        "posture_only_executable_ratio_at_least_99_percent": (
+            posture_executable_ratio >= 0.99
+        ),
+        "no_multi_tick_posture_solver_stall": maximum_posture_failure_run <= 1,
         "no_replay_exceptions": not failures,
     }
     return {
@@ -273,6 +305,9 @@ def replay(
             "euler_disabled_samples": len(body_disabled),
             "posture_only_base_locked_samples": len(posture_base_zero),
             "posture_only_arm_active_samples": len(arm_active),
+            "posture_only_executable_samples": sum(posture_executable),
+            "posture_only_executable_ratio": posture_executable_ratio,
+            "posture_only_max_consecutive_infeasible": maximum_posture_failure_run,
             "max_abs_arm_rate_rps": max((
                 max(abs(value) for value in sample["posture_only"]["arm_joint_velocity_rps"])
                 for sample in samples
