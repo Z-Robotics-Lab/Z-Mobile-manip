@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, dataclass
 from enum import Enum
+import json
 import math
 from typing import Any, Callable, Mapping, Protocol
 
@@ -32,6 +33,7 @@ class CommandOwner(str, Enum):
     NONE = "none"
     BASE = "base"
     POSTURE = "posture"
+    FEEDBACK = "feedback"
     FULL_STOP = "full_stop"
 
 
@@ -256,6 +258,85 @@ def sport_response_code(response: Mapping[str, Any]) -> int | None:
         return None
 
 
+def _height_scalar(value: Any, *, path: str) -> tuple[float, str] | None:
+    """Decode one explicitly height-shaped GetBodyHeight response value.
+
+    The installed WebRTC connector returns the firmware response unchanged.
+    Firmware revisions have used a number, a numeric string, a JSON string,
+    or a mapping below ``data``/``parameter``.  We accept only those explicit
+    envelopes; status codes and unrelated numeric fields are never searched.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"GetBodyHeight value at {path} is not finite")
+        return result, path
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            try:
+                decoded = float(stripped)
+            except ValueError as error:
+                raise ValueError(
+                    f"GetBodyHeight value at {path} is neither JSON nor numeric"
+                ) from error
+        return _height_scalar(decoded, path=f"{path}<json>")
+    if isinstance(value, Mapping):
+        candidates: list[tuple[float, str]] = []
+        for key in ("body_height", "bodyHeight", "height", "value", "data"):
+            if key in value:
+                parsed = _height_scalar(value[key], path=f"{path}.{key}")
+                if parsed is not None:
+                    candidates.append(parsed)
+        if not candidates:
+            return None
+        first = candidates[0]
+        if any(abs(item[0] - first[0]) > 1e-9 for item in candidates[1:]):
+            raise ValueError("GetBodyHeight response contains conflicting height values")
+        return first
+    return None
+
+
+def get_body_height_from_response(response: Mapping[str, Any]) -> tuple[float, str]:
+    """Return the API-1024 command-domain height and its evidence path.
+
+    A non-zero robot status is a hard failure.  A successful envelope without
+    an unambiguous height is also a failure; callers must retain the raw
+    response and expose the exception rather than substituting SPORT state or
+    a hand-written nominal height.
+    """
+    if not isinstance(response, Mapping):
+        raise ValueError("GetBodyHeight response must be a mapping")
+    code = sport_response_code(response)
+    if code not in (0, None):
+        raise ValueError(f"GetBodyHeight refused by robot (code={code})")
+    candidates: list[tuple[float, str]] = []
+    data = response.get("data")
+    if isinstance(data, Mapping):
+        for key in ("data", "parameter", "body_height", "bodyHeight", "height", "value"):
+            if key in data:
+                parsed = _height_scalar(data[key], path=f"data.{key}")
+                if parsed is not None:
+                    candidates.append(parsed)
+    for key in ("parameter", "body_height", "bodyHeight", "height", "value"):
+        if key in response:
+            parsed = _height_scalar(response[key], path=key)
+            if parsed is not None:
+                candidates.append(parsed)
+    if not candidates:
+        raise ValueError("GetBodyHeight response contains no supported height payload")
+    first = candidates[0]
+    if any(abs(item[0] - first[0]) > 1e-9 for item in candidates[1:]):
+        raise ValueError("GetBodyHeight response contains conflicting height values")
+    return first
+
+
 class SportCommandArbiter:
     """Serialize command families and give Full Stop unconditional priority.
 
@@ -268,6 +349,7 @@ class SportCommandArbiter:
     def __init__(self) -> None:
         self._moves: deque[SportRequest] = deque(maxlen=1)
         self._posture: deque[SportRequest] = deque()
+        self._feedback: deque[SportRequest] = deque(maxlen=1)
         self._stop: SportRequest | None = None
         self.owner = CommandOwner.NONE
 
@@ -283,11 +365,15 @@ class SportCommandArbiter:
         if request.command in (SportCommand.BODY_HEIGHT, SportCommand.EULER):
             self._posture.append(request)
             return
+        if request.command == SportCommand.GET_BODY_HEIGHT:
+            self._feedback.append(request)
+            return
         raise ValueError(f"unsupported command family: {request.command.value}")
 
     def full_stop(self) -> None:
         self._moves.clear()
         self._posture.clear()
+        self._feedback.clear()
         self._stop = SportRequest(SportCommand.STOP_MOVE, {})
         self.owner = CommandOwner.FULL_STOP
 
@@ -304,6 +390,9 @@ class SportCommandArbiter:
         if self._posture:
             self.owner = CommandOwner.POSTURE
             return self._posture.popleft()
+        if self._feedback:
+            self.owner = CommandOwner.FEEDBACK
+            return self._feedback.pop()
         if self._moves:
             self.owner = CommandOwner.BASE
             return self._moves.pop()
@@ -312,7 +401,10 @@ class SportCommandArbiter:
 
     @property
     def pending(self) -> int:
-        return len(self._moves) + len(self._posture) + int(self._stop is not None)
+        return (
+            len(self._moves) + len(self._posture) + len(self._feedback)
+            + int(self._stop is not None)
+        )
 
 
 class Go2WPostureAdapter:
@@ -539,6 +631,36 @@ def feedback_from_mapping(message: Mapping[str, Any], *, stamp_s: float) -> Post
     )
 
 
+def feedback_from_sources(
+    sport_state: Mapping[str, Any],
+    get_body_height_response: Mapping[str, Any],
+    *,
+    stamp_s: float,
+) -> PostureFeedback:
+    """Fuse replayable SPORT state with API-1024 command-domain feedback.
+
+    This is the pure/test boundary used by shadow replays.  Attitude and base
+    velocity come from SPORT state; body height comes only from the explicit
+    GetBodyHeight response.  The absolute SPORT ``body_height`` is therefore
+    never mistaken for an API-1013 offset.
+    """
+    state_feedback = feedback_from_mapping(sport_state, stamp_s=stamp_s)
+    height_offset_m, parse_path = get_body_height_from_response(
+        get_body_height_response,
+    )
+    return PostureFeedback(
+        stamp_s=state_feedback.stamp_s,
+        body_height_m=height_offset_m,
+        roll_rad=state_feedback.roll_rad,
+        pitch_rad=state_feedback.pitch_rad,
+        yaw_rad=state_feedback.yaw_rad,
+        base_linear_x_mps=state_feedback.base_linear_x_mps,
+        base_linear_y_mps=state_feedback.base_linear_y_mps,
+        base_yaw_rate_rps=state_feedback.base_yaw_rate_rps,
+        source=f"sport_mode_state+GetBodyHeight:{parse_path}",
+    )
+
+
 __all__ = [
     "POSTURE_STATUS_SCHEMA",
     "CommandEvidence",
@@ -555,5 +677,7 @@ __all__ = [
     "SportRequest",
     "SportTransport",
     "feedback_from_mapping",
+    "feedback_from_sources",
+    "get_body_height_from_response",
     "sport_response_code",
 ]

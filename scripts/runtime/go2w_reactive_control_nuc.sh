@@ -17,10 +17,6 @@ if [[ "$MODE" == live ]]; then
     printf 'live blocked: set Z_MANIP_GO2W_LIVE_ACK=%s on the NUC\n' "$expected" >&2
     exit 3
   }
-  [[ -n "${Z_MANIP_GO2W_NOMINAL_BODY_HEIGHT_M:-}" ]] || {
-    printf 'live blocked: set measured Z_MANIP_GO2W_NOMINAL_BODY_HEIGHT_M\n' >&2
-    exit 3
-  }
 fi
 
 set +u

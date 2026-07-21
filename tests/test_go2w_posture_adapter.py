@@ -13,6 +13,8 @@ from z_manip.control.go2w_posture import (
     SportCommandArbiter,
     SportRequest,
     feedback_from_mapping,
+    feedback_from_sources,
+    get_body_height_from_response,
 )
 
 
@@ -160,6 +162,92 @@ def test_arbiter_coalesces_move_and_prioritizes_posture_over_move():
     assert move is not None
     assert move.command == SportCommand.MOVE
     assert move.parameter["x"] == 0.2
+
+
+def test_get_body_height_queries_are_coalesced_and_serialized():
+    arbiter = SportCommandArbiter()
+    arbiter.submit(SportRequest(SportCommand.MOVE, {"x": 0.1}))
+    arbiter.submit(SportRequest(SportCommand.GET_BODY_HEIGHT, {}))
+    arbiter.submit(SportRequest(SportCommand.GET_BODY_HEIGHT, {}))
+
+    query = arbiter.pop_next()
+    assert query is not None
+    assert query.command == SportCommand.GET_BODY_HEIGHT
+    assert query.api_id == 1024
+    assert arbiter.owner == CommandOwner.FEEDBACK
+    assert arbiter.pending == 1
+
+
+@pytest.mark.parametrize(
+    "response,expected,path",
+    [
+        (
+            {"data": {"header": {"status": {"code": 0}}, "data": -0.04}},
+            -0.04,
+            "data.data",
+        ),
+        (
+            {"data": {"header": {"status": {"code": 0}}, "data": "-0.03"}},
+            -0.03,
+            "data.data<json>",
+        ),
+        (
+            {
+                "data": {
+                    "header": {"status": {"code": 0}},
+                    "parameter": '{"body_height":-0.02}',
+                }
+            },
+            -0.02,
+            "data.parameter<json>.body_height",
+        ),
+        ({"height": 0.01}, 0.01, "height"),
+    ],
+)
+def test_get_body_height_response_envelopes_are_parsed_strictly(
+    response, expected, path,
+):
+    height, evidence_path = get_body_height_from_response(response)
+    assert height == pytest.approx(expected)
+    assert evidence_path == path
+
+
+def test_get_body_height_never_substitutes_status_or_ambiguous_values():
+    with pytest.raises(ValueError, match="no supported height"):
+        get_body_height_from_response(
+            {"data": {"header": {"status": {"code": 0}}}},
+        )
+    with pytest.raises(ValueError, match="refused"):
+        get_body_height_from_response(
+            {"data": {"header": {"status": {"code": -1}}, "data": -0.04}},
+        )
+    with pytest.raises(ValueError, match="conflicting"):
+        get_body_height_from_response(
+            {"data": {"data": -0.04, "height": -0.02}},
+        )
+
+
+def test_shadow_replay_fuses_query_offset_without_hand_written_nominal():
+    feedback = feedback_from_sources(
+        {
+            "data": {
+                "body_height": 0.312,
+                "imu_state": {"rpy": [0.01, -0.08, 0.02]},
+                "velocity": [0.0, 0.0, 0.0],
+            }
+        },
+        {
+            "data": {
+                "header": {"status": {"code": 0}},
+                "data": '{"height":-0.055}',
+            }
+        },
+        stamp_s=12.0,
+    )
+
+    assert feedback.body_height_m == pytest.approx(-0.055)
+    assert feedback.pitch_rad == pytest.approx(-0.08)
+    assert "GetBodyHeight:data.data<json>.height" in feedback.source
 
 
 def test_feedback_normalizer_requires_measured_height_and_attitude():

@@ -9,7 +9,7 @@ lock.  Full Stop latches immediately, drops pending work, and owns the next
 SPORT request slot.
 
 ``/go2w/posture_cmd`` is deliberately a transport message, not a geometry
-intent: ``linear.z`` is the Unitree BodyHeight *offset from nominal* and
+intent: ``linear.z`` is the Unitree BodyHeight offset command and
 ``angular.x/y/z`` are absolute roll/pitch/yaw targets in ``base_link``.
 """
 
@@ -33,6 +33,8 @@ from std_msgs.msg import Empty, String
 from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
 from unitree_webrtc_ros.unitree_control import UnitreeControlNode
 
+from z_manip.control.go2w_posture import get_body_height_from_response
+
 
 POSTURE_COMMAND_TOPIC = "/go2w/posture_cmd"
 POSTURE_CANCEL_TOPIC = "/go2w/posture_cancel"
@@ -50,16 +52,15 @@ def _status_code(response: Any) -> int | None:
         return None
 
 
-def _finite_env(name: str, *, required: bool = False, default: float = 0.0) -> float:
-    raw = os.environ.get(name)
-    if raw in (None, ""):
-        if required:
-            raise RuntimeError(f"{name} is required in live mode")
-        return default
-    value = float(raw)
-    if not math.isfinite(value):
-        raise RuntimeError(f"{name} must be finite")
-    return value
+def _raw_response_evidence(response: Any) -> Any:
+    """Keep bounded JSON-safe query evidence for status/log consumers."""
+    try:
+        encoded = json.dumps(response, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        return {"repr": repr(response)[:2048], "json_safe": False}
+    if len(encoded) > 8192:
+        return {"json": encoded[:8192], "truncated": True}
+    return response
 
 
 class _StatusNode(Node):
@@ -71,6 +72,7 @@ class _StatusNode(Node):
     _MAX_PITCH_RAD = math.radians(12.0)
     _MAX_YAW_RAD = math.radians(8.0)
     _STATE_TIMEOUT_S = 0.50
+    _HEIGHT_QUERY_TIMEOUT_S = 0.50
     _QUIET_LINEAR_MPS = 0.035
     _QUIET_YAW_RPS = 0.05
     _HEIGHT_TOLERANCE_M = 0.015
@@ -78,12 +80,19 @@ class _StatusNode(Node):
 
     def _init_status_surface(self, *, mode: str) -> None:
         self._bridge_mode = mode
-        self._nominal_body_height_m = _finite_env(
-            "Z_MANIP_GO2W_NOMINAL_BODY_HEIGHT_M",
-            required=mode == "live",
-        )
         self._sport_state: dict[str, Any] | None = None
         self._sport_state_received_s: float | None = None
+        # API 1024 is the only feedback in the same command domain as API
+        # 1013.  SPORT_MOD_STATE.body_height is retained as independent
+        # absolute telemetry, but is never combined with a hand-entered
+        # nominal height to manufacture command feedback.
+        self._height_query_offset_m: float | None = None
+        self._height_query_received_s: float | None = None
+        self._height_query_response: Any = None
+        self._height_query_parse_path: str | None = None
+        self._height_query_error: str | None = None
+        self._height_query_code: int | None = None
+        self._height_query_count = 0
         self._target: tuple[float, float, float, float] | None = None
         self._phase = "idle" if mode == "live" else "shadow"
         self._detail = (
@@ -128,17 +137,23 @@ class _StatusNode(Node):
         return values
 
     def _feedback_age_s(self) -> float | None:
-        if self._sport_state_received_s is None:
+        stamps = (self._sport_state_received_s, self._height_query_received_s)
+        if any(stamp is None for stamp in stamps):
             return None
-        return max(0.0, time.monotonic() - self._sport_state_received_s)
+        return max(0.0, time.monotonic() - min(stamps))
 
     def _fresh_feedback(self) -> tuple[bool, str]:
         age_s = self._feedback_age_s()
-        if self._sport_state is None or age_s is None:
+        if self._sport_state is None:
             return False, "measured SPORT state is unavailable"
+        if self._height_query_offset_m is None or self._height_query_received_s is None:
+            detail = self._height_query_error or "GetBodyHeight feedback is unavailable"
+            return False, detail
+        if age_s is None:
+            return False, "measured posture feedback is unavailable"
         if age_s > self._STATE_TIMEOUT_S:
-            return False, f"measured SPORT state is stale ({age_s:.3f}s)"
-        return True, "measured SPORT state is fresh"
+            return False, f"measured posture feedback is stale ({age_s:.3f}s)"
+        return True, "SPORT state and GetBodyHeight feedback are fresh"
 
     def _base_quiet(self) -> tuple[bool, str]:
         fresh, detail = self._fresh_feedback()
@@ -175,13 +190,17 @@ class _StatusNode(Node):
             return
 
     def _update_reached_phase(self) -> None:
-        if self._target is None or self._sport_state is None or self._stop_latched:
+        if (
+            self._target is None
+            or self._sport_state is None
+            or self._height_query_offset_m is None
+            or self._stop_latched
+        ):
             return
         offset, roll, pitch, yaw = self._target
-        expected_height = self._nominal_body_height_m + offset
         measured_rpy = self._sport_state["rpy"]
         reached = (
-            abs(float(self._sport_state["body_height"]) - expected_height)
+            abs(self._height_query_offset_m - offset)
             <= self._HEIGHT_TOLERANCE_M
             and abs(float(measured_rpy[0]) - roll) <= self._ANGLE_TOLERANCE_RAD
             and abs(float(measured_rpy[1]) - pitch) <= self._ANGLE_TOLERANCE_RAD
@@ -196,10 +215,8 @@ class _StatusNode(Node):
         fresh = age_s is not None and age_s <= self._STATE_TIMEOUT_S
         state = self._sport_state or {}
         target = self._target
-        current_height = state.get("body_height")
-        target_height = (
-            None if target is None else self._nominal_body_height_m + target[0]
-        )
+        current_height = self._height_query_offset_m
+        target_height = None if target is None else target[0]
         current_rpy = state.get("rpy") or (None, None, None)
         velocity = state.get("velocity") or (None, None, None)
         linear_speed = (
@@ -216,7 +233,9 @@ class _StatusNode(Node):
             "detail": self._detail,
             "body_height": {
                 "current_m": current_height,
-                "nominal_m": self._nominal_body_height_m,
+                "command_domain": "body_height_offset_m",
+                "measured_absolute_m": state.get("body_height"),
+                "nominal_m": None,
                 "target_offset_m": None if target is None else target[0],
                 "target_m": target_height,
                 "error_m": (
@@ -237,7 +256,27 @@ class _StatusNode(Node):
                 "linear_speed_mps": linear_speed,
                 "yaw_rate_rps": velocity[2],
             },
-            "feedback": {"fresh": fresh, "source": "sport_mode_state"},
+            "feedback": {
+                "fresh": fresh,
+                "source": "sport_mode_state+GetBodyHeight",
+                "sport_state_age_s": (
+                    None if self._sport_state_received_s is None
+                    else max(0.0, time.monotonic() - self._sport_state_received_s)
+                ),
+                "get_body_height_age_s": (
+                    None if self._height_query_received_s is None
+                    else max(0.0, time.monotonic() - self._height_query_received_s)
+                ),
+            },
+            "get_body_height": {
+                "api_id": SPORT_CMD["GetBodyHeight"],
+                "query_count": self._height_query_count,
+                "last_robot_code": self._height_query_code,
+                "parsed_offset_m": self._height_query_offset_m,
+                "parse_path": self._height_query_parse_path,
+                "parse_error": self._height_query_error,
+                "raw_response": self._height_query_response,
+            },
             "command": {"last_robot_code": self._last_code},
             "updated_unix_ns": time.time_ns(),
         }
@@ -305,8 +344,12 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
         self.conn.datachannel.pub_sub.subscribe(
             RTC_TOPIC["SPORT_MOD_STATE"], self._on_sport_mode_state,
         )
+        self._height_feedback_future = asyncio.run_coroutine_threadsafe(
+            self._poll_body_height_feedback(), self.loop,
+        )
         self.get_logger().info(
-            "LIVE single-owner bridge enabled: Move + BodyHeight + Euler + StopMove"
+            "LIVE single-owner bridge enabled: Move + BodyHeight + Euler + "
+            "GetBodyHeight + StopMove"
         )
 
     def cmd_vel_callback(self, message: TwistStamped) -> None:
@@ -314,16 +357,69 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             return
         UnitreeControlNode.cmd_vel_callback(self, message)
 
-    async def _request_sport(self, name: str, parameter: dict[str, float]) -> int | None:
+    async def _request_sport_response(
+        self,
+        name: str,
+        parameter: dict[str, float],
+        *,
+        timeout_s: float = 1.0,
+    ) -> Any:
         async with self._sport_request_lock:
-            response = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self.conn.datachannel.pub_sub.publish_request_new(
                     RTC_TOPIC["SPORT_MOD"],
                     {"api_id": SPORT_CMD[name], "parameter": parameter},
                 ),
-                timeout=1.0,
+                timeout=timeout_s,
             )
+
+    async def _request_sport(self, name: str, parameter: dict[str, float]) -> int | None:
+        response = await self._request_sport_response(name, parameter)
         return _status_code(response)
+
+    async def _poll_body_height_feedback(self) -> None:
+        """Poll API 1024 through the same serialized SPORT request owner.
+
+        API 1024 feedback is authoritative for API 1013's offset domain.
+        Parse failures invalidate only height feedback and remain observable;
+        SPORT state is never silently substituted.
+        """
+        while True:
+            try:
+                self._height_query_count += 1
+                self._height_query_response = None
+                self._height_query_code = None
+                response = await self._request_sport_response(
+                    "GetBodyHeight", {}, timeout_s=self._HEIGHT_QUERY_TIMEOUT_S,
+                )
+                self._height_query_response = _raw_response_evidence(response)
+                self._height_query_code = _status_code(response)
+                height, parse_path = get_body_height_from_response(response)
+                if not self._MIN_HEIGHT_OFFSET_M <= height <= self._MAX_HEIGHT_OFFSET_M:
+                    raise ValueError(
+                        "GetBodyHeight value is outside the configured command envelope "
+                        f"({height:.4f}m)"
+                    )
+                self._height_query_offset_m = height
+                self._height_query_received_s = time.monotonic()
+                self._height_query_parse_path = parse_path
+                self._height_query_error = None
+                self._update_reached_phase()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                self._height_query_error = (
+                    f"GetBodyHeight failed: {type(error).__name__}: {error}"
+                )
+                # Never continue against a previous query after the latest
+                # API-1024 response failed transport or parsing.
+                self._height_query_offset_m = None
+                self._height_query_received_s = None
+                self._height_query_parse_path = None
+                if self._phase not in {"stopped", "fault"}:
+                    self._phase = "blocked"
+                    self._detail = self._height_query_error
+            await asyncio.sleep(0.20)
 
     async def _drain_move_commands(self) -> None:
         """Override upstream pump so Move shares the SPORT request lock."""

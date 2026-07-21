@@ -13,7 +13,7 @@ PC posture intent bridge (shadow by default)
         |
         v
 NUC reactive bridge (shadow by default; the only live WebRTC owner)
-  Move + BodyHeight + Euler + StopMove -> one SPORT request lock
+  Move + BodyHeight + Euler + GetBodyHeight + StopMove -> one SPORT request lock
   /go2w/posture_state -> measured, freshness-qualified status
 ```
 
@@ -27,10 +27,11 @@ The visual-servo policy publishes this input schema:
 }
 ```
 
-These values are offsets from the measured neutral manipulation stance. They
-are not accumulated on every control tick. The PC relay clamps them to the
-calibrated envelope and turns them into `/go2w/posture_cmd`. The NUC rejects
-posture commands without fresh `SPORT_MOD_STATE` feedback. Its status uses
+These values are API-1013 offsets. They are not accumulated on every control
+tick. The PC relay clamps them to the calibrated envelope and turns them into
+`/go2w/posture_cmd`. The NUC rejects posture commands without both fresh
+`SPORT_MOD_STATE` attitude/velocity and fresh API-1024 `GetBodyHeight`
+feedback. Its status uses
 `z_manip.go2w_posture_status.v1` on `/go2w/posture_state`.
 
 ## Full Stop
@@ -64,14 +65,12 @@ live bridge. `z-mobile-manip-go2w-reactive-live.service` declares a systemd
 conflict with that service and the shadow service, making it the single WebRTC
 owner.
 
-Before supervised live testing, measure the balanced nominal body height from
-SPORT feedback and create this NUC-only file:
+Before supervised live testing, create this NUC-only acknowledgement file:
 
 ```bash
 mkdir -p ~/.config/z-mobile-manip
 cat > ~/.config/z-mobile-manip/go2w-reactive-live.env <<'EOF'
 Z_MANIP_GO2W_LIVE_ACK=I_UNDERSTAND_GO2W_WILL_MOVE
-Z_MANIP_GO2W_NOMINAL_BODY_HEIGHT_M=MEASURED_VALUE_HERE
 # Optional only after moving-posture validation:
 # Z_MANIP_GO2W_ALLOW_POSTURE_WHILE_MOVING=1
 EOF
@@ -105,5 +104,7 @@ The versioned NUC service files are:
 
 Install the script under `~/.local/lib/z-mobile-manip/` and the chosen unit
 under `~/.config/systemd/user/`, then use `systemctl --user daemon-reload`.
-Keep the live unit disabled until the nominal-height semantics and physical
-envelope have been measured on the actual Go2W.
+Keep the live unit disabled until API-1024 parsing and the physical command
+envelope have been inspected in shadow/log replay. Live status retains the raw
+GetBodyHeight response, parse path/error, robot code, sample age, and query
+count so an unsupported firmware response cannot masquerade as feedback.

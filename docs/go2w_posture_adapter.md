@@ -13,6 +13,9 @@ into the adapter. `SportCommandArbiter` then orders all high-level commands:
 2. `BodyHeight` and `Euler` form a serialized posture pair.
 3. `Move` is latest-value coalesced, so delayed velocity requests cannot build
    a stale queue.
+4. `GetBodyHeight` (API 1024) is latest-value coalesced and uses the same
+   serialized SPORT request owner. It is feedback, never a second WebRTC
+   connection.
 
 The default posture policy waits for measured base velocity to become quiet.
 Reactive camera retention may explicitly set
@@ -32,19 +35,21 @@ command `[-0.12, 0.02] m`, pitch `±12°`, roll/yaw `±8°`, height steps of
 `0.01 m`, angle steps of `2°`, and a minimum `0.20 s` command period. These
 values are configuration, not hidden controller constants.
 
-> The installed WebRTC API calls command 1013 `BodyHeight`; this legacy
-> interface represents the height setpoint using `parameter.data`. Before the
-> first live deployment, verify whether the Go2W firmware reports that value
-> as a nominal-height offset or an absolute measured height, and normalize the
-> NUC state bridge accordingly. Euler `x/y/z` is roll/pitch/yaw and matches the
-> official Unitree SDK contract.
+The installed Go2W WebRTC firmware calls command 1013 `BodyHeight`; this
+interface represents the height setpoint using `parameter.data`. Completion is
+checked against API 1024 `GetBodyHeight`, in the same command domain. The
+absolute `SPORT_MOD_STATE.body_height` remains useful telemetry, but the
+controller never combines it with a hand-written nominal height. An unknown,
+rejected, ambiguous, malformed, or stale API-1024 response blocks posture
+commands and exposes its raw response and parse evidence. Euler `x/y/z` is
+roll/pitch/yaw.
 
 ## Feedback and UI contract
 
-Posture execution requires fresh measured body height, roll/pitch/yaw, and base
-velocity. Missing or stale feedback produces `blocked` with no command. Target
-completion requires all measured errors to remain within tolerance for the
-settling window.
+Posture execution requires both fresh API-1024 height-offset feedback and fresh
+SPORT state roll/pitch/yaw/base velocity. Missing or stale feedback produces
+`blocked` with no command. Target completion requires all measured errors to
+remain within tolerance for the settling window.
 
 `PostureOutput.status_document()` emits
 `z_manip.go2w_posture_status.v1`. Runtime integration should publish it at

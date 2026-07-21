@@ -32,16 +32,16 @@ def test_shadow_path_cannot_construct_unitree_transport():
     assert "UnitreeWebRTCConnection(" not in source
 
 
-def test_live_requires_exact_gate_and_measured_nominal_height():
+def test_live_requires_exact_gate_but_not_a_hand_written_nominal_height():
     source = SOURCE.read_text(encoding="utf-8")
     launcher = LAUNCHER.read_text(encoding="utf-8")
 
     assert 'LIVE_ACK = "I_UNDERSTAND_GO2W_WILL_MOVE"' in source
     assert "Z_MANIP_GO2W_LIVE_ACK" in source
-    assert "Z_MANIP_GO2W_NOMINAL_BODY_HEIGHT_M" in source
+    assert "Z_MANIP_GO2W_NOMINAL_BODY_HEIGHT_M" not in source
     assert 'MODE="${1:-shadow}"' in launcher
     assert "Z_MANIP_GO2W_LIVE_ACK" in launcher
-    assert "Z_MANIP_GO2W_NOMINAL_BODY_HEIGHT_M" in launcher
+    assert "Z_MANIP_GO2W_NOMINAL_BODY_HEIGHT_M" not in launcher
 
 
 def test_live_bridge_is_one_owner_with_serialized_stop_move_and_posture():
@@ -50,6 +50,8 @@ def test_live_bridge_is_one_owner_with_serialized_stop_move_and_posture():
     assert "class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode)" in source
     assert "self._sport_request_lock = asyncio.Lock()" in source
     assert "async with self._sport_request_lock" in source
+    assert '"GetBodyHeight", {}, timeout_s=self._HEIGHT_QUERY_TIMEOUT_S' in source
+    assert "get_body_height_from_response(response)" in source
     assert '"Move", {"x": x, "y": y, "z": yaw}' in source
     assert '("BodyHeight", {"data": height})' in source
     assert '("Euler", {"x": roll, "y": pitch, "z": yaw})' in source
@@ -59,11 +61,23 @@ def test_live_bridge_is_one_owner_with_serialized_stop_move_and_posture():
     assert "self._pending_posture = None" in source
 
 
+def test_get_body_height_feedback_is_raw_observable_and_freshness_gated():
+    source = SOURCE.read_text(encoding="utf-8")
+
+    assert 'SPORT_CMD["GetBodyHeight"]' in source
+    assert '"raw_response": self._height_query_response' in source
+    assert '"parse_path": self._height_query_parse_path' in source
+    assert '"parse_error": self._height_query_error' in source
+    assert "self._height_query_received_s = time.monotonic()" in source
+    assert "Never continue against a previous query" in source
+    assert '"sport_mode_state+GetBodyHeight"' in source
+
+
 def test_feedback_freshness_gates_posture_and_stop_reset():
     source = SOURCE.read_text(encoding="utf-8")
 
     assert "_STATE_TIMEOUT_S = 0.50" in source
-    assert "measured SPORT state is stale" in source
+    assert "measured posture feedback is stale" in source
     assert "fresh, detail = self._fresh_feedback()" in source
     assert "cannot release Full Stop" in source
     assert "Full Stop is always" not in source  # NUC reset is still feedback gated.
