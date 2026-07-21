@@ -16,9 +16,24 @@ if [[ "$MODE" == live ]]; then
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-set +u
-source /opt/ros/jazzy/setup.bash
-set -u
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-20}"
-export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
-exec python3 "$SCRIPT_DIR/go2w_posture_intent_bridge.py" --mode "$MODE"
+STACK_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+DDS_CONFIG="$STACK_ROOT/docker/runtime/cyclonedds-go2w-pc.xml"
+IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:pinocchio}"
+CONTAINER="z-mobile-manip-posture-intent"
+
+[[ -r "$DDS_CONFIG" ]] || { printf 'missing DDS profile: %s\n' "$DDS_CONFIG" >&2; exit 1; }
+docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+exec docker run --rm \
+  --name "$CONTAINER" \
+  --network host \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp \
+  -e ROS_DOMAIN_ID=20 \
+  -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+  -e CYCLONEDDS_URI=file:///config/cyclonedds.xml \
+  -e Z_MANIP_POSTURE_INTENT_LIVE_ACK="${Z_MANIP_POSTURE_INTENT_LIVE_ACK:-}" \
+  -e PYTHONPATH="$STACK_ROOT:/opt/z_manip/python" \
+  -v "$DDS_CONFIG:/config/cyclonedds.xml:ro" \
+  -v "$STACK_ROOT:$STACK_ROOT:ro" \
+  "$IMAGE" \
+  python3 "$SCRIPT_DIR/go2w_posture_intent_bridge.py" --mode "$MODE"

@@ -29,9 +29,14 @@ The visual-servo policy publishes this input schema:
 
 These values are API-1013 offsets. They are not accumulated on every control
 tick. The PC relay clamps them to the calibrated envelope and turns them into
-`/go2w/posture_cmd`. The NUC rejects posture commands without both fresh
-`SPORT_MOD_STATE` attitude/velocity and fresh API-1024 `GetBodyHeight`
-feedback. Its status uses
+`/go2w/posture_cmd`. The NUC requires fresh `SPORT_MOD_STATE`
+attitude/velocity. On firmware that implements API 1024 it also uses measured
+`GetBodyHeight` feedback. The tested Go2W EDU firmware returns status code
+3203 for API 1024, so the bridge falls back to a bounded API-1013 command-ack
+estimate for the height offset while keeping roll/pitch/yaw measured from the
+IMU. The fallback is explicitly reported as
+`api_1013_command_ack_estimate`; it is never presented as measured height. Its
+status uses
 `z_manip.go2w_posture_status.v1` on `/go2w/posture_state`.
 
 ## Full Stop
@@ -104,10 +109,26 @@ The versioned NUC service files are:
 
 Install the script under `~/.local/lib/z-mobile-manip/` and the chosen unit
 under `~/.config/systemd/user/`, then use `systemctl --user daemon-reload`.
-Keep the live unit disabled until API-1024 parsing and the physical command
-envelope have been inspected in shadow/log replay. Live status retains the raw
-GetBodyHeight response, parse path/error, robot code, sample age, and query
-count so an unsupported firmware response cannot masquerade as feedback.
+Live status retains the raw GetBodyHeight response, parse path/error, robot
+code, sample age, fallback source and query count so an unsupported firmware
+response cannot masquerade as measured feedback.
+
+## Integrated whole-body approach
+
+`manip bringup` starts the complete chain: perception, the single NUC WebRTC
+owner, the PC posture relay, and the Pinocchio/CasADi runtime image. The depth
+servo loads the measured wrist-camera calibration and real Go2W URDF, solves a
+bounded CasADi QP at runtime, and sends base velocity plus BodyHeight/Euler
+targets through the single owner. The optimizer also computes PiPER joint
+velocity as a reachability and conditioning diagnostic. Arm motion is not
+streamed while the base walks; after the handoff distance is reached the
+existing fresh-perception Pinocchio IK and checked arm trajectory executor own
+the arm. This prevents two simultaneous PiPER command owners.
+
+Use `START SHADOW` first after a reboot. A healthy solve reports the
+`casadi-qrqp` backend and a decreasing objective without opening a motion
+transport. `FIND → APPROACH → GRASP` is the operator-authorized live path, and
+`FULL STOP` interrupts the base/posture workflow.
 
 ## State heartbeat supervision
 

@@ -101,6 +101,10 @@ VISUAL_COMPONENTS = frozenset({
     "edgetam",
     "perception",
     "perception-all",
+    "reactive-control",
+    "posture-bridge",
+    "whole-body",
+    "mobile-control",
 })
 LOG_COMPONENTS = VISUAL_COMPONENTS | {"manager"}
 INTERACTIVE_STATUS_ROUTE = "/api/sessions/status"
@@ -3081,7 +3085,7 @@ def _runtime_handler(
             if action == COMPONENT_RESTART_ACTION and document.get("component") not in VISUAL_COMPONENTS:
                 self._interactive_error(
                     "INVALID_COMPONENT",
-                    "component must be one of ui, nuc-camera, passive-feedback, observer, rgbd, edgetam, perception, perception-all",
+                    "component must be a supported perception or mobile-control service",
                     status=HTTPStatus.BAD_REQUEST,
                 )
                 return None

@@ -94,7 +94,7 @@ def ownership_snapshot(runtime: Mapping[str, Any]) -> dict[str, str]:
     published_linear = _finite(output.get("published_linear_x")) or 0.0
     published_yaw = _finite(output.get("published_angular_z")) or 0.0
     base_owner = "visual_servo" if (
-        phase in {"approach", "base_approach"}
+        phase in {"approach", "base_approach", "whole_body_approach"}
         or abs(published_linear) > 1e-9
         or abs(published_yaw) > 1e-9
     ) else "zero_hold"
@@ -105,8 +105,13 @@ def ownership_snapshot(runtime: Mapping[str, Any]) -> dict[str, str]:
             if str(arm_view.get("mode", "hold")) not in {"", "hold"}
             else "none"
         )
-    optimizer = _mapping(runtime.get("optimizer"))
-    optimizer_owner = str(optimizer.get("owner", "unavailable"))
+    whole_body = _mapping(runtime.get("whole_body"))
+    optimizer = _mapping(whole_body.get("command")) or _mapping(runtime.get("optimizer"))
+    optimizer_owner = str(
+        optimizer.get("backend")
+        or optimizer.get("owner")
+        or ("initializing" if whole_body.get("enabled") is True else "unavailable")
+    )
     return {
         "base": base_owner,
         "body": str(posture["owner"]),

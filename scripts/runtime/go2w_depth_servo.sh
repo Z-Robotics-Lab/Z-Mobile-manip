@@ -25,7 +25,9 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STACK_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DDS_CONFIG="$STACK_ROOT/docker/runtime/cyclonedds-go2w-pc.xml"
-RUNTIME_IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:pinocchio}"
+RUNTIME_IMAGE="${Z_MANIP_WHOLE_BODY_IMAGE:-z-mobile-manip-whole-body:latest}"
+WHOLE_BODY_URDF="${Z_MANIP_WHOLE_BODY_URDF:-$STACK_ROOT/../go2W_Sim/assets/urdf/go2w_sensored.urdf}"
+WHOLE_BODY_CALIBRATION="${Z_MANIP_WHOLE_BODY_CALIBRATION:-$STACK_ROOT/../artifacts/go2w_real/calibration/piper_wrist_camera_calibration.json}"
 CONTAINER_NAME="z-manip-go2w-depth-servo"
 
 if [[ ! -r "$DDS_CONFIG" ]]; then
@@ -35,6 +37,19 @@ fi
 if ! command -v docker >/dev/null 2>&1; then
   printf 'docker is required for the fixed CycloneDDS depth-servo runtime\n' >&2
   exit 1
+fi
+[[ -r "$WHOLE_BODY_URDF" ]] || {
+  printf 'missing whole-body URDF: %s\n' "$WHOLE_BODY_URDF" >&2
+  exit 1
+}
+[[ -r "$WHOLE_BODY_CALIBRATION" ]] || {
+  printf 'missing measured hand-eye calibration: %s\n' "$WHOLE_BODY_CALIBRATION" >&2
+  exit 1
+}
+if ! docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1; then
+  printf 'building one-time CasADi whole-body runtime image: %s\n' "$RUNTIME_IMAGE" >&2
+  docker build -t "$RUNTIME_IMAGE" \
+    -f "$STACK_ROOT/docker/whole_body_runtime/Dockerfile" "$STACK_ROOT"
 fi
 
 # A user service can remain active after Unitree's WebRTC data channel has
@@ -63,6 +78,8 @@ exec docker run --rm \
   -e PYTHONPATH="$STACK_ROOT:/opt/z_manip/python" \
   -v "$DDS_CONFIG:/config/cyclonedds.xml:ro" \
   -v "$STACK_ROOT:$STACK_ROOT:ro" \
+  -v "$WHOLE_BODY_URDF:/robot/go2w_sensored.urdf:ro" \
+  -v "$WHOLE_BODY_CALIBRATION:/robot/piper_wrist_camera_calibration.json:ro" \
   -v "$(dirname -- "$STATUS_PATH"):$(dirname -- "$STATUS_PATH"):rw" \
   "$RUNTIME_IMAGE" \
   python3 "$SCRIPT_DIR/go2w_depth_servo.py" \
@@ -74,6 +91,9 @@ exec docker run --rm \
   --velocity-topic /cmd_vel \
   --runtime-state "$RUNTIME_STATE_PATH" \
   --runtime-transform-timeout-s 0.50 \
+  --whole-body casadi \
+  --whole-body-urdf /robot/go2w_sensored.urdf \
+  --whole-body-calibration /robot/piper_wrist_camera_calibration.json \
   --desired-depth-m 0.50 \
   --handoff-depth-m 0.52 \
   --handoff-bearing-deg 20 \

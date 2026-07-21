@@ -35,6 +35,10 @@ from z_manip.control.reactive_servo import (
     TargetGeometry,
 )
 from z_manip.control.visual_servo import VisualServoConfig, VisualServoController
+from z_manip.control.whole_body_runtime import (
+    WholeBodyRuntimeCommand,
+    WholeBodyRuntimeController,
+)
 
 
 STATUS_SCHEMA = "z_manip.depth_servo_status.v1"
@@ -751,6 +755,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--tracking-loss-grace-s", type=float, default=0.75)
     parser.add_argument("--transform-timeout-s", type=float, default=0.25)
     parser.add_argument("--rate-hz", type=float, default=20.0)
+    parser.add_argument("--whole-body", choices=("off", "casadi"), default="casadi")
+    parser.add_argument("--whole-body-urdf", type=Path)
+    parser.add_argument("--whole-body-calibration", type=Path)
     return parser.parse_args()
 
 
@@ -806,6 +813,23 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.posture_status_received_s: float | None = None
             self.last_posture_intent: tuple[float, float] | None = None
             self.last_posture_intent_s = 0.0
+            self.whole_body: WholeBodyRuntimeController | None = None
+            self.whole_body_command: WholeBodyRuntimeCommand | None = None
+            self.whole_body_error: str | None = None
+            if args.whole_body == "casadi":
+                if args.whole_body_urdf is None or args.whole_body_calibration is None:
+                    self.whole_body_error = (
+                        "CasADi whole-body controller requires URDF and calibration"
+                    )
+                else:
+                    try:
+                        self.whole_body = WholeBodyRuntimeController(
+                            urdf_path=args.whole_body_urdf,
+                            calibration_path=args.whole_body_calibration,
+                            desired_standoff_m=settings.desired_depth_m,
+                        )
+                    except Exception as error:
+                        self.whole_body_error = f"whole-body initialization failed: {error}"
             self.last_output = self.core.tick(now_s=time.monotonic(), tracking=False)
             self.last_trace_phase: str | None = None
             self.last_trace_s = 0.0
@@ -992,19 +1016,33 @@ def _run_ros(args: argparse.Namespace) -> int:
         def _publish_posture_intent(self, *, blocked: bool = False) -> None:
             if blocked:
                 return
-            status = self.core.reactive_status
-            if status is None or status.get("phase") not in {
-                ReactivePhase.POSTURE_ADJUST.value,
-                ReactivePhase.VIEW_RECOVERY.value,
-            }:
-                return
-            posture = status.get("posture")
-            if not isinstance(posture, dict):
-                return
-            target = (
-                float(posture.get("body_height_delta_m", 0.0)),
-                float(posture.get("pitch_delta_rad", 0.0)),
-            )
+            roll = 0.0
+            yaw = 0.0
+            if self.whole_body_command is not None:
+                # In live mode a QP intent is forwarded only when every
+                # measured-state gate used by the solve was fresh. Shadow
+                # remains completely transport-free.
+                if not self.whole_body_command.executable:
+                    return
+                target = (
+                    self.whole_body_command.body_height_target_m,
+                    self.whole_body_command.body_pitch_target_rad,
+                )
+                roll = self.whole_body_command.body_roll_target_rad
+            else:
+                status = self.core.reactive_status
+                if status is None or status.get("phase") not in {
+                    ReactivePhase.POSTURE_ADJUST.value,
+                    ReactivePhase.VIEW_RECOVERY.value,
+                }:
+                    return
+                posture = status.get("posture")
+                if not isinstance(posture, dict):
+                    return
+                target = (
+                    float(posture.get("body_height_delta_m", 0.0)),
+                    float(posture.get("pitch_delta_rad", 0.0)),
+                )
             now_s = time.monotonic()
             if (
                 self.last_posture_intent == target
@@ -1016,7 +1054,9 @@ def _run_ros(args: argparse.Namespace) -> int:
                 {
                     "schema": "z_manip.go2w_posture_intent.v1",
                     "body_height_delta_m": target[0],
+                    "roll_delta_rad": roll,
                     "pitch_delta_rad": target[1],
+                    "yaw_delta_rad": yaw,
                 },
                 separators=(",", ":"),
                 allow_nan=False,
@@ -1103,6 +1143,21 @@ def _run_ros(args: argparse.Namespace) -> int:
                         "pitch_delta_rad": self.last_posture_intent[1],
                     },
                 },
+                "whole_body": (
+                    {
+                        "enabled": args.whole_body == "casadi",
+                        "ready": self.whole_body is not None,
+                        "error": self.whole_body_error,
+                        "command": None,
+                    }
+                    if self.whole_body_command is None
+                    else {
+                        "enabled": True,
+                        "ready": True,
+                        "error": self.whole_body_error,
+                        "command": self.whole_body_command.document,
+                    }
+                ),
                 "source_stamp_ns": self.last_source_stamp_ns,
                 "output": asdict(self.last_output),
                 "filter": self.core.filter_stats,
@@ -1130,9 +1185,111 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self.last_trace_phase = self.last_output.phase
                 self.last_trace_s = now_s
 
+        def _whole_body_output(self, fallback: DepthServoOutput) -> DepthServoOutput:
+            self.whole_body_command = None
+            if self.whole_body is None:
+                if args.whole_body == "casadi":
+                    return DepthServoOutput(
+                        phase="whole_body_blocked",
+                        proposed_linear_x=0.0,
+                        proposed_angular_z=0.0,
+                        published_linear_x=0.0,
+                        published_angular_z=0.0,
+                        depth_error_m=fallback.depth_error_m,
+                        yaw_error_rad=fallback.yaw_error_rad,
+                        target_age_s=fallback.target_age_s,
+                        reason=self.whole_body_error or "whole-body controller unavailable",
+                        reactive_phase=fallback.reactive_phase,
+                    )
+                return fallback
+            geometry = self.core.geometry
+            target = self.core.target
+            if (
+                geometry is None
+                or target is None
+                or self.tracking is not True
+                or fallback.phase in {
+                    "transform_unavailable", "tracking_lost", "reacquiring",
+                    "waiting_target", "posture_blocked",
+                }
+            ):
+                return fallback
+            if (
+                geometry.base_planar_distance_m <= settings.handoff_depth_m
+                and abs(geometry.base_bearing_rad) <= settings.handoff_bearing_rad
+            ):
+                if self.whole_body is not None:
+                    self.whole_body.reset()
+                return DepthServoOutput(
+                    phase="reached",
+                    proposed_linear_x=0.0,
+                    proposed_angular_z=0.0,
+                    published_linear_x=0.0,
+                    published_angular_z=0.0,
+                    depth_error_m=geometry.base_planar_distance_m - settings.desired_depth_m,
+                    yaw_error_rad=geometry.base_bearing_rad,
+                    target_age_s=fallback.target_age_s,
+                    done=True,
+                    reason="whole-body controller entered the coarse manipulation handoff zone",
+                    reactive_phase="handoff_ready",
+                )
+            if args.runtime_state is None:
+                self.whole_body_error = "whole-body controller requires runtime state"
+                return fallback
+            try:
+                command = self.whole_body.solve(
+                    camera_target_xyz_m=target,
+                    posture_status=self.posture_status,
+                    runtime_state_path=args.runtime_state,
+                    mode=settings.mode,
+                )
+            except Exception as error:
+                self.whole_body_error = f"whole-body solve failed: {error}"
+                return DepthServoOutput(
+                    phase="whole_body_blocked",
+                    proposed_linear_x=0.0,
+                    proposed_angular_z=0.0,
+                    published_linear_x=0.0,
+                    published_angular_z=0.0,
+                    depth_error_m=geometry.base_planar_distance_m - settings.desired_depth_m,
+                    yaw_error_rad=geometry.base_bearing_rad,
+                    target_age_s=fallback.target_age_s,
+                    reason=self.whole_body_error,
+                    reactive_phase="whole_body",
+                )
+            self.whole_body_command = command
+            self.whole_body_error = None
+            linear = float(np.clip(command.base_forward_mps, 0.0, settings.max_forward_mps))
+            # Maintain Go2W's gait above its observed dead zone while outside
+            # the handoff; CasADi still chooses whether forward motion helps.
+            if linear > 1e-3:
+                linear = max(linear, settings.min_forward_mps)
+            yaw = float(np.clip(
+                command.base_yaw_rps,
+                -settings.max_yaw_rps,
+                settings.max_yaw_rps,
+            ))
+            executable = command.executable
+            return DepthServoOutput(
+                phase=("whole_body_approach" if executable else "whole_body_shadow"),
+                proposed_linear_x=linear,
+                proposed_angular_z=yaw,
+                published_linear_x=linear if executable else 0.0,
+                published_angular_z=yaw if executable else 0.0,
+                depth_error_m=geometry.base_planar_distance_m - settings.desired_depth_m,
+                yaw_error_rad=geometry.base_bearing_rad,
+                target_age_s=fallback.target_age_s,
+                reason=(
+                    "Pinocchio/CasADi coupled base-body intent"
+                    if executable
+                    else "Pinocchio/CasADi shadow intent; measured live gates not satisfied"
+                ),
+                reactive_phase="whole_body",
+            )
+
         def _tick(self) -> None:
             settled, blocked, shadow_verified, detail = self._posture_feedback()
-            self.last_output = self.core.tick(
+            fallback = self.core.tick(
                 now_s=time.monotonic(),
                 tracking=self.tracking,
                 body_settled=settled,
@@ -1140,6 +1297,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 posture_shadow_verified=shadow_verified,
                 posture_detail=detail,
             )
+            self.last_output = self._whole_body_output(fallback)
             self._publish_posture_intent(blocked=blocked)
             if settings.mode == "live":
                 self._publish(

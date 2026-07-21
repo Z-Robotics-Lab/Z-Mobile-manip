@@ -95,6 +95,7 @@ class _StatusNode(Node):
         self._height_query_error: str | None = None
         self._height_query_code: int | None = None
         self._height_query_count = 0
+        self._height_feedback_estimated = False
         self._target: tuple[float, float, float, float] | None = None
         self._phase = "idle" if mode == "live" else "shadow"
         self._detail = (
@@ -159,7 +160,12 @@ class _StatusNode(Node):
         skew_s = abs(self._sport_state_received_s - self._height_query_received_s)
         if skew_s > self._FEEDBACK_SYNC_TOLERANCE_S:
             return False, f"measured posture feedback is unsynchronized ({skew_s:.3f}s)"
-        return True, "SPORT state and GetBodyHeight feedback are fresh"
+        height_detail = (
+            "API-1013 command-ack height estimate"
+            if self._height_feedback_estimated
+            else "measured GetBodyHeight"
+        )
+        return True, f"measured SPORT state and {height_detail} are fresh"
 
     def _base_quiet(self) -> tuple[bool, str]:
         fresh, detail = self._fresh_feedback()
@@ -255,6 +261,12 @@ class _StatusNode(Node):
                     else target_height - float(current_height)
                 ),
                 "feedback_age_s": age_s,
+                "measured": not self._height_feedback_estimated,
+                "source": (
+                    "BodyHeight command acknowledgement estimate"
+                    if self._height_feedback_estimated
+                    else "GetBodyHeight API 1024"
+                ),
             },
             "attitude": {
                 "current_roll_rad": current_rpy[0],
@@ -270,7 +282,11 @@ class _StatusNode(Node):
             },
             "feedback": {
                 "fresh": fresh,
-                "source": "sport_mode_state+GetBodyHeight",
+                "source": (
+                    "sport_mode_state+api_1013_command_ack_estimate"
+                    if self._height_feedback_estimated
+                    else "sport_mode_state+GetBodyHeight"
+                ),
                 "sport_state_age_s": (
                     None if self._sport_state_received_s is None
                     else max(0.0, time.monotonic() - self._sport_state_received_s)
@@ -356,6 +372,18 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
         self.conn.datachannel.pub_sub.subscribe(
             RTC_TOPIC["SPORT_MOD_STATE"], self._on_sport_mode_state,
         )
+        # Go2W firmware variants publish the same state on the low-frequency
+        # topic, or expose only lowstate IMU. Subscribe to all three and keep
+        # the freshest valid observation instead of waiting forever on one
+        # firmware-specific channel.
+        self.conn.datachannel.pub_sub.subscribe(
+            RTC_TOPIC["LF_SPORT_MOD_STATE"], self._on_sport_mode_state,
+        )
+        # LOW_STATE is already subscribed by UnitreeControlNode.  Its
+        # connection setup resolves ``self._on_lowstate`` dynamically, so the
+        # override below receives the same packet and preserves battery
+        # telemetry without registering a second callback for a single-cast
+        # WebRTC topic.
         self._height_feedback_future = asyncio.run_coroutine_threadsafe(
             self._poll_body_height_feedback(), self.loop,
         )
@@ -363,6 +391,39 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             "LIVE single-owner bridge enabled: Move + BodyHeight + Euler + "
             "GetBodyHeight + StopMove"
         )
+
+    def _on_lowstate(self, message: Any) -> None:
+        """Preserve battery handling and cache measured lowstate attitude."""
+        UnitreeControlNode._on_lowstate(self, message)
+        # UnitreeControlNode subscribes during its constructor. A lowstate
+        # packet can therefore arrive before this subclass has created the
+        # posture status surface. Preserve the parent battery update and let
+        # the next packet populate posture instead of dereferencing fields
+        # that do not exist yet.
+        if not hasattr(self, "_sport_state"):
+            return
+        try:
+            data = message.get("data", message)
+            imu = data["imu_state"]
+            rpy = imu["rpy"]
+            values = tuple(float(rpy[index]) for index in range(3))
+            if not all(math.isfinite(value) for value in values):
+                return
+            current_velocity = (
+                self._sport_state.get("velocity", [0.0, 0.0, 0.0])
+                if isinstance(getattr(self, "_sport_state", None), dict)
+                else [0.0, 0.0, 0.0]
+            )
+            self._sport_state = {
+                "body_height": None,
+                "rpy": list(values),
+                "velocity": current_velocity,
+                "source": "lowstate_imu",
+            }
+            self._sport_state_received_s = time.monotonic()
+            self._update_reached_phase()
+        except (KeyError, IndexError, TypeError, ValueError):
+            return
 
     def cmd_vel_callback(self, message: TwistStamped) -> None:
         if self._stop_latched:
@@ -457,6 +518,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 self._height_query_received_s = time.monotonic()
                 self._height_query_parse_path = parse_path
                 self._height_query_error = None
+                self._height_feedback_estimated = False
                 self._update_reached_phase()
             except asyncio.CancelledError:
                 raise
@@ -464,12 +526,31 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 self._height_query_error = (
                     f"GetBodyHeight failed: {type(error).__name__}: {error}"
                 )
-                # Never continue against a previous query after the latest
-                # API-1024 response failed transport or parsing.
-                self._height_query_offset_m = None
-                self._height_query_received_s = None
-                self._height_query_parse_path = None
-                if self._phase not in {"stopped", "fault"}:
+                # Firmware code 3203 means API 1024 is unsupported.  API 1013
+                # still acknowledges BodyHeight, so retain a clearly labelled
+                # command-acknowledged estimate.  This is not presented as
+                # measured height; lowstate IMU remains measured attitude.
+                unsupported = self._height_query_code == 3203
+                if unsupported:
+                    if self._height_query_offset_m is None:
+                        self._height_query_offset_m = 0.0
+                    self._height_query_received_s = time.monotonic()
+                    self._height_feedback_estimated = True
+                    self._height_query_parse_path = "api_1013_command_ack_estimate"
+                    if self._phase == "blocked":
+                        self._phase = "idle"
+                    self._detail = (
+                        "GetBodyHeight unsupported; using labelled API-1013 "
+                        "command-ack estimate plus measured lowstate IMU"
+                    )
+                else:
+                    # Never continue against a previous query after an
+                    # ordinary transport or parse failure.
+                    self._height_query_offset_m = None
+                    self._height_query_received_s = None
+                    self._height_feedback_estimated = False
+                    self._height_query_parse_path = None
+                if not unsupported and self._phase not in {"stopped", "fault"}:
                     self._phase = "blocked"
                     self._detail = self._height_query_error
             await asyncio.sleep(0.20)
@@ -564,6 +645,9 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                         self._phase = "fault"
                         self._detail = f"{name} refused by robot (code={self._last_code})"
                         return
+                    if name == "BodyHeight" and self._height_feedback_estimated:
+                        self._height_query_offset_m = height
+                        self._height_query_received_s = time.monotonic()
                 self._last_posture_command_s = time.monotonic()
                 self._phase = "settling"
                 self._detail = "command accepted; waiting for measured posture"

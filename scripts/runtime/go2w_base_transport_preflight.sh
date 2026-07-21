@@ -5,7 +5,7 @@ set -euo pipefail
 # The UI cannot supply a host, service, command, or environment override.
 NUC_HOST="yusenzlabnuc@192.168.3.8"
 NUC_KEY="$HOME/.ssh/id_ed25519_codex_nuc"
-SERVICE="z-manip-go2w-base-control.service"
+SERVICE="z-mobile-manip-go2w-reactive-live.service"
 SSH=(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST")
 
 [[ -f "$NUC_KEY" ]] || {
@@ -20,7 +20,8 @@ active="$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)"
 logs="$(journalctl --user -u "$SERVICE" -n 240 --no-pager -o cat 2>/dev/null || true)"
 ok_line="$(grep -nF 'Data Channel Verification:' <<<"$logs" | grep -F 'OK' | tail -n1 | cut -d: -f1 || true)"
 fail_line="$(grep -nF 'Data channel is not open' <<<"$logs" | tail -n1 | cut -d: -f1 || true)"
-if [[ "$active" == active && -n "$ok_line" && ( -z "$fail_line" || "$ok_line" -gt "$fail_line" ) ]]; then
+owner_line="$(grep -nF 'LIVE single-owner bridge enabled' <<<"$logs" | tail -n1 | cut -d: -f1 || true)"
+if [[ "$active" == active && -n "$ok_line" && -n "$owner_line" && ( -z "$fail_line" || "$ok_line" -gt "$fail_line" ) ]]; then
   printf 'ready\n'
 else
   printf 'stale\n'

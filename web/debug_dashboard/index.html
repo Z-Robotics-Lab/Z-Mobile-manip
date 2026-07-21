@@ -881,9 +881,9 @@
     </section>
 
     <details class="component-console" id="component-console">
-      <summary>Vision services · status, logs and restart</summary>
+      <summary>Robot services · status, logs and restart</summary>
       <div class="component-console-body">
-        <div class="component-toolbar"><span>Cold start after a NUC/PC reboot. Camera and telemetry remain subscribe-only.</span><button class="component-button" id="component-bringup" type="button">Bring up all vision services</button></div>
+        <div class="component-toolbar"><span>Cold start after a NUC/PC reboot. Status checks never send motion commands.</span><button class="component-button" id="component-bringup" type="button">Bring up complete stack</button></div>
         <div class="component-grid" id="component-grid">
           <div class="component-card" data-component-card="ui"><div class="component-head"><span>UI workbench</span><span data-component-badge="ui">—</span></div><div class="component-state" data-component-state="ui">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="ui">Restart</button><button class="component-button log" type="button" data-component-log="ui">Logs</button></div></div>
           <div class="component-card" data-component-card="nuc-camera"><div class="component-head"><span>NUC D435</span><span data-component-badge="nuc-camera">—</span></div><div class="component-state" data-component-state="nuc-camera">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="nuc-camera">Restart</button><button class="component-button log" type="button" data-component-log="nuc-camera">Logs</button></div></div>
@@ -893,6 +893,10 @@
           <div class="component-card" data-component-card="edgetam"><div class="component-head"><span>EdgeTAM</span><span data-component-badge="edgetam">—</span></div><div class="component-state" data-component-state="edgetam">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="edgetam">Restart</button><button class="component-button log" type="button" data-component-log="edgetam">Logs</button></div></div>
           <div class="component-card" data-component-card="perception"><div class="component-head"><span>Perception ROS</span><span data-component-badge="perception">—</span></div><div class="component-state" data-component-state="perception">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="perception">Restart</button><button class="component-button log" type="button" data-component-log="perception">Logs</button></div></div>
           <div class="component-card" data-component-card="perception-all"><div class="component-head"><span>All perception</span><span data-component-badge="perception-all">—</span></div><div class="component-state" data-component-state="perception-all">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="perception-all">Restart all</button><button class="component-button log" type="button" data-component-log="perception-all">Logs</button></div></div>
+          <div class="component-card" data-component-card="reactive-control"><div class="component-head"><span>Go2W WebRTC owner</span><span data-component-badge="reactive-control">—</span></div><div class="component-state" data-component-state="reactive-control">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="reactive-control">Restart</button><button class="component-button log" type="button" data-component-log="reactive-control">Logs</button></div></div>
+          <div class="component-card" data-component-card="posture-bridge"><div class="component-head"><span>Posture relay</span><span data-component-badge="posture-bridge">—</span></div><div class="component-state" data-component-state="posture-bridge">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="posture-bridge">Restart</button><button class="component-button log" type="button" data-component-log="posture-bridge">Logs</button></div></div>
+          <div class="component-card" data-component-card="whole-body"><div class="component-head"><span>Pinocchio + CasADi</span><span data-component-badge="whole-body">—</span></div><div class="component-state" data-component-state="whole-body">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="whole-body">Rebuild</button><button class="component-button log" type="button" data-component-log="whole-body">Logs</button></div></div>
+          <div class="component-card" data-component-card="mobile-control"><div class="component-head"><span>Mobile control chain</span><span data-component-badge="mobile-control">—</span></div><div class="component-state" data-component-state="mobile-control">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="mobile-control">Restart chain</button><button class="component-button log" type="button" data-component-log="mobile-control">Logs</button></div></div>
         </div>
         <pre class="component-log" id="component-log" hidden aria-live="polite"></pre>
       </div>
@@ -2306,7 +2310,8 @@
         ? postureEnvelope.document : postureEnvelope;
       const supervision = state.approach?.supervision || state.approachWorkflow?.supervision || {};
       const ownership = supervision.owners || runtime.ownership || {};
-      const optimizer = runtime.optimizer || reactive.optimizer || supervision.optimizer || {};
+      const wholeBody = runtime.whole_body || {};
+      const optimizer = wholeBody.command || runtime.optimizer || reactive.optimizer || supervision.optimizer || {};
       const armView = reactive.arm_view || {};
       const search = state.approach?.wrist_search || {};
       const terminalPhase = ["degraded", "blocked", "stopped"].includes(String(state.approach?.phase))
@@ -2393,13 +2398,20 @@
         optimizer.primal_residual,
         optimizer.kkt_residual,
       );
+      const objectiveBefore = firstFinite(optimizer.objective?.before);
+      const objectiveAfter = firstFinite(optimizer.objective?.after);
+      const objectiveDelta = finiteNumber(objectiveBefore) && finiteNumber(objectiveAfter)
+        ? objectiveBefore - objectiveAfter : undefined;
       const optimizerText = [
-        optimizer.phase || "—",
-        finiteNumber(optimizerResidual) ? optimizerResidual.toExponential(2) : "res —",
-        optimizer.owner || ownership.optimizer || "owner —",
+        optimizer.backend || optimizer.phase || (wholeBody.ready ? "Pinocchio/CasADi" : "—"),
+        finiteNumber(objectiveDelta) ? `ΔJ ${objectiveDelta.toExponential(2)}`
+          : finiteNumber(optimizerResidual) ? `res ${optimizerResidual.toExponential(2)}` : "res —",
+        optimizer.executable === true || optimizer.executable_intent === true ? "LIVE READY"
+          : wholeBody.ready ? "SHADOW/GATED" : optimizer.owner || ownership.optimizer || "owner —",
       ].join(" · ");
       setApproachMetric("approach-optimizer", optimizerText,
-        optimizer.converged === false || supervision.timed_out === true ? "waiting" : "");
+        optimizer.success === false || optimizer.converged === false || supervision.timed_out === true ? "waiting"
+          : optimizer.executable === true ? "ready" : "");
       const fov = typeof visibility.in_fov === "boolean" ? visibility.in_fov
         : typeof visibility.predicted_in_fov === "boolean" ? visibility.predicted_in_fov
           : typeof reactive.fov_visible === "boolean" ? reactive.fov_visible : null;
@@ -2437,6 +2449,7 @@
         seeding_tracker: "track", waiting_for_track: "track", tracking: "track",
         align: "approach", approach: "approach", approaching: "approach", base_approach: "approach",
         posture_adjust: "posture", waiting_base_quiet: "posture", commanding: "posture", settling: "posture",
+        whole_body_approach: "approach", whole_body_shadow: "approach", whole_body_blocked: "posture",
         degraded: "posture", blocked: "posture",
         reacquire: "reacquire", reacquiring: "reacquire", view_recovery: "reacquire",
         search_required: "search", reached: "handoff", handoff_ready: "handoff", handoff_to_grasp: "handoff",
@@ -2928,8 +2941,8 @@
         button.textContent = active === component ? "Restarting…" : (component === "perception-all" ? "Restart all" : "Restart");
       }
       byId("component-bringup").disabled = state.components.busy === true || componentActionBusy();
-      byId("component-bringup").textContent = active === "bringup" ? "Bringing services up…" : "Bring up all vision services";
-      for (const name of ["ui", "nuc-camera", "passive-feedback", "observer", "rgbd", "edgetam", "perception", "perception-all"]) {
+      byId("component-bringup").textContent = active === "bringup" ? "Bringing services up…" : "Bring up complete stack";
+      for (const name of ["ui", "nuc-camera", "passive-feedback", "observer", "rgbd", "edgetam", "perception", "perception-all", "reactive-control", "posture-bridge", "whole-body", "mobile-control"]) {
         const component = state.components.components?.[name] || { state: "offline", summary: "status unavailable" };
         const badge = document.querySelector(`[data-component-badge="${name}"]`);
         const detail = document.querySelector(`[data-component-state="${name}"]`);

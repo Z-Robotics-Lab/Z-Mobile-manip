@@ -11,6 +11,10 @@ LAB_SCRIPT="$SCRIPT_DIR/go2w_perception_lab.sh"
 UI_UNIT="z-manip-planning-workbench.service"
 OBSERVER_UNIT="z-manip-runtime-observer.service"
 GROUNDING_UNIT="z-manip-local-grounding.service"
+POSTURE_UNIT="z-mobile-manip-go2w-posture-intent-live.service"
+REACTIVE_NUC_UNIT="z-mobile-manip-go2w-reactive-live.service"
+REACTIVE_INSTALLER="$SCRIPT_DIR/install_go2w_reactive_runtime.sh"
+WHOLE_BODY_IMAGE="z-mobile-manip-whole-body:latest"
 USER_SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UI_PORT="${Z_MANIP_DEBUG_UI_PORT:-8766}"
 NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
@@ -38,9 +42,9 @@ usage() {
   cat >&2 <<'EOF'
 usage: go2w_component_manager.sh bringup
        go2w_component_manager.sh install
-       go2w_component_manager.sh status [all|ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all]
-       go2w_component_manager.sh restart {ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all}
-       go2w_component_manager.sh logs {manager|ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all} [lines]
+       go2w_component_manager.sh status [all|ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control]
+       go2w_component_manager.sh restart {ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control}
+       go2w_component_manager.sh logs {manager|ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all|reactive-control|posture-bridge|mobile-control} [lines]
 EOF
   exit 2
 }
@@ -49,7 +53,7 @@ install_pc_units() {
   local unit source target wants
   wants="$USER_SYSTEMD_DIR/default.target.wants"
   mkdir -p "$USER_SYSTEMD_DIR" "$wants"
-  for unit in "$UI_UNIT" "$OBSERVER_UNIT" "$GROUNDING_UNIT"; do
+  for unit in "$UI_UNIT" "$OBSERVER_UNIT" "$GROUNDING_UNIT" "$POSTURE_UNIT"; do
     source="$STACK_ROOT/configs/$unit"
     target="$USER_SYSTEMD_DIR/$unit"
     [[ -f "$source" ]] || {
@@ -64,7 +68,7 @@ install_pc_units() {
 
 valid_component() {
   case "$1" in
-    ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all) return 0 ;;
+    ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -174,6 +178,44 @@ status_one() {
         summary="observer=$observer_state, rgbd=$rgbd_state, edgetam=$edgetam_state, perception=$perception_state"
       fi
       ;;
+    reactive-control)
+      if remote_service_active "$REACTIVE_NUC_UNIT"; then
+        state="healthy"
+        summary="NUC single WebRTC owner active; Move + BodyHeight + Euler"
+      else
+        summary="NUC reactive WebRTC owner inactive"
+      fi
+      ;;
+    posture-bridge)
+      if $SYSTEMCTL --user is-active --quiet "$POSTURE_UNIT" 2>/dev/null \
+          && container_running z-mobile-manip-posture-intent; then
+        state="healthy"
+        summary="PC posture intent/status relay active"
+      else
+        summary="posture intent relay service/container inactive"
+      fi
+      ;;
+    whole-body)
+      if $DOCKER image inspect "$WHOLE_BODY_IMAGE" >/dev/null 2>&1; then
+        state="healthy"
+        summary="Pinocchio + CasADi runtime image installed"
+      else
+        summary="whole-body runtime image missing"
+      fi
+      ;;
+    mobile-control)
+      local reactive_state posture_state whole_body_state
+      reactive_state="$(status_state reactive-control)"
+      posture_state="$(status_state posture-bridge)"
+      whole_body_state="$(status_state whole-body)"
+      if [[ "$reactive_state" == healthy && "$posture_state" == healthy && "$whole_body_state" == healthy ]]; then
+        state="healthy"
+        summary="NUC owner + posture relay + Pinocchio/CasADi ready"
+      else
+        state="degraded"
+        summary="reactive=$reactive_state, posture=$posture_state, whole-body=$whole_body_state"
+      fi
+      ;;
   esac
   printf '%s\t%s\t%s\n' "$component" "$state" "$summary"
 }
@@ -280,6 +322,11 @@ observer_ready() {
     && container_running z-manip-runtime-observer
 }
 
+posture_bridge_ready() {
+  $SYSTEMCTL --user is-active --quiet "$POSTURE_UNIT" 2>/dev/null \
+    && container_running z-mobile-manip-posture-intent
+}
+
 nuc_camera_ready() {
   remote_service_active d435i.service && remote_camera_device_ready
 }
@@ -345,6 +392,14 @@ restart_one() {
       restart_one perception || return 1
       restart_one observer
       ;;
+    reactive-control|posture-bridge|mobile-control)
+      "$REACTIVE_INSTALLER" || return 1
+      wait_until "NUC reactive control" remote_service_active "$REACTIVE_NUC_UNIT" || return 1
+      wait_until "posture relay" posture_bridge_ready
+      ;;
+    whole-body)
+      $DOCKER build -t "$WHOLE_BODY_IMAGE" "$STACK_ROOT/docker/whole_body_runtime" || return 1
+      ;;
   esac
 }
 
@@ -369,6 +424,12 @@ cold_bringup_steps() {
   wait_until "runtime observer" observer_ready || return 1
   $SYSTEMCTL --user enable --now "$UI_UNIT" || return 1
   wait_until "UI workbench" ui_ready || return 1
+  "$REACTIVE_INSTALLER" || return 1
+  wait_until "NUC reactive control" remote_service_active "$REACTIVE_NUC_UNIT" || return 1
+  wait_until "posture relay" posture_bridge_ready || return 1
+  if ! $DOCKER image inspect "$WHOLE_BODY_IMAGE" >/dev/null 2>&1; then
+    $DOCKER build -t "$WHOLE_BODY_IMAGE" "$STACK_ROOT/docker/whole_body_runtime" || return 1
+  fi
   printf '[%s] cold bringup healthy\n' "$(date --iso-8601=seconds)"
 }
 
@@ -383,8 +444,16 @@ show_logs() {
     rgbd) $DOCKER logs --tail "$lines" z-manip-rgbd 2>&1 ;;
     edgetam) $DOCKER logs --tail "$lines" z-manip-edgetam 2>&1 ;;
     perception) $DOCKER logs --tail "$lines" z-manip-hw 2>&1 ;;
+    reactive-control) remote_command "journalctl --user -u $REACTIVE_NUC_UNIT -n $lines --no-pager -o cat" 2>&1 ;;
+    posture-bridge) $JOURNALCTL --user -u "$POSTURE_UNIT" -n "$lines" --no-pager -o cat 2>&1 ;;
     perception-all)
       for item in observer edgetam rgbd perception; do
+        printf '===== %s =====\n' "$item"
+        show_logs "$item" "$lines"
+      done
+      ;;
+    mobile-control)
+      for item in reactive-control posture-bridge; do
         printf '===== %s =====\n' "$item"
         show_logs "$item" "$lines"
       done
@@ -403,7 +472,7 @@ case "$action" in
     ;;
   status)
     if [[ "$component" == all ]]; then
-      for item in ui nuc-camera passive-feedback observer rgbd edgetam perception perception-all; do
+      for item in ui nuc-camera passive-feedback observer rgbd edgetam perception perception-all reactive-control posture-bridge whole-body mobile-control; do
         status_one "$item"
       done
     else
@@ -444,7 +513,7 @@ case "$action" in
       tail -n 50 "$MANAGER_LOG" >&2
       exit "$rc"
     fi
-    for item in ui nuc-camera passive-feedback observer rgbd edgetam perception perception-all; do
+    for item in ui nuc-camera passive-feedback observer rgbd edgetam perception perception-all reactive-control posture-bridge whole-body mobile-control; do
       status_one "$item"
     done
     ;;
