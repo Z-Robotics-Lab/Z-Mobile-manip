@@ -859,9 +859,35 @@ def _run_ros(args: argparse.Namespace) -> int:
         ) -> tuple[np.ndarray, np.ndarray]:
             if not source_frame:
                 raise ValueError("target point cloud has an empty frame_id")
+            runtime_error: Exception | None = None
+            # The combined robot frames are intentionally reconstructed by
+            # the subscribe-only observer on this deployment. Prefer that
+            # fresh local artifact over waiting for two TF timeouts on every
+            # camera callback; TF remains a valid fallback for simulations or
+            # a future robot_state_publisher deployment.
+            if args.runtime_state is not None:
+                try:
+                    base_matrix, arm_matrix, stamp_ns = _runtime_state_transforms(
+                        args.runtime_state,
+                        source_frame=source_frame,
+                        base_frame=settings.base_frame,
+                        arm_base_frame=settings.arm_base_frame,
+                        now_unix_ns=time.time_ns(),
+                        max_age_s=args.runtime_transform_timeout_s,
+                    )
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    runtime_error = error
+                else:
+                    self.last_transform_stamps_ns = {
+                        settings.base_frame: stamp_ns,
+                        settings.arm_base_frame: stamp_ns,
+                    }
+                    self.last_transform_success_s = time.monotonic()
+                    self.last_transform_source = "runtime_observer_kinematics"
+                    self.last_transform_error = None
+                    return base_matrix, arm_matrix
             query_time = Time.from_msg(source_stamp)
             timeout = Duration(seconds=settings.transform_timeout_s)
-            tf_error: Exception | None = None
             try:
                 base = self.tf_buffer.lookup_transform(
                     settings.base_frame,
@@ -883,31 +909,10 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self.last_transform_source = "tf2"
                 self.last_transform_error = None
                 return self._matrix(base), self._matrix(arm)
-            except TransformException as error:
-                tf_error = error
-            if args.runtime_state is None:
-                raise ValueError(f"TF lookup failed and no runtime state is configured: {tf_error}")
-            try:
-                base_matrix, arm_matrix, stamp_ns = _runtime_state_transforms(
-                    args.runtime_state,
-                    source_frame=source_frame,
-                    base_frame=settings.base_frame,
-                    arm_base_frame=settings.arm_base_frame,
-                    now_unix_ns=time.time_ns(),
-                    max_age_s=args.runtime_transform_timeout_s,
-                )
-            except (OSError, ValueError, json.JSONDecodeError) as runtime_error:
+            except TransformException as tf_error:
                 raise ValueError(
-                    f"TF lookup failed ({tf_error}); runtime model failed ({runtime_error})",
-                ) from runtime_error
-            self.last_transform_stamps_ns = {
-                settings.base_frame: stamp_ns,
-                settings.arm_base_frame: stamp_ns,
-            }
-            self.last_transform_success_s = time.monotonic()
-            self.last_transform_source = "runtime_observer_kinematics"
-            self.last_transform_error = None
-            return base_matrix, arm_matrix
+                    f"runtime model failed ({runtime_error}); TF lookup failed ({tf_error})",
+                ) from tf_error
 
         def _target(self, message: PointCloud2) -> None:
             xs: list[float] = []
