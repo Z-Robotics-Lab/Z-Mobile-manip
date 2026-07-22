@@ -45,6 +45,7 @@ ARTIFACT_ROOT = WORKSPACE_ROOT / "artifacts"
 PERCEPTION = SCRIPT_DIR / "go2w_perception_dry_run.py"
 SESSION_GATE = SCRIPT_DIR / "piper_planning_session_gate.py"
 PLANNER = SCRIPT_DIR / "piper_planning_dry_run.py"
+PLANNING_WORKER = SCRIPT_DIR / "piper_planning_worker.py"
 STACK_CONFIG = STACK_ROOT / "configs" / "go2w_piper.json"
 DEBUG_BUNDLE = SCRIPT_DIR / "go2w_debug_bundle.py"
 SAFETY_GATE = SCRIPT_DIR / "go2w_debug_safety_gate.py"
@@ -959,6 +960,7 @@ class FixedReadOnlyBackend:
         return (
             SESSION_GATE,
             PLANNER,
+            PLANNING_WORKER,
             STACK_CONFIG,
             DEBUG_BUNDLE,
             SAFETY_GATE,
@@ -1258,7 +1260,10 @@ class FixedReadOnlyBackend:
                 "-e",
                 f"Z_MANIP_IK_BACKEND={self.runtime.ik_backend}",
                 PLANNING_RUNNER_CONTAINER,
-                *planner_args,
+                "z-manip-piper-planning-worker",
+                "client",
+                "--",
+                *planner_args[1:],
             )
         else:
             planner_command = (
@@ -1283,6 +1288,8 @@ class FixedReadOnlyBackend:
                 f"{ROBOT_ASSETS}:/robot_assets:ro",
                 "-v",
                 f"{PLANNER}:/usr/local/bin/z-manip-piper-planning-dry-run:ro",
+                "-v",
+                f"{PLANNING_WORKER}:/usr/local/bin/z-manip-piper-planning-worker:ro",
                 "-v",
                 f"{STACK_CONFIG}:/opt/z_manip/configs/go2w_piper.json:ro",
                 "-v",

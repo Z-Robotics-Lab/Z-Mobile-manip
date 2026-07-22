@@ -269,12 +269,13 @@ start_planning_runner() {
     -e PYTHONPATH=/opt/z_manip_ws/install/lib/python3.12/site-packages:/opt/ros/jazzy/lib/python3.12/site-packages:/opt/z_manip/python \
     -e LD_LIBRARY_PATH=/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib \
     -v "$ROOT_DIR/scripts/runtime/piper_planning_dry_run.py:/usr/local/bin/z-manip-piper-planning-dry-run:ro" \
+    -v "$ROOT_DIR/scripts/runtime/piper_planning_worker.py:/usr/local/bin/z-manip-piper-planning-worker:ro" \
     -v "$ROOT_DIR/z_manip:/opt/z_manip/python/z_manip:ro" \
     -v "$ROOT_DIR/configs/go2w_piper.json:/opt/z_manip/configs/go2w_piper.json:ro" \
     -v "$ROOT_DIR/../go2W_Sim/assets:/robot_assets:ro" \
     -v "$PERCEPTION_RUNNER_ARTIFACT_ROOT:/workspace-artifacts:ro" \
     -v "$PLANNING_RUNNER_SCRATCH_ROOT:/workspace-planning-output" \
-    "$IMAGE" sleep infinity >/dev/null
+    "$IMAGE" z-manip-piper-planning-worker serve >/dev/null
 }
 
 wait_anygrasp_healthy() {

@@ -20,11 +20,21 @@ import os
 from pathlib import Path
 import re
 import time
+from typing import Sequence
 
 import numpy as np
 
 
 COLLISION_WITNESS_REPLAY_LIMIT = 4
+
+
+# A resident, network-disabled planning worker may call ``main`` repeatedly.
+# Keep only the expensive immutable robot models warm.  Per-request scene,
+# target, collision margins, controls, trajectories, and artifacts are always
+# rebuilt below.  The key includes file identity and every option that changes
+# StackConfig, so a deployed config/URDF update cannot silently reuse an old
+# model.
+_PLANNER_CACHE: dict[tuple[object, ...], tuple[object, object, object]] = {}
 
 
 def grasp_centrality_scores(
@@ -912,7 +922,7 @@ def _gripper_scene_radius_scale(value: str) -> float:
     return result
 
 
-def _arguments() -> argparse.Namespace:
+def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
@@ -1003,12 +1013,86 @@ def _arguments() -> argparse.Namespace:
             "URDF mesh self-collision remains unchanged"
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
+def _file_identity(path: Path) -> tuple[str, int, int]:
+    resolved = path.expanduser().resolve()
+    stat = resolved.stat()
+    return str(resolved), int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def _load_planner(args: argparse.Namespace) -> tuple[object, object, bool]:
+    """Return a process-local immutable planner template and cache evidence."""
+
+    from z_manip.configuration import load_stack_config
+    from z_manip_task.planning import OnlinePlanner
+
+    environment = dict(os.environ)
+    environment["Z_MANIP_ROBOT_URDF"] = str(args.urdf.expanduser().resolve())
+    key = (
+        _file_identity(args.config),
+        _file_identity(args.urdf),
+        os.environ.get("Z_MANIP_IK_BACKEND", "pinocchio"),
+        args.search_timeout_s,
+        args.symmetry_samples,
+        args.max_hypotheses,
+        args.max_feasible_plans,
+    )
+    cached = _PLANNER_CACHE.get(key)
+    if cached is None:
+        config = load_stack_config(args.config, environ=environment)
+        if any(
+            value is not None
+            for value in (
+                args.search_timeout_s,
+                args.symmetry_samples,
+                args.max_hypotheses,
+                args.max_feasible_plans,
+            )
+        ):
+            config = replace(
+                config,
+                grasp_plan=replace(
+                    config.grasp_plan,
+                    search_timeout_s=(
+                        config.grasp_plan.search_timeout_s
+                        if args.search_timeout_s is None
+                        else args.search_timeout_s
+                    ),
+                    symmetry_samples=(
+                        config.grasp_plan.symmetry_samples
+                        if args.symmetry_samples is None
+                        else args.symmetry_samples
+                    ),
+                    max_hypotheses=(
+                        config.grasp_plan.max_hypotheses
+                        if args.max_hypotheses is None
+                        else args.max_hypotheses
+                    ),
+                    max_feasible_plans=(
+                        config.grasp_plan.max_feasible_plans
+                        if args.max_feasible_plans is None
+                        else args.max_feasible_plans
+                    ),
+                ),
+            )
+        planner = OnlinePlanner(config)
+        base_collision_model = planner.collision_model
+        _PLANNER_CACHE.clear()
+        _PLANNER_CACHE[key] = (config, planner, base_collision_model)
+        return config, planner, False
+
+    config, planner, base_collision_model = cached
+    # The dry-run applies calibrated scene/gripper margins to this dataclass.
+    # Restore the exact immutable template before every request.
+    planner.collision_model = base_collision_model
+    return config, planner, True
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     total_started = time.perf_counter()
-    args = _arguments()
+    args = _arguments(argv)
     artifacts = args.artifacts.expanduser().resolve()
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -1022,51 +1106,10 @@ def main() -> int:
         else np.asarray(args.planning_joints, dtype=float)
     )
 
-    from z_manip.configuration import load_stack_config
     from z_manip.models.grasp_source import GraspCandidates
     from z_manip.models.planner import PlanningError
     from z_manip.planning_control import PlanningControl
-    from z_manip_task.planning import OnlinePlanner
-
-    environment = dict(os.environ)
-    environment["Z_MANIP_ROBOT_URDF"] = str(args.urdf.expanduser().resolve())
-    config = load_stack_config(args.config, environ=environment)
-    if any(
-        value is not None
-        for value in (
-            args.search_timeout_s,
-            args.symmetry_samples,
-            args.max_hypotheses,
-            args.max_feasible_plans,
-        )
-    ):
-        config = replace(
-            config,
-            grasp_plan=replace(
-                config.grasp_plan,
-                search_timeout_s=(
-                    config.grasp_plan.search_timeout_s
-                    if args.search_timeout_s is None
-                    else args.search_timeout_s
-                ),
-                symmetry_samples=(
-                    config.grasp_plan.symmetry_samples
-                    if args.symmetry_samples is None
-                    else args.symmetry_samples
-                ),
-                max_hypotheses=(
-                    config.grasp_plan.max_hypotheses
-                    if args.max_hypotheses is None
-                    else args.max_hypotheses
-                ),
-                max_feasible_plans=(
-                    config.grasp_plan.max_feasible_plans
-                    if args.max_feasible_plans is None
-                    else args.max_feasible_plans
-                ),
-            ),
-        )
-    planner = OnlinePlanner(config)
+    config, planner, planner_cache_hit = _load_planner(args)
     if args.gripper_scene_radius_scale < 1.0:
         planner.collision_model = replace(
             planner.collision_model,
@@ -1200,6 +1243,7 @@ def main() -> int:
         ),
         "candidate_count": len(grasps_base),
         "ik_backend": getattr(planner, "ik_backend", "unknown"),
+        "planner_model_cache_hit": planner_cache_hit,
         "scene_points": len(scene_base),
         "target_points": len(target_base),
         "base_from_camera": base_from_camera.tolist(),
