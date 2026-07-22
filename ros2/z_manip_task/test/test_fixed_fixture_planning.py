@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
+from z_manip.models.planner import JointTrajectory
+from z_manip.planning.grasp_pipeline import PlannedGrasp
 from z_manip.configuration import load_stack_config
 from z_manip_task import planning as planning_module
 from z_manip_task.planning import OnlinePlanner
@@ -116,7 +119,21 @@ class _FixturePhaseProbe:
             EDGE_START,
             required_width_m=0.04,
         )
-        return "fixture-phase-contract-passed"
+        return PlannedGrasp(
+            candidate_index=0,
+            symmetry_index=0,
+            grasp_pose=np.eye(4),
+            pregrasp_pose=np.eye(4),
+            transit=JointTrajectory(
+                self.joint_planner.joint_names,
+                np.vstack((EDGE_START, EDGE_START, EDGE_START)),
+            ),
+            approach_joints=np.vstack((EDGE_START, EDGE_START)),
+            lift_joints=np.vstack((EDGE_START, EDGE_START)),
+            required_width_m=0.04,
+            score=1.0,
+            failures=(),
+        )
 
 
 def test_fixed_fixture_model_keeps_body_lidar_camera_and_plate_geometry():
@@ -130,12 +147,21 @@ def test_fixed_fixture_model_keeps_body_lidar_camera_and_plate_geometry():
     assert {
         "platform_head",
         "platform_head_lower",
+        "go2w_chassis",
         "mid360",
         "d435_body",
         "gripper_camera_plate",
     }.issubset(supplemental)
     assert any("mid360" in pair for pair in planner.fixed_fixture_guard.pairs)
+    assert any("go2w_chassis" in pair for pair in planner.fixed_fixture_guard.pairs)
     assert any("platform_head" in pair for pair in planner.fixed_fixture_guard.pairs)
+
+
+def test_calibrated_go2w_chassis_envelope_keeps_measured_home_valid():
+    planner = _planner()
+    home = json.loads((ROOT / "configs/piper_home.json").read_text())
+
+    assert planner._fixed_fixture_state_valid(home["joint_radians"])
 
 
 def test_fixed_fixture_path_checks_interiors_not_only_safe_endpoints():
@@ -174,6 +200,19 @@ def test_online_plan_applies_fixed_fixture_guard_to_every_motion_phase(
         "GraspPlanGenerator",
         _FixturePhaseProbe,
     )
+    refined = np.vstack((EDGE_START, EDGE_START, EDGE_START))
+    refined[1, 0] += 0.001
+    refinement = SimpleNamespace(
+        trajectory=refined,
+        accepted=True,
+        backend="test",
+        document=lambda: {"schema": "test"},
+    )
+    monkeypatch.setattr(
+        planning_module,
+        "refine_joint_trajectory",
+        lambda *_args, **_kwargs: refinement,
+    )
 
     far_scene = np.column_stack((
         np.linspace(10.0, 11.0, 64),
@@ -189,7 +228,8 @@ def test_online_plan_applies_fixed_fixture_guard_to_every_motion_phase(
         pose_ranker=lambda *_args, **_kwargs: 0.0,
     )
 
-    assert result == "fixture-phase-contract-passed"
+    assert result.trajectory_refinement is refinement
+    np.testing.assert_allclose(result.transit.waypoints, refined)
 
 
 def test_execution_revalidation_cannot_bypass_fixed_fixture_edge_collision(

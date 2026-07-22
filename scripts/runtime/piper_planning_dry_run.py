@@ -1246,11 +1246,14 @@ def main() -> int:
             planner.chain.forward(raw_approach[-1]),
             contact_target,
         )
-        lift_target = np.asarray(planned.grasp_pose, dtype=float).copy()
-        lift_target[:3, 3] += (
-            config.grasp_plan.lift_distance_m
-            * np.asarray(config.grasp_plan.lift_direction_base, dtype=float)
-        )
+        if planned.lift_pose is None:
+            lift_target = np.asarray(planned.grasp_pose, dtype=float).copy()
+            lift_target[:3, 3] += (
+                config.grasp_plan.lift_distance_m
+                * np.asarray(config.grasp_plan.lift_direction_base, dtype=float)
+            )
+        else:
+            lift_target = np.asarray(planned.lift_pose, dtype=float).copy()
         lift_position_error_m, lift_orientation_error_rad = rigid_pose_error(
             planner.chain.forward(raw_lift[-1]),
             tool_tip_pose(lift_target, config.grasp_plan.tool_from_tip),
@@ -1359,6 +1362,12 @@ def main() -> int:
         "lift_duration_s": float(lift.times_s[-1]),
         "grasp_pose": np.asarray(planned.grasp_pose, dtype=float).tolist(),
         "pregrasp_pose": np.asarray(planned.pregrasp_pose, dtype=float).tolist(),
+        "lift_pose": np.asarray(lift_target, dtype=float).tolist(),
+        "trajectory_refinement": (
+            None
+            if planned.trajectory_refinement is None
+            else planned.trajectory_refinement.document()
+        ),
         "rejection_count": len(planned.failures),
         "rejections_truncated": False,
         "rejections": _failure_records(planned.failures, {}),

@@ -268,6 +268,8 @@ class PlannedGrasp:
     failures: tuple[CandidateFailure, ...]
     selected_global_rank: int = 1
     higher_rank_rejection_count: int = 0
+    lift_pose: np.ndarray | None = None
+    trajectory_refinement: object | None = None
 
 
 class GraspPlanningError(PlanningError):
@@ -733,6 +735,7 @@ class GraspPlanGenerator:
             symmetry_index,
             grasp.copy(),
             pregrasp,
+            lift.copy(),
             transit,
             approach_joints,
             lift_joints,
@@ -953,7 +956,7 @@ class GraspPlanGenerator:
                 ),
             )
             (
-                candidate_index, symmetry_index, grasp, pregrasp, transit,
+                candidate_index, symmetry_index, grasp, pregrasp, lift, transit,
                 approach_joints, lift_joints, width,
             ) = data
             return PlannedGrasp(
@@ -974,6 +977,7 @@ class GraspPlanGenerator:
                     if global_ranks[failure.candidate_index]
                     < global_ranks[candidate_index]
                 }),
+                lift_pose=lift,
             )
         raise GraspPlanningError(
             "no grasp candidate survived aperture/IK/planning; "

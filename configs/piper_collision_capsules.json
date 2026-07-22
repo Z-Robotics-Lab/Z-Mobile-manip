@@ -25,6 +25,17 @@
       "supplemental_self_collision": true
     },
     {
+      "name": "go2w_chassis",
+      "start_frame": "piper_base_link",
+      "end_frame": "piper_base_link",
+      "radius": 0.074,
+      "start_offset": [-0.242626599, 0.0, -0.081794287],
+      "end_offset": [-0.014426599, 0.0, -0.081794287],
+      "check_scene": false,
+      "check_target": false,
+      "supplemental_self_collision": true
+    },
+    {
       "name": "mid360",
       "start_frame": "piper_base_link",
       "end_frame": "piper_base_link",
@@ -120,6 +131,13 @@
       ["platform_head_lower", "gripper_camera_plate"],
       ["platform_head_lower", "finger_left_proximal"], ["platform_head_lower", "finger_left_mid"], ["platform_head_lower", "finger_left_pad"], ["platform_head_lower", "finger_left_tip"],
       ["platform_head_lower", "finger_right_proximal"], ["platform_head_lower", "finger_right_mid"], ["platform_head_lower", "finger_right_pad"], ["platform_head_lower", "finger_right_tip"],
+      ["go2w_chassis", "forearm"],
+      ["go2w_chassis", "wrist"],
+      ["go2w_chassis", "palm"],
+      ["go2w_chassis", "d435_body"],
+      ["go2w_chassis", "gripper_camera_plate"],
+      ["go2w_chassis", "finger_left_proximal"], ["go2w_chassis", "finger_left_mid"], ["go2w_chassis", "finger_left_pad"], ["go2w_chassis", "finger_left_tip"],
+      ["go2w_chassis", "finger_right_proximal"], ["go2w_chassis", "finger_right_mid"], ["go2w_chassis", "finger_right_pad"], ["go2w_chassis", "finger_right_tip"],
       ["mid360", "upper_arm"],
       ["mid360", "forearm"],
       ["mid360", "wrist"],

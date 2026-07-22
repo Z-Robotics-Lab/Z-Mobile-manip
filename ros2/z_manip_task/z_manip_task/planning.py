@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from typing import Callable
@@ -35,7 +35,7 @@ from z_manip.models.grasp_source import (
     GraspCandidates,
     GraspContext,
 )
-from z_manip.models.planner import PlanningError
+from z_manip.models.planner import JointTrajectory, PlanningError
 from z_manip.perception.rgbd import filter_object_cloud
 from z_manip.planning.grasp_pipeline import (
     CandidateFailure,
@@ -47,6 +47,11 @@ from z_manip.planning.grasp_pipeline import (
 from z_manip.planning.rrt_connect import JointSpaceRRTConnect
 from z_manip.planning.standoff import ReachabilityStandoffOptimizer
 from z_manip.planning.time_parameterization import retime_path, TimedJointTrajectory
+from z_manip.planning.trajectory_refinement import (
+    refine_joint_trajectory,
+    TrajectoryRefinementConfig,
+    TrajectoryRefinementUnavailable,
+)
 from z_manip.planning.work_pose import (
     BoundedSE2WorkPoseOptimizer,
     WorkPoseCandidate,
@@ -633,7 +638,7 @@ class OnlinePlanner:
         )
         if pose_ranker is None:
             pose_ranker = self.ik.make_seed_pose_ranker(current_joints, control)
-        return GraspPlanGenerator(
+        planned = GraspPlanGenerator(
             self.ik,
             joint_planner,
             self.config.grasp_plan,
@@ -644,6 +649,42 @@ class OnlinePlanner:
             current_joints=current_joints,
             pose_ranker=pose_ranker,
             control=control,
+        )
+        checkpoint(control, 'RRT trajectory refinement')
+        try:
+            refinement = refine_joint_trajectory(
+                planned.transit.waypoints,
+                lower_limits=self.chain.lower_limits,
+                upper_limits=self.chain.upper_limits,
+                state_valid=transit_checker.is_state_valid,
+                fixed_guard=self.fixed_fixture_guard,
+                config=TrajectoryRefinementConfig(
+                    max_joint_step_rad=min(
+                        0.01,
+                        float(self.config.rrt.collision_resolution),
+                    ),
+                ),
+                backend=os.environ.get(
+                    'Z_MANIP_TRAJECTORY_REFINEMENT_BACKEND',
+                    'auto',
+                ),
+            )
+        except (TrajectoryRefinementUnavailable, RuntimeError):
+            # Refinement is opportunistic: a known-safe RRT seed remains a
+            # valid plan if the optional optimizer/backend is unavailable.
+            return planned
+        checkpoint(control, 'RRT trajectory refinement')
+        transit = planned.transit
+        if refinement.accepted:
+            transit = JointTrajectory(
+                joint_names=planned.transit.joint_names,
+                waypoints=refinement.trajectory,
+                times=planned.transit.times,
+            )
+        return replace(
+            planned,
+            transit=transit,
+            trajectory_refinement=refinement,
         )
 
     def _new_checker(
