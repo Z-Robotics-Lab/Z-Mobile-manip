@@ -404,6 +404,10 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert 'data-approach-phase="reacquire"' in lowered
     assert 'data-approach-phase="handoff"' in lowered
     assert "ground-plane distance for base translation" in lowered
+    assert 'id="approach-only"' in lowered
+    assert 'function startapproachonly()' in lowered
+    assert 'auto_handoff: false' in lowered
+    assert 'byid("approach-only").addeventlistener("click", startapproachonly)' in lowered
 
 
 def test_dashboard_explains_blocked_attempt_while_showing_last_good_bundle():

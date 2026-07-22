@@ -853,6 +853,7 @@
         </div>
         <div class="approach-actions">
           <button class="session-button approach-live" id="approach-auto" type="button" disabled>Find → approach → grasp</button>
+          <button class="session-button approach-live" id="approach-only" type="button" disabled>Approach only</button>
           <button class="session-button" id="approach-shadow" type="button" disabled>Shadow check</button>
           <button class="session-button approach-stop" id="approach-stop" type="button">Full stop</button>
         </div>
@@ -2522,6 +2523,7 @@
         && !running
         && !otherBusy;
       byId("approach-auto").disabled = !canAutoStart;
+      byId("approach-only").disabled = !canAutoStart;
       byId("approach-shadow").disabled = !canStart;
       // Full Stop is a recovery control, not a normal workflow action. Keep
       // it available when browser and server state disagree about liveness.
@@ -2530,6 +2532,10 @@
       byId("approach-auto").textContent = state.approachWorkflow?.active
         ? `${state.approachWorkflow.phase.replaceAll("_", " ")}…`
         : "Find → approach → grasp";
+      byId("approach-only").textContent = state.approachWorkflow?.active
+        && state.approachWorkflow?.auto_handoff === false
+        ? `${state.approachWorkflow.phase.replaceAll("_", " ")}…`
+        : "Approach only";
       const status = byId("approach-session-state");
       status.className = `session-state ${running ? "running" : runtime.phase === "reached" ? "succeeded" : ""}`;
       status.textContent = running
@@ -2771,6 +2777,24 @@
         target,
         acquire_target: true,
         auto_handoff: true,
+        operator_present: true,
+        speed_percent: speed
+      })) state.approachWorkflow = null;
+    }
+
+    async function startApproachOnly() {
+      const target = byId("perception-target").value.trim();
+      if (target.length < 1 || target.length > 160) return;
+      if (!window.confirm(
+        `Approach only toward “${target}”?\n\nThe Go2W will detect, track, and stop at the manipulation handoff. It will not start close-range planning or move the arm for grasp execution. Keep Full stop and the physical emergency stop within reach.`
+      )) return;
+      state.approachWorkflow = { active: true, phase: "detecting", target, auto_handoff: false };
+      renderApproachStatus(state.approach);
+      const speed = selectedSpeedPercent() || 5;
+      if (!await startApproach("live", false, {
+        target,
+        acquire_target: true,
+        auto_handoff: false,
         operator_present: true,
         speed_percent: speed
       })) state.approachWorkflow = null;
@@ -3297,6 +3321,7 @@
       byId("session-perform-grasp").addEventListener("click", () => startGraspAction());
       byId("session-perform-selected").addEventListener("click", startSelectedGraspAction);
       byId("approach-auto").addEventListener("click", startApproachAndGrasp);
+      byId("approach-only").addEventListener("click", startApproachOnly);
       byId("approach-shadow").addEventListener("click", () => startApproach("shadow"));
       byId("approach-stop").addEventListener("click", () => stopApproach());
       byId("session-clear-demo").addEventListener("click", () => runMaintenanceAction("clear-demo"));
