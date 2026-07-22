@@ -29,9 +29,12 @@ class PinocchioIKSolver:
     of the planning stack.
     """
 
-    _DAMPING = 1e-5
-    _INTEGRATION_STEP = 0.35
+    _DAMPING = 1e-4
+    _MIN_DAMPING = 1e-7
+    _MAX_DAMPING = 1e2
+    _INTEGRATION_STEP = 1.0
     _MAX_TANGENT_STEP = 0.70
+    _LINE_SEARCH_STEPS = (1.0, 0.5, 0.25, 0.125)
 
     def __init__(
         self,
@@ -144,6 +147,46 @@ class PinocchioIKSolver:
             min_joint_limit_margin=float(np.min(normalized_margin)),
         )
 
+    def _task_weights(self, position_error: float) -> np.ndarray:
+        """Return translation-first task weights for one LM iteration.
+
+        The old implementation minimized metres and radians in the same
+        unscaled vector.  For the PiPER work envelope that made a moderate
+        wrist-orientation error dominate several centimetres of translation,
+        so an otherwise reachable pregrasp was often abandoned far from the
+        object.  Translation now receives a tight scale tied to the actual
+        acceptance tolerance.  Orientation is introduced gradually after the
+        tip enters a small capture region, then becomes a normal soft task.
+        """
+
+        position_scale = min(
+            self.config.position_scale_m,
+            max(2.0 * self.config.position_tolerance_m, 0.01),
+        )
+        capture_radius = max(3.0 * self.config.position_tolerance_m, 0.025)
+        if position_error >= capture_radius:
+            orientation_gain = 0.05
+        else:
+            # Smoothly ramp from a weak viewing-direction preference at the
+            # capture boundary to full orientation tracking at the target.
+            progress = 1.0 - position_error / capture_radius
+            orientation_gain = 0.05 + 0.95 * progress * progress
+        return np.asarray(
+            [
+                1.0 / position_scale,
+                1.0 / position_scale,
+                1.0 / position_scale,
+                orientation_gain / self.config.orientation_scale_rad,
+                orientation_gain / self.config.orientation_scale_rad,
+                orientation_gain / self.config.orientation_scale_rad,
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _weighted_cost(error_twist: np.ndarray, weights: np.ndarray) -> float:
+        return float(np.linalg.norm(weights * np.asarray(error_twist, dtype=float)))
+
     def _attempt(
         self,
         goal: np.ndarray,
@@ -157,6 +200,7 @@ class PinocchioIKSolver:
         pin = self.pin
         joints = np.minimum(np.maximum(seed, lower + 1e-10), upper - 1e-10)
         best = (float("inf"), float("inf"))
+        damping = self._DAMPING
         for iteration in range(self.config.max_iterations):
             checkpoint(control, "Pinocchio inverse kinematics")
             position_error, orientation_error, tip_world, desired_world = (
@@ -186,20 +230,47 @@ class PinocchioIKSolver:
                 pin.LOCAL,
             )
             task_jacobian = -pin.Jlog6(tip_from_desired.inverse()) @ jacobian
-            tangent = -task_jacobian.T @ np.linalg.solve(
-                task_jacobian @ task_jacobian.T
-                + self._DAMPING * np.eye(6),
-                error_twist,
+            weights = self._task_weights(position_error)
+            weighted_jacobian = weights[:, None] * task_jacobian
+            weighted_error = weights * error_twist
+            normal = weighted_jacobian.T @ weighted_jacobian
+            gradient = weighted_jacobian.T @ weighted_error
+            tangent = -np.linalg.solve(
+                normal + damping * np.eye(self.model.nv),
+                gradient,
             )
             tangent_norm = float(np.linalg.norm(tangent))
             if tangent_norm > self._MAX_TANGENT_STEP:
                 tangent *= self._MAX_TANGENT_STEP / tangent_norm
-            joints = pin.integrate(
-                self.model,
-                joints,
-                tangent * self._INTEGRATION_STEP,
-            )
-            joints = np.minimum(np.maximum(joints, lower + 1e-10), upper - 1e-10)
+            current_cost = self._weighted_cost(error_twist, weights)
+            accepted = False
+            for step_scale in self._LINE_SEARCH_STEPS:
+                checkpoint(control, "Pinocchio inverse kinematics line search")
+                candidate = pin.integrate(
+                    self.model,
+                    joints,
+                    tangent * (self._INTEGRATION_STEP * step_scale),
+                )
+                candidate = np.minimum(
+                    np.maximum(candidate, lower + 1e-10),
+                    upper - 1e-10,
+                )
+                _, _, candidate_tip, candidate_desired = self._pose_error(
+                    candidate,
+                    goal,
+                )
+                candidate_error = pin.log6(
+                    candidate_tip.actInv(candidate_desired),
+                ).vector
+                if self._weighted_cost(candidate_error, weights) < current_cost - 1e-9:
+                    joints = candidate
+                    damping = max(self._MIN_DAMPING, damping * 0.35)
+                    accepted = True
+                    break
+            if not accepted:
+                damping = min(self._MAX_DAMPING, damping * 10.0)
+                if damping >= self._MAX_DAMPING:
+                    break
         return None, best
 
     def _bounded_solve(

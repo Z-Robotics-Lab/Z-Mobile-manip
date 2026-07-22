@@ -78,9 +78,10 @@ def test_deployment_config_resolves_robot_path_and_builds_typed_settings():
     assert config.work_pose.preferred_target_abs_y_m == pytest.approx(0.14)
     assert config.work_pose.max_base_translation_m == pytest.approx(1.5)
     # Objects smaller than 30 mm are outside the current picking scope.  Keep
-    # a sub-centimetre position gate while avoiding false IK rejection from
+    # a one-centimetre position gate while avoiding false IK rejection from
     # camera/hand-eye/model residuals on the real arm.
-    assert config.ik.position_tolerance_m == pytest.approx(0.004)
+    assert config.ik.position_tolerance_m == pytest.approx(0.010)
+    assert config.ik.position_scale_m == pytest.approx(0.025)
     assert config.ik.orientation_tolerance_rad == pytest.approx(0.3490658504)
     assert config.ik.continuation_timeout_s == pytest.approx(0.18)
     assert config.ik.continuation_seed_timeout_s == pytest.approx(0.08)

@@ -53,11 +53,11 @@
     "max_pitch_rad": 0.2094395102
   },
   "ik": {
-    "position_tolerance_m": 0.004,
+    "position_tolerance_m": 0.010,
     "orientation_tolerance_rad": 0.3490658504,
     "max_iterations": 220,
     "random_seeds": 14,
-    "position_scale_m": 0.1,
+    "position_scale_m": 0.025,
     "orientation_scale_rad": 0.35,
     "current_distance_weight": 0.015,
     "joint_limit_weight": 0.003,
