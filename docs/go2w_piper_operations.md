@@ -236,7 +236,7 @@ browser remaining open:
 ```text
 fresh open-vocabulary detection in the current D435 frame
 → if absent: finite J4/J5 wrist-camera viewpoints
-→ two consecutive detections at confidence >= 0.55
+→ two consecutive detector-qualified observations at confidence >= 0.20
 → fresh EdgeTAM seed and three depth-validated tracking updates
 → filtered target x/z at 5–10 Hz
 → coarse legged-base alignment, body/view adjustment, and curved vx/wz approach

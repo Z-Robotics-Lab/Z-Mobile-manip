@@ -39,7 +39,10 @@ class WristSearchConfig:
     settle_s: float = 0.35
     detector_hz: float = 5.0
     observations_per_view: int = 3
-    confidence_threshold: float = 0.55
+    # The resident grounding service already rejects candidates below 0.20
+    # and applies finite/border/area gates. Search adds temporal confirmation,
+    # not a contradictory second confidence gate.
+    confidence_threshold: float = 0.20
     confirmations_required: int = 2
     joint_tolerance_rad: float = math.radians(1.0)
     # At 5% each smooth 18 degree wrist edge takes about 1.9 seconds.  The

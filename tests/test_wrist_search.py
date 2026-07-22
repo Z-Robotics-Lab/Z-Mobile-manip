@@ -106,3 +106,9 @@ def test_stop_is_terminal_and_configuration_is_fail_closed():
         WristSearchConfig(confidence_threshold=0.0)
     with pytest.raises(ValueError):
         WristSearchConfig(confirmations_required=4, observations_per_view=3)
+
+
+def test_default_confirmation_threshold_matches_grounding_service_contract():
+    config = WristSearchConfig()
+    assert config.confidence_threshold == pytest.approx(0.20)
+    assert config.confirmations_required == 2
