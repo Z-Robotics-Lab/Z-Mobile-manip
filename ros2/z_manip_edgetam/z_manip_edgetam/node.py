@@ -409,6 +409,11 @@ class EdgeTamAdapter(Node):
         )
 
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        tracking_state_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         seed_offer_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -432,7 +437,7 @@ class EdgeTamAdapter(Node):
         self._tracking_pub = self.create_publisher(
             Bool,
             self._topic('tracking_topic'),
-            reliable,
+            tracking_state_qos,
         )
         self._failure_pub = self.create_publisher(
             String,

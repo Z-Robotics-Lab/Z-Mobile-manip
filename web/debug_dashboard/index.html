@@ -2390,6 +2390,12 @@
         `base ${ownership.base || "—"}`,
         `body ${ownership.body || "—"}`,
         `arm ${ownership.arm_view || "—"}`,
+        postureStatus.transport?.motion_mode?.name
+          ? `mode ${postureStatus.transport.motion_mode.name}/${postureStatus.transport.motion_mode.api_family || "unknown-api"}`
+          : "mode —",
+        postureStatus.capabilities?.euler_state
+          ? `Euler ${postureStatus.capabilities.euler_state}${finiteNumber(postureStatus.command?.codes?.Euler) ? `(${postureStatus.command.codes.Euler})` : ""}`
+          : "Euler —",
       ].join(" · ");
       setApproachMetric("approach-owner", ownerText,
         supervision.timed_out === true ? "waiting" : "");

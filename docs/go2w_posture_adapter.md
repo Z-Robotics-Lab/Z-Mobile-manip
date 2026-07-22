@@ -1,5 +1,13 @@
 # Go2W posture adapter
 
+> Legacy transport-independent adapter note: this document describes the
+> older `BodyHeight + Euler` abstraction and is retained for offline contract
+> tests. It is **not** the capability declaration for the current Go2W
+> `ai-w` runtime. Live capability is determined from MotionSwitcher
+> `CheckMode` plus each robot RPC response. In the present `ai-w` session,
+> `Move(1008)` works while Go2 `Euler(1007)` returns 3203; wheeled
+> `FreeEuler(1051)` is only a boolean mode toggle.
+
 `z_manip.control.go2w_posture` is the transport-independent boundary for
 reactive Go2W body height and Euler posture control. It does not open WebRTC,
 publish ROS commands, or move hardware by itself.

@@ -58,6 +58,13 @@ DEFAULT_TOPICS = {
         "std_msgs/msg/String",
         1.50,
     ),
+    "tracker_target": (
+        "/track_3d/selected_target_pointcloud",
+        "sensor_msgs/msg/PointCloud2",
+        0.75,
+    ),
+    "tracker_state": ("/track_3d/is_tracking", "std_msgs/msg/Bool", 0.75),
+    "tracker_failure": ("/track_3d/failure", "std_msgs/msg/String", 5.00),
     "tf": ("/tf", "tf2_msgs/msg/TFMessage", 2.00),
     "tf_static": ("/tf_static", "tf2_msgs/msg/TFMessage", 3600.00),
 }
@@ -511,6 +518,74 @@ def summarize_depth_filter(message: object) -> dict[str, object]:
     return {"valid": True, "error": None, "depth_filter": normalized}
 
 
+def summarize_bool(message: object) -> dict[str, object]:
+    """Summarize a headerless ROS Bool without inventing a source stamp."""
+
+    value = getattr(message, "data", None)
+    if not isinstance(value, bool):
+        return {"valid": False, "error": "Bool payload is not boolean"}
+    return {"valid": True, "error": None, "value": value}
+
+
+def summarize_tracker_failure(message: object) -> dict[str, object]:
+    """Expose bounded, seed-correlated EdgeTAM terminal-failure evidence."""
+
+    payload = getattr(message, "data", None)
+    if not isinstance(payload, str) or len(payload) > 4096:
+        return {"valid": False, "error": "tracker failure is not a bounded string"}
+    try:
+        report = json.loads(payload)
+    except (json.JSONDecodeError, RecursionError) as error:
+        return {"valid": False, "error": f"invalid tracker failure: {error}"}
+    if (
+        not isinstance(report, dict)
+        or report.get("schema") != "z_manip.tracker_failure.v1"
+    ):
+        return {"valid": False, "error": "unsupported tracker failure schema"}
+    seed_id = report.get("seed_id")
+    seed_stamp_ns = report.get("seed_stamp_ns")
+    reason_code = report.get("reason_code")
+    reason = report.get("reason")
+    counts = {
+        key: report.get(key)
+        for key in (
+            "replay_candidates",
+            "replay_selected",
+            "replay_span_ns",
+            "acquisition_live_updates",
+        )
+    }
+    if (
+        not isinstance(seed_id, str)
+        or not seed_id
+        or len(seed_id) > 256
+        or isinstance(seed_stamp_ns, bool)
+        or not isinstance(seed_stamp_ns, int)
+        or not 0 <= seed_stamp_ns <= (1 << 63) - 1
+        or not isinstance(reason_code, str)
+        or not isinstance(reason, str)
+        or len(reason_code) > 128
+        or len(reason) > 256
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > 86_400_000_000_000
+            for value in counts.values()
+        )
+    ):
+        return {"valid": False, "error": "tracker failure fields violate bounds"}
+    return {
+        "valid": True,
+        "error": None,
+        "seed_id": seed_id,
+        "seed_stamp_ns": seed_stamp_ns,
+        "reason_code": reason_code,
+        "reason": reason,
+        **counts,
+    }
+
+
 @dataclass
 class TopicState:
     topic: str
@@ -645,6 +720,24 @@ class RuntimeObserverState:
             and joint["publisher_count"] > 0
             and joint.get("valid") is True
         )
+        tracker_state = topic_snapshots.get("tracker_state", {})
+        tracker_target = topic_snapshots.get("tracker_target", {})
+        tracker_failure = topic_snapshots.get("tracker_failure", {})
+        failure_is_latest = bool(
+            tracker_failure.get("fresh") is True
+            and int(tracker_failure.get("received_unix_ns") or 0)
+            >= int(tracker_state.get("received_unix_ns") or 0)
+        )
+        if failure_is_latest:
+            tracker_phase = "failed"
+        elif tracker_state.get("fresh") is True and tracker_state.get("value") is True:
+            tracker_phase = (
+                "tracking" if tracker_target.get("fresh") is True else "target_stale"
+            )
+        elif tracker_state.get("received") is True:
+            tracker_phase = "idle_or_lost"
+        else:
+            tracker_phase = "unobserved"
         return {
             "schema": "z_manip.runtime_observer.v1",
             "sequence": self.sequence,
@@ -666,8 +759,12 @@ class RuntimeObserverState:
             "summary": {
                 "joint_state_available": joint_available,
                 "camera_rgbd_fresh": {"color", "depth", "camera_info"} <= fresh,
-            "point_cloud_fresh": bool({"scene_cloud", "target_cloud"} & fresh),
-            "depth_filter_fresh": "depth_filter" in fresh,
+                "point_cloud_fresh": bool(
+                    {"scene_cloud", "target_cloud"} & fresh
+                ),
+                "depth_filter_fresh": "depth_filter" in fresh,
+                "tracker_phase": tracker_phase,
+                "tracker_target_fresh": "tracker_target" in fresh,
                 "tf_available": bool({"tf", "tf_static"} & fresh),
                 "observed_topic_count": len(observed),
                 "fresh_topic_count": len(fresh),
@@ -685,6 +782,26 @@ class RuntimeObserverState:
                 "velocities_rad_s": joint.get("velocities_rad_s", []),
                 "efforts": joint.get("efforts", []),
                 "reason": None if joint_available else joint["availability"],
+            },
+            "tracker": {
+                "phase": tracker_phase,
+                "tracking": (
+                    tracker_state.get("value")
+                    if tracker_state.get("fresh") is True
+                    else None
+                ),
+                "target_fresh": tracker_target.get("fresh") is True,
+                "target_source_stamp_ns": tracker_target.get("source_stamp_ns"),
+                "failure": (
+                    {
+                        "seed_id": tracker_failure.get("seed_id"),
+                        "seed_stamp_ns": tracker_failure.get("seed_stamp_ns"),
+                        "reason_code": tracker_failure.get("reason_code"),
+                        "reason": tracker_failure.get("reason"),
+                    }
+                    if failure_is_latest
+                    else None
+                ),
             },
             "topics": topic_snapshots,
         }
@@ -746,6 +863,7 @@ def build_runtime_state(
             "fresh_topic_count": int(summary.get("fresh_topic_count", 0)),
             "configured_topic_count": int(summary.get("configured_topic_count", 0)),
             "depth_filter": filter_status,
+            "tracker": diagnostic.get("tracker", {}),
         },
     }
     if not available or chain is None:
@@ -911,7 +1029,7 @@ def run_ros_observer(args: argparse.Namespace) -> int:
         qos_profile_sensor_data,
     )
     from sensor_msgs.msg import CameraInfo, Image, JointState, PointCloud2
-    from std_msgs.msg import String
+    from std_msgs.msg import Bool, String
     from tf2_msgs.msg import TFMessage
 
     chain = None
@@ -960,6 +1078,21 @@ def run_ros_observer(args: argparse.Namespace) -> int:
             args.depth_filter_manifest_topic,
             "std_msgs/msg/String",
             args.cloud_age_s,
+        ),
+        "tracker_target": (
+            args.tracker_target_topic,
+            "sensor_msgs/msg/PointCloud2",
+            args.tracker_age_s,
+        ),
+        "tracker_state": (
+            args.tracker_state_topic,
+            "std_msgs/msg/Bool",
+            args.tracker_age_s,
+        ),
+        "tracker_failure": (
+            args.tracker_failure_topic,
+            "std_msgs/msg/String",
+            args.tracker_failure_age_s,
         ),
         "tf": (args.tf_topic, "tf2_msgs/msg/TFMessage", args.tf_age_s),
         "tf_static": (
@@ -1035,6 +1168,24 @@ def run_ros_observer(args: argparse.Namespace) -> int:
             String,
             args.depth_filter_manifest_topic,
             _callback(state, "depth_filter", summarize_depth_filter),
+            qos_profile_sensor_data,
+        ),
+        node.create_subscription(
+            PointCloud2,
+            args.tracker_target_topic,
+            _callback(state, "tracker_target", summarize_point_cloud),
+            qos_profile_sensor_data,
+        ),
+        node.create_subscription(
+            Bool,
+            args.tracker_state_topic,
+            _callback(state, "tracker_state", summarize_bool),
+            qos_profile_sensor_data,
+        ),
+        node.create_subscription(
+            String,
+            args.tracker_failure_topic,
+            _callback(state, "tracker_failure", summarize_tracker_failure),
             qos_profile_sensor_data,
         ),
         node.create_subscription(
@@ -1123,6 +1274,18 @@ def _arguments() -> argparse.Namespace:
         "--depth-filter-manifest-topic",
         default=DEFAULT_TOPICS["depth_filter"][0],
     )
+    parser.add_argument(
+        "--tracker-target-topic",
+        default=DEFAULT_TOPICS["tracker_target"][0],
+    )
+    parser.add_argument(
+        "--tracker-state-topic",
+        default=DEFAULT_TOPICS["tracker_state"][0],
+    )
+    parser.add_argument(
+        "--tracker-failure-topic",
+        default=DEFAULT_TOPICS["tracker_failure"][0],
+    )
     parser.add_argument("--tf-topic", default=DEFAULT_TOPICS["tf"][0])
     parser.add_argument("--tf-static-topic", default=DEFAULT_TOPICS["tf_static"][0])
     parser.add_argument("--urdf", type=Path)
@@ -1143,6 +1306,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--joint-age-s", type=float, default=0.50)
     parser.add_argument("--camera-age-s", type=float, default=1.00)
     parser.add_argument("--cloud-age-s", type=float, default=1.50)
+    parser.add_argument("--tracker-age-s", type=float, default=0.75)
+    parser.add_argument("--tracker-failure-age-s", type=float, default=5.00)
     parser.add_argument("--tf-age-s", type=float, default=2.00)
     parser.add_argument("--tf-static-age-s", type=float, default=3600.00)
     parser.add_argument(
@@ -1159,6 +1324,8 @@ def _arguments() -> argparse.Namespace:
         "joint_age_s",
         "camera_age_s",
         "cloud_age_s",
+        "tracker_age_s",
+        "tracker_failure_age_s",
         "tf_age_s",
         "tf_static_age_s",
     ):

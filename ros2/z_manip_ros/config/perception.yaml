@@ -75,6 +75,13 @@ vlm_edgetam_bridge:
     tracker_acquisition_timeout_s: 8.0
     # Covers the adapter's bounded 0.5 s result lag plus DDS bundle join time.
     tracker_data_timeout_s: 1.0
+    # A tracker terminal event revokes old geometry immediately, then retries
+    # grounding from a newly admitted exact RGB-D frame. Retries are bounded per
+    # operator request and never reuse the failed target/TF timestamp.
+    tracker_auto_reacquire_enabled: true
+    tracker_auto_reacquire_max_attempts: 2
+    tracker_auto_reacquire_backoff_s: 0.25
+    tracker_auto_reacquire_window_s: 8.0
     min_cloud_points: 24
     # Exact-stamp/frame cache for joining detection, target, and target cloud.
     bundle_cache_size: 12

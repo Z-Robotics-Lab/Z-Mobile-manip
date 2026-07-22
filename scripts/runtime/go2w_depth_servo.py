@@ -652,7 +652,14 @@ class DepthServoCore:
             and transform_age_s is not None
             and transform_age_s <= self.settings.transform_timeout_s
         )
-        if not transform_fresh:
+        # A transform is synchronized to a target observation.  Once the
+        # tracker stops publishing targets, both timestamps necessarily age
+        # together.  Classify that condition as target/tracking loss first;
+        # otherwise a terminal EdgeTAM loss is misleadingly reported as a TF
+        # outage even while the runtime observer continues publishing fresh
+        # kinematic transforms.  A genuinely fresh target with missing/stale
+        # geometry remains fail-closed below.
+        if fresh_tracking and not transform_fresh:
             reason = self._transform_error or (
                 f"synchronized transforms are stale ({transform_age_s:.3f}s)"
                 if transform_age_s is not None

@@ -221,6 +221,7 @@ def test_fresh_authorization_suppresses_only_repeated_health_zero() -> None:
         _contract=_HealthContract(snapshot),
         _poll_grounding=lambda _now: None,
         _handle_new_failure=lambda: None,
+        _maybe_start_tracker_reacquire=lambda _now: False,
         get_parameter=lambda _name: SimpleNamespace(value=True),
         _motion_override_is_fresh=lambda _now: False,
         _frozen_coarse_nav_authorization_releases_hold=lambda: True,
@@ -253,6 +254,7 @@ def test_health_ticks_contract_before_polling_a_ready_future() -> None:
         _contract=Contract(),
         _poll_grounding=lambda _now: events.append('poll'),
         _handle_new_failure=lambda: events.append('failure'),
+        _maybe_start_tracker_reacquire=lambda _now: False,
         get_parameter=lambda _name: SimpleNamespace(value=True),
         _motion_override_is_fresh=lambda _now: False,
         _frozen_coarse_nav_authorization_releases_hold=lambda: False,
@@ -273,11 +275,17 @@ def test_authorization_never_suppresses_the_initial_failure_zero() -> None:
         _tracker_failure_detail='mask continuity',
         _contract=SimpleNamespace(
             failure=FailureCode.TRACKER_REPORTED_LOSS,
+            snapshot=SimpleNamespace(
+                failure=FailureCode.TRACKER_REPORTED_LOSS,
+                instruction='pick the bottle',
+                request_id=REQUEST_ID,
+            ),
         ),
         _cancel_pending_grounding=lambda: effects.append('cancel_grounding'),
         _clear_tracker_messages=lambda: effects.append('clear_tracker'),
         _publish_seed_command=lambda action: effects.append(action),
         _publish_zero_velocity=lambda: effects.append('zero'),
+        _schedule_tracker_reacquire=lambda _snapshot: False,
         get_logger=lambda: SimpleNamespace(
             error=lambda _detail: effects.append('log_failure'),
         ),

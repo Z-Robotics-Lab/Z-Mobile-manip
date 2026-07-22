@@ -59,7 +59,10 @@ def test_validated_intent_accepts_fresh_schema_and_clips_velocity() -> None:
         (intent(deadline_unix_ns=999_999_999), 1_050_000_000),
         (intent(deadline_unix_ns=1_010_000_000), 1_050_000_000),
         (intent(), 1_400_000_001),
-        (intent(source_timestamp_ns=1_200_000_001, deadline_unix_ns=1_300_000_000), 1_000_000_000),
+        (
+            intent(source_timestamp_ns=1_500_000_001, deadline_unix_ns=1_750_000_000),
+            1_000_000_000,
+        ),
         (intent(joint_velocity_rps=[0.0] * 5), 1_050_000_000),
         (intent(joint_velocity_rps=[0.0, 0.0, 0.0, 0.0, 0.0, float("nan")]), 1_050_000_000),
         (intent(joint_velocity_rps=None), 1_050_000_000),
@@ -71,6 +74,21 @@ def test_validated_intent_rejects_bad_schema_time_and_vector(
 ) -> None:
     with pytest.raises(ValueError):
         MODULE.validated_intent(document, now_ns=now_ns)
+
+
+def test_validated_intent_accepts_measured_pc_to_nuc_clock_skew() -> None:
+    """The NUC can be about 310 ms behind the PC without invalidating a lease."""
+    seq, source_ns, qdot = MODULE.validated_intent(
+        intent(
+            source_timestamp_ns=1_310_000_000,
+            deadline_unix_ns=1_560_000_000,
+            joint_velocity_rps=[0.1] * 6,
+        ),
+        now_ns=1_000_000_000,
+    )
+    assert seq == 7
+    assert source_ns == 1_310_000_000
+    np.testing.assert_allclose(qdot, [0.1] * 6)
 
 
 def test_bounded_target_limits_qdot_step_and_joint_envelope() -> None:
@@ -156,6 +174,14 @@ def test_reactive_owner_uses_sensor_data_qos_for_standard_joint_topic() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
     assert 'JOINT_STATE_TOPIC = "/piper/state"' in source
     assert 'JointState, JOINT_STATE_TOPIC, qos_profile_sensor_data' in source
+
+
+def test_reactive_owner_does_not_starve_intent_callback_behind_can_timer() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "MultiThreadedExecutor(num_threads=2)" in source
+    assert "callback_group=self.intent_group" in source
+    assert "callback_group=self.hardware_group" in source
+    assert "with self.intent_lock:" in source
 
 
 def test_joint_state_fields_match_passive_bridge_contract() -> None:

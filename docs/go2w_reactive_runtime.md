@@ -15,10 +15,16 @@ PiPER qdot(6)           -> wrist-camera view and reach
 ```
 
 `BodyHeight` (SPORT API 1013) and `GetBodyHeight` (1024) are not control
-dependencies. Current Unitree SDK2 keeps `Move()` and `Euler()` but no longer
-exposes those height calls, and current Go2W EDU firmware rejects 1013/1024.
-See the official [SportClient header](https://github.com/unitreerobotics/unitree_sdk2/blob/main/include/unitree/robot/go2/sport/sport_client.hpp)
-and [Unitree ROS2 release notes](https://github.com/unitreerobotics/unitree_ros2/releases).
+dependencies. Their availability is motion-service and firmware specific, so
+the 10-DOF controller deliberately excludes height from its decision vector
+and refuses non-zero `linear.z` instead of pretending the body moved.
+
+The active service matters as much as the numeric API ID. Go2W `ai-w` is the
+wheeled sport family: this robot accepts `Move(1008)` but returns 3203 for the
+Go2-family `Euler(1007)`. The bridge records read-only MotionSwitcher
+`CheckMode(1001)` evidence and the raw command response. It never calls
+`SelectMode` or `ReleaseMode` automatically. B2/wheeled `FreeEuler(1051)` is a
+boolean mode toggle, not an Euler target command.
 
 The model may retain a fixed zero body-height state for transform compatibility,
 but height is not a QP decision variable and cannot block the controller.

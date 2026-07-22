@@ -31,8 +31,13 @@ starting a new task generation.
 
 There is no per-frame VLM call and no color/depth heuristic tracker in this
 path. A lost status, empty detection set, identity change, thin cloud, or stale
-stream invalidates the contract and publishes zero `TwistStamped` commands on
-the dedicated `/safety_cmd_vel` channel until a new grounding request succeeds.
+stream invalidates the contract, clears every validated target message, and
+publishes zero `TwistStamped` commands on the dedicated `/safety_cmd_vel`
+channel. Tracker failures may then run a small, configured number of automatic
+re-grounding attempts. Each attempt admits a new exact RGB-D frame and has a
+new seed nonce; it never reuses the failed target timestamp or geometry. The
+diagnostic status reports `reacquire_state` and `reacquire_attempts`, and a
+failed or exhausted retry remains fail-closed until a new operator request.
 The task runtime retains sole ownership of `/local_movement_cmd_vel`; a downstream
 command arbiter must give the safety channel priority over task-local commands.
 

@@ -516,7 +516,12 @@ class VlmEdgeTamBridge(Node):
             self._seed_offer_manifest_cb,
             seed_offer_qos,
         )
-        self.create_subscription(Bool, topic('edge_tracking_topic'), self._tracking_cb, reliable)
+        self.create_subscription(
+            Bool,
+            topic('edge_tracking_topic'),
+            self._tracking_cb,
+            latched,
+        )
         self.create_subscription(
             String,
             topic('edge_failure_topic'),
@@ -558,6 +563,15 @@ class VlmEdgeTamBridge(Node):
         self._tracker_failure_detail = ''
         self._motion_override_active = False
         self._motion_override_at: float | None = None
+        # Re-grounding is bounded per operator request.  A tracker loss always
+        # revokes the old observation first; this state only schedules a fresh
+        # exact-frame seed after the fail-closed transition has completed.
+        self._tracker_reacquire_attempts = 0
+        self._tracker_reacquire_due_monotonic_s: float | None = None
+        self._tracker_reacquire_deadline_monotonic_s: float | None = None
+        self._tracker_reacquire_instruction = ''
+        self._tracker_reacquire_request_id = ''
+        self._tracker_reacquire_state = 'idle'
 
         self.create_subscription(
             Bool,
@@ -625,6 +639,10 @@ class VlmEdgeTamBridge(Node):
             'grounding_timeout_s': 60.0,
             'tracker_acquisition_timeout_s': 8.0,
             'tracker_data_timeout_s': 1.0,
+            'tracker_auto_reacquire_enabled': True,
+            'tracker_auto_reacquire_max_attempts': 2,
+            'tracker_auto_reacquire_backoff_s': 0.25,
+            'tracker_auto_reacquire_window_s': 8.0,
             'min_cloud_points': 24,
             'bundle_cache_size': 12,
             'status_period_s': 0.1,
@@ -632,6 +650,25 @@ class VlmEdgeTamBridge(Node):
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
+        max_attempts = int(
+            self.get_parameter('tracker_auto_reacquire_max_attempts').value,
+        )
+        backoff_s = float(
+            self.get_parameter('tracker_auto_reacquire_backoff_s').value,
+        )
+        window_s = float(
+            self.get_parameter('tracker_auto_reacquire_window_s').value,
+        )
+        if max_attempts < 0 or max_attempts > 5:
+            raise ValueError('tracker auto-reacquire attempts must be within [0, 5]')
+        if (
+            not math.isfinite(backoff_s)
+            or not math.isfinite(window_s)
+            or backoff_s < 0.0
+            or window_s <= 0.0
+            or backoff_s >= window_s
+        ):
+            raise ValueError('tracker auto-reacquire timing is invalid')
 
     def _record_vlm_attempt(self, event: VLMAttemptEvent) -> None:
         detail = f' detail={event.detail}' if event.detail else ''
@@ -746,6 +783,7 @@ class VlmEdgeTamBridge(Node):
                 self._publish_contract()
                 return
             self._grounding_scope = request.scope
+            self._reset_tracker_reacquire()
             self._contract.request(
                 request.instruction,
                 now_s=now,
@@ -763,6 +801,7 @@ class VlmEdgeTamBridge(Node):
 
     def _reset_cb(self, _msg: Empty) -> None:
         with self._lock:
+            self._reset_tracker_reacquire()
             self._publish_seed_command('cancel')
             self._contract.reset()
             self._grounding_scope = 'grasp_only'
@@ -1362,6 +1401,10 @@ class VlmEdgeTamBridge(Node):
     def _finish_tracker_update(self, before: ContractPhase) -> None:
         if self._contract.phase is ContractPhase.TRACKING:
             self._tracker_failure_detail = ''
+            if self._tracker_reacquire_attempts:
+                self._tracker_reacquire_state = 'recovered'
+            self._tracker_reacquire_due_monotonic_s = None
+            self._tracker_reacquire_deadline_monotonic_s = None
         if self._contract.phase is ContractPhase.FAILED and before is not ContractPhase.FAILED:
             self._handle_new_failure()
         self._relay_if_valid()
@@ -1374,6 +1417,8 @@ class VlmEdgeTamBridge(Node):
             self._contract.tick(now_s=now)
             if self._contract.phase is ContractPhase.FAILED and before is not ContractPhase.FAILED:
                 self._handle_new_failure()
+            if self._contract.phase is ContractPhase.FAILED:
+                self._maybe_start_tracker_reacquire(now)
             if self._contract.phase is not ContractPhase.FAILED:
                 self._poll_grounding(now)
             if (
@@ -1409,14 +1454,109 @@ class VlmEdgeTamBridge(Node):
         )
 
     def _handle_new_failure(self) -> None:
+        snapshot = self._contract.snapshot
         self._cancel_pending_grounding()
         self._clear_tracker_messages()
         self._publish_seed_command('cancel')
         self._publish_zero_velocity()
+        self._schedule_tracker_reacquire(snapshot)
         suffix = f' ({self._tracker_failure_detail})' if self._tracker_failure_detail else ''
         self.get_logger().error(
             f'perception contract failed: {self._contract.failure.value}{suffix}',
         )
+
+    def _reset_tracker_reacquire(self) -> None:
+        """Forget retry authority at an explicit operator task boundary."""
+        self._tracker_reacquire_attempts = 0
+        self._tracker_reacquire_due_monotonic_s = None
+        self._tracker_reacquire_deadline_monotonic_s = None
+        self._tracker_reacquire_instruction = ''
+        self._tracker_reacquire_request_id = ''
+        self._tracker_reacquire_state = 'idle'
+
+    def _schedule_tracker_reacquire(self, snapshot: Any) -> bool:
+        """Schedule one bounded fresh-frame grounding after tracker loss."""
+        if not bool(
+            self.get_parameter('tracker_auto_reacquire_enabled').value,
+        ):
+            self._tracker_reacquire_state = 'disabled'
+            return False
+        if snapshot.failure not in _TRACKER_FAILURES:
+            self._tracker_reacquire_state = 'not_tracker_loss'
+            return False
+        instruction = str(snapshot.instruction).strip()
+        request_id = str(snapshot.request_id).strip()
+        if not instruction or not request_id:
+            self._tracker_reacquire_state = 'unavailable'
+            return False
+        limit = int(
+            self.get_parameter('tracker_auto_reacquire_max_attempts').value,
+        )
+        if self._tracker_reacquire_attempts >= limit:
+            self._tracker_reacquire_state = 'exhausted'
+            self._tracker_failure_detail = (
+                f'tracker_lost; reacquire_exhausted '
+                f'{self._tracker_reacquire_attempts}/{limit}'
+            )
+            return False
+        now = self._monotonic_s()
+        backoff_s = float(
+            self.get_parameter('tracker_auto_reacquire_backoff_s').value,
+        )
+        window_s = float(
+            self.get_parameter('tracker_auto_reacquire_window_s').value,
+        )
+        self._tracker_reacquire_instruction = instruction
+        self._tracker_reacquire_request_id = request_id
+        self._tracker_reacquire_due_monotonic_s = now + backoff_s
+        self._tracker_reacquire_deadline_monotonic_s = now + window_s
+        self._tracker_reacquire_state = 'scheduled'
+        self._tracker_failure_detail = (
+            f'tracker_lost; reacquire_scheduled '
+            f'{self._tracker_reacquire_attempts + 1}/{limit}'
+        )
+        return True
+
+    def _maybe_start_tracker_reacquire(self, now_ros_s: float) -> bool:
+        """Start a scheduled retry without ever reviving old target geometry."""
+        due = self._tracker_reacquire_due_monotonic_s
+        deadline = self._tracker_reacquire_deadline_monotonic_s
+        if due is None or deadline is None:
+            return False
+        now = self._monotonic_s()
+        if not math.isfinite(now) or now > deadline:
+            self._tracker_reacquire_due_monotonic_s = None
+            self._tracker_reacquire_deadline_monotonic_s = None
+            self._tracker_reacquire_state = 'expired'
+            self._tracker_failure_detail = 'tracker_lost; reacquire_expired'
+            return False
+        if now < due:
+            return False
+        instruction = self._tracker_reacquire_instruction
+        request_id = self._tracker_reacquire_request_id
+        self._tracker_reacquire_due_monotonic_s = None
+        self._tracker_reacquire_deadline_monotonic_s = None
+        self._tracker_reacquire_attempts += 1
+        self._tracker_reacquire_state = 'grounding'
+        self._contract.request(
+            instruction,
+            now_s=now_ros_s,
+            request_id=request_id,
+        )
+        self._coarse_nav_authorization.reset()
+        self._clear_tracker_messages()
+        self._expected_edge_seed_id = ''
+        self._expected_edge_seed_stamp_ns = None
+        self._cancel_pending_grounding()
+        self._publish_seed_command('arm')
+        self._publish_zero_velocity()
+        self.get_logger().warn(
+            'tracker lost; started bounded fresh-frame perception reacquire '
+            f'{self._tracker_reacquire_attempts}/'
+            f'{int(self.get_parameter("tracker_auto_reacquire_max_attempts").value)}',
+        )
+        self._publish_contract()
+        return True
 
     def _relay_if_valid(self) -> None:
         observation_stamp_ns, observation_frame_id = self._verified_observation_key()
@@ -1470,6 +1610,11 @@ class VlmEdgeTamBridge(Node):
             KeyValue(key='track_id', value=snapshot.track_id),
             KeyValue(key='failure', value=snapshot.failure.value),
             KeyValue(key='failure_detail', value=self._tracker_failure_detail),
+            KeyValue(key='reacquire_state', value=self._tracker_reacquire_state),
+            KeyValue(
+                key='reacquire_attempts',
+                value=str(self._tracker_reacquire_attempts),
+            ),
             KeyValue(key='observation_stamp_ns', value=observation_stamp_ns),
             KeyValue(key='observation_frame_id', value=observation_frame_id),
         ]

@@ -465,6 +465,7 @@ def test_bridge_reset_drains_but_never_reads_stale_running_future():
 
     class Harness:
         _cancel_pending_grounding = VlmEdgeTamBridge._cancel_pending_grounding
+        _reset_tracker_reacquire = VlmEdgeTamBridge._reset_tracker_reacquire
 
         def __init__(self) -> None:
             from z_manip_ros.vlm_edgetam_bridge import (
@@ -484,6 +485,12 @@ def test_bridge_reset_drains_but_never_reads_stale_running_future():
             self._expected_edge_seed_id = 'old-seed'
             self._expected_edge_seed_stamp_ns = 123
             self._tracker_failure_detail = 'old failure'
+            self._tracker_reacquire_attempts = 1
+            self._tracker_reacquire_due_monotonic_s = 1.0
+            self._tracker_reacquire_deadline_monotonic_s = 2.0
+            self._tracker_reacquire_instruction = 'cancel this'
+            self._tracker_reacquire_request_id = 'old-request'
+            self._tracker_reacquire_state = 'scheduled'
             self._coarse_nav_authorization = (
                 _FrozenCoarseNavAuthorizationGate(0.30)
             )
@@ -524,6 +531,8 @@ def test_bridge_reset_drains_but_never_reads_stale_running_future():
     assert harness.contract_publish_calls == 1
     assert harness._future_cancel_event is None
     assert harness.restart_calls == 0
+    assert harness._tracker_reacquire_attempts == 0
+    assert harness._tracker_reacquire_state == 'idle'
 
 
 def test_bridge_request_identity_is_idempotent_and_task_owned():
@@ -539,6 +548,8 @@ def test_bridge_request_identity_is_idempotent_and_task_owned():
             self.messages.append(message)
 
     class Harness:
+        _reset_tracker_reacquire = VlmEdgeTamBridge._reset_tracker_reacquire
+
         def __init__(self) -> None:
             from z_manip_ros.vlm_edgetam_bridge import (
                 _FrozenCoarseNavAuthorizationGate,
@@ -549,6 +560,12 @@ def test_bridge_request_identity_is_idempotent_and_task_owned():
             self._expected_edge_seed_id = ''
             self._expected_edge_seed_stamp_ns = None
             self._tracker_failure_detail = ''
+            self._tracker_reacquire_attempts = 0
+            self._tracker_reacquire_due_monotonic_s = None
+            self._tracker_reacquire_deadline_monotonic_s = None
+            self._tracker_reacquire_instruction = ''
+            self._tracker_reacquire_request_id = ''
+            self._tracker_reacquire_state = 'idle'
             self._coarse_nav_authorization = (
                 _FrozenCoarseNavAuthorizationGate(0.30)
             )
@@ -621,6 +638,7 @@ def test_bridge_request_identity_is_idempotent_and_task_owned():
     assert harness._contract.request_id == 'task-a'
     assert harness._contract.instruction == 'pick the mug'
     assert harness._grounding_scope == 'grasp_for_place'
+    assert harness._tracker_reacquire_state == 'idle'
 
     VlmEdgeTamBridge._request_cb(harness, message('task-a', 'pick the mug'))
     assert harness._contract.generation == generation
@@ -887,6 +905,8 @@ def test_perception_status_exposes_only_an_exact_validated_observation_key():
             self._bundle_serial = 1
             self._relayed_bundle_serial = 0
             self._tracker_failure_detail = ''
+            self._tracker_reacquire_attempts = 0
+            self._tracker_reacquire_state = 'idle'
             self._producer_epoch = 'test-bridge-epoch'
             self._grounding_scope = 'grasp_only'
             self._valid_pub = Publisher()

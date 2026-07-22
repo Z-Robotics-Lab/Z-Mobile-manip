@@ -123,9 +123,12 @@ docker run --rm --network none \
     --output /tmp/whole-body-bag-replay.json
 ```
 
-当前 Go2W motion service 若对 `Euler(1007)` 返回 3203，控制器会将机身
-roll/pitch 自由度从 QP 中锁定，并把 FOV/垂直观测任务分配给 PiPER；这时 UI 中不应期待
-机身倾斜，但底盘视觉伺服与机械臂 reactive view 会继续运行。
+当前 Go2W 的 `ai-w` 是 wheeled sport 服务。它可接受 `Move(1008)`，但实机
+对通用 Go2 的 `Euler(1007)` 返回 3203（API 未实现）。控制器会记录活动模式、
+服务 topic 和机器人返回码，将机身 roll/pitch 自由度从 QP 中锁定，并把
+FOV/垂直观测任务分配给 PiPER；不会把“ROS 已发布”或“WebRTC 已发送”误报成
+“姿态已执行”。B2/wheeled API 的 `FreeEuler(1051)` 是布尔模式开关，不是
+roll/pitch/yaw 目标，不能替换 `Euler(1007)`。
 
 ## UI 工作流
 

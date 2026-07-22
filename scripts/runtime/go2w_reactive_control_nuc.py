@@ -9,9 +9,9 @@ lock.  Full Stop latches immediately, drops pending work, and owns the next
 SPORT request slot.
 
 ``/go2w/posture_cmd`` is deliberately a transport message, not a geometry
-intent.  ``angular.x/y/z`` are roll/pitch/yaw targets.  BodyHeight is
-capability-gated because current Unitree firmware rejects the deprecated API
-ids 1013/1024 even when an older connector still exposes their constants.
+intent.  ``angular.x/y/z`` are roll/pitch/yaw targets.  BodyHeight is excluded
+from this controller's decision vector: its availability differs by active
+motion service and the visual-servo loop does not depend on it.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ POSTURE_STATE_TOPIC = "/go2w/posture_state"
 STATUS_SCHEMA = "z_manip.go2w_posture_status.v1"
 LIVE_ACK = "I_UNDERSTAND_GO2W_WILL_MOVE"
 RPC_ERR_SERVER_API_NOT_IMPL = 3203
+MOTION_SWITCHER_CHECK_MODE_API_ID = 1001
 
 
 def _status_code(response: Any) -> int | None:
@@ -79,6 +80,50 @@ def _euler_response_outcome(code: int | None) -> str:
     return "fault"
 
 
+def _motion_mode_evidence(response: Any) -> dict[str, Any]:
+    """Parse the read-only motion-switcher CheckMode response.
+
+    The WebRTC connector returns the mode payload as JSON text inside
+    ``data.data``.  Keep the raw bounded response as evidence, but never infer
+    that an advertised SDK method is executable merely from its Python
+    constant: the active robot motion service remains the authority.
+    """
+
+    code = _status_code(response)
+    name: str | None = None
+    form: str | None = None
+    parse_error: str | None = None
+    try:
+        payload = response["data"]["data"]
+        decoded = json.loads(payload) if isinstance(payload, str) else payload
+        if not isinstance(decoded, dict):
+            raise ValueError("motion mode payload is not an object")
+        raw_name = decoded.get("name")
+        raw_form = decoded.get("form")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError("motion mode name is missing")
+        if not isinstance(raw_form, (str, int)):
+            raise ValueError("motion mode form is missing")
+        name = raw_name.strip()
+        form = str(raw_form)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        parse_error = str(error)
+    api_family = None
+    if name in {"ai-w", "normal-w"}:
+        api_family = "wheeled_sport"
+    elif form == "0" and name in {"normal", "ai", "advanced"}:
+        api_family = "go2_sport"
+    return {
+        "check_api_id": MOTION_SWITCHER_CHECK_MODE_API_ID,
+        "robot_code": code,
+        "name": name,
+        "form": form,
+        "api_family": api_family,
+        "parse_error": parse_error,
+        "raw_response": _raw_response_evidence(response),
+    }
+
+
 class _StatusNode(Node):
     """Common ROS status/input surface; it owns no transport."""
 
@@ -97,8 +142,22 @@ class _StatusNode(Node):
         self._bridge_mode = mode
         self._sport_state: dict[str, Any] | None = None
         self._sport_state_received_s: float | None = None
-        self._command_codes: dict[str, int | None] = {"Euler": None}
+        self._command_codes: dict[str, int | None] = {
+            "Move": None,
+            "Euler": None,
+            "StopMove": None,
+        }
+        self._motion_mode: dict[str, Any] = {
+            "check_api_id": MOTION_SWITCHER_CHECK_MODE_API_ID,
+            "robot_code": None,
+            "name": None,
+            "form": None,
+            "api_family": None,
+            "parse_error": "motion mode has not been queried by this owner",
+            "raw_response": None,
+        }
         self._euler_supported = True
+        self._euler_capability_state = "unknown"
         self._euler_reason = "Euler capability has not been rejected by the robot"
         self._target: tuple[float, float, float, float] | None = None
         self._phase = "idle" if mode == "live" else "shadow"
@@ -253,7 +312,7 @@ class _StatusNode(Node):
                 "feedback_age_s": age_s,
                 "supported": False,
                 "measured": False,
-                "source": "unsupported by current Unitree firmware",
+                "source": "not a configured control DOF",
             },
             "attitude": {
                 "current_roll_rad": current_rpy[0],
@@ -279,10 +338,14 @@ class _StatusNode(Node):
             "capabilities": {
                 "move": True,
                 "euler": self._euler_supported,
+                "euler_state": self._euler_capability_state,
                 "body_height": False,
                 "get_body_height": False,
                 "euler_reason": self._euler_reason,
-                "height_reason": "Unitree current SDK/firmware removed API 1013 and 1024",
+                "height_reason": (
+                    "excluded from the 10-DOF controller; availability is "
+                    "motion-service specific"
+                ),
             },
             "get_body_height": {
                 "api_id": None,
@@ -290,12 +353,33 @@ class _StatusNode(Node):
                 "last_robot_code": None,
                 "parsed_offset_m": None,
                 "parse_path": None,
-                "parse_error": "unsupported by current Unitree firmware",
+                "parse_error": "query is not used by this controller",
                 "raw_response": None,
             },
             "command": {
                 "last_robot_code": self._last_code,
+                "api_ids": {
+                    "Move": SPORT_CMD["Move"],
+                    "Euler": SPORT_CMD["Euler"],
+                    "StopMove": SPORT_CMD["StopMove"],
+                },
                 "codes": dict(self._command_codes),
+            },
+            "transport": {
+                "kind": "webrtc",
+                "connected": bool(
+                    self._bridge_mode == "live" and getattr(self, "conn", None)
+                ),
+                "sport_request_topic": RTC_TOPIC["SPORT_MOD"],
+                "sport_state_topics": [
+                    RTC_TOPIC["SPORT_MOD_STATE"],
+                    RTC_TOPIC["LF_SPORT_MOD_STATE"],
+                ],
+                "motion_switcher_topic": RTC_TOPIC["MOTION_SWITCHER"],
+                "motion_mode": dict(self._motion_mode),
+                "acceptance_rule": (
+                    "robot RPC code 0 plus measured SPORT/IMU convergence"
+                ),
             },
             "updated_unix_ns": time.time_ns(),
         }
@@ -376,9 +460,41 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
         # telemetry without registering a second callback for a single-cast
         # WebRTC topic.
         self.get_logger().info(
-            "LIVE single-owner bridge enabled: Move + Euler + StopMove; "
-            "BodyHeight/GetBodyHeight unsupported"
+            "LIVE single-owner bridge enabled: Move + capability-gated Euler "
+            "+ StopMove; BodyHeight/GetBodyHeight are not control dependencies"
         )
+        asyncio.run_coroutine_threadsafe(self._refresh_motion_mode(), self.loop)
+
+    async def _refresh_motion_mode(self) -> None:
+        """Read the active Go2W motion service over the owned WebRTC link."""
+
+        try:
+            response = await self._request_sport_api_response(
+                MOTION_SWITCHER_CHECK_MODE_API_ID,
+                {},
+                topic=RTC_TOPIC["MOTION_SWITCHER"],
+            )
+            previous_name = self._motion_mode.get("name")
+            evidence = _motion_mode_evidence(response)
+            self._motion_mode = evidence
+            current_name = evidence.get("name")
+            if previous_name and current_name and previous_name != current_name:
+                self._euler_supported = True
+                self._euler_capability_state = "unknown"
+                self._euler_reason = (
+                    "motion service changed; Euler capability awaits a new "
+                    "robot RPC verdict"
+                )
+            self.get_logger().info(
+                "WebRTC motion service evidence: "
+                f"name={current_name!r} form={evidence.get('form')!r} "
+                f"code={evidence.get('robot_code')}"
+            )
+        except Exception as error:  # noqa: BLE001
+            self._motion_mode = {
+                **self._motion_mode,
+                "parse_error": f"CheckMode failed: {type(error).__name__}: {error}",
+            }
 
     def _on_lowstate(self, message: Any) -> None:
         """Preserve battery handling and cache measured lowstate attitude."""
@@ -424,11 +540,12 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
         parameter: dict[str, float],
         *,
         timeout_s: float = 1.0,
+        topic: str | None = None,
     ) -> Any:
         async with self._sport_request_lock:
             return await asyncio.wait_for(
                 self.conn.datachannel.pub_sub.publish_request_new(
-                    RTC_TOPIC["SPORT_MOD"],
+                    topic or RTC_TOPIC["SPORT_MOD"],
                     {"api_id": api_id, "parameter": parameter},
                 ),
                 timeout=timeout_s,
@@ -496,6 +613,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                     self._last_code = await self._request_sport(
                         "Move", {"x": x, "y": y, "z": yaw},
                     )
+                    self._command_codes["Move"] = self._last_code
                     self._move_timeout_count = 0
                     self._move_send_count += 1
                 except asyncio.TimeoutError:
@@ -575,6 +693,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                     outcome = _euler_response_outcome(self._last_code)
                     if outcome == "unsupported":
                         self._euler_supported = False
+                        self._euler_capability_state = "unsupported_for_session"
                         self._euler_reason = (
                             "robot returned 3203 (RPC_ERR_SERVER_API_NOT_IMPL) "
                             "for Euler(1007)"
@@ -590,6 +709,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                         self._phase = "fault"
                         self._detail = f"{name} refused by robot (code={self._last_code})"
                         return
+                    self._euler_capability_state = "supported"
                 self._last_posture_command_s = time.monotonic()
                 self._phase = "settling"
                 self._detail = "command accepted; waiting for measured posture"
@@ -624,6 +744,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
         async def stop() -> None:
             try:
                 self._last_code = await self._request_sport("StopMove", {})
+                self._command_codes["StopMove"] = self._last_code
                 self._phase = "stopped"
                 self._detail = f"Full Stop latched; StopMove response code={self._last_code}"
             except Exception as error:  # noqa: BLE001

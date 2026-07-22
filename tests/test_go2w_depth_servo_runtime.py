@@ -419,7 +419,7 @@ def test_stale_synchronized_transform_never_reuses_old_geometry_for_motion():
     assert "stale" in output.reason
 
 
-def test_tracking_loss_with_stale_tf_reports_transform_block_not_old_view_intent():
+def test_tracking_loss_with_stale_tf_reports_tracker_recovery_not_tf_outage():
     core = _reactive_core(target_timeout_s=1.0, transform_timeout_s=0.25)
     assert _observe_in_frames(
         core,
@@ -431,10 +431,29 @@ def test_tracking_loss_with_stale_tf_reports_transform_block_not_old_view_intent
 
     output = core.tick(now_s=5.30, tracking=False)
 
-    assert output.phase == "transform_unavailable"
+    assert output.phase == "search_required"
     assert output.published_linear_x == output.published_angular_z == 0.0
     assert core.reactive_status is not None
-    assert core.reactive_status["phase"] == "transform_unavailable"
+    assert core.reactive_status["phase"] == "search_required"
+    assert "search" in output.reason
+
+
+def test_stale_target_with_tracking_true_is_tracking_loss_not_tf_outage():
+    core = _reactive_core(target_timeout_s=0.25, transform_timeout_s=0.25)
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.20, 0.80),
+        base_xyz=(0.75, 0.0, -0.30),
+        arm_xyz=(0.60, 0.0, -0.15),
+        stamp_s=6.0,
+    )
+    assert core.tick(now_s=6.05, tracking=True).phase == "posture_adjust"
+
+    output = core.tick(now_s=6.30, tracking=True)
+
+    assert output.phase == "view_recovery"
+    assert output.published_linear_x == output.published_angular_z == 0.0
+    assert output.reactive_phase == "view_recovery"
 
 
 def test_ros_style_quaternion_transform_builder_rotates_and_translates():

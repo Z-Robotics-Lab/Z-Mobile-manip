@@ -1,5 +1,6 @@
 import importlib.util
 import ast
+import json
 import math
 from pathlib import Path
 
@@ -38,6 +39,31 @@ def _load_euler_classifier():
     namespace = {}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
     return namespace["_euler_response_outcome"]
+
+
+def _load_motion_mode_parser():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    names = {
+        "MOTION_SWITCHER_CHECK_MODE_API_ID",
+        "RPC_ERR_SERVER_API_NOT_IMPL",
+    }
+    functions = {
+        "_status_code",
+        "_raw_response_evidence",
+        "_motion_mode_evidence",
+    }
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in names
+            for target in node.targets
+        ):
+            selected.append(node)
+        if isinstance(node, ast.FunctionDef) and node.name in functions:
+            selected.append(node)
+    namespace = {"Any": object, "json": json}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    return namespace["_motion_mode_evidence"]
 
 
 def test_shadow_path_cannot_construct_unitree_transport():
@@ -80,6 +106,35 @@ def test_live_bridge_is_one_owner_with_serialized_stop_move_and_posture():
     assert "self._pending_posture = None" in source
 
 
+def test_web_rtc_status_keeps_mode_and_per_command_robot_evidence():
+    parse = _load_motion_mode_parser()
+    source = SOURCE.read_text(encoding="utf-8")
+    response = {
+        "type": "res",
+        "topic": "rt/api/motion_switcher/response",
+        "data": {
+            "header": {"status": {"code": 0}},
+            "data": '{"form":"1","name":"ai-w"}',
+        },
+    }
+
+    assert parse(response) == {
+        "check_api_id": 1001,
+        "robot_code": 0,
+        "name": "ai-w",
+        "form": "1",
+        "api_family": "wheeled_sport",
+        "parse_error": None,
+        "raw_response": response,
+    }
+    assert '"motion_switcher_topic": RTC_TOPIC["MOTION_SWITCHER"]' in source
+    assert '"Move": None' in source
+    assert '"Euler": None' in source
+    assert '"StopMove": None' in source
+    assert 'self._command_codes["Move"] = self._last_code' in source
+    assert 'self._command_codes["StopMove"] = self._last_code' in source
+
+
 def test_body_height_is_explicitly_unsupported_and_never_queried():
     source = SOURCE.read_text(encoding="utf-8")
 
@@ -120,6 +175,8 @@ def test_euler_api_not_implemented_degrades_instead_of_faulting_forever():
     assert classify(None) == "fault"
     assert 'self._phase = "unsupported"' in source
     assert '"euler": self._euler_supported' in source
+    assert '"euler_state": self._euler_capability_state' in source
+    assert 'self._euler_capability_state = "unsupported_for_session"' in source
     assert "degraded to base + arm control" in source
 
 

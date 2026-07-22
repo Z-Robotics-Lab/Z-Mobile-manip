@@ -281,6 +281,86 @@ def test_depth_filter_manifest_rejects_unknown_fields_and_impossible_bounds():
     assert OBSERVER.summarize_depth_filter(unknown)["valid"] is False
 
 
+def test_tracker_data_plane_reports_tracking_and_terminal_failure():
+    state = OBSERVER.RuntimeObserverState(
+        OBSERVER.DEFAULT_TOPICS,
+        ros_domain_id=20,
+        started_unix_ns=100,
+    )
+    state.observe(
+        "tracker_state",
+        OBSERVER.summarize_bool(SimpleNamespace(data=True)),
+        None,
+        received_unix_ns=200,
+        received_monotonic_ns=1_000_000_000,
+    )
+    state.observe(
+        "tracker_target",
+        {"valid": True, "frame_id": "camera_color_optical_frame"},
+        1234,
+        received_unix_ns=210,
+        received_monotonic_ns=1_000_000_000,
+    )
+    tracking = state.snapshot(
+        publisher_counts={"tracker_state": 1, "tracker_target": 1},
+        generated_unix_ns=300,
+        now_monotonic_ns=1_100_000_000,
+    )
+    assert tracking["tracker"] == {
+        "phase": "tracking",
+        "tracking": True,
+        "target_fresh": True,
+        "target_source_stamp_ns": 1234,
+        "failure": None,
+    }
+
+    failure = {
+        "schema": "z_manip.tracker_failure.v1",
+        "seed_id": "z-manip-seed:2",
+        "seed_stamp_ns": 1234,
+        "reason_code": "mask_continuity",
+        "reason": "mask scale collapsed",
+        "replay_candidates": 25,
+        "replay_selected": 8,
+        "replay_span_ns": 9_500_000_000,
+        "acquisition_live_updates": 1,
+    }
+    state.observe(
+        "tracker_failure",
+        OBSERVER.summarize_tracker_failure(
+            SimpleNamespace(data=json.dumps(failure)),
+        ),
+        None,
+        received_unix_ns=400,
+        received_monotonic_ns=1_200_000_000,
+    )
+    failed = state.snapshot(
+        publisher_counts={
+            "tracker_state": 1,
+            "tracker_target": 1,
+            "tracker_failure": 1,
+        },
+        generated_unix_ns=500,
+        now_monotonic_ns=1_300_000_000,
+    )
+    assert failed["summary"]["tracker_phase"] == "failed"
+    assert failed["tracker"]["failure"]["reason_code"] == "mask_continuity"
+    assert (
+        OBSERVER.build_runtime_state(failed)["telemetry"]["tracker"]["phase"]
+        == "failed"
+    )
+
+
+def test_tracker_failure_parser_rejects_unbounded_or_ambiguous_payload():
+    assert OBSERVER.summarize_bool(SimpleNamespace(data=1))["valid"] is False
+    assert (
+        OBSERVER.summarize_tracker_failure(SimpleNamespace(data="{}"))["valid"]
+        is False
+    )
+    oversized = SimpleNamespace(data="x" * 4097)
+    assert OBSERVER.summarize_tracker_failure(oversized)["valid"] is False
+
+
 def test_atomic_snapshot_replaces_valid_json(tmp_path):
     output = tmp_path / "runtime.json"
     OBSERVER.atomic_write_json(output, {"sequence": 1})

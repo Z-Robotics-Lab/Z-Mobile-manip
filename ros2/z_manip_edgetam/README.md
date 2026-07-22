@@ -115,6 +115,10 @@ of these conditions occurs:
   expires. Both acquisition and tracking queues replace older pending work with
   the freshest RGB-D frame; the default tracking window is latest-only.
 
+`is_tracking` uses reliable transient-local QoS. A downstream controller that
+starts after a failure therefore observes the latest false state instead of
+mistaking a previously cached target or transform for an active track.
+
 A single mask whose cleaned component is a strict subset collapse is handled as
 a bounded pending anomaly, not a new anchor. The adapter advances the strict
 service sequence but publishes nothing and retains the previous validated mask

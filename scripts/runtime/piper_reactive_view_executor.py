@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any
 
@@ -34,7 +35,13 @@ JOINT_STATE_FRAME = "piper_base_link"
 FULL_STOP_TOPIC = "/go2w/full_stop"
 LIVE_ACK = "I_UNDERSTAND_PIPER_REACTIVE_VIEW_WILL_MOVE"
 MAX_INTENT_AGE_S = 0.30
-MAX_FUTURE_SKEW_S = 0.10
+# The intent publisher runs on the 4090 PC while this executor runs on the
+# NUC.  Their wall clocks are NTP-synchronised but are not phase locked.  The
+# measured PC-to-NUC midpoint offset is about 0.31 s, so a 0.10 s future check
+# rejects every otherwise-fresh command.  The local monotonic lease below
+# remains the actual motion timeout; this allowance is used only when accepting
+# a newly received cross-host document.
+MAX_FUTURE_SKEW_S = 0.50
 MAX_FEEDBACK_AGE_S = 0.30
 MAX_QDOT_RPS = math.radians(12.0)
 MAX_STEP_RAD = math.radians(2.0)
@@ -156,6 +163,8 @@ def main() -> int:
         raise SystemExit("reactive rate/speed is outside the bounded envelope")
 
     import rclpy
+    from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from sensor_msgs.msg import JointState
@@ -182,6 +191,17 @@ def main() -> int:
                 self.commands_sent = 0
                 self.stop_latched = False
                 self.fault: str | None = None
+                self.rejected_intents = 0
+                self.last_intent_error: str | None = None
+                # CAN feedback + move_j can consume nearly the entire 50 ms
+                # timer period.  A SingleThreadedExecutor may consequently
+                # keep selecting the overdue timer and never dispatch the
+                # intent subscription.  Put the short subscription callbacks
+                # in a separate callback group/thread; only the timer touches
+                # the hardware SDK.
+                self.intent_lock = threading.Lock()
+                self.intent_group = MutuallyExclusiveCallbackGroup()
+                self.hardware_group = MutuallyExclusiveCallbackGroup()
                 qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
                 self.publisher = self.create_publisher(String, STATUS_TOPIC, qos)
                 # The passive bridge is stopped while this process owns CAN.
@@ -190,27 +210,48 @@ def main() -> int:
                 self.joint_publisher = self.create_publisher(
                     JointState, JOINT_STATE_TOPIC, qos_profile_sensor_data
                 )
-                self.create_subscription(String, INTENT_TOPIC, self._intent, qos)
-                self.create_subscription(Empty, FULL_STOP_TOPIC, self._stop, qos)
-                self.create_timer(1.0 / args.rate_hz, self._tick)
+                self.create_subscription(
+                    String,
+                    INTENT_TOPIC,
+                    self._intent,
+                    qos,
+                    callback_group=self.intent_group,
+                )
+                self.create_subscription(
+                    Empty,
+                    FULL_STOP_TOPIC,
+                    self._stop,
+                    qos,
+                    callback_group=self.intent_group,
+                )
+                self.create_timer(
+                    1.0 / args.rate_hz,
+                    self._tick,
+                    callback_group=self.hardware_group,
+                )
 
             def _intent(self, message: String) -> None:
                 try:
                     value = validated_intent(json.loads(message.data), now_ns=time.time_ns())
-                    if value[0] <= self.last_seq:
-                        return
-                    self.latest = value
-                    self.last_seq = value[0]
-                    self.last_intent_s = time.monotonic()
+                    with self.intent_lock:
+                        if value[0] <= self.last_seq:
+                            return
+                        self.latest = value
+                        self.last_seq = value[0]
+                        self.last_intent_s = time.monotonic()
+                        self.last_intent_error = None
                 except (ValueError, TypeError, json.JSONDecodeError) as error:
                     # A malformed or stale message must not leave the previous
                     # velocity command live for the rest of its lease.
-                    self.latest = None
-                    self.fault = str(error)
+                    with self.intent_lock:
+                        self.latest = None
+                        self.rejected_intents += 1
+                        self.last_intent_error = str(error)
 
             def _stop(self, _message: Empty) -> None:
-                self.stop_latched = True
-                self.latest = None
+                with self.intent_lock:
+                    self.stop_latched = True
+                    self.latest = None
 
             def _tick(self) -> None:
                 now = time.monotonic()
@@ -236,13 +277,18 @@ def main() -> int:
                     joint_state.position = positions
                     self.joint_publisher.publish(joint_state)
                     piper.check_arm_status(robot, require_idle=False)
-                    fresh_intent = (
-                        self.latest is not None
-                        and self.last_intent_s is not None
-                        and now - self.last_intent_s <= MAX_INTENT_AGE_S
-                        and not self.stop_latched
-                    )
-                    qdot = self.latest[2] if fresh_intent else np.zeros(6)
+                    with self.intent_lock:
+                        fresh_intent = (
+                            self.latest is not None
+                            and self.last_intent_s is not None
+                            and now - self.last_intent_s <= MAX_INTENT_AGE_S
+                            and not self.stop_latched
+                        )
+                        qdot = (
+                            self.latest[2].copy()
+                            if fresh_intent and self.latest is not None
+                            else np.zeros(6)
+                        )
                     self.target = bounded_target(self.actual, qdot, 1.0 / args.rate_hz)
                     # Stale/Full Stop holds the measured pose rather than
                     # unloading torque or replaying an old target.
@@ -252,13 +298,18 @@ def main() -> int:
                     self.fault = None
                 except Exception as error:  # noqa: BLE001
                     self.fault = f"{type(error).__name__}: {error}"
+                with self.intent_lock:
+                    accepted_seq = self.last_seq
+                    stop_latched = self.stop_latched
+                    rejected_intents = self.rejected_intents
+                    last_intent_error = self.last_intent_error
                 status = String()
                 status.data = json.dumps({
                     "schema": STATUS_SCHEMA,
                     "owner": "piper_reactive_view_executor",
                     "ready": self.fault is None,
-                    "stop_latched": self.stop_latched,
-                    "accepted_seq": self.last_seq,
+                    "stop_latched": stop_latched,
+                    "accepted_seq": accepted_seq,
                     "actual_joints_rad": self.actual.tolist(),
                     "target_joints_rad": self.target.tolist(),
                     "max_error_rad": float(np.max(np.abs(self.target - self.actual))),
@@ -267,6 +318,9 @@ def main() -> int:
                         if self.feedback_receipt_s > 0.0 else None
                     ),
                     "commands_sent": self.commands_sent,
+                    "rejected_intents": rejected_intents,
+                    "last_intent_error": last_intent_error,
+                    "future_clock_skew_tolerance_s": MAX_FUTURE_SKEW_S,
                     "fault": self.fault,
                     "updated_unix_ns": time.time_ns(),
                 }, separators=(",", ":"), allow_nan=False)
@@ -274,9 +328,12 @@ def main() -> int:
 
         rclpy.init()
         node = ExecutorNode()
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(node)
         try:
-            rclpy.spin(node)
+            executor.spin()
         finally:
+            executor.shutdown()
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
