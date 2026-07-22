@@ -133,6 +133,8 @@ def test_web_rtc_status_keeps_mode_and_per_command_robot_evidence():
     assert '"StopMove": None' in source
     assert 'self._command_codes["Move"] = self._last_code' in source
     assert 'self._command_codes["StopMove"] = self._last_code' in source
+    assert 'evidence.get("api_family") == "wheeled_sport"' in source
+    assert '"Go2 Euler(1007); robot evidence is 3203"' in source
 
 
 def test_body_height_is_explicitly_unsupported_and_never_queried():

@@ -478,7 +478,19 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             evidence = _motion_mode_evidence(response)
             self._motion_mode = evidence
             current_name = evidence.get("name")
-            if previous_name and current_name and previous_name != current_name:
+            if evidence.get("api_family") == "wheeled_sport":
+                # The public wheeled/B2 SPORT table has no Go2-style Euler
+                # target.  This exact robot also returned 3203 for API 1007
+                # in ai-w.  Lock the unavailable DOFs as soon as CheckMode
+                # identifies the service, rather than sending one known-bad
+                # posture request after every reconnect.
+                self._euler_supported = False
+                self._euler_capability_state = "unsupported_for_session"
+                self._euler_reason = (
+                    f"active {current_name} wheeled_sport service does not expose "
+                    "Go2 Euler(1007); robot evidence is 3203"
+                )
+            elif previous_name and current_name and previous_name != current_name:
                 self._euler_supported = True
                 self._euler_capability_state = "unknown"
                 self._euler_reason = (
