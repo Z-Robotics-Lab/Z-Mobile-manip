@@ -38,7 +38,9 @@ was opened.
 The production planner image was `z-manip-runtime:pinocchio` with Pinocchio
 4.0.0. CasADi 3.7.2 exists only in the separate
 `z-mobile-manip-whole-body:latest` image (also Pinocchio 4.0.0). Therefore these
-results are Pinocchio planner results; they must not be described as CasADi IK.
+primary matrix results are Pinocchio planner results. The separate CasADi
+counterfactual below is explicitly identified and was not integrated into the
+production planner.
 
 ## Before and after
 
@@ -64,6 +66,43 @@ The non-strict deployed tolerance replay can produce 13/13 plans in 1.808 s p50
 and 2.435 s p95 with four symmetries. That result is intentionally excluded from
 the strict acceptance decision because it uses the deployed 10 mm / 0.349 rad
 tolerances rather than the requested 3 mm / 0.03 rad evidence boundary.
+
+## CasADi strict counterfactual
+
+A separate, non-production experiment rebuilt the calibrated six-joint FK in
+CasADi 3.7.2 and solved each pregrasp/grasp/lift target with IPOPT. It did not
+use `pinocchio.casadi` (that module is unavailable in the installed Pinocchio
+build). Every returned state was projected inside the exact URDF bounds and
+then independently rechecked with the production FK, 3 mm position tolerance,
+0.03 rad orientation tolerance, URDF limits, fixture checks, scene collision,
+attached-target collision, and trajectory validation. The replay remained
+network-isolated and did not open hardware or ROS transports.
+
+With four symmetries / 64 hypotheses, this counterfactual produced:
+
+| Metric | Result |
+| --- | ---: |
+| Valid plans | 11/13 |
+| Successful total p50 | 1.808 s |
+| Successful total p95 | 1.943 s |
+| Maximum successful total | 2.007 s |
+| Maximum across every case | 8.333 s |
+| All cases within the 3 s budget | No |
+
+The valid sessions were `033954`, `034126`, `034208`, `100709`, `100915`,
+`101749`, `101946`, `102726`, `103206`, `103409`, and `103623`. Session
+`080241` remained invalid because the strict collision pipeline still rejects
+the recorded scene/attached target. Session `102927` remained invalid and took
+8.333 s total (7.554 s search), exposing an unbounded failure tail despite the
+nominal 3 s outer search budget. In contrast, CasADi reduced `100915` from the
+Pinocchio matrix's 3.547 s to 1.599 s.
+
+Decision: do not integrate this CasADi fallback yet. Its 11 successful cases
+are individually below 3 s, but the 8.333 s failure violates the whole-planning
+budget, and CasADi is absent from the production planner image. The experiment
+is positive feasibility evidence for a future bounded fallback only after the
+solver call is made hard-cancellable and its dependency is added to the actual
+planner image. It is not evidence for loosening IK or collision acceptance.
 
 ## Why `20260720-080241` is not an IK-only failure
 
