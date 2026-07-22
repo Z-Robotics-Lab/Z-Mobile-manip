@@ -37,6 +37,10 @@ def _planner(
     planner = OnlinePlanner.__new__(OnlinePlanner)
     planner.chain = KinematicChain.from_urdf(urdf, 'base', 'tool')
     planner.mesh_self_collision = None
+    # This one-DOF contact fixture exercises point-cloud phase semantics only;
+    # fixed Go2W attachments are covered by test_fixed_fixture_planning.py.
+    planner._fixed_fixture_state_valid = lambda _joints: True
+    planner._fixed_fixture_path_valid = lambda _path: True
     planner.collision_model = RobotCollisionModel(
         capsules=(
             CapsuleSpec(

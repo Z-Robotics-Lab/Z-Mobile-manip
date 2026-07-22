@@ -1020,6 +1020,12 @@ class OnlinePlanner:
             return False
         if scene.ndim != 2 or scene.shape[1] != 3 or target.ndim != 2 or target.shape[1] != 3:
             return False
+        # Robot-mounted fixtures do not depend on the newest depth frame.
+        # Validate them first and with the immutable calibrated model so that
+        # revalidation can never approve a path which the final actuator
+        # boundary will reject around Mid360/platform/D435 geometry.
+        if not self._fixed_fixture_path_valid(positions):
+            return False
         try:
             if segment_name in ('lift', 'carry', 'place_transit'):
                 if attachment_joints is None:
@@ -1183,11 +1189,18 @@ class OnlinePlanner:
             attachment_joints=current,
             allowed_contact_capsules=self.collision_model.target_contact_capsules,
         )
+
+        def attached_state_valid(joints: object) -> bool:
+            return bool(
+                self._fixed_fixture_state_valid(joints)
+                and checker.is_state_valid(joints)
+            )
+
         planner = JointSpaceRRTConnect(
             joint_names=self.chain.joint_names,
             lower_limits=self.chain.lower_limits,
             upper_limits=self.chain.upper_limits,
-            state_valid=checker.is_state_valid,
+            state_valid=attached_state_valid,
             config=self.config.rrt,
         )
         path = planner.plan_joint(

@@ -190,3 +190,29 @@ def test_online_plan_applies_fixed_fixture_guard_to_every_motion_phase(
     )
 
     assert result == "fixture-phase-contract-passed"
+
+
+def test_execution_revalidation_cannot_bypass_fixed_fixture_edge_collision(
+    monkeypatch,
+):
+    """A clear/stale depth scene cannot approve a Mid360-crossing path."""
+
+    planner = _planner()
+    monkeypatch.setattr(
+        planning_module,
+        "PointCloudCollisionChecker",
+        _AlwaysClearSceneChecker,
+    )
+    far_scene = np.column_stack((
+        np.linspace(10.0, 11.0, 64),
+        np.full(64, 10.0),
+        np.full(64, 10.0),
+    ))
+
+    assert not planner.validate_path(
+        np.vstack((EDGE_START, EDGE_END)),
+        scene_points=far_scene,
+        target_points=np.asarray(((12.0, 12.0, 12.0),)),
+        stamp_s=10.0,
+        segment_name="transit",
+    )
