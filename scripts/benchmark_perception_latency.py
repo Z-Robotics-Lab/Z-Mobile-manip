@@ -61,7 +61,10 @@ def collect(root: Path) -> dict[str, object]:
     reused: list[float] = []
     fresh: list[float] = []
     internal_by_session: dict[Path, float] = {}
+    mode_by_session: dict[Path, str] = {}
     failures = 0
+    instrumented_reports = 0
+    legacy_reports = 0
     stage_values: dict[str, list[float]] = {}
     for path in reports:
         try:
@@ -85,16 +88,29 @@ def collect(root: Path) -> dict[str, object]:
                 session_dir = path.parent
                 if session_dir.name == "perception":
                     session_dir = session_dir.parent
-                internal_by_session[session_dir.resolve()] = elapsed_s
+                resolved_session = session_dir.resolve()
+                internal_by_session[resolved_session] = elapsed_s
+                mode_by_session[resolved_session] = (
+                    "reused_tracking"
+                    if report.get("grounding_reused") is True
+                    else "fresh_grounding"
+                )
         timings = report.get("timings")
         if isinstance(timings, dict):
+            instrumented_reports += 1
             for name, value in timings.items():
                 if isinstance(name, str) and isinstance(value, (int, float)):
                     stage_values.setdefault(name, []).append(float(value))
+        else:
+            legacy_reports += 1
 
     attempts: list[float] = []
     totals: list[float] = []
+    reused_totals: list[float] = []
+    fresh_totals: list[float] = []
     wrapper_overhead: list[float] = []
+    reused_wrapper_overhead: list[float] = []
+    fresh_wrapper_overhead: list[float] = []
     for log_path in root.rglob("perception.log"):
         session_total: float | None = None
         for event in _json_lines(log_path):
@@ -106,9 +122,18 @@ def collect(root: Path) -> dict[str, object]:
             elif event.get("stage") == "perception_total":
                 session_total = float(elapsed)
                 totals.append(session_total)
-        internal_elapsed = internal_by_session.get(log_path.parent.resolve())
+        resolved_session = log_path.parent.resolve()
+        internal_elapsed = internal_by_session.get(resolved_session)
         if session_total is not None and internal_elapsed is not None:
-            wrapper_overhead.append(max(0.0, session_total - internal_elapsed))
+            overhead = max(0.0, session_total - internal_elapsed)
+            wrapper_overhead.append(overhead)
+            mode = mode_by_session.get(resolved_session)
+            if mode == "reused_tracking":
+                reused_totals.append(session_total)
+                reused_wrapper_overhead.append(overhead)
+            elif mode == "fresh_grounding":
+                fresh_totals.append(session_total)
+                fresh_wrapper_overhead.append(overhead)
 
     return {
         "schema": "z_manip.perception_latency_benchmark.v1",
@@ -116,13 +141,21 @@ def collect(root: Path) -> dict[str, object]:
         "root": str(root.resolve()),
         "reports": len(reports),
         "failures": failures,
+        "instrumentation": {
+            "instrumented_reports": instrumented_reports,
+            "legacy_reports": legacy_reports,
+        },
         "internal": _summary(internal),
         "successful_internal": _summary(successful_internal),
         "fresh_grounding": _summary(fresh),
         "reused_tracking": _summary(reused),
         "wrapper_attempt": _summary(attempts),
         "wrapper_total": _summary(totals),
+        "fresh_grounding_wrapper_total": _summary(fresh_totals),
+        "reused_tracking_wrapper_total": _summary(reused_totals),
         "wrapper_overhead": _summary(wrapper_overhead),
+        "fresh_grounding_wrapper_overhead": _summary(fresh_wrapper_overhead),
+        "reused_tracking_wrapper_overhead": _summary(reused_wrapper_overhead),
         "stages": {
             name: _summary(values)
             for name, values in sorted(stage_values.items())

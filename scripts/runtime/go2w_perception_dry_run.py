@@ -201,6 +201,7 @@ def main() -> int:
     matching_tracking_request_id = ""
     matching_tracking_valid = False
     accepted_source_request_id = ""
+    reused_source_request_id = ""
 
     def valid_callback(message: Bool) -> None:
         nonlocal valid
@@ -253,6 +254,15 @@ def main() -> int:
             matching_tracking_request_id = (
                 status_request_id if matching_tracking_valid else ""
             )
+            if reused_source_request_id and (
+                status_request_id != reused_source_request_id
+                or not matching_tracking_valid
+            ):
+                perception_failure = (
+                    "tracker_identity_changed: the exact reused instruction "
+                    "is no longer the active valid tracking contract"
+                )
+                continue
             failure = values.get("failure", "").strip()
             failure_matches = status_request_id == request_id or (
                 accepted_source_request_id
@@ -360,6 +370,7 @@ def main() -> int:
             if matching_tracking_valid and matching_tracking_request_id:
                 grounding_reused = True
                 accepted_source_request_id = matching_tracking_request_id
+                reused_source_request_id = matching_tracking_request_id
                 break
         stage_timings["tracking_reuse_probe_s"] = round(
             time.monotonic() - reuse_probe_started,

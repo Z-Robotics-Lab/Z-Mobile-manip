@@ -37,13 +37,46 @@ def test_collect_separates_reused_tracking_and_wrapper_latency(tmp_path):
             "elapsed_s": 1.75,
         }) + "\n",
     )
+    (second / "perception.log").write_text(
+        json.dumps({
+            "schema": "z_manip.interactive_timing.v1",
+            "stage": "perception_total",
+            "elapsed_s": 4.0,
+        }) + "\n",
+    )
 
     result = BENCHMARK.collect(tmp_path)
 
     assert result["internal"]["samples"] == 2
     assert result["reused_tracking"]["p50_s"] == 1.25
     assert result["fresh_grounding"]["p50_s"] == 3.0
-    assert result["wrapper_total"]["p50_s"] == 1.75
-    assert result["wrapper_overhead"]["p50_s"] == 0.5
+    assert result["wrapper_total"]["p50_s"] == 2.875
+    assert result["reused_tracking_wrapper_total"]["p50_s"] == 1.75
+    assert result["fresh_grounding_wrapper_total"]["p50_s"] == 4.0
+    assert result["reused_tracking_wrapper_overhead"]["p50_s"] == 0.5
+    assert result["fresh_grounding_wrapper_overhead"]["p50_s"] == 1.0
     assert result["stages"]["bundle_wait_s"]["p50_s"] == 1.125
+    assert result["instrumentation"] == {
+        "instrumented_reports": 2,
+        "legacy_reports": 0,
+    }
     assert result["targets"]["internal_under_target"] == 1
+
+
+def test_collect_marks_legacy_reports_without_stage_timings(tmp_path):
+    session = tmp_path / "legacy"
+    session.mkdir()
+    (session / "report.json").write_text(json.dumps({
+        "read_only": True,
+        "elapsed_s": 0.9,
+        "grounding_reused": True,
+    }))
+
+    result = BENCHMARK.collect(tmp_path)
+
+    assert result["instrumentation"] == {
+        "instrumented_reports": 0,
+        "legacy_reports": 1,
+    }
+    assert result["reused_tracking"]["p50_s"] == 0.9
+    assert result["reused_tracking_wrapper_total"]["samples"] == 0
