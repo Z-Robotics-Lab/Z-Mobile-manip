@@ -3,6 +3,12 @@
 This note records the offline evidence used to tune the mobile handoff pipeline.
 No replay in this report opened ROS, CAN, WebRTC, or a PiPER transport.
 
+Two evidence generations are intentionally kept separate below. The rosbag
+records the older, live-observed pipeline and is the authority for its actual
+latency and failure modes. The newer warm-worker, Monte Carlo, and overlap
+results are **offline optimized benchmarks** derived from those captures. They
+do not establish a successful physical grasp or replace the next live run.
+
 ## Dataset
 
 - Rosbag: `mobile-tuning-20260722-182620-mobile-handoff-tuning`
@@ -49,6 +55,30 @@ The replay report is `/tmp/z-mobile-planning-replay-2f8c3d5.json` on the tuning
 machine. Reproduce it with `scripts/offline/planning_replay_benchmark.py` as
 documented in the README.
 
+### Current persistent-planner benchmark
+
+Keeping the planner process and robot model resident removes the remaining
+per-call setup cost. On the same five genuine close-range captures, the current
+persistent worker produced:
+
+- success: **5/5**;
+- planner wall time: p50 **1.266 s**, max **1.814 s**;
+- worker setup: about **3 ms**.
+
+The success criterion remains the production candidate, IK, and collision
+gate; this is not a relaxed feasibility check. It is nevertheless an offline
+benchmark: no arm motion or grasp execution occurred.
+
+Target and joint-state perturbation replay adds two robustness checks around
+the recorded close-range states:
+
+- realistic noise, 3 mm target sigma and 0.5 deg joint sigma: **25/25**;
+- stress noise, 5 mm target sigma and 1.0 deg joint sigma: **15/15**.
+
+These trials demonstrate repeatable offline IK/planning feasibility near the
+recorded states. They do not measure calibration error, actuator tracking, or
+physical grasp success.
+
 ## Perception result
 
 Historical captures in this bag predate the warm-runner change and therefore
@@ -63,6 +93,14 @@ Existing valid tracked-target samples show a core p50 of **0.84 s**. The
 expected steady UI path is about **1.68 s**, but the `< 2 s` claim must be
 validated with a new post-change real capture. Fresh YOLOE acquisition and
 same-target tracked refresh must be reported separately.
+
+The historical artifact set further bounds what can be claimed: fresh
+grounding core p50 is **4.604 s**, its wrapper total p50 is **5.596 s**, and
+wrapper overhead p50 is **1.314 s**. All **375** reports predate the new stage
+timing fields; consequently the tracked-path wrapper total and overhead have
+zero instrumented samples. The implementation now emits those fields, but a
+new live artifact set is required before reporting fresh or tracked end-to-end
+perception below 2 s.
 
 An additional 4090-only benchmark isolated dynamic YOLOE prompt setup. The
 detector, 640-pixel input, confidence threshold, and box selection remained
@@ -113,14 +151,19 @@ after the base-stop timestamp; this does not relax readiness or collision
 acceptance. A continuous passive cache should expose the accepted source stamp
 instead of adding a fixed sleep.
 
-The current warm-runner evidence gives an expected tracked perception path of
-about **1.68 s** (pending new live validation) and a verified close-range
-planner maximum of **2.43 s**. Even if the 1.84 s readiness wait is completely
-hidden behind perception, the projected fresh-perception -> plan-finish path is
-about **4.11 s**, still **1.11 s over** the 3.0 s target, before grasp-start
-overhead. Meeting 3.0 s therefore also requires planner search near 1.3 s (or
-an equivalent split of savings between capture and planning); removing UI
-checks cannot close the gap.
+The current safe parallel handoff implementation starts the read-only capture
+and post-stop joint watcher together and joins both before planning. Based on
+the recorded lifecycle timestamps, its expected critical-path recovery is
+about **0.904 s**. This is a projection from overlapping two already-required
+operations, not a live latency measurement and not permission to bypass the
+post-stop joint epoch check.
+
+The current offline projection combines the unverified tracked UI estimate of
+about **1.68 s** with the persistent-planner p50 of **1.266 s**, giving
+**2.946 s** before grasp-start overhead. The planner maximum would instead give
+**3.494 s**. Therefore neither the perception `< 2 s` goal nor the complete
+replan-to-grasp `< 3 s` goal is claimed yet; both require a post-change live
+capture that includes the executor start timestamp.
 
 Reproduce the bounded lifecycle report with:
 
@@ -155,7 +198,11 @@ python3 scripts/offline/mobile_handoff_benchmark.py \
 
 After the operator returns, record a new short bag and check:
 
-1. same-target tracked perception UI time is below 2 s;
+1. fresh and same-target tracked wrapper totals are emitted and separately
+   remain below 2 s;
 2. every capture inside 0.70 m reaches planning rather than base approach;
-3. close-range warm planner calls remain below 3 s;
-4. no motion command is issued when the disposition is `NEED_BASE_APPROACH`.
+3. persistent close-range planner p50/max agree with the 1.266/1.814 s offline
+   benchmark;
+4. base stop -> executor/grasp start is measured, including the projected
+   0.904 s safe-overlap recovery, and is below 3 s;
+5. no motion command is issued when the disposition is `NEED_BASE_APPROACH`.
