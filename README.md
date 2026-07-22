@@ -130,6 +130,22 @@ python3 scripts/offline/mobile_handoff_benchmark.py \
 The benchmark is filesystem-only and cannot open ROS, WebRTC, CAN, or PiPER
 transports.
 
+To rerun every valid perception capture inside the same bag window through the
+current planner, using a device-free Docker container with networking disabled:
+
+```bash
+python3 scripts/offline/planning_replay_benchmark.py \
+  --bag /path/to/rosbag_directory \
+  --sessions-root /path/to/interactive_sessions \
+  --output-root /tmp/planning-replay \
+  --report /tmp/planning-replay.json \
+  --markdown /tmp/planning-replay.md \
+  --min-success-rate 0.8 --max-p95-s 3 --strict
+```
+
+Pass a previous report with `--baseline` to reject success-rate or latency
+regressions after changing IK or planning code.
+
 报告分别量化 detect、track、base、posture、arm intent/ACK 和 handoff，并检查 JSON
 完整性、时间戳单调性、必要 topic 以及 MCAP 首尾 framing。需要把缺失 ACK、损坏记录或
 姿态命令故障作为 CI 失败时追加 `--strict`。
