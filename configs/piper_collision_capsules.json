@@ -3,6 +3,28 @@
   "point_radius_m": 0.003,
   "capsules": [
     {
+      "name": "platform_head",
+      "start_frame": "piper_base_link",
+      "end_frame": "piper_base_link",
+      "radius": 0.06,
+      "start_offset": [0.225, 0.0, -0.102],
+      "end_offset": [0.225, 0.0, -0.012],
+      "check_scene": false,
+      "check_target": false,
+      "supplemental_self_collision": true
+    },
+    {
+      "name": "mid360",
+      "start_frame": "piper_base_link",
+      "end_frame": "piper_base_link",
+      "radius": 0.042,
+      "start_offset": [0.19717, 0.0, -0.00224],
+      "end_offset": [0.22283, 0.0, 0.06824],
+      "check_scene": false,
+      "check_target": false,
+      "supplemental_self_collision": true
+    },
+    {
       "name": "mount",
       "start_frame": "piper_base_link",
       "end_frame": "piper_base_link",
@@ -53,7 +75,18 @@
   ],
   "self_collision": {
     "pairs": [
-      ["mount", "forearm"],
+      ["platform_head", "upper_arm"],
+      ["platform_head", "forearm"],
+      ["platform_head", "wrist"],
+      ["platform_head", "palm"],
+      ["platform_head", "finger_left_proximal"], ["platform_head", "finger_left_mid"], ["platform_head", "finger_left_pad"], ["platform_head", "finger_left_tip"],
+      ["platform_head", "finger_right_proximal"], ["platform_head", "finger_right_mid"], ["platform_head", "finger_right_pad"], ["platform_head", "finger_right_tip"],
+      ["mid360", "upper_arm"],
+      ["mid360", "forearm"],
+      ["mid360", "wrist"],
+      ["mid360", "palm"],
+      ["mid360", "finger_left_proximal"], ["mid360", "finger_left_mid"], ["mid360", "finger_left_pad"], ["mid360", "finger_left_tip"],
+      ["mid360", "finger_right_proximal"], ["mid360", "finger_right_mid"], ["mid360", "finger_right_pad"], ["mid360", "finger_right_tip"],
       ["mount", "wrist"],
       ["mount", "palm"],
       ["mount", "finger_left_proximal"], ["mount", "finger_left_mid"], ["mount", "finger_left_pad"], ["mount", "finger_left_tip"],

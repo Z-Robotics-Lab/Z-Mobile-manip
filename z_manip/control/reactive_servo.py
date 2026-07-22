@@ -184,6 +184,13 @@ class ReactiveServoConfig:
     handoff_arm_max_range_m: float = 0.80
     handoff_arm_min_height_m: float = -0.40
     handoff_arm_max_height_m: float = 0.65
+    # The D435 is mounted on the wrist.  Do not keep extending the viewing
+    # pose until the target enters the camera's unreliable near field.  The
+    # soft limit starts close-range planning while depth is still usable; the
+    # hard limit stops posture/view motion even if another corridor check has
+    # not converged yet.
+    camera_handoff_depth_m: float = 0.42
+    camera_hard_min_depth_m: float = 0.38
     preferred_target_height_m: float = -0.10
     target_height_deadband_m: float = 0.08
     desired_camera_elevation_rad: float = math.radians(-8.0)
@@ -210,6 +217,8 @@ class ReactiveServoConfig:
             self.handoff_planar_max_m,
             self.handoff_arm_min_range_m,
             self.handoff_arm_max_range_m,
+            self.camera_handoff_depth_m,
+            self.camera_hard_min_depth_m,
             self.target_height_deadband_m,
             self.camera_elevation_soft_limit_rad,
             self.camera_elevation_hard_limit_rad,
@@ -233,6 +242,8 @@ class ReactiveServoConfig:
             raise ValueError("invalid arm range corridor")
         if self.handoff_arm_min_height_m >= self.handoff_arm_max_height_m:
             raise ValueError("invalid arm height corridor")
+        if self.camera_hard_min_depth_m >= self.camera_handoff_depth_m:
+            raise ValueError("camera hard depth limit must precede handoff depth")
         if self.camera_elevation_soft_limit_rad >= self.camera_elevation_hard_limit_rad:
             raise ValueError("camera soft elevation limit must precede hard limit")
         if not 0.0 <= self.max_arm_view_extension_fraction <= 1.0:
@@ -364,6 +375,51 @@ class ReactiveTargetController:
         self._last_geometry = geometry
         self._last_seen_s = now
         arm_view = self._arm_view(geometry)
+        camera_depth_m = geometry.camera_xyz_m[2]
+        near_field_handoff = (
+            camera_depth_m <= self.config.camera_handoff_depth_m
+            and geometry.base_planar_distance_m
+            <= self.config.handoff_planar_max_m + 0.05
+        )
+        hard_near_field = camera_depth_m <= self.config.camera_hard_min_depth_m
+
+        # Handoff must precede another posture increment.  Once the wrist
+        # camera reaches its near-field boundary, continuing to move the arm
+        # destroys the depth evidence that the grasp planner needs.  HOLD is
+        # intentional: the planning supervisor captures at the last reliable
+        # pose and owns any subsequent pregrasp motion.
+        if near_field_handoff or hard_near_field:
+            self._posture_requested = False
+            self._reacquire_since_s = None
+            hold_view = ArmViewIntent(mode=ArmViewMode.HOLD)
+            corridor_ok = self._handoff_geometry_ok(geometry)
+            if corridor_ok and ik_feasible is True:
+                self.phase = ReactivePhase.HANDOFF_READY
+                return ReactiveServoDecision(
+                    phase=self.phase,
+                    base=BaseMotionIntent(),
+                    posture=PostureIntent(),
+                    arm_view=hold_view,
+                    geometry=geometry,
+                    handoff_ready=True,
+                    reason="D435 near-field handoff reached with an IK-feasible grasp",
+                )
+            self.phase = ReactivePhase.HANDOFF_PROBE
+            return ReactiveServoDecision(
+                phase=self.phase,
+                base=BaseMotionIntent(),
+                posture=PostureIntent(),
+                arm_view=hold_view,
+                geometry=geometry,
+                needs_ik_probe=ik_feasible is None,
+                reason=(
+                    "D435 hard near-field floor reached; freeze the viewing pose "
+                    "and start close-range planning"
+                    if hard_near_field
+                    else "D435 soft near-field boundary reached; start close-range "
+                    "planning before depth is lost"
+                ),
+            )
         height_error = geometry.target_height_m - self.config.preferred_target_height_m
         elevation_error = (
             geometry.camera_elevation_rad - self.config.desired_camera_elevation_rad

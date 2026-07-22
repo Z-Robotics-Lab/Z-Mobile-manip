@@ -78,7 +78,7 @@
     "seed": 17
   },
   "standoff": {
-    "min_camera_depth_m": 0.32,
+    "min_camera_depth_m": 0.38,
     "max_camera_depth_m": 0.75,
     "depth_samples": 10,
     "base_motion_penalty": 0.02,

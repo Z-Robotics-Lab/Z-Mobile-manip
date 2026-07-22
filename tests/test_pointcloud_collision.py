@@ -5,6 +5,7 @@ import pytest
 
 from z_manip.collision import (
     CapsuleSpec,
+    CollisionResult,
     PointCloudCollisionChecker,
     PointCloudCollisionConfig,
     RobotCollisionModel,
@@ -53,6 +54,7 @@ def _checker(
     max_age=0.5,
     scene_noise_tolerance=0.0,
     scene_noise_min_support_points=1,
+    self_collision_checker=None,
 ):
     chain, frames = _chain_and_frames(tmp_path)
     if model is None:
@@ -83,6 +85,7 @@ def _checker(
             segment_joint_step=0.02,
         ),
         now_fn=clock,
+        self_collision_checker=self_collision_checker,
     )
 
 
@@ -283,6 +286,79 @@ def test_self_collision_pairs_and_ignore_list_are_configurable(tmp_path):
     checker = _checker(tmp_path, model=ignored)
     checker.update_scene(np.array([[0.8, 0.8, 0.8]]), stamp_s=10.0)
     assert checker.is_state_valid(np.array([0.0]))
+
+
+def test_fixed_platform_capsule_skips_scene_and_target_but_keeps_self_collision(tmp_path):
+    model = RobotCollisionModel(
+        capsules=(
+            CapsuleSpec(
+                "platform_sensor",
+                "base",
+                "base",
+                0.05,
+                check_scene=False,
+                check_target=False,
+                supplemental_self_collision=True,
+            ),
+            CapsuleSpec("moving_arm", "tool", "tool", 0.03),
+        ),
+        self_collision=SelfCollisionConfig(
+            pairs=(("platform_sensor", "moving_arm"),),
+        ),
+    )
+    checker = _checker(tmp_path, model=model)
+    checker.update_scene(np.array([[0.0, 0.0, 0.0]]), stamp_s=10.0)
+    checker.update_target(np.array([[0.0, 0.0, 0.0]]))
+
+    assert checker.is_state_valid(np.array([0.5]))
+    collision = checker.check_state(np.array([0.0]))
+    assert not collision.valid
+    assert collision.kind == "self"
+    assert set(collision.capsules) == {"platform_sensor", "moving_arm"}
+
+
+def test_capsule_self_collision_supplements_valid_mesh_backend(tmp_path):
+    crossing = RobotCollisionModel(
+        capsules=(
+            CapsuleSpec(
+                "vertical",
+                "tool",
+                "tool",
+                0.02,
+                start_offset=(0.0, 0.0, -0.1),
+                end_offset=(0.0, 0.0, 0.1),
+                supplemental_self_collision=True,
+            ),
+            CapsuleSpec(
+                "lateral",
+                "tool",
+                "tool",
+                0.02,
+                start_offset=(0.0, -0.1, 0.0),
+                end_offset=(0.0, 0.1, 0.0),
+            ),
+        ),
+        self_collision=SelfCollisionConfig(
+            pairs=(("vertical", "lateral"),),
+        ),
+    )
+    mesh_calls = []
+
+    def valid_mesh_backend(joints):
+        mesh_calls.append(np.asarray(joints).copy())
+        return CollisionResult(True, "mesh collision-free")
+
+    checker = _checker(
+        tmp_path,
+        model=crossing,
+        self_collision_checker=valid_mesh_backend,
+    )
+    checker.update_scene(np.array([[0.8, 0.8, 0.8]]), stamp_s=10.0)
+
+    collision = checker.check_state(np.array([0.0]))
+    assert not collision.valid
+    assert collision.kind == "self"
+    assert mesh_calls == []
 
 
 def test_bad_geometry_or_perception_configuration_is_rejected(tmp_path):

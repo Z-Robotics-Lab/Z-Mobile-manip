@@ -231,6 +231,52 @@ def test_handoff_requires_3d_arm_corridor_and_explicit_ik_probe():
     assert accepted.base.linear_x_mps == accepted.base.angular_z_rps == 0.0
 
 
+def test_near_field_handoff_precedes_another_posture_increment():
+    controller = ReactiveTargetController()
+    geometry = _geometry(
+        camera_xyz=(0.0, 0.18, 0.40),
+        base_xyz=(0.58, 0.0, -0.28),
+        arm_xyz=(0.54, 0.0, -0.14),
+    )
+
+    decision = controller.update(
+        geometry,
+        now_s=6.0,
+        tracking=True,
+        body_settled=True,
+        ik_feasible=None,
+    )
+
+    assert decision.phase is ReactivePhase.HANDOFF_PROBE
+    assert decision.needs_ik_probe
+    assert decision.base.linear_x_mps == decision.base.angular_z_rps == 0.0
+    assert decision.posture.body_height_delta_m == 0.0
+    assert decision.posture.pitch_delta_rad == 0.0
+    assert decision.arm_view.mode is ArmViewMode.HOLD
+    assert "near-field" in decision.reason
+
+
+def test_hard_camera_floor_stops_view_motion_outside_soft_handoff_corridor():
+    controller = ReactiveTargetController()
+    geometry = _geometry(
+        camera_xyz=(0.0, 0.0, 0.36),
+        base_xyz=(0.82, 0.0, -0.10),
+        arm_xyz=(0.78, 0.0, 0.10),
+    )
+
+    decision = controller.update(
+        geometry,
+        now_s=6.0,
+        tracking=True,
+        body_settled=True,
+    )
+
+    assert decision.phase is ReactivePhase.HANDOFF_PROBE
+    assert decision.arm_view.mode is ArmViewMode.HOLD
+    assert decision.base.linear_x_mps == 0.0
+    assert "hard near-field floor" in decision.reason
+
+
 def test_from_frames_accepts_external_tf_results_without_reinterpreting_axes():
     geometry = TargetGeometry.from_frames(
         (0.1, 0.2, 0.8),
@@ -251,4 +297,9 @@ def test_configuration_rejects_overlapping_or_inverted_corridors():
         ReactiveServoConfig(
             camera_elevation_soft_limit_rad=0.5,
             camera_elevation_hard_limit_rad=0.4,
+        )
+    with pytest.raises(ValueError):
+        ReactiveServoConfig(
+            camera_handoff_depth_m=0.38,
+            camera_hard_min_depth_m=0.40,
         )

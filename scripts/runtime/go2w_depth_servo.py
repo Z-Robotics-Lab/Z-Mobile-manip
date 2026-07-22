@@ -1416,6 +1416,23 @@ def _run_ros(args: argparse.Namespace) -> int:
             posture_settled: bool,
         ) -> DepthServoOutput:
             self.whole_body_command = None
+            # The reactive layer deliberately hands control to the close-range
+            # planner before the wrist D435 enters its blind zone.  Do not run
+            # another whole-body posture/QP step here: that would extend the
+            # camera after the handoff decision and invalidate the last usable
+            # RGB-D capture.
+            if (
+                fallback.needs_ik_probe
+                or fallback.reactive_phase
+                in {
+                    ReactivePhase.HANDOFF_PROBE.value,
+                    ReactivePhase.HANDOFF_READY.value,
+                }
+            ):
+                self.whole_body_handoff_settle_cycles = 0
+                if self.whole_body is not None:
+                    self.whole_body.reset()
+                return fallback
             if self.whole_body is None:
                 if args.whole_body == "casadi":
                     return DepthServoOutput(

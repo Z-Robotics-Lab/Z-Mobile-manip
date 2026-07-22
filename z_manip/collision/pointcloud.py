@@ -51,6 +51,12 @@ class CapsuleSpec:
     radius: float
     start_offset: _Offset = (0.0, 0.0, 0.0)
     end_offset: _Offset = (0.0, 0.0, 0.0)
+    check_scene: bool = True
+    check_target: bool = True
+    # Keep this capsule in the lightweight self-collision pass even when a
+    # mesh backend owns normal arm self collision.  This is intended for
+    # platform fixtures that are not part of the active arm chain.
+    supplemental_self_collision: bool = False
 
     def __post_init__(self) -> None:
         if not self.name or not self.start_frame or not self.end_frame:
@@ -71,6 +77,11 @@ class CapsuleSpec:
             radius=float(data["radius"]),
             start_offset=tuple(data.get("start_offset", (0.0, 0.0, 0.0))),
             end_offset=tuple(data.get("end_offset", (0.0, 0.0, 0.0))),
+            check_scene=bool(data.get("check_scene", True)),
+            check_target=bool(data.get("check_target", True)),
+            supplemental_self_collision=bool(
+                data.get("supplemental_self_collision", False)
+            ),
         )
 
 
@@ -1040,10 +1051,20 @@ class PointCloudCollisionChecker:
             )
         return None
 
-    def _check_self_collision(self, capsules: tuple[_WorldCapsule, ...]) -> CollisionResult | None:
+    def _check_self_collision(
+        self,
+        capsules: tuple[_WorldCapsule, ...],
+        *,
+        supplemental_only: bool = False,
+    ) -> CollisionResult | None:
         by_name = {capsule.spec.name: capsule for capsule in capsules}
         for first_name, second_name in self._self_pairs:
             first, second = by_name[first_name], by_name[second_name]
+            if supplemental_only and not (
+                first.spec.supplemental_self_collision
+                or second.spec.supplemental_self_collision
+            ):
+                continue
             distance = _segment_distance(first.start, first.end, second.start, second.end)
             threshold = first.spec.radius + second.spec.radius + self.config.clearance
             if distance <= threshold:
@@ -1072,9 +1093,18 @@ class PointCloudCollisionChecker:
             return frame_problem
         assert capsules is not None
         base_t_tip = self.chain.forward(values)
-        if self._self_collision_checker is None:
-            self_problem = self._check_self_collision(capsules)
-        else:
+        # With no mesh backend, the capsule model owns all configured pairs.
+        # With a mesh backend, keep only explicitly supplemental platform
+        # fixtures here; the mesh checker continues to own the existing arm
+        # pairs.  This preserves the validated deployed arm model while adding
+        # Go2W head/Mid-360 obstacles that are outside the active arm chain.
+        self_problem = self._check_self_collision(
+            capsules,
+            supplemental_only=self._self_collision_checker is not None,
+        )
+        if self_problem is not None:
+            return self_problem
+        if self._self_collision_checker is not None:
             try:
                 self_problem = self._self_collision_checker(values.copy())
             except Exception as error:
@@ -1086,21 +1116,23 @@ class PointCloudCollisionChecker:
                 )
             if self_problem.valid:
                 self_problem = None
-        if self_problem is not None:
-            return self_problem
+            if self_problem is not None:
+                return self_problem
         attached_scene_collision = self._check_attached_target_scene(base_t_tip)
         if attached_scene_collision is not None:
             return attached_scene_collision
         for capsule in capsules:
-            scene_collision = self._check_scene_capsule(capsule)
-            if scene_collision is not None:
-                return scene_collision
-            target_collision = self._check_target_capsule(
-                capsule,
-                base_t_tip=base_t_tip,
-            )
-            if target_collision is not None:
-                return target_collision
+            if capsule.spec.check_scene:
+                scene_collision = self._check_scene_capsule(capsule)
+                if scene_collision is not None:
+                    return scene_collision
+            if capsule.spec.check_target:
+                target_collision = self._check_target_capsule(
+                    capsule,
+                    base_t_tip=base_t_tip,
+                )
+                if target_collision is not None:
+                    return target_collision
         return CollisionResult(True, "collision-free")
 
     def is_state_valid(self, joints: object) -> bool:

@@ -126,6 +126,10 @@ class WholeBodyRuntimeController:
         config = WholeBodyOptimizerConfig(
             horizon_dt_s=0.20,
             handoff_planar_m=float(desired_standoff_m),
+            # The wrist-mounted D435 must retain a usable depth image for the
+            # manipulation handoff.  This is a deployed sensor limit, not a
+            # generic optimizer tuning knob.
+            camera_min_depth_m=0.38,
             base_forward_min_mps=-0.02,
             base_forward_max_mps=0.18,
             base_yaw_max_rps=0.12,
