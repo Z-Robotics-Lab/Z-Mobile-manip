@@ -91,3 +91,60 @@ def test_servo_timing_quantifies_handoff_transitions():
     }
     assert report["handoff_settle_to_probe_s"]["p50"] == 0.3
     assert report["handoff_probe_to_stop_s"]["p50"] == 0.2
+
+
+def test_window_is_strict_and_lifecycle_does_not_invent_grasp_start(tmp_path):
+    bag = _bag(tmp_path)
+    sessions = tmp_path / "sessions"
+    perception = _write_attempt(
+        sessions, "perception", "p1",
+        "1970-01-01T00:01:41Z", "1970-01-01T00:01:42Z", "succeeded",
+    )
+    (perception / "perception").mkdir()
+    (perception / "perception" / "report.json").write_text(
+        json.dumps({"elapsed_s": 0.8}), encoding="utf-8",
+    )
+    planning = _write_attempt(
+        sessions, "planning", "q1",
+        "1970-01-01T00:01:42.1Z", "1970-01-01T00:01:43.5Z", "blocked",
+        selected_perception_session_id="p1",
+        error={"code": "OFFLINE_PLANNER_BLOCKED"},
+    )
+    planning_dir = planning / "artifacts" / "planning"
+    planning_dir.mkdir(parents=True)
+    (planning_dir / "planning_report.json").write_text(
+        json.dumps({"timings_s": {"total": 1.2}, "rejections": []}),
+        encoding="utf-8",
+    )
+    # Exact metadata end is outside the half-open bag window.
+    _write_attempt(
+        sessions, "perception", "at-end",
+        "1970-01-01T00:02:00Z", "1970-01-01T00:02:01Z", "succeeded",
+    )
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text("\n".join(json.dumps(item) for item in [
+        {"phase": "stopped", "updated_unix_ns": 100_500_000_000},
+        {"phase": "stopped", "updated_unix_ns": 120_000_000_000},
+    ]), encoding="utf-8")
+    grasp_log = tmp_path / "piper-grasp.log"
+    grasp_log.write_text(
+        "Mobile handoff joint readiness passed: sequence=7 "
+        "source_timestamp_ns=100900000000\n",
+        encoding="utf-8",
+    )
+
+    report = BENCH.build_report(
+        bag=bag, sessions_root=sessions,
+        trace_jsonl=trace, grasp_log=grasp_log,
+    )
+
+    assert report["perception"]["attempts"] == 1
+    assert report["servo"]["records"] == 1
+    lifecycle = report["handoff_lifecycle"]
+    assert lifecycle["paired_base_stops"] == 1
+    assert lifecycle["paired_joint_sources"] == 1
+    assert lifecycle["grasp_start_events"] == 0
+    assert lifecycle["grasp_start_status"] == "not_observed_in_artifacts"
+    assert lifecycle["items"][0]["base_stop_to_fresh_perception_start_s"] == 0.5
+    assert lifecycle["items"][0]["base_stop_to_joint_source_s"] == 0.4
+    assert lifecycle["items"][0]["joint_source_to_fresh_perception_start_s"] == 0.1

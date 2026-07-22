@@ -74,6 +74,65 @@ the former implementation (`max_abs_diff = 0`). Historical fresh perception
 still contains about 1.46 s of capture/wrapper overhead, so this optimization
 does not by itself establish the fresh `< 2 s` target.
 
+## Recorded handoff lifecycle (historical implementation)
+
+The benchmark now pairs depth-servo `stopped` records, interactive perception
+attempts, linked planning attempts, and the passive-joint source timestamp in
+the strict rosbag `[start, end)` window. These timings describe the
+**implementation recorded in the bag**, before the warm perception/planning
+runner changes above. They are not measurements of the current warm runners.
+
+Five handoff transactions have complete stop, fresh-perception, and planning
+timestamps:
+
+- base stop -> fresh perception start: p50 **1.846 s**, p95/max **2.221 s**;
+- fresh perception: p50 **5.905 s**, p95/max **7.176 s**;
+- perception finish -> planner start: p50 **0.010 s**, p95 **0.014 s**;
+- planning: p50 **7.177 s**, p95/max **7.603 s**;
+- base stop -> plan finish: p50 **14.671 s**, p95/max **16.525 s**.
+
+The latest overwritten handoff log contains one explicit passive-joint source
+stamp. It places the first accepted post-stop sample **1.841 s** after stop and
+only **0.025 s** before fresh perception starts. Older logs do not retain this
+evidence, so the benchmark reports one joint-source sample rather than
+extrapolating it to all five transactions. All five linked plans were blocked;
+no executor/grasp-start timestamp exists in these artifacts. Worker launch is
+therefore not counted as grasp execution.
+
+The depth-servo transition itself is small but intentional:
+
+- handoff settle -> probe: p50 **0.300 s**, p95 **0.354 s**;
+- probe -> stopped: p50 **0.150 s**, p95 **0.200 s**.
+
+The 10–14 ms perception/planner orchestration gap is negligible. The actionable
+critical path is the post-stop joint-readiness wait, fresh perception, and IK
+search. The safe latency change is to start the read-only fresh capture and
+the post-stop passive-joint watcher concurrently, then join both before any
+transform, planning, or motion gate. The joint sample must still be measured
+after the base-stop timestamp; this does not relax readiness or collision
+acceptance. A continuous passive cache should expose the accepted source stamp
+instead of adding a fixed sleep.
+
+The current warm-runner evidence gives an expected tracked perception path of
+about **1.68 s** (pending new live validation) and a verified close-range
+planner maximum of **2.43 s**. Even if the 1.84 s readiness wait is completely
+hidden behind perception, the projected fresh-perception -> plan-finish path is
+about **4.11 s**, still **1.11 s over** the 3.0 s target, before grasp-start
+overhead. Meeting 3.0 s therefore also requires planner search near 1.3 s (or
+an equivalent split of savings between capture and planning); removing UI
+checks cannot close the gap.
+
+Reproduce the bounded lifecycle report with:
+
+```bash
+python3 scripts/offline/mobile_handoff_benchmark.py \
+  --bag /home/yusenzlabpc/Z-Robotics-Lab/artifacts/go2w_real/rosbags/mobile-tuning-20260722-182620-mobile-handoff-tuning \
+  --sessions-root /home/yusenzlabpc/Z-Robotics-Lab/artifacts/go2w_real/interactive_sessions \
+  --trace-jsonl /home/yusenzlabpc/Z-Robotics-Lab/artifacts/go2w_real/latest/depth-servo.trace.jsonl \
+  --grasp-log /home/yusenzlabpc/Z-Robotics-Lab/artifacts/go2w_real/planning_sessions/piper-grasp.log \
+  --output /tmp/z-mobile-handoff-lifecycle.json
+```
+
 ## Safety and regression checks
 
 - Final IK position/orientation acceptance and collision checks were retained.

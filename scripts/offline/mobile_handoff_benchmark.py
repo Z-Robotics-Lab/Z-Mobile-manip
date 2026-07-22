@@ -124,7 +124,9 @@ def _attempts(
         if attempt is None:
             continue
         started_ns = _stamp(attempt.get("started_at"))
-        if started_ns is None or not start_ns <= started_ns <= end_ns:
+        # Rosbag windows are half-open.  An attempt beginning exactly at the
+        # metadata end stamp belongs to the next recording, not this one.
+        if started_ns is None or not start_ns <= started_ns < end_ns:
             continue
         result.append({
             **attempt,
@@ -282,8 +284,33 @@ def pair_transactions(
                 "perception_to_plan_finish_s": total,
                 "failure_code": plan.get("failure_code"),
                 "rejection_stages": plan.get("rejection_stages"),
+                "perception_started_unix_ns": start_ns,
+                "perception_finished_unix_ns": capture_end_ns,
+                "planning_started_unix_ns": plan_start_ns,
+                "planning_finished_unix_ns": end_ns,
             })
     return result
+
+
+def _record_stamp(record: dict[str, Any]) -> int | None:
+    try:
+        return int(record.get("updated_unix_ns", record.get("sample_unix_ns")))
+    except (TypeError, ValueError):
+        return None
+
+
+def window_trace_records(
+    records: Iterable[dict[str, Any]],
+    *,
+    start_ns: int,
+    end_ns: int,
+) -> list[dict[str, Any]]:
+    """Return trace records in the same strict ``[start, end)`` bag window."""
+    return [
+        record for record in records
+        if (stamp := _record_stamp(record)) is not None
+        and start_ns <= stamp < end_ns
+    ]
 
 
 def servo_timing(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -296,10 +323,7 @@ def servo_timing(records: list[dict[str, Any]]) -> dict[str, Any]:
     probe_to_stop: list[float] = []
     for item in records:
         phase = str(item.get("phase", "unknown"))
-        try:
-            stamp_ns = int(item.get("updated_unix_ns", item.get("sample_unix_ns")))
-        except (TypeError, ValueError):
-            stamp_ns = None
+        stamp_ns = _record_stamp(item)
         if phase != previous_phase:
             if previous_phase is not None:
                 transitions[f"{previous_phase}->{phase}"] += 1
@@ -332,11 +356,140 @@ def servo_timing(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def parse_joint_source_evidence(path: Path | None) -> list[int]:
+    """Read passive-joint source stamps recorded by the handoff readiness gate.
+
+    The current log is intentionally conservative evidence: it records the
+    source timestamp of the accepted passive sample, but not a separately
+    timestamped gate-completion or actuator-start event.
+    """
+    if path is None:
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    return [
+        int(match.group(1))
+        for match in re.finditer(r"source_timestamp_ns=(\d+)", text)
+    ]
+
+
+def handoff_lifecycle(
+    transactions: list[dict[str, Any]],
+    trace_records: list[dict[str, Any]],
+    *,
+    joint_source_stamps: Iterable[int] = (),
+    stop_lookback_s: float = 15.0,
+) -> dict[str, Any]:
+    """Pair stop, fresh capture and planning without inventing executor events."""
+    stops = sorted(
+        stamp for record in trace_records
+        if record.get("phase") == "stopped"
+        and (stamp := _record_stamp(record)) is not None
+    )
+    joint_sources = sorted(int(stamp) for stamp in joint_source_stamps)
+    used_stops: set[int] = set()
+    used_joint_sources: set[int] = set()
+    items: list[dict[str, Any]] = []
+    max_lookback_ns = int(stop_lookback_s * 1e9)
+
+    for transaction in sorted(
+        transactions,
+        key=lambda item: int(item.get("perception_started_unix_ns") or 0),
+    ):
+        perception_start = transaction.get("perception_started_unix_ns")
+        perception_finish = transaction.get("perception_finished_unix_ns")
+        planning_start = transaction.get("planning_started_unix_ns")
+        planning_finish = transaction.get("planning_finished_unix_ns")
+        if not isinstance(perception_start, int):
+            continue
+        eligible_stops = [
+            stamp for stamp in stops
+            if stamp not in used_stops
+            and stamp <= perception_start
+            and perception_start - stamp <= max_lookback_ns
+        ]
+        stop = eligible_stops[-1] if eligible_stops else None
+        if stop is not None:
+            used_stops.add(stop)
+
+        eligible_joints = [
+            stamp for stamp in joint_sources
+            if stamp not in used_joint_sources
+            and (stop is None or stamp >= stop)
+            and stamp <= perception_start
+        ]
+        joint_source = eligible_joints[-1] if eligible_joints else None
+        if joint_source is not None:
+            used_joint_sources.add(joint_source)
+
+        def delta(later: object, earlier: object) -> float | None:
+            if isinstance(later, int) and isinstance(earlier, int) and later >= earlier:
+                return round((later - earlier) / 1e9, 9)
+            return None
+
+        items.append({
+            "perception_session_id": transaction.get("perception_session_id"),
+            "planning_session_id": transaction.get("planning_session_id"),
+            "base_stop_unix_ns": stop,
+            "joint_source_unix_ns": joint_source,
+            "perception_started_unix_ns": perception_start,
+            "planning_finished_unix_ns": planning_finish,
+            "base_stop_to_fresh_perception_start_s": delta(perception_start, stop),
+            "base_stop_to_joint_source_s": delta(joint_source, stop),
+            "joint_source_to_fresh_perception_start_s": delta(
+                perception_start, joint_source,
+            ),
+            "fresh_perception_s": delta(perception_finish, perception_start),
+            "perception_to_planning_gap_s": delta(planning_start, perception_finish),
+            "planning_s": delta(planning_finish, planning_start),
+            "base_stop_to_plan_finish_s": delta(planning_finish, stop),
+            # Neither attempt.json nor the depth-servo trace records an
+            # executor-start stamp.  A blocked plan must never be represented
+            # as a grasp start merely because the handoff worker was launched.
+            "grasp_start_observed": False,
+        })
+
+    stage_names = (
+        "base_stop_to_fresh_perception_start_s",
+        "base_stop_to_joint_source_s",
+        "joint_source_to_fresh_perception_start_s",
+        "fresh_perception_s",
+        "perception_to_planning_gap_s",
+        "planning_s",
+        "base_stop_to_plan_finish_s",
+    )
+    stages = {}
+    for stage in stage_names:
+        values = [item.get(stage) for item in items]
+        observed = [value for value in values if isinstance(value, (int, float))]
+        stages[stage] = {
+            "samples": len(observed),
+            "min": _percentile(observed, 0.0),
+            "p50": _percentile(observed, 0.50),
+            "p95": _percentile(observed, 0.95),
+            "max": _percentile(observed, 1.0),
+        }
+    return {
+        "transactions": len(items),
+        "paired_base_stops": sum(item["base_stop_unix_ns"] is not None for item in items),
+        "paired_joint_sources": sum(
+            item["joint_source_unix_ns"] is not None for item in items
+        ),
+        "grasp_start_events": 0,
+        "grasp_start_status": "not_observed_in_artifacts",
+        "stages": stages,
+        "items": items,
+    }
+
+
 def build_report(
     *,
     bag: Path,
     sessions_root: Path,
     trace_jsonl: Path | None = None,
+    grasp_log: Path | None = None,
 ) -> dict[str, Any]:
     window = bag_window(bag)
     perception = enrich_attempts(_attempts(
@@ -399,7 +552,17 @@ def build_report(
         "attempts": {"perception": perception, "planning": planning},
     }
     if trace_jsonl is not None:
-        report["servo"] = servo_timing(_load_json_stream(trace_jsonl))
+        trace_records = window_trace_records(
+            _load_json_stream(trace_jsonl),
+            start_ns=window["start_unix_ns"],
+            end_ns=window["end_unix_ns"],
+        )
+        report["servo"] = servo_timing(trace_records)
+        report["handoff_lifecycle"] = handoff_lifecycle(
+            transactions,
+            trace_records,
+            joint_source_stamps=parse_joint_source_evidence(grasp_log),
+        )
     return report
 
 
@@ -419,6 +582,18 @@ def render_markdown(report: dict[str, Any]) -> str:
         "", "## Bottlenecks", "",
     ]
     lines.extend(f"- {item}" for item in report["bottlenecks"])
+    lifecycle = report.get("handoff_lifecycle")
+    if isinstance(lifecycle, dict):
+        stages = lifecycle["stages"]
+        lines.extend((
+            "", "## Recorded handoff lifecycle", "",
+            f"- Base stop -> fresh perception start: p50 {stages['base_stop_to_fresh_perception_start_s']['p50']} s, p95 {stages['base_stop_to_fresh_perception_start_s']['p95']} s",
+            f"- Fresh perception: p50 {stages['fresh_perception_s']['p50']} s, p95 {stages['fresh_perception_s']['p95']} s",
+            f"- Perception -> planning gap: p50 {stages['perception_to_planning_gap_s']['p50']} s, p95 {stages['perception_to_planning_gap_s']['p95']} s",
+            f"- Planning: p50 {stages['planning_s']['p50']} s, p95 {stages['planning_s']['p95']} s",
+            f"- Base stop -> plan finish: p50 {stages['base_stop_to_plan_finish_s']['p50']} s, p95 {stages['base_stop_to_plan_finish_s']['p95']} s",
+            f"- Grasp start: {lifecycle['grasp_start_status']}",
+        ))
     lines.extend(("", "## Safety evidence", "", "- Offline filesystem analysis only", "- Network/ROS/CAN/WebRTC transports opened: no", "- Motion commands sent: 0", ""))
     return "\n".join(lines)
 
@@ -428,6 +603,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bag", required=True, type=Path)
     parser.add_argument("--sessions-root", required=True, type=Path)
     parser.add_argument("--trace-jsonl", type=Path)
+    parser.add_argument("--grasp-log", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--strict-goals", action="store_true")
@@ -440,6 +616,7 @@ def main() -> int:
         bag=args.bag,
         sessions_root=args.sessions_root,
         trace_jsonl=args.trace_jsonl,
+        grasp_log=args.grasp_log,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output:
