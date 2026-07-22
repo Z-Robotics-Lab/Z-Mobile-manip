@@ -23,6 +23,15 @@ from .time_parameterization import (
     TimeParameterizationConfig,
     retime_path,
 )
+from .staged_trajectory import (
+    GraspStage,
+    GraspTrajectorySegment,
+    GraspTrajectoryTarget,
+    SidePreference,
+    StagedGraspRequest,
+    StagedGraspTrajectory,
+    StagedGraspTrajectoryBuilder,
+)
 from .work_pose import (
     BoundedSE2WorkPoseOptimizer,
     WorkPoseCandidate,
@@ -38,6 +47,9 @@ from .work_pose import (
 __all__ = [
     "GraspPlanConfig",
     "GraspPlanGenerator",
+    "GraspStage",
+    "GraspTrajectorySegment",
+    "GraspTrajectoryTarget",
     "JointSpaceRRTConnect",
     "BoundedSE2WorkPoseOptimizer",
     "NormalizedPlacementRegion",
@@ -53,6 +65,10 @@ __all__ = [
     "ReachabilityStandoffConfig",
     "ReachabilityStandoffOptimizer",
     "StandoffChoice",
+    "SidePreference",
+    "StagedGraspRequest",
+    "StagedGraspTrajectory",
+    "StagedGraspTrajectoryBuilder",
     "SupportPlane",
     "TimedJointTrajectory",
     "TimeParameterizationConfig",
