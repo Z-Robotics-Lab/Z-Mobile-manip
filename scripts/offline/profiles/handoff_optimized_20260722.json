@@ -1,0 +1,47 @@
+{
+  "goal_s": 3.0,
+  "scenarios": [
+    {
+      "name": "optimized-p50-with-recorded-passive-readiness",
+      "evidence_class": "offline projection from recorded and optimized benchmarks",
+      "source": "2026-07-22 bag passive sample plus tracked perception estimate and persistent planner p50",
+      "timing_s": {
+        "perception_start_after_stop_s": 0.0,
+        "passive_start_after_stop_s": 0.0,
+        "fresh_perception_s": 1.68,
+        "passive_ready_s": 1.840508,
+        "planning_dispatch_s": 0.010228,
+        "planning_s": 1.266,
+        "grasp_start_dispatch_s": null
+      }
+    },
+    {
+      "name": "optimized-p50-with-continuous-passive-cache",
+      "evidence_class": "offline projection; passive-cache latency requires live measurement",
+      "source": "tracked perception estimate and persistent planner p50",
+      "timing_s": {
+        "perception_start_after_stop_s": 0.0,
+        "passive_start_after_stop_s": 0.0,
+        "fresh_perception_s": 1.68,
+        "passive_ready_s": 0.05,
+        "planning_dispatch_s": 0.010228,
+        "planning_s": 1.266,
+        "grasp_start_dispatch_s": null
+      }
+    },
+    {
+      "name": "optimized-worst-recorded-close-range-planner",
+      "evidence_class": "offline projection",
+      "source": "tracked perception estimate and persistent planner max",
+      "timing_s": {
+        "perception_start_after_stop_s": 0.0,
+        "passive_start_after_stop_s": 0.0,
+        "fresh_perception_s": 1.68,
+        "passive_ready_s": 0.05,
+        "planning_dispatch_s": 0.010228,
+        "planning_s": 1.814,
+        "grasp_start_dispatch_s": null
+      }
+    }
+  ]
+}
