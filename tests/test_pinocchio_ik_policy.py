@@ -83,3 +83,32 @@ def test_nearby_failed_pose_is_reused_before_global_seeds():
 
     assert np.array_equal(seeds[0], warm)
     assert np.array_equal(seeds[1], global_seed)
+
+
+def test_only_nearest_warm_start_precedes_global_seeds():
+    solver = _solver_policy()
+    solver._warm_starts = deque(maxlen=solver._WARM_START_CAPACITY)
+    farther = np.full(6, 0.10)
+    nearest = np.full(6, 0.03)
+    middle = np.full(6, 0.05)
+    solver._warm_starts.extend(
+        (
+            (np.array([0.10, 0.0, 0.0]), farther),
+            (np.array([0.03, 0.0, 0.0]), nearest),
+            (np.array([0.05, 0.0, 0.0]), middle),
+        ),
+    )
+    goal = np.eye(4)
+    global_seed = np.zeros(6)
+
+    seeds = solver._prepend_warm_starts(
+        goal,
+        [global_seed],
+        np.full(6, -1.0),
+        np.full(6, 1.0),
+    )
+
+    assert np.array_equal(seeds[0], nearest)
+    assert np.array_equal(seeds[1], global_seed)
+    assert not any(np.array_equal(seed, farther) for seed in seeds)
+    assert not any(np.array_equal(seed, middle) for seed in seeds)

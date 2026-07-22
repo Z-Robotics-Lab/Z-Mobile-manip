@@ -38,7 +38,7 @@ class PinocchioIKSolver:
     _LINE_SEARCH_STEPS = (1.0, 0.5, 0.25, 0.125)
     _WARM_START_CAPACITY = 16
     _WARM_START_RADIUS_M = 0.20
-    _WARM_START_COUNT = 3
+    _WARM_START_COUNT = 1
     _FAILED_WARM_START_POSITION_M = 0.08
 
     def __init__(
