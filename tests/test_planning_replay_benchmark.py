@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sys
 
+import numpy as np
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/offline/planning_replay_benchmark.py"
@@ -32,6 +34,7 @@ def _options(tmp_path, **overrides):
         "scene_clearance_m": 0.001,
         "scene_point_radius_m": 0.001,
         "gripper_scene_radius_scale": 0.6,
+        "handoff_reach_m": 0.7,
         "max_trials": None,
         "baseline": None,
         "min_success_rate": 0.5,
@@ -125,10 +128,12 @@ def test_batch_replays_only_sessions_in_bag_window_and_reports_thresholds(tmp_pa
         host_output = output / "p1" / "planning"
         (host_output / "planning_report.json").write_text(json.dumps({
             "plan_valid": True,
+            "base_from_camera": np.eye(4).tolist(),
             "rejection_count": 1,
             "rejections": [{"stage": "approach_collision"}],
             "timings_s": {"search": 1.2, "total": 1.4},
         }), encoding="utf-8")
+        np.save(sessions / "perception" / "p1" / "perception" / "target_points.npy", [[0.4, 0.0, 0.0]])
         return 0, 1.5, False
 
     report = BENCH.build_report(
@@ -142,7 +147,32 @@ def test_batch_replays_only_sessions_in_bag_window_and_reports_thresholds(tmp_pa
     assert report["summary"]["success_rate"] == 1.0
     assert report["summary"]["planner_wall_s"]["p95"] == 1.5
     assert report["summary"]["rejection_stages"] == {"approach_collision": 1}
+    assert report["summary"]["handoff"]["success_rate"] == 1.0
+    assert report["trials"][0]["target_base_range_m"] == 0.4
     assert report["thresholds"]["passed"] is True
+
+
+def test_handoff_summary_separates_far_perception_from_close_planning():
+    summary = BENCH.summarize_trials([
+        {
+            "status": "failed", "handoff_eligible": False,
+            "planner_wall_s": 6.0, "total_wall_s": 6.1,
+            "planner_timings_s": {"search": 6.0},
+            "rejection_stages": {"ik": 64},
+        },
+        {
+            "status": "succeeded", "handoff_eligible": True,
+            "planner_wall_s": 2.2, "total_wall_s": 2.3,
+            "planner_timings_s": {"search": 1.1},
+            "rejection_stages": {"ik": 4},
+        },
+    ])
+
+    assert summary["success_rate"] == 0.5
+    assert summary["handoff"]["eligible_trials"] == 1
+    assert summary["handoff"]["needs_base_approach_trials"] == 1
+    assert summary["handoff"]["success_rate"] == 1.0
+    assert summary["handoff"]["planner_wall_s"]["p95"] == 2.2
 
 
 def test_thresholds_compare_against_baseline():

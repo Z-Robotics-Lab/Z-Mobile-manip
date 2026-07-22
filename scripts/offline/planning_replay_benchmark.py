@@ -24,6 +24,8 @@ import sys
 import time
 from typing import Any, Callable, Iterable, Sequence
 
+import numpy as np
+
 
 SCHEMA = "z_mobile_manip.offline_planning_replay.v1"
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +48,7 @@ REQUIRED_PERCEPTION_FILES = (
     "target_points.npy",
 )
 Runner = Callable[[Sequence[str], float, Path], tuple[int, float, bool]]
+DEFAULT_HANDOFF_REACH_M = 0.70
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -251,6 +254,29 @@ def _stage_counts(report: dict[str, Any] | None) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def target_base_range_m(
+    artifacts: Path,
+    report: dict[str, Any] | None,
+) -> float | None:
+    """Return robust target range in the measured arm-base frame."""
+    matrix = (report or {}).get("base_from_camera")
+    try:
+        transform = np.asarray(matrix, dtype=np.float64)
+        points = np.asarray(
+            np.load(artifacts / "target_points.npy", allow_pickle=False),
+            dtype=np.float64,
+        )
+    except (OSError, ValueError, TypeError):
+        return None
+    if transform.shape != (4, 4) or points.ndim != 2 or points.shape[1] != 3:
+        return None
+    if points.shape[0] == 0 or not np.isfinite(transform).all() or not np.isfinite(points).all():
+        return None
+    base_points = points @ transform[:3, :3].T + transform[:3, 3]
+    value = float(np.linalg.norm(np.median(base_points, axis=0)))
+    return round(value, 6) if math.isfinite(value) else None
+
+
 def run_trial(
     session: dict[str, Any],
     output_root: Path,
@@ -307,6 +333,12 @@ def run_trial(
     )
     report = _load_json(planning_dir / "planning_report.json")
     plan_valid = bool(report and report.get("plan_valid") is True and planner_rc == 0)
+    target_range_m = target_base_range_m(artifacts, report)
+    handoff_eligible = (
+        target_range_m <= options.handoff_reach_m
+        if target_range_m is not None
+        else None
+    )
     return {
         **session,
         "status": "succeeded" if plan_valid else ("timeout" if planner_timeout else "failed"),
@@ -318,6 +350,8 @@ def run_trial(
         "total_wall_s": round(time.perf_counter() - total_started, 6),
         "plan_valid": plan_valid,
         "candidate_count": gate.get("candidate_count"),
+        "target_base_range_m": target_range_m,
+        "handoff_eligible": handoff_eligible,
         "rejection_count": (report or {}).get("rejection_count", 0),
         "rejection_stages": _stage_counts(report),
         "planner_timings_s": (report or {}).get("timings_s", {}),
@@ -353,7 +387,7 @@ def summarize_trials(trials: list[dict[str, Any]]) -> dict[str, Any]:
         statuses[str(item.get("status", "unknown"))] += 1
     rejection_total = sum(rejection_stages.values())
     ik_total = rejection_stages.get("ik", 0)
-    return {
+    result = {
         "trials": len(trials),
         "succeeded": success,
         "success_rate": round(success / len(trials), 6) if trials else None,
@@ -375,6 +409,30 @@ def summarize_trials(trials: list[dict[str, Any]]) -> dict[str, Any]:
             round(ik_total / rejection_total, 6) if rejection_total else 0.0
         ),
     }
+    eligible = [item for item in trials if item.get("handoff_eligible") is True]
+    far = [item for item in trials if item.get("handoff_eligible") is False]
+    close_success = sum(item.get("status") == "succeeded" for item in eligible)
+    result["handoff"] = {
+        "eligible_trials": len(eligible),
+        "needs_base_approach_trials": len(far),
+        "unknown_range_trials": len(trials) - len(eligible) - len(far),
+        "succeeded": close_success,
+        "success_rate": (
+            round(close_success / len(eligible), 6) if eligible else None
+        ),
+        "planner_wall_s": _latency(
+            float(item["planner_wall_s"])
+            for item in eligible
+            if isinstance(item.get("planner_wall_s"), (int, float))
+        ),
+        "planner_search_s": _latency(
+            float(item["planner_timings_s"]["search"])
+            for item in eligible
+            if isinstance(item.get("planner_timings_s"), dict)
+            and isinstance(item["planner_timings_s"].get("search"), (int, float))
+        ),
+    }
+    return result
 
 
 def evaluate_thresholds(
@@ -477,6 +535,7 @@ def build_report(
             "scene_clearance_m": options.scene_clearance_m,
             "scene_point_radius_m": options.scene_point_radius_m,
             "gripper_scene_radius_scale": options.gripper_scene_radius_scale,
+            "handoff_reach_m": options.handoff_reach_m,
             "config_sha256": _sha256(options.config),
             "urdf_sha256": _sha256(options.urdf),
             "planner_sha256": _sha256(PLANNER),
@@ -491,9 +550,13 @@ def build_report(
 
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
+    handoff = summary["handoff"]
     lines = [
         "# Offline planning replay", "",
         f"- Sessions: {summary['succeeded']}/{summary['trials']} succeeded ({summary['success_rate']})",
+        f"- Close-range handoff: {handoff['succeeded']}/{handoff['eligible_trials']} succeeded ({handoff['success_rate']})",
+        f"- Needs more base approach: {handoff['needs_base_approach_trials']}",
+        f"- Close-range planner wall time: p50 {handoff['planner_wall_s']['p50']} s, p95 {handoff['planner_wall_s']['p95']} s",
         f"- Planner wall time: p50 {summary['planner_wall_s']['p50']} s, p95 {summary['planner_wall_s']['p95']} s",
         f"- Planner search: p50 {summary['planner_search_s']['p50']} s, p95 {summary['planner_search_s']['p95']} s",
         f"- Rejections: {summary['rejection_stages']}",
@@ -553,6 +616,12 @@ def parse_args() -> argparse.Namespace:
         "--gripper-scene-radius-scale",
         type=_gripper_scene_radius_scale,
         default=0.60,
+    )
+    parser.add_argument(
+        "--handoff-reach-m",
+        type=_positive,
+        default=DEFAULT_HANDOFF_REACH_M,
+        help="maximum target range in piper_base_link counted as a handoff trial",
     )
     parser.add_argument("--max-trials", type=int)
     parser.add_argument("--baseline", type=Path)
