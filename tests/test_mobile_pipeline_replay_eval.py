@@ -187,3 +187,25 @@ def test_evaluation_flags_bag_arm_intents_that_executor_never_accepted():
         "PiPER executor never accepted a recorded arm intent sequence"
         in report["issues"]
     )
+
+
+def test_webrtc_base_trace_does_not_require_cmd_vel_topic():
+    trace = [{
+        "phase": "whole_body_approach",
+        "tracking": True,
+        "output": {"published_linear_x": 0.15, "published_angular_z": 0.02},
+    }]
+    topics = {topic: 1 for topic in EVAL.REQUIRED_TOPICS}
+    assert "/cmd_vel" not in topics
+    bag = {
+        "topics": topics,
+        "required_topics_missing": [],
+        "required_topics_empty": [],
+        "framing_valid": True,
+    }
+
+    report = EVAL.evaluate(api_records=[], trace_records=trace, bag=bag)
+
+    assert report["stages"]["base"]["state"] == "active"
+    assert report["stages"]["base"]["active_command_samples"] == 1
+    assert "rosbag is missing required topics" not in report["issues"]

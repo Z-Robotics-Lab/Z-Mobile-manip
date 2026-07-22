@@ -23,7 +23,6 @@ REQUIRED_TOPICS = (
     "/z_manip/grounding/request",
     "/track_3d/is_tracking",
     "/track_3d/selected_target_pointcloud",
-    "/cmd_vel",
     "/z_manip/reactive/posture_intent",
     "/go2w/posture_state",
     "/z_manip/reactive/arm_view_intent",
@@ -386,19 +385,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strict", action="store_true", help="fail when the report has integrity issues")
     args = parser.parse_args()
     if args.artifacts_root:
-        args.api_jsonl = args.api_jsonl or _newest(args.artifacts_root, "rosbags/*-api-status.jsonl")
+        if args.api_jsonl is None:
+            try:
+                args.api_jsonl = _newest(args.artifacts_root, "rosbags/*-api-status.jsonl")
+            except FileNotFoundError:
+                # Current recorders intentionally keep the command-free API
+                # snapshot optional. The depth-servo trace remains the
+                # authoritative WebRTC base-command evidence.
+                pass
         args.trace_jsonl = args.trace_jsonl or args.artifacts_root / "latest/depth-servo.trace.jsonl"
         if args.bag is None:
             newest_mcap = _newest(args.artifacts_root, "rosbags/**/*.mcap")
             args.bag = newest_mcap.parent
-    if args.api_jsonl is None or args.trace_jsonl is None:
-        parser.error("provide --artifacts-root or both --api-jsonl and --trace-jsonl")
+    if args.trace_jsonl is None:
+        parser.error("provide --artifacts-root or --trace-jsonl")
     return args
 
 
 def main() -> int:
     args = parse_args()
-    api, api_integrity = load_json_stream(args.api_jsonl)
+    if args.api_jsonl is None:
+        api = []
+        api_integrity = {
+            "path": None,
+            "bytes": 0,
+            "records": 0,
+            "decode_errors": [],
+            "timestamped_records": 0,
+            "monotonic_violations": 0,
+            "first_unix_ns": None,
+            "last_unix_ns": None,
+            "duration_s": 0.0,
+            "max_gap_s": 0.0,
+            "optional_absent": True,
+        }
+    else:
+        api, api_integrity = load_json_stream(args.api_jsonl)
     trace, trace_integrity = load_json_stream(args.trace_jsonl)
     bag = inspect_rosbag(args.bag) if args.bag else None
     report = evaluate(api_records=api, trace_records=trace, bag=bag)

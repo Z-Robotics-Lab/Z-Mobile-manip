@@ -115,6 +115,21 @@ python3 scripts/offline/mobile_pipeline_replay_eval.py \
   --output /tmp/mobile-pipeline-eval.json
 ```
 
+For handoff latency, scope interactive attempts to one rosbag's exact time
+window and report wrapper overhead plus perception/planning rejection stages:
+
+```bash
+python3 scripts/offline/mobile_handoff_benchmark.py \
+  --bag /path/to/rosbag_directory \
+  --sessions-root /path/to/interactive_sessions \
+  --trace-jsonl /path/to/depth-servo.trace.jsonl \
+  --output /tmp/mobile-handoff.json \
+  --markdown /tmp/mobile-handoff.md
+```
+
+The benchmark is filesystem-only and cannot open ROS, WebRTC, CAN, or PiPER
+transports.
+
 报告分别量化 detect、track、base、posture、arm intent/ACK 和 handoff，并检查 JSON
 完整性、时间戳单调性、必要 topic 以及 MCAP 首尾 framing。需要把缺失 ACK、损坏记录或
 姿态命令故障作为 CI 失败时追加 `--strict`。
