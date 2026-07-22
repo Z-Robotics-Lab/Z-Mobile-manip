@@ -7,7 +7,12 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import shutil
+import socket
 import sys
+import threading
+import time
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -57,8 +62,71 @@ def _write_perception_success(output: Path, target: str) -> None:
         "edgetam_mask.png",
         "edgetam_overlay.png",
         "grasp_candidates_overlay.png",
+        "grasp_candidates.npz",
+        "scene_collision_points.npy",
+        "target_points.npy",
     ):
         (output / name).write_bytes(b"fixed")
+
+
+def test_fixed_worker_request_uses_private_bounded_unix_socket(tmp_path):
+    module = _integration_module()
+    socket_path = tmp_path / "worker.sock"
+    log_path = tmp_path / "worker.log"
+    ready = threading.Event()
+    received = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(socket_path))
+            os.chmod(socket_path, 0o600)
+            server.listen(1)
+            ready.set()
+            connection, _ = server.accept()
+            with connection:
+                payload = bytearray()
+                while True:
+                    block = connection.recv(4096)
+                    if not block:
+                        break
+                    payload.extend(block)
+                received.append(json.loads(bytes(payload)))
+                connection.sendall(json.dumps({
+                    "return_code": 0,
+                    "elapsed_s": 0.125,
+                    "output": "fixed worker output\n",
+                }).encode("utf-8"))
+
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+    assert ready.wait(timeout=1.0)
+
+    result = module._run_fixed_worker_request(
+        socket_path,
+        {"argv": ["--output", "/fixed"]},
+        log_path,
+    )
+    server_thread.join(timeout=1.0)
+
+    assert result.returncode == 0
+    assert result.worker_elapsed_s == pytest.approx(0.125)
+    assert received == [{"argv": ["--output", "/fixed"]}]
+    assert log_path.read_text(encoding="utf-8") == "fixed worker output\n"
+
+
+def test_fixed_worker_request_rejects_public_socket(tmp_path):
+    module = _integration_module()
+    socket_path = tmp_path / "worker.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(socket_path))
+        os.chmod(socket_path, 0o666)
+        assert module._fixed_worker_socket_available(socket_path) is False
+        with pytest.raises(OSError, match="unavailable or unsafe"):
+            module._run_fixed_worker_request(
+                socket_path,
+                {"argv": []},
+                tmp_path / "worker.log",
+            )
 
 
 class FakeBackend:
@@ -487,7 +555,10 @@ def test_perception_passes_immutable_output_and_captures_synchronized_joints(
 
     class FakeProcess:
         def __init__(self):
-            self.polls = iter((None, 0))
+            # Keep the perception worker alive for several supervisor polls.
+            # Once the exact selected report exists, the backend must wait for
+            # completion without repeatedly opening SSH capture windows.
+            self.polls = iter((None, None, None, None, 0))
 
         def poll(self):
             return next(self.polls, 0)
@@ -505,6 +576,7 @@ def test_perception_passes_immutable_output_and_captures_synchronized_joints(
     )
 
     def fake_capture(output_dir, _log_path, _environment):
+        captured["passive_calls"] = captured.get("passive_calls", 0) + 1
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
         (output_dir / "selected_passive_joint_report.json").write_text(payload)
@@ -565,6 +637,7 @@ def test_perception_passes_immutable_output_and_captures_synchronized_joints(
         if event.get("stage") == "perception_total"
     )
     assert attempt_timing["passive_capture_count"] == 1
+    assert captured["passive_calls"] == 1
     assert attempt_timing["process_launch_s"] >= 0.0
     assert total_timing["target_identity_valid"] is True
     assert total_timing["internal_elapsed_s"] == 0.25
@@ -651,6 +724,95 @@ def test_perception_uses_warm_runner_for_workspace_artifacts(tmp_path, monkeypat
     assert argv[argv.index("--output") + 1] == (
         "/workspace-artifacts/go2w_real/interactive_sessions/sample"
     )
+
+
+def test_perception_calls_resident_worker_socket_without_client_process(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    key = tmp_path / "server-key"
+    key.write_text("test", encoding="utf-8")
+    # Keep the AF_UNIX path below Linux's 108-byte sockaddr_un limit even
+    # when pytest's temporary directory name is long.
+    artifact_root = Path(tempfile.mkdtemp(prefix="zmi-", dir="/tmp"))
+    output = artifact_root / "go2w_real" / "interactive_sessions" / "sample"
+    output.mkdir(parents=True)
+    log = tmp_path / "perception.log"
+    socket_path = artifact_root / "go2w_real" / ".perception_runner.sock"
+    ready = threading.Event()
+    received = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(socket_path))
+            os.chmod(socket_path, 0o600)
+            server.listen(1)
+            ready.set()
+            connection, _ = server.accept()
+            with connection:
+                payload = bytearray()
+                while True:
+                    block = connection.recv(4096)
+                    if not block:
+                        break
+                    payload.extend(block)
+                received.append(json.loads(bytes(payload)))
+                deadline = time.monotonic() + 1.0
+                selected = output / "selected_passive_joint_report.json"
+                while not selected.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                _write_perception_success(output, "white adapter")
+                connection.sendall(json.dumps({
+                    "return_code": 0,
+                    "elapsed_s": 0.01,
+                    "output": "fixed resident request\n",
+                }).encode("utf-8"))
+
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+    assert ready.wait(timeout=1.0)
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+
+    def fake_capture(output_dir, _log_path, _environment):
+        payload = json.dumps(_passive_report())
+        (output_dir / "live_passive_joint_report.json").write_text(payload)
+        (output_dir / "selected_passive_joint_report.json").write_text(payload)
+        return module.BackendResult(0)
+
+    monkeypatch.setattr(module, "NUC_KEY", key)
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(backend, "_capture_passive_window", fake_capture)
+    monkeypatch.setattr(
+        backend,
+        "_perception_runner_running",
+        lambda: pytest.fail("docker inspect must not run when socket is ready"),
+    )
+
+    result = backend.run_perception(
+        target="white adapter",
+        output_dir=output,
+        log_path=log,
+    )
+    server_thread.join(timeout=1.0)
+
+    assert result.exit_code == 0
+    assert received[0]["argv"][0:2] == ["--instruction", "white adapter"]
+    assert received[0]["argv"][3] == (
+        "/workspace-artifacts/go2w_real/interactive_sessions/sample"
+    )
+    timing = [
+        json.loads(line)
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("{")
+    ]
+    attempt = next(item for item in timing if item["stage"] == "perception_attempt")
+    assert attempt["runner_transport"] == "unix_socket"
+    assert attempt["passive_capture_count"] == 1
+    shutil.rmtree(artifact_root)
 
 
 def test_perception_retries_one_geometric_mask_failure(tmp_path, monkeypatch):
@@ -1098,6 +1260,111 @@ def test_planning_warm_runner_uses_read_only_inputs_and_atomic_scratch(
     )
     assert (output / "planning" / "planning_report.json").is_file()
     assert list(scratch_root.iterdir()) == []
+
+
+def test_planning_calls_private_runner_socket_and_promotes_atomic_output(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    artifact_root = Path(tempfile.mkdtemp(prefix="zmp-", dir="/tmp"))
+    perception = artifact_root / "sessions" / "capture" / "perception"
+    perception.mkdir(parents=True)
+    (perception / "selected_passive_joint_report.json").write_text(
+        json.dumps(_passive_report()),
+        encoding="utf-8",
+    )
+    output = artifact_root / "sessions" / "planning-attempt"
+    output.mkdir(parents=True)
+    calibration = artifact_root / "calibration.json"
+    calibration.write_text("{}", encoding="utf-8")
+    scratch_root = artifact_root / ".planning-runner-scratch"
+    scratch_root.mkdir()
+    socket_path = scratch_root / ".planner.sock"
+    log = tmp_path / "planning.log"
+    ready = threading.Event()
+    received = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(socket_path))
+            os.chmod(socket_path, 0o600)
+            server.listen(1)
+            ready.set()
+            connection, _ = server.accept()
+            with connection:
+                payload = bytearray()
+                while True:
+                    block = connection.recv(4096)
+                    if not block:
+                        break
+                    payload.extend(block)
+                request = json.loads(bytes(payload))
+                received.append(request)
+                argv = request["argv"]
+                container_output = Path(argv[argv.index("--output") + 1])
+                host_output = scratch_root / container_output.name
+                (host_output / "planning_report.json").write_text(
+                    '{"success": true}',
+                    encoding="utf-8",
+                )
+                connection.sendall(json.dumps({
+                    "return_code": 0,
+                    "elapsed_s": 0.02,
+                    "output": "fixed planning request\n",
+                }).encode("utf-8"))
+
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+    assert ready.wait(timeout=1.0)
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(module, "CALIBRATION", calibration)
+    monkeypatch.setattr(module, "PLANNING_RUNNER_SCRATCH_ROOT", scratch_root)
+    monkeypatch.setattr(backend, "_required_planning_files", lambda: ())
+    monkeypatch.setattr(
+        backend,
+        "_planning_runner_running",
+        lambda: pytest.fail("docker inspect must not run when socket is ready"),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_build_visualization_bundle",
+        lambda **_kwargs: module.BackendResult(0),
+    )
+
+    def fake_run(argv, _log_path, *, environment):
+        destination = Path(argv[argv.index("--output") + 1])
+        destination.write_text(json.dumps({
+            "planning_ready": True,
+            "measured_joints_rad": [0.0] * 6,
+            "planning_start_joints_rad": [0.0] * 6,
+        }))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "_run_logged", fake_run)
+    result = backend.run_planning(
+        perception_dir=perception,
+        output_dir=output,
+        log_path=log,
+    )
+    server_thread.join(timeout=1.0)
+
+    assert result.exit_code == 0
+    assert received[0]["ik_backend"] == "pinocchio"
+    assert (output / "planning" / "planning_report.json").is_file()
+    timing = [
+        json.loads(line)
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("{")
+    ]
+    search = next(item for item in timing if item["stage"] == "planning_search")
+    assert search["runner_transport"] == "unix_socket"
+    assert search["worker_elapsed_s"] == pytest.approx(0.02)
+    shutil.rmtree(artifact_root)
 
 
 def test_planning_warm_runner_exit_without_report_fails_closed(

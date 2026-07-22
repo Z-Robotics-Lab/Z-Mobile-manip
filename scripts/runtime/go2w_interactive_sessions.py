@@ -21,10 +21,12 @@ import pwd
 from pathlib import Path
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Mapping, Sequence
 
@@ -90,6 +92,8 @@ MAX_PLANNER_ERROR_CHARS = 600
 MAX_PERCEPTION_REPORT_BYTES = 256 * 1024
 MAX_PERCEPTION_ERROR_CHARS = 600
 MAX_REJECTIONS_TO_SUMMARIZE = 4096
+MAX_WORKER_REQUEST_BYTES = 64 * 1024
+MAX_WORKER_RESPONSE_BYTES = 8 * 1024 * 1024
 SEARCH_TIMEOUT_S = "6"
 SYMMETRY_SAMPLES = "4"
 MAX_HYPOTHESES = "64"
@@ -98,6 +102,85 @@ SUPPORT_APPROACH_PRIOR_WEIGHT = "0.05"
 SUPERVISED_SCENE_CLEARANCE_M = "0.001"
 SUPERVISED_SCENE_POINT_RADIUS_M = "0.001"
 SUPERVISED_GRIPPER_SCENE_RADIUS_SCALE = "0.60"
+
+
+@dataclass(frozen=True)
+class _WorkerResult:
+    """Bounded result returned by a fixed local resident worker."""
+
+    returncode: int
+    worker_elapsed_s: float | None = None
+
+
+def _fixed_worker_socket_available(socket_path: Path) -> bool:
+    """Accept only the server-owned, private Unix socket at a fixed path."""
+
+    try:
+        metadata = socket_path.lstat()
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISSOCK(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and metadata.st_gid == os.getegid()
+        and metadata.st_mode & 0o077 == 0
+    )
+
+
+def _run_fixed_worker_request(
+    socket_path: Path,
+    request: Mapping[str, object],
+    log_path: Path,
+) -> _WorkerResult:
+    """Call one private local worker without spawning a Python client.
+
+    This is deliberately Unix-socket-only.  The worker still owns argument
+    validation, path confinement, read-only/planning-only policy, and output
+    generation; this helper merely removes ``docker exec`` and client import
+    overhead from the request transport.
+    """
+
+    if not _fixed_worker_socket_available(socket_path):
+        raise OSError("fixed resident worker socket is unavailable or unsafe")
+    encoded_request = json.dumps(request, separators=(",", ":")).encode("utf-8")
+    if len(encoded_request) > MAX_WORKER_REQUEST_BYTES:
+        raise ValueError("resident worker request exceeds bounded size")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(str(socket_path))
+        client.sendall(encoded_request)
+        client.shutdown(socket.SHUT_WR)
+        response = bytearray()
+        while len(response) <= MAX_WORKER_RESPONSE_BYTES:
+            block = client.recv(64 * 1024)
+            if not block:
+                break
+            response.extend(block)
+    if len(response) > MAX_WORKER_RESPONSE_BYTES:
+        raise RuntimeError("resident worker response exceeds bounded size")
+    try:
+        document: Any = json.loads(bytes(response))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("resident worker returned malformed JSON") from error
+    if not isinstance(document, dict):
+        raise RuntimeError("resident worker response is not an object")
+    return_code = document.get("return_code")
+    output = document.get("output", "")
+    worker_elapsed = document.get("elapsed_s")
+    if not isinstance(return_code, int) or not isinstance(output, str):
+        raise RuntimeError("resident worker response violates its schema")
+    with log_path.open("ab") as log:
+        log.write(output.encode("utf-8", errors="replace"))
+    return _WorkerResult(
+        returncode=return_code,
+        worker_elapsed_s=(
+            float(worker_elapsed)
+            if isinstance(worker_elapsed, (int, float))
+            and math.isfinite(float(worker_elapsed))
+            and float(worker_elapsed) >= 0.0
+            else None
+        ),
+    )
 
 
 def _append_timing(log_path: Path, stage: str, elapsed_s: float, **fields: object) -> None:
@@ -699,14 +782,18 @@ class FixedReadOnlyBackend:
             output_dir / "report.json",
             output_dir / "edgetam_mask.png",
             output_dir / "edgetam_overlay.png",
+            output_dir / "grasp_candidates.npz",
             output_dir / "grasp_candidates_overlay.png",
+            output_dir / "scene_collision_points.npy",
             output_dir / "selected_passive_joint_report.json",
+            output_dir / "target_points.npy",
         )
+        selected_passive = output_dir / "selected_passive_joint_report.json"
         report = FixedReadOnlyBackend._perception_report(output_dir)
         return bool(
             all(path.is_file() and not path.is_symlink() for path in required)
-            and required[-1].stat().st_size <= MAX_PASSIVE_REPORT_BYTES
-            and FixedReadOnlyBackend._passive_report_valid(required[-1])
+            and selected_passive.stat().st_size <= MAX_PASSIVE_REPORT_BYTES
+            and FixedReadOnlyBackend._passive_report_valid(selected_passive)
             and report is not None
             and report.get("read_only") is True
             and report.get("instruction") == target
@@ -896,13 +983,18 @@ class FixedReadOnlyBackend:
         })
         log_path.parent.mkdir(parents=True, exist_ok=True)
         runner_output: Path | None = None
+        runner_socket: Path | None = None
         runner_probe_started = time.monotonic()
         try:
             relative_output = output_dir.resolve().relative_to(
                 ARTIFACT_ROOT.resolve(),
             )
             candidate = PERCEPTION_RUNNER_ARTIFACT_ROOT / relative_output
-            if self._perception_runner_running():
+            fixed_socket = ARTIFACT_ROOT / "go2w_real" / ".perception_runner.sock"
+            if _fixed_worker_socket_available(fixed_socket):
+                runner_output = candidate
+                runner_socket = fixed_socket
+            elif self._perception_runner_running():
                 runner_output = candidate
         except ValueError:
             # Tests and explicitly isolated callers may use a temporary output
@@ -910,7 +1002,7 @@ class FixedReadOnlyBackend:
             # one-shot container as a safe compatibility fallback.
             pass
         runner_probe_s = time.monotonic() - runner_probe_started
-        if runner_output is not None:
+        if runner_output is not None and runner_socket is None:
             command_prefix = (
                 "/usr/bin/docker",
                 "exec",
@@ -920,7 +1012,7 @@ class FixedReadOnlyBackend:
                 "--",
             )
             artifact_output = str(runner_output)
-        else:
+        elif runner_output is None:
             command_prefix = (
                 "/usr/bin/docker",
                 "run",
@@ -955,10 +1047,13 @@ class FixedReadOnlyBackend:
                 self.runtime.runtime_image,
             )
             artifact_output = "/artifacts"
+        else:
+            command_prefix = ()
+            artifact_output = str(runner_output)
         dry_run_program = () if runner_output is not None else (
             "z-manip-go2w-perception-dry-run",
         )
-        command = command_prefix + dry_run_program + (
+        perception_args = (
             "--instruction",
             target,
             "--output",
@@ -983,6 +1078,7 @@ class FixedReadOnlyBackend:
             "--tracking-reuse-max-age",
             "0.5",
         )
+        command = command_prefix + dry_run_program + perception_args
         return_code = 1
         passive_capture_s_total = 0.0
         passive_capture_count_total = 0
@@ -1003,22 +1099,67 @@ class FixedReadOnlyBackend:
                     log.write(
                         b"Retrying perception after an invalid geometric mask.\n",
                     )
-            with log_path.open("ab") as log:
-                attempt_started = time.monotonic()
-                process_launch_started = time.monotonic()
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    env=environment,
-                    shell=False,
+            attempt_started = time.monotonic()
+            process_launch_started = time.monotonic()
+            process: subprocess.Popen[bytes] | None = None
+            worker_result: list[_WorkerResult] = []
+            worker_error: list[Exception] = []
+            worker_thread: threading.Thread | None = None
+            worker_elapsed_s: float | None = None
+            if runner_socket is not None:
+                def request_worker() -> None:
+                    try:
+                        worker_result.append(_run_fixed_worker_request(
+                            runner_socket,
+                            {"argv": list(perception_args)},
+                            log_path,
+                        ))
+                    except Exception as error:  # surfaced on this request
+                        worker_error.append(error)
+
+                worker_thread = threading.Thread(
+                    target=request_worker,
+                    name="z-manip-perception-request",
+                    daemon=True,
                 )
-                process_launch_s = time.monotonic() - process_launch_started
+                worker_thread.start()
+            else:
+                with log_path.open("ab") as log:
+                    process = subprocess.Popen(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        env=environment,
+                        shell=False,
+                    )
+            process_launch_s = time.monotonic() - process_launch_started
             passive_capture_s = 0.0
             passive_capture_count = 0
             try:
-                while process.poll() is None:
+                while (
+                    worker_thread.is_alive()
+                    if worker_thread is not None
+                    else process is not None and process.poll() is None
+                ):
+                    selected_passive = (
+                        output_dir / "selected_passive_joint_report.json"
+                    )
+                    if (
+                        selected_passive.is_file()
+                        and not selected_passive.is_symlink()
+                        and selected_passive.stat().st_size
+                        <= MAX_PASSIVE_REPORT_BYTES
+                        and self._passive_report_valid(selected_passive)
+                    ):
+                        # The dry-run atomically selected this exact zero-TX
+                        # evidence. Repeating SSH capture after selection adds
+                        # latency but cannot strengthen this immutable request.
+                        if worker_thread is not None:
+                            worker_thread.join(timeout=0.01)
+                        else:
+                            time.sleep(0.01)
+                        continue
                     passive_capture_started = time.monotonic()
                     passive = self._capture_passive_window(
                         output_dir,
@@ -1032,9 +1173,29 @@ class FixedReadOnlyBackend:
                     passive_capture_count_total += 1
                     if passive.exit_code != 0:
                         return passive
-                return_code = process.wait()
+                if worker_thread is not None:
+                    worker_thread.join()
+                    if worker_error or not worker_result:
+                        detail = (
+                            str(worker_error[0])
+                            if worker_error
+                            else "resident worker returned no result"
+                        )
+                        with log_path.open("ab") as log:
+                            log.write(
+                                f"resident perception transport failed: {detail}\n".encode(
+                                    "utf-8", errors="replace",
+                                ),
+                            )
+                        return_code = 70
+                    else:
+                        return_code = worker_result[0].returncode
+                        worker_elapsed_s = worker_result[0].worker_elapsed_s
+                elif process is not None:
+                    return_code = process.wait()
             finally:
-                self._stop_process(process)
+                if process is not None:
+                    self._stop_process(process)
             _append_timing(
                 log_path,
                 "perception_attempt",
@@ -1042,6 +1203,10 @@ class FixedReadOnlyBackend:
                 attempt=attempt + 1,
                 return_code=return_code,
                 runner_warm=runner_output is not None,
+                runner_transport=(
+                    "unix_socket" if runner_socket is not None else "subprocess"
+                ),
+                worker_elapsed_s=worker_elapsed_s,
                 process_launch_s=round(process_launch_s, 6),
                 passive_capture_s=round(passive_capture_s, 6),
                 passive_capture_count=passive_capture_count,
@@ -1326,14 +1491,19 @@ class FixedReadOnlyBackend:
         runner_perception: Path | None = None
         runner_planning: Path | None = None
         runner_scratch: Path | None = None
+        runner_socket: Path | None = None
         try:
             relative_perception = perception_dir.resolve().relative_to(
                 ARTIFACT_ROOT.resolve(),
             )
-            if self._planning_runner_running():
+            fixed_socket = PLANNING_RUNNER_SCRATCH_ROOT / ".planner.sock"
+            runner_available = _fixed_worker_socket_available(fixed_socket)
+            if runner_available or self._planning_runner_running():
                 runner_perception = (
                     PLANNING_RUNNER_ARTIFACT_ROOT / relative_perception
                 )
+                if runner_available:
+                    runner_socket = fixed_socket
                 # The warm runner sees all immutable perception/calibration
                 # evidence read-only.  It can write only a fresh, server-owned
                 # scratch directory; the host atomically promotes that output
@@ -1397,7 +1567,7 @@ class FixedReadOnlyBackend:
             "--output",
             str(runner_planning or Path("/session/planning")),
         )
-        if runner_perception is not None:
+        if runner_perception is not None and runner_socket is None:
             planner_command = (
                 "/usr/bin/docker",
                 "exec",
@@ -1409,7 +1579,7 @@ class FixedReadOnlyBackend:
                 "--",
                 *planner_args[1:],
             )
-        else:
+        elif runner_perception is None:
             planner_command = (
                 "/usr/bin/docker",
                 "run",
@@ -1441,14 +1611,32 @@ class FixedReadOnlyBackend:
                 self.runtime.runtime_image,
                 *planner_args,
             )
+        else:
+            planner_command = ()
         planner_started = time.monotonic()
         try:
-            planner = _run_logged(
-                planner_command,
-                log_path,
-                environment=_server_environment(),
-            )
-        except OSError:
+            if runner_socket is not None:
+                planner = _run_fixed_worker_request(
+                    runner_socket,
+                    {
+                        "argv": list(planner_args[1:]),
+                        "ik_backend": self.runtime.ik_backend,
+                    },
+                    log_path,
+                )
+            else:
+                planner = _run_logged(
+                    planner_command,
+                    log_path,
+                    environment=_server_environment(),
+                )
+        except (OSError, RuntimeError, ValueError) as error:
+            with log_path.open("ab") as log:
+                log.write(
+                    f"resident planning transport failed: {error}\n".encode(
+                        "utf-8", errors="replace",
+                    ),
+                )
             _append_timing(
                 log_path,
                 "planning_search",
@@ -1468,6 +1656,14 @@ class FixedReadOnlyBackend:
             "planning_search",
             time.monotonic() - planner_started,
             return_code=planner.returncode,
+            runner_transport=(
+                "unix_socket" if runner_socket is not None else "subprocess"
+            ),
+            worker_elapsed_s=(
+                planner.worker_elapsed_s
+                if isinstance(planner, _WorkerResult)
+                else None
+            ),
         )
         if runner_scratch is not None:
             runner_report = runner_scratch / "planning_report.json"
