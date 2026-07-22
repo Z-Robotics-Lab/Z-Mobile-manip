@@ -180,6 +180,7 @@ class ReactiveServoConfig:
     desired_planar_standoff_m: float = 0.52
     posture_entry_planar_m: float = 0.85
     handoff_planar_max_m: float = 0.62
+    handoff_lateral_tolerance_m: float = 0.07
     handoff_arm_min_range_m: float = 0.20
     handoff_arm_max_range_m: float = 0.80
     handoff_arm_min_height_m: float = -0.40
@@ -215,6 +216,7 @@ class ReactiveServoConfig:
             self.desired_planar_standoff_m,
             self.posture_entry_planar_m,
             self.handoff_planar_max_m,
+            self.handoff_lateral_tolerance_m,
             self.handoff_arm_min_range_m,
             self.handoff_arm_max_range_m,
             self.camera_handoff_depth_m,
@@ -309,10 +311,17 @@ class ReactiveTargetController:
             ),
         )
 
-    def _handoff_geometry_ok(self, geometry: TargetGeometry) -> bool:
+    def _handoff_geometry_ok(
+        self,
+        geometry: TargetGeometry,
+        *,
+        desired_target_lateral_m: float,
+    ) -> bool:
         arm_z = geometry.arm_xyz_m[2]
         return (
             geometry.base_planar_distance_m <= self.config.handoff_planar_max_m
+            and abs(geometry.base_xyz_m[1] - desired_target_lateral_m)
+            <= self.config.handoff_lateral_tolerance_m
             and self.config.handoff_arm_min_range_m
             <= geometry.arm_range_m
             <= self.config.handoff_arm_max_range_m
@@ -364,10 +373,14 @@ class ReactiveTargetController:
         tracking: bool,
         body_settled: bool,
         ik_feasible: bool | None = None,
+        desired_target_lateral_m: float = 0.0,
     ) -> ReactiveServoDecision:
         now = float(now_s)
         if not math.isfinite(now):
             raise ValueError("reactive-servo timestamp must be finite")
+        desired_lateral = float(desired_target_lateral_m)
+        if not math.isfinite(desired_lateral):
+            raise ValueError("desired target lateral offset must be finite")
         if not tracking or geometry is None:
             self._reacquire_since_s = None
             return self._lost(now_s=now)
@@ -376,10 +389,15 @@ class ReactiveTargetController:
         self._last_seen_s = now
         arm_view = self._arm_view(geometry)
         camera_depth_m = geometry.camera_xyz_m[2]
+        lateral_error_m = geometry.base_xyz_m[1] - desired_lateral
+        lateral_aligned = (
+            abs(lateral_error_m) <= self.config.handoff_lateral_tolerance_m
+        )
         near_field_handoff = (
             camera_depth_m <= self.config.camera_handoff_depth_m
             and geometry.base_planar_distance_m
             <= self.config.handoff_planar_max_m + 0.05
+            and lateral_aligned
         )
         hard_near_field = camera_depth_m <= self.config.camera_hard_min_depth_m
 
@@ -392,7 +410,10 @@ class ReactiveTargetController:
             self._posture_requested = False
             self._reacquire_since_s = None
             hold_view = ArmViewIntent(mode=ArmViewMode.HOLD)
-            corridor_ok = self._handoff_geometry_ok(geometry)
+            corridor_ok = self._handoff_geometry_ok(
+                geometry,
+                desired_target_lateral_m=desired_lateral,
+            )
             if corridor_ok and ik_feasible is True:
                 self.phase = ReactivePhase.HANDOFF_READY
                 return ReactiveServoDecision(
@@ -470,7 +491,10 @@ class ReactiveTargetController:
                 reason="target height/elevation risks leaving the wrist-camera view",
             )
 
-        if self._handoff_geometry_ok(geometry):
+        if self._handoff_geometry_ok(
+            geometry,
+            desired_target_lateral_m=desired_lateral,
+        ):
             if ik_feasible is True:
                 self.phase = ReactivePhase.HANDOFF_READY
                 return ReactiveServoDecision(
@@ -498,15 +522,22 @@ class ReactiveTargetController:
             )
 
         self.phase = ReactivePhase.BASE_APPROACH
-        distance_error = max(
-            0.0,
-            geometry.base_planar_distance_m - self.config.desired_planar_standoff_m,
-        )
+        desired_forward_m = math.sqrt(max(
+            self.config.desired_planar_standoff_m**2 - desired_lateral**2,
+            0.05**2,
+        ))
+        distance_error = max(0.0, geometry.base_xyz_m[0] - desired_forward_m)
         linear = min(
             self.config.linear_gain * distance_error,
             self.config.max_forward_mps,
         )
-        bearing = geometry.base_bearing_rad
+        # Steer toward a side work pose, not the platform centreline.  The
+        # lateral error is expressed in the base frame; a non-holonomic base
+        # removes it by following this shifted line of sight while advancing.
+        bearing = math.atan2(
+            lateral_error_m,
+            max(geometry.base_xyz_m[0], 0.05),
+        )
         angular = _clamp(
             self.config.yaw_gain * bearing,
             -self.config.max_yaw_rps,
@@ -525,7 +556,10 @@ class ReactiveTargetController:
             geometry=geometry,
             reason=(
                 "inside the coarse arm corridor; waiting for an IK-feasible grasp"
-                if self._handoff_geometry_ok(geometry)
+                if self._handoff_geometry_ok(
+                    geometry,
+                    desired_target_lateral_m=desired_lateral,
+                )
                 else "approaching with ground-plane Euclidean distance"
             ),
         )

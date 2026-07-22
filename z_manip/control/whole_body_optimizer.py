@@ -72,6 +72,7 @@ class WholeBodyTask:
     desired_image_u: float = 0.0
     desired_image_v: float = 0.0
     desired_target_height_in_body_m: float = -0.10
+    desired_target_lateral_in_body_m: float = 0.0
     tool_target_offset_world_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
@@ -82,6 +83,7 @@ class WholeBodyTask:
             self.desired_image_u,
             self.desired_image_v,
             self.desired_target_height_in_body_m,
+            self.desired_target_lateral_in_body_m,
         )
         if not all(math.isfinite(value) for value in finite):
             raise ValueError("whole-body task values must be finite")
@@ -101,6 +103,7 @@ class WholeBodyOptimizerConfig:
     # residual can incorrectly pull the rolling base inside the 0.5 m zone.
     planar_weight: float = 100.0
     target_height_weight: float = 5.0
+    target_lateral_weight: float = 40.0
     tool_position_weight: float = 12.0
     control_weight: float = 0.30
     smooth_weight: float = 1.50
@@ -124,6 +127,7 @@ class WholeBodyOptimizerConfig:
             self.image_weight,
             self.planar_weight,
             self.target_height_weight,
+            self.target_lateral_weight,
             self.tool_position_weight,
             self.control_weight,
             self.smooth_weight,
@@ -310,6 +314,7 @@ class WholeBodyShadowOptimizer:
         "image_u",
         "image_v",
         "ground_standoff_m",
+        "target_lateral_in_body_m",
         "target_height_in_body_m",
         "tool_x_m",
         "tool_y_m",
@@ -383,6 +388,7 @@ class WholeBodyShadowOptimizer:
                 camera_target[0] / depth - task.desired_image_u,
                 camera_target[1] / depth - task.desired_image_v,
                 planar - task.desired_planar_standoff_m,
+                target_body[1] - task.desired_target_lateral_in_body_m,
                 target_body[2] - task.desired_target_height_in_body_m,
                 *(tool_position - desired_tool),
             ),
@@ -399,6 +405,7 @@ class WholeBodyShadowOptimizer:
                 self.config.image_weight * (0.55 + 0.45 * near),
                 self.config.image_weight * (0.55 + 0.45 * near),
                 self.config.planar_weight,
+                self.config.target_lateral_weight * (0.35 + 0.65 * near),
                 self.config.target_height_weight * (0.20 + 0.80 * near),
                 self.config.tool_position_weight * near,
                 self.config.tool_position_weight * near,

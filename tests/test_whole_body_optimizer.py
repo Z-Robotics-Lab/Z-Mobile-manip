@@ -196,6 +196,21 @@ def test_near_low_target_couples_body_and_arm_without_blocking_phase():
     assert result.objective_after < result.objective_before
 
 
+def test_task_carries_nonzero_body_lateral_setpoint_into_qp_residual():
+    optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
+    problem = optimizer.linearize(
+        _state(),
+        WholeBodyTask(
+            target_world_xyz_m=(0.80, 0.20, -0.05),
+            desired_target_lateral_in_body_m=0.13,
+        ),
+    )
+
+    index = problem.residual_names.index("target_lateral_in_body_m")
+    assert problem.residual[index] == pytest.approx(0.07)
+    assert np.linalg.norm(problem.jacobian[index]) > 0.0
+
+
 def test_locked_untransported_controls_remain_exactly_stationary():
     optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
     result = optimizer.solve(

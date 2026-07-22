@@ -220,6 +220,7 @@ class WholeBodyRuntimeController:
         runtime_state_path: Path,
         mode: str,
         freeze_base: bool = False,
+        desired_target_lateral_in_body_m: float = 0.0,
     ) -> WholeBodyRuntimeCommand:
         camera_target = np.asarray(camera_target_xyz_m, dtype=float)
         if camera_target.shape != (3,) or not np.isfinite(camera_target).all() or camera_target[2] <= 0.0:
@@ -244,6 +245,9 @@ class WholeBodyRuntimeController:
         task = WholeBodyTask(
             target_world_xyz_m=tuple(float(item) for item in target_world[:3]),
             desired_planar_standoff_m=self.desired_standoff_m,
+            desired_target_lateral_in_body_m=float(
+                desired_target_lateral_in_body_m
+            ),
         )
         result = self.optimizer.solve(
             state,

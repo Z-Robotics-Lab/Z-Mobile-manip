@@ -83,6 +83,41 @@ def test_base_approach_uses_ground_plane_euclidean_distance_not_camera_depth():
     assert "ground-plane" in decision.reason
 
 
+def test_side_setpoint_steers_off_centre_and_gates_handoff():
+    controller = ReactiveTargetController()
+    centred = _geometry(
+        camera_xyz=(0.0, 0.0, 0.55),
+        base_xyz=(0.55, 0.0, -0.10),
+        arm_xyz=(0.50, 0.0, 0.10),
+    )
+
+    approach = controller.update(
+        centred,
+        now_s=1.0,
+        tracking=True,
+        body_settled=True,
+        ik_feasible=True,
+        desired_target_lateral_m=0.13,
+    )
+    assert approach.phase is ReactivePhase.BASE_APPROACH
+    assert approach.base.angular_z_rps < 0.0
+
+    aligned = _geometry(
+        camera_xyz=(0.0, 0.0, 0.55),
+        base_xyz=(0.55, 0.13, -0.10),
+        arm_xyz=(0.50, 0.0, 0.10),
+    )
+    handoff = controller.update(
+        aligned,
+        now_s=1.1,
+        tracking=True,
+        body_settled=True,
+        ik_feasible=True,
+        desired_target_lateral_m=0.13,
+    )
+    assert handoff.phase is ReactivePhase.HANDOFF_READY
+
+
 def test_low_target_requests_body_and_arm_view_adjustment_before_handoff():
     controller = ReactiveTargetController()
     geometry = _geometry(

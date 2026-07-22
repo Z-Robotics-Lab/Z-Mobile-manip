@@ -61,6 +61,13 @@ class DepthServoSettings:
     # makes body sway repeatedly reset the handoff window.
     depth_tolerance_m: float = 0.01
     lateral_tolerance_m: float = 0.12
+    # Keep the target to one side of the chassis/lidar stack at handoff.  The
+    # sign is latched once per tracking session from the cheapest current
+    # side; near-centre starts use ``preferred_side_sign`` deterministically.
+    side_lateral_offset_m: float = 0.13
+    side_lock_deadband_m: float = 0.025
+    side_handoff_tolerance_m: float = 0.07
+    preferred_side_sign: int = 1
     settle_time_s: float = 0.10
     handoff_depth_m: float = 0.52
     handoff_bearing_rad: float = math.radians(20.0)
@@ -116,6 +123,14 @@ class DepthServoSettings:
             raise ValueError("transform timeout must be finite and positive")
         if not math.isfinite(self.handoff_depth_m) or self.handoff_depth_m <= 0.0:
             raise ValueError("handoff depth must be finite and positive")
+        if not math.isfinite(self.side_lateral_offset_m) or self.side_lateral_offset_m <= 0.0:
+            raise ValueError("side lateral offset must be finite and positive")
+        if not math.isfinite(self.side_lock_deadband_m) or self.side_lock_deadband_m < 0.0:
+            raise ValueError("side-lock deadband must be finite and nonnegative")
+        if not math.isfinite(self.side_handoff_tolerance_m) or self.side_handoff_tolerance_m <= 0.0:
+            raise ValueError("side handoff tolerance must be finite and positive")
+        if self.preferred_side_sign not in {-1, 1}:
+            raise ValueError("preferred side sign must be -1 or 1")
         if (
             not math.isfinite(self.min_forward_mps)
             or not 0.0 < self.min_forward_mps <= self.max_forward_mps
@@ -449,6 +464,7 @@ class DepthServoCore:
             desired_planar_standoff_m=settings.desired_depth_m,
             posture_entry_planar_m=max(settings.handoff_depth_m + 0.20, 0.80),
             handoff_planar_max_m=settings.handoff_depth_m,
+            handoff_lateral_tolerance_m=settings.side_handoff_tolerance_m,
             linear_gain=settings.linear_gain,
             yaw_gain=settings.yaw_gain,
             max_forward_mps=settings.max_forward_mps,
@@ -474,6 +490,7 @@ class DepthServoCore:
         self._ik_feasible: bool | None = None
         self._last_decision: ReactiveServoDecision | None = None
         self._done = False
+        self._side_sign: int | None = None
 
     @property
     def target(self) -> tuple[float, float, float] | None:
@@ -496,6 +513,29 @@ class DepthServoCore:
         return self._geometry
 
     @property
+    def desired_target_lateral_m(self) -> float:
+        if self._side_sign is None:
+            return 0.0
+        return self._side_sign * self.settings.side_lateral_offset_m
+
+    @property
+    def side_lateral_error_m(self) -> float | None:
+        if self._geometry is None or self._side_sign is None:
+            return None
+        return self._geometry.base_xyz_m[1] - self.desired_target_lateral_m
+
+    def _latch_side(self, geometry: TargetGeometry) -> None:
+        if self._side_sign is not None:
+            return
+        lateral_m = geometry.base_xyz_m[1]
+        if lateral_m > self.settings.side_lock_deadband_m:
+            self._side_sign = 1
+        elif lateral_m < -self.settings.side_lock_deadband_m:
+            self._side_sign = -1
+        else:
+            self._side_sign = self.settings.preferred_side_sign
+
+    @property
     def reactive_status(self) -> dict[str, Any] | None:
         decision = self._last_decision
         if decision is None:
@@ -505,6 +545,13 @@ class DepthServoCore:
             "reason": decision.reason,
             "handoff_ready": decision.handoff_ready,
             "needs_ik_probe": decision.needs_ik_probe,
+            "side": (
+                None if self._side_sign is None else (
+                    "left" if self._side_sign > 0 else "right"
+                )
+            ),
+            "desired_target_lateral_m": self.desired_target_lateral_m,
+            "lateral_error_m": self.side_lateral_error_m,
             "posture": asdict(decision.posture),
             "arm_view": {
                 **asdict(decision.arm_view),
@@ -627,6 +674,7 @@ class DepthServoCore:
             )
             self._transforms_received_s = float(stamp_s)
             self._transform_error = None
+            self._latch_side(self._geometry)
         return True
 
     def reset(self) -> None:
@@ -644,6 +692,7 @@ class DepthServoCore:
         self._ik_feasible = None
         self._last_decision = None
         self._done = False
+        self._side_sign = None
         self.controller.reset()
         self.reactive.reset()
 
@@ -735,8 +784,16 @@ class DepthServoCore:
             # must never manufacture an active body command.
             body_settled=body_settled,
             ik_feasible=self._ik_feasible,
+            desired_target_lateral_m=self.desired_target_lateral_m,
         )
         self._last_decision = decision
+        if (
+            not fresh_tracking
+            and decision.phase is ReactivePhase.SEARCH_REQUIRED
+        ):
+            # A terminal loss ends the side-approach session.  A subsequent
+            # reacquisition must choose its side from the new target geometry.
+            self._side_sign = None
         phase = decision.phase.value
         if decision.phase is ReactivePhase.HANDOFF_READY:
             self._done = True
@@ -759,7 +816,10 @@ class DepthServoCore:
                 geometry.base_planar_distance_m
                 - self.settings.desired_depth_m
             )
-            yaw_error = geometry.base_bearing_rad
+            yaw_error = math.atan2(
+                geometry.base_xyz_m[1] - self.desired_target_lateral_m,
+                max(geometry.base_xyz_m[0], 0.05),
+            )
         return DepthServoOutput(
             phase=phase,
             proposed_linear_x=linear_x,
@@ -1497,7 +1557,9 @@ def _run_ros(args: argparse.Namespace) -> int:
                 return fallback
             inside_handoff = (
                 geometry.base_planar_distance_m <= settings.handoff_depth_m
-                and abs(geometry.base_bearing_rad) <= settings.handoff_bearing_rad
+                and self.core.side_lateral_error_m is not None
+                and abs(self.core.side_lateral_error_m)
+                <= settings.side_handoff_tolerance_m
             )
             if args.runtime_state is None:
                 self.whole_body_error = "whole-body controller requires runtime state"
@@ -1510,6 +1572,9 @@ def _run_ros(args: argparse.Namespace) -> int:
                     runtime_state_path=args.runtime_state,
                     mode=settings.mode,
                     freeze_base=inside_handoff,
+                    desired_target_lateral_in_body_m=(
+                        self.core.desired_target_lateral_m
+                    ),
                 )
             except Exception as error:
                 self.whole_body_error = f"whole-body solve failed: {error}"

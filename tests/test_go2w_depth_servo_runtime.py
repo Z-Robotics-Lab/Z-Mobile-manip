@@ -384,7 +384,7 @@ def test_reactive_runtime_stops_for_downstream_ik_probe_in_3d_corridor():
     assert _observe_in_frames(
         core,
         camera_xyz=(0.0, 0.0, 0.55),
-        base_xyz=(0.55, 0.0, -0.10),
+        base_xyz=(0.55, 0.13, -0.10),
         arm_xyz=(0.50, 0.0, 0.10),
         stamp_s=3.0,
     )
@@ -396,11 +396,36 @@ def test_reactive_runtime_stops_for_downstream_ik_probe_in_3d_corridor():
     assert probe.published_linear_x == probe.published_angular_z == 0.0
     assert core.reactive_status is not None
     assert core.reactive_status["needs_ik_probe"] is True
+    assert core.reactive_status["side"] == "left"
+    assert core.reactive_status["desired_target_lateral_m"] == pytest.approx(0.13)
 
     core.set_ik_probe_result(True)
     reached = core.tick(now_s=3.10, tracking=True)
     assert reached.phase == "reached"
     assert reached.done
+
+
+def test_side_choice_is_latched_until_terminal_tracking_loss():
+    core = _reactive_core(target_timeout_s=0.25)
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.0, 0.80),
+        base_xyz=(0.90, -0.20, -0.10),
+        arm_xyz=(0.75, 0.0, 0.10),
+        stamp_s=1.0,
+    )
+    assert core.desired_target_lateral_m == pytest.approx(-0.13)
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.0, 0.78),
+        base_xyz=(0.88, 0.20, -0.10),
+        arm_xyz=(0.73, 0.0, 0.10),
+        stamp_s=1.1,
+    )
+    assert core.desired_target_lateral_m == pytest.approx(-0.13)
+
+    core.tick(now_s=2.0, tracking=False)
+    assert core.desired_target_lateral_m == 0.0
 
 
 def test_stale_synchronized_transform_never_reuses_old_geometry_for_motion():
@@ -736,3 +761,6 @@ def test_launcher_uses_fixed_cyclonedds_runtime_for_pc_to_nuc_commands():
     assert "--max-forward-mps 0.18" in launcher
     assert "--handoff-depth-m 0.52" in launcher
     assert "--handoff-bearing-deg 20" in launcher
+    assert "configs/piper_collision_capsules.json" in launcher
+    assert ":/robot/piper_collision_capsules.json:ro" in launcher
+    assert "--whole-body-collision-model /robot/piper_collision_capsules.json" in launcher
