@@ -184,6 +184,19 @@ def test_reactive_owner_does_not_starve_intent_callback_behind_can_timer() -> No
     assert "with self.intent_lock:" in source
 
 
+def test_reactive_owner_checks_fixed_fixtures_at_final_command_boundary() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "FixedSelfCollisionGuard" in source
+    assert "fixed_collision_guard.check_step" in source
+    unsafe_hold = source.index("self.target = self.actual.copy()")
+    transport = source.index("robot.move_j", unsafe_hold)
+    assert unsafe_hold < transport
+    assert '"fixed_collision_guard": collision_evidence' in source
+    assert '"unsafe_target_forwarded": False' in source
+    assert '"measured_hold_sent": self.measured_hold_sent' in source
+    assert '"last_blocked_seq": self.last_blocked_seq' in source
+
+
 def test_joint_state_fields_match_passive_bridge_contract() -> None:
     measured = np.asarray([0.1, -0.2, 0.3, -0.4, 0.5, -0.6])
     frame_id, names, positions = MODULE.joint_state_fields(measured)

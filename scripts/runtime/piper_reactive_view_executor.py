@@ -22,7 +22,13 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
+# In the source tree the package lives two levels above this script; in the
+# installed NUC layout it is a sibling of the script and SCRIPT_DIR suffices.
+SOURCE_ROOT = SCRIPT_DIR.parents[1]
+if (SOURCE_ROOT / "z_manip").is_dir():
+    sys.path.insert(0, str(SOURCE_ROOT))
 import piper_staged_grasp_executor as piper
+from z_manip.fixed_self_collision import FixedSelfCollisionGuard, StepDecision
 
 
 INTENT_SCHEMA = "z_manip.piper_reactive_view_intent.v1"
@@ -155,12 +161,28 @@ def main() -> int:
     parser.add_argument("--firmware", default="v188", choices=("default", "v183", "v188", "v189"))
     parser.add_argument("--rate-hz", type=float, default=20.0)
     parser.add_argument("--speed-percent", type=int, default=5)
+    parser.add_argument(
+        "--urdf",
+        type=Path,
+        default=Path.home() / ".local/share/z-mobile-manip/go2w_sensored.urdf",
+    )
+    parser.add_argument(
+        "--collision-model",
+        type=Path,
+        default=Path.home() / ".local/share/z-mobile-manip/piper_collision_capsules.json",
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     if not args.execute or __import__("os").environ.get("Z_MANIP_PIPER_REACTIVE_ACK") != LIVE_ACK:
         raise SystemExit("live PiPER reactive executor requires --execute and exact acknowledgement")
     if not 5.0 <= args.rate_hz <= 30.0 or not 1 <= args.speed_percent <= 12:
         raise SystemExit("reactive rate/speed is outside the bounded envelope")
+    # Parse and validate every geometry input before importing ROS or opening
+    # CAN.  A missing/stale deployment must fail closed at the process edge.
+    fixed_collision_guard = FixedSelfCollisionGuard(
+        urdf_path=args.urdf,
+        model_path=args.collision_model,
+    )
 
     import rclpy
     from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -193,6 +215,10 @@ def main() -> int:
                 self.fault: str | None = None
                 self.rejected_intents = 0
                 self.last_intent_error: str | None = None
+                self.collision_rejections = 0
+                self.collision_decision: StepDecision | None = None
+                self.last_blocked_seq: int | None = None
+                self.measured_hold_sent = False
                 # CAN feedback + move_j can consume nearly the entire 50 ms
                 # timer period.  A SingleThreadedExecutor may consequently
                 # keep selecting the overdue timer and never dispatch the
@@ -290,12 +316,32 @@ def main() -> int:
                             else np.zeros(6)
                         )
                     self.target = bounded_target(self.actual, qdot, 1.0 / args.rate_hz)
+                    decision = fixed_collision_guard.check_step(
+                        self.actual,
+                        self.target,
+                        max_joint_step_rad=0.01,
+                    )
+                    self.collision_decision = decision
+                    collision_fault: str | None = None
+                    if not decision.allowed:
+                        # Keep position control loaded at the measured pose;
+                        # never forward the unsafe target to the arm SDK.
+                        self.target = self.actual.copy()
+                        self.collision_rejections += 1
+                        with self.intent_lock:
+                            self.last_blocked_seq = self.last_seq if fresh_intent else None
+                        collision_fault = (
+                            "FixedCollisionBlocked: "
+                            f"{decision.witness.pair[0]} vs {decision.witness.pair[1]} "
+                            f"margin={decision.witness.margin_m:.6f}m; {decision.reason}"
+                        )
                     # Stale/Full Stop holds the measured pose rather than
                     # unloading torque or replaying an old target.
                     guard.mark_before_command()
                     robot.move_j([float(value) for value in self.target])
+                    self.measured_hold_sent = not decision.allowed
                     self.commands_sent += 1
-                    self.fault = None
+                    self.fault = collision_fault
                 except Exception as error:  # noqa: BLE001
                     self.fault = f"{type(error).__name__}: {error}"
                 with self.intent_lock:
@@ -304,6 +350,18 @@ def main() -> int:
                     rejected_intents = self.rejected_intents
                     last_intent_error = self.last_intent_error
                 status = String()
+                decision = self.collision_decision
+                collision_evidence = None if decision is None else {
+                    "allowed": decision.allowed,
+                    "escaping": decision.escaping,
+                    "reason": decision.reason,
+                    "pair": list(decision.witness.pair),
+                    "distance_m": decision.witness.distance_m,
+                    "threshold_m": decision.witness.threshold_m,
+                    "margin_m": decision.witness.margin_m,
+                    "current_margin_m": decision.current_margin_m,
+                    "target_margin_m": decision.target_margin_m,
+                }
                 status.data = json.dumps({
                     "schema": STATUS_SCHEMA,
                     "owner": "piper_reactive_view_executor",
@@ -318,6 +376,14 @@ def main() -> int:
                         if self.feedback_receipt_s > 0.0 else None
                     ),
                     "commands_sent": self.commands_sent,
+                    "fixed_collision_guard": collision_evidence,
+                    "collision_rejections": self.collision_rejections,
+                    # These fields make the final command boundary auditable:
+                    # a rejected target is never forwarded, while the arm
+                    # remains torque-loaded at its measured pose.
+                    "unsafe_target_forwarded": False,
+                    "measured_hold_sent": self.measured_hold_sent,
+                    "last_blocked_seq": self.last_blocked_seq,
                     "rejected_intents": rejected_intents,
                     "last_intent_error": last_intent_error,
                     "future_clock_skew_tolerance_s": MAX_FUTURE_SKEW_S,

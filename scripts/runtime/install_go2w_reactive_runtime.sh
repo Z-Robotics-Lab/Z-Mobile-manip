@@ -13,7 +13,7 @@ SSH=(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST")
 SCP=(scp -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5)
 
 [[ -f "$NUC_KEY" ]] || { printf 'missing NUC SSH key: %s\n' "$NUC_KEY" >&2; exit 1; }
-"${SSH[@]}" 'mkdir -p "$HOME/.local/lib/z-mobile-manip/z_manip/control" "$HOME/.config/systemd/user" "$HOME/.config/z-mobile-manip"'
+"${SSH[@]}" 'mkdir -p "$HOME/.local/lib/z-mobile-manip/z_manip/control" "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics" "$HOME/.local/share/z-mobile-manip" "$HOME/.config/systemd/user" "$HOME/.config/z-mobile-manip"'
 "${SCP[@]}" \
   "$SCRIPT_DIR/go2w_reactive_control_nuc.py" \
   "$SCRIPT_DIR/go2w_reactive_control_nuc.sh" \
@@ -23,12 +23,22 @@ SCP=(scp -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5)
   "$NUC_HOST:.local/lib/z-mobile-manip/"
 "${SCP[@]}" \
   "$STACK_ROOT/z_manip/__init__.py" \
+  "$STACK_ROOT/z_manip/fixed_self_collision.py" \
   "$NUC_HOST:.local/lib/z-mobile-manip/z_manip/"
+"${SCP[@]}" \
+  "$STACK_ROOT/configs/nuc-kinematics-init.py" \
+  "$STACK_ROOT/z_manip/kinematics/chain.py" \
+  "$NUC_HOST:.local/lib/z-mobile-manip/z_manip/kinematics/"
 "${SCP[@]}" \
   "$STACK_ROOT/configs/nuc-control-init.py" \
   "$STACK_ROOT/z_manip/control/go2w_posture.py" \
   "$NUC_HOST:.local/lib/z-mobile-manip/z_manip/control/"
 "${SSH[@]}" 'mv "$HOME/.local/lib/z-mobile-manip/z_manip/control/nuc-control-init.py" "$HOME/.local/lib/z-mobile-manip/z_manip/control/__init__.py"'
+"${SSH[@]}" 'mv "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics/nuc-kinematics-init.py" "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics/__init__.py"'
+"${SCP[@]}" \
+  "$STACK_ROOT/../go2W_Sim/assets/urdf/go2w_sensored.urdf" \
+  "$STACK_ROOT/configs/piper_collision_capsules.json" \
+  "$NUC_HOST:.local/share/z-mobile-manip/"
 "${SCP[@]}" \
   "$STACK_ROOT/configs/z-mobile-manip-go2w-reactive-live.service" \
   "$STACK_ROOT/configs/z-mobile-manip-piper-reactive-view.service" \

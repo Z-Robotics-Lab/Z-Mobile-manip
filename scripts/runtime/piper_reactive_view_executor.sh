@@ -13,4 +13,6 @@ export Z_MANIP_PIPER_REACTIVE_ACK=I_UNDERSTAND_PIPER_REACTIVE_VIEW_WILL_MOVE
 cd "$HOME/pyAgxArm"
 exec /usr/bin/python3 \
   "$HOME/.local/lib/z-mobile-manip/piper_reactive_view_executor.py" \
-  --execute --channel can0 --firmware v188 --rate-hz 20 --speed-percent 5
+  --execute --channel can0 --firmware v188 --rate-hz 20 --speed-percent 5 \
+  --urdf "$HOME/.local/share/z-mobile-manip/go2w_sensored.urdf" \
+  --collision-model "$HOME/.local/share/z-mobile-manip/piper_collision_capsules.json"
