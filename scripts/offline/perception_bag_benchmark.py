@@ -293,6 +293,21 @@ def _benchmark_bundle(slot: dict[str, Any], repeats: int) -> dict[str, Any]:
                     widths=np.asarray(widths, dtype=np.float32),
                 )
         finished = time.perf_counter()
+        candidate_regression = None
+        if candidates is not None:
+            grasp_array = np.ascontiguousarray(candidates.grasps, dtype=np.float64)
+            score_array = np.ascontiguousarray(candidates.scores, dtype=np.float32)
+            width_array = np.ascontiguousarray(widths, dtype=np.float32)
+            digest = hashlib.sha256()
+            for array in (grasp_array, score_array, width_array):
+                digest.update(array.tobytes())
+            candidate_regression = {
+                "sha256": digest.hexdigest(),
+                "count": int(len(grasp_array)),
+                "best_score": float(np.max(score_array)),
+                "width_min_m": float(np.min(width_array)),
+                "width_max_m": float(np.max(width_array)),
+            }
         measurements.append({
             "decode_s": decoded_at - started,
             "filter_s": filtered_at - decoded_at,
@@ -305,6 +320,7 @@ def _benchmark_bundle(slot: dict[str, Any], repeats: int) -> dict[str, Any]:
             "collision_scene_points": int(len(collision_scene)),
             "grasp_candidates": 0 if candidates is None else int(len(candidates.grasps)),
             "grasp_error": grasp_error,
+            "candidate_regression": candidate_regression,
         })
 
     return {

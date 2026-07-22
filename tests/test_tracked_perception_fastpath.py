@@ -48,6 +48,13 @@ def test_exact_same_target_status_accepts_only_new_same_track_bundle():
         stamp_ns=1_100_000_000,
         frame_id="camera_color_optical_frame",
     )
+    assert contract.accepts_fresh_bundle(
+        _manifest(),
+        stamp_ns=1_100_000_000,
+        frame_id="camera_color_optical_frame",
+        latest_observation_stamp_ns=1_500_000_000,
+        max_age_s=0.5,
+    )
     next_observation = parse_tracking_reuse_contract(
         _status(observation_stamp_ns="1200000000"),
         expected_instruction_sha256=SHA,
@@ -110,6 +117,21 @@ def test_reuse_rejects_old_cross_track_or_cross_frame_bundle():
             stamp_ns=stamp,
             frame_id=frame,
         )
+
+
+def test_reuse_rejects_exact_identity_when_cached_rgbd_is_stale():
+    contract = parse_tracking_reuse_contract(
+        _status(),
+        expected_instruction_sha256=SHA,
+    )
+    assert contract is not None
+    assert not contract.accepts_fresh_bundle(
+        _manifest(),
+        stamp_ns=1_100_000_000,
+        frame_id="camera_color_optical_frame",
+        latest_observation_stamp_ns=1_600_000_001,
+        max_age_s=0.5,
+    )
 
 
 def test_reuse_status_requires_complete_observation_identity():

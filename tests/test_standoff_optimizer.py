@@ -656,3 +656,44 @@ def test_evaluator_body_type_error_is_not_retried_as_legacy():
         )
 
     assert calls == 1
+
+
+def _reference_directionally_diverse_indices(grasps, scores, limit):
+    poses = np.asarray(grasps, dtype=float)
+    values = np.asarray(scores, dtype=float)
+    axes = poses[:, :3, 2]
+    axes = axes / np.linalg.norm(axes, axis=1)[:, None]
+    target_count = min(int(limit), len(poses))
+    ranked = np.argsort(-values, kind="stable").tolist()
+    quality_count = max(1, (target_count + 1) // 2)
+    quality = ranked[:quality_count]
+    ranked = ranked[quality_count:]
+    diverse = []
+    references = quality.copy()
+    while len(quality) + len(diverse) < target_count:
+        def key(index):
+            similarity = max(float(np.dot(axes[index], axes[kept])) for kept in references)
+            return 1.0 - similarity, float(values[index])
+
+        chosen = max(ranked, key=key)
+        diverse.append(chosen)
+        references.append(chosen)
+        ranked.remove(chosen)
+    selected = [index for pair in zip(quality, diverse) for index in pair]
+    if len(quality) > len(diverse):
+        selected.append(quality[-1])
+    return np.asarray(selected, dtype=int)
+
+
+def test_directional_ordering_vectorization_preserves_greedy_selection():
+    rng = np.random.default_rng(1729)
+    poses = np.repeat(np.eye(4)[None, :, :], 240, axis=0)
+    axes = rng.normal(size=(len(poses), 3))
+    axes /= np.linalg.norm(axes, axis=1)[:, None]
+    poses[:, :3, 2] = axes
+    scores = rng.uniform(-0.2, 1.4, size=len(poses))
+
+    expected = _reference_directionally_diverse_indices(poses, scores, 64)
+    actual = directionally_diverse_indices(poses, scores, 64)
+
+    assert np.array_equal(actual, expected)

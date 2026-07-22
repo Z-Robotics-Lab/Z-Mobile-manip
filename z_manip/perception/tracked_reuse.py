@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Mapping
 
 
@@ -59,6 +60,31 @@ class TrackingReuseContract:
             and str(manifest.get("session_id", ""))
             and str(manifest.get("seed_id", ""))
         )
+
+    def accepts_fresh_bundle(
+        self,
+        manifest: Mapping[str, object],
+        *,
+        stamp_ns: int,
+        frame_id: str,
+        latest_observation_stamp_ns: int,
+        max_age_s: float,
+    ) -> bool:
+        """Accept this identity only while its RGB-D evidence is recent."""
+
+        if (
+            not math.isfinite(max_age_s)
+            or max_age_s <= 0.0
+            or latest_observation_stamp_ns <= 0
+            or not self.accepts_bundle(
+                manifest,
+                stamp_ns=stamp_ns,
+                frame_id=frame_id,
+            )
+        ):
+            return False
+        age_ns = max(0, int(latest_observation_stamp_ns) - int(stamp_ns))
+        return age_ns <= int(max_age_s * 1_000_000_000)
 
 
 def parse_tracking_reuse_contract(

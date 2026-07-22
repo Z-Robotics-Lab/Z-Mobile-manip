@@ -33,6 +33,34 @@ def _cylinder_cloud(radius=0.032, height=0.14, n_angle=48, n_height=10):
     return np.vstack((side, caps))
 
 
+def _reference_normals(points, neighbours):
+    tree = antipodal_module.cKDTree(points)
+    k = min(max(6, neighbours), len(points))
+    _, indices = tree.query(points, k=k)
+    normals = np.empty_like(points)
+    centroid = np.median(points, axis=0)
+    for index, nearby in enumerate(indices):
+        local = points[np.atleast_1d(nearby)]
+        centred = local - local.mean(axis=0)
+        covariance = centred.T @ centred / max(1, len(local) - 1)
+        _, vectors = np.linalg.eigh(covariance)
+        normal = vectors[:, 0]
+        if np.dot(normal, points[index] - centroid) < 0.0:
+            normal = -normal
+        normals[index] = normal
+    return normals
+
+
+def test_vectorized_normals_match_reference_geometry():
+    points = _cylinder_cloud(n_angle=20, n_height=6).astype(np.float64)
+    actual = antipodal_module._estimate_outward_normals(points, 18)
+    expected = _reference_normals(points, 18)
+
+    # Eigenvector signs are fixed outward by both implementations. Compare
+    # directions, allowing only numerical noise from batched LAPACK dispatch.
+    assert np.allclose(actual, expected, rtol=1e-10, atol=1e-10)
+
+
 def test_antipodal_source_generates_multi_direction_six_dof_grasps():
     candidates = AntipodalGraspSource(
         max_candidates=32,

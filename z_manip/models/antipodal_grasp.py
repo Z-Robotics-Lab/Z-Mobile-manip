@@ -34,17 +34,18 @@ def _estimate_outward_normals(points: np.ndarray, neighbours: int) -> np.ndarray
     tree = cKDTree(points)
     k = min(max(6, neighbours), len(points))
     _, indices = tree.query(points, k=k)
-    normals = np.empty_like(points)
+    local = points[np.asarray(indices)]
+    centred = local - local.mean(axis=1, keepdims=True)
+    covariance = np.einsum("nki,nkj->nij", centred, centred, optimize=True)
+    covariance /= max(1, k - 1)
+    # ``numpy.linalg.eigh`` accepts a stack of symmetric matrices.  This is
+    # mathematically identical to the former Python loop but removes hundreds
+    # of small LAPACK dispatches from every perception request.
+    _, vectors = np.linalg.eigh(covariance)
+    normals = vectors[:, :, 0]
     centroid = np.median(points, axis=0)
-    for index, nearby in enumerate(indices):
-        local = points[np.atleast_1d(nearby)]
-        centred = local - local.mean(axis=0)
-        covariance = centred.T @ centred / max(1, len(local) - 1)
-        _, vectors = np.linalg.eigh(covariance)
-        normal = vectors[:, 0]
-        if np.dot(normal, points[index] - centroid) < 0.0:
-            normal = -normal
-        normals[index] = normal
+    inward = np.einsum("ni,ni->n", normals, points - centroid) < 0.0
+    normals[inward] *= -1.0
     return normals
 
 

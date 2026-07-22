@@ -110,18 +110,38 @@ def directionally_diverse_indices(
     ranked = ranked[quality_count:]
     diverse: list[int] = []
     separation_references = quality.copy()
+    remaining = np.asarray(ranked, dtype=int)
+    if len(remaining):
+        # Keep each remaining candidate's closest selected approach updated
+        # incrementally.  The former implementation recomputed every dot
+        # product against every selected candidate in Python on each round
+        # (over a million generator iterations for a typical 768-candidate
+        # proposal).  This is the same greedy rule, expressed as batched
+        # NumPy operations.
+        closest_similarity = np.max(
+            axes[remaining] @ axes[np.asarray(separation_references, dtype=int)].T,
+            axis=1,
+        )
     while len(quality) + len(diverse) < target_count:
-        def separation_key(index: int) -> tuple[float, float]:
-            closest_similarity = max(
-                float(np.dot(axes[index], axes[kept]))
-                for kept in separation_references
-            )
-            return (1.0 - closest_similarity, float(values[index]))
-
-        chosen = max(ranked, key=separation_key)
+        separation = 1.0 - closest_similarity
+        best_separation = np.max(separation)
+        tied = np.flatnonzero(separation == best_separation)
+        if len(tied) > 1:
+            tied_values = values[remaining[tied]]
+            tied = tied[tied_values == np.max(tied_values)]
+        # ``ranked`` is stable score order and Python's max kept its first
+        # element on a fully equal key.  Taking tied[0] preserves that rule.
+        chosen_position = int(tied[0])
+        chosen = int(remaining[chosen_position])
         diverse.append(chosen)
         separation_references.append(chosen)
-        ranked.remove(chosen)
+        remaining = np.delete(remaining, chosen_position)
+        closest_similarity = np.delete(closest_similarity, chosen_position)
+        if len(remaining):
+            closest_similarity = np.maximum(
+                closest_similarity,
+                axes[remaining] @ axes[chosen],
+            )
     selected = [
         index
         for pair in zip(quality, diverse)

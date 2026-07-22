@@ -120,6 +120,15 @@ def main() -> int:
             "returns immediately after a matching or mismatching status"
         ),
     )
+    parser.add_argument(
+        "--tracking-reuse-max-age",
+        type=float,
+        default=0.5,
+        help=(
+            "maximum age of an exact cached tracker bundle relative to the "
+            "latest camera stamp; older evidence is never reused"
+        ),
+    )
     parser.add_argument("--learned-endpoint", default="")
     parser.add_argument("--soak-duration", type=float, default=0.0)
     parser.add_argument("--max-recoveries", type=int, default=0)
@@ -171,6 +180,8 @@ def main() -> int:
         or args.max_recoveries < 0
         or args.recovery_timeout <= 5.0
         or not 0.0 <= args.tracking_reuse_probe_timeout <= 0.25
+        or not math.isfinite(args.tracking_reuse_max_age)
+        or not 0.0 < args.tracking_reuse_max_age <= 5.0
         or not math.isfinite(args.max_observed_result_lag)
         or args.max_observed_result_lag <= 0.0
         or not 1.0 <= args.fallback_contact_angle_deg <= 89.0
@@ -182,6 +193,7 @@ def main() -> int:
             "minimum bundle target points must be at least 40; "
             "max recoveries must be non-negative; observed result lag must be "
             "positive; tracking reuse probe timeout must be in [0, 0.25] s; "
+            "tracking reuse max age must be in (0, 5] s; "
             "fallback contact angle must be in [1, 89] degrees; "
             "and target exclusion radius must be positive"
         )
@@ -445,10 +457,12 @@ def main() -> int:
                     if grounding_reused:
                         assert reuse_contract is not None
                         cloud_frame_id = str(clouds[stamp].header.frame_id)
-                        if not reuse_contract.accepts_bundle(
+                        if not reuse_contract.accepts_fresh_bundle(
                             manifests[stamp],
                             stamp_ns=stamp,
                             frame_id=cloud_frame_id,
+                            latest_observation_stamp_ns=max(infos),
+                            max_age_s=args.tracking_reuse_max_age,
                         ):
                             rejected_reuse_bundle_stamps.add(stamp)
                             continue
@@ -513,6 +527,7 @@ def main() -> int:
             "source_grounding_request_id": accepted_source_request_id,
             "grounding_reused": grounding_reused,
             "rejected_reuse_bundles": len(rejected_reuse_bundle_stamps),
+            "tracking_reuse_max_age_s": args.tracking_reuse_max_age,
             "instruction": instruction,
             "elapsed_s": round(time.monotonic() - started, 3),
             "stage": "perception_bundle",
@@ -794,6 +809,7 @@ def main() -> int:
         "source_grounding_request_id": accepted_source_request_id,
         "grounding_reused": grounding_reused,
         "rejected_reuse_bundles": len(rejected_reuse_bundle_stamps),
+        "tracking_reuse_max_age_s": args.tracking_reuse_max_age,
         "instruction": instruction,
         "elapsed_s": round(time.monotonic() - started, 3),
         "frame": candidates.frame if candidates is not None else cloud_message.header.frame_id,
