@@ -34,6 +34,9 @@ PERCEPTION_RUNNER_ARTIFACT_ROOT="$ROOT_DIR/../artifacts"
 PERCEPTION_RUNNER="z-manip-perception-runner"
 PLANNING_RUNNER="z-manip-planning-runner"
 PLANNING_RUNNER_SCRATCH_ROOT="$PERCEPTION_RUNNER_ARTIFACT_ROOT/go2w_real/.planning_runner_scratch"
+PERCEPTION_RUNNER_SOCKET="$PERCEPTION_RUNNER_ARTIFACT_ROOT/go2w_real/.perception_runner.sock"
+PLANNING_RUNNER_SOCKET="$PLANNING_RUNNER_SCRATCH_ROOT/.planner.sock"
+FINGERPRINT_TOOL="$ROOT_DIR/scripts/runtime/z_manip_runtime_fingerprint.py"
 SOAK_MAX_RECOVERIES="${Z_MANIP_SOAK_MAX_RECOVERIES:-2}"
 SOAK_RECOVERY_TIMEOUT="${Z_MANIP_SOAK_RECOVERY_TIMEOUT:-25}"
 
@@ -47,6 +50,10 @@ docker_env=(
 
 require_file() {
   [[ -f "$1" ]] || { echo "required file is missing: $1" >&2; exit 1; }
+}
+
+runtime_fingerprint() {
+  python3 "$FINGERPRINT_TOOL"
 }
 
 preflight() {
@@ -239,10 +246,15 @@ start_perception_runner() {
   # Keep the Python/ROS perception process imports warm between UI clicks.
   # Requests still execute the fixed fail-closed dry-run; this container has
   # no CAN/device mount and no actuator environment.
-  mkdir -p "$PERCEPTION_RUNNER_ARTIFACT_ROOT"
+  local fingerprint
+  fingerprint="$(runtime_fingerprint)"
+  mkdir -p "$PERCEPTION_RUNNER_ARTIFACT_ROOT" "$(dirname "$PERCEPTION_RUNNER_SOCKET")"
   docker rm -f "$PERCEPTION_RUNNER" >/dev/null 2>&1 || true
+  rm -f -- "$PERCEPTION_RUNNER_SOCKET"
   docker run -d --name "$PERCEPTION_RUNNER" --restart unless-stopped \
+    --label "org.zlab.z-manip.runtime-sha256=$fingerprint" \
     --user "$(id -u):$(id -g)" "${docker_env[@]}" \
+    -e "Z_MANIP_RUNTIME_FINGERPRINT=$fingerprint" \
     -e HOME=/tmp/z-manip \
     -e ROS_LOG_DIR=/tmp/z-manip-ros-logs \
     -e PYTHONPATH=/opt/z_manip_ws/install/lib/python3.12/site-packages:/opt/ros/jazzy/lib/python3.12/site-packages:/opt/z_manip/python \
@@ -259,14 +271,19 @@ start_planning_runner() {
   # network, ROS environment, hardware device, CAN socket, or actuator mount.
   # Interactive requests execute the same fixed planner and full safety checks
   # through docker exec, avoiding per-click image/container cold-start jitter.
+  local fingerprint
+  fingerprint="$(runtime_fingerprint)"
   mkdir -p "$PERCEPTION_RUNNER_ARTIFACT_ROOT" "$PLANNING_RUNNER_SCRATCH_ROOT"
   docker rm -f "$PLANNING_RUNNER" >/dev/null 2>&1 || true
+  rm -f -- "$PLANNING_RUNNER_SOCKET"
   docker run -d --name "$PLANNING_RUNNER" --restart unless-stopped \
+    --label "org.zlab.z-manip.runtime-sha256=$fingerprint" \
     --user "$(id -u):$(id -g)" \
     --network none \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     -e HOME=/tmp/z-manip \
+    -e "Z_MANIP_RUNTIME_FINGERPRINT=$fingerprint" \
     -e PYTHONPATH=/opt/z_manip_ws/install/lib/python3.12/site-packages:/opt/ros/jazzy/lib/python3.12/site-packages:/opt/z_manip/python \
     -e LD_LIBRARY_PATH=/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib \
     -v "$ROOT_DIR/scripts/runtime/piper_planning_dry_run.py:/usr/local/bin/z-manip-piper-planning-dry-run:ro" \
@@ -390,6 +407,9 @@ case "${1:-status}" in
     start_perception_runner
     start_planning_runner
     ;;
+  fingerprint)
+    runtime_fingerprint
+    ;;
   preflight)
     preflight
     ;;
@@ -511,7 +531,7 @@ case "${1:-status}" in
       "$0" probe
     ;;
   *)
-    echo "usage: $0 {build|preflight|verify-latest-only|daily [count] [seconds] [instruction]|start|restart-edgetam|restart-rgbd|restart-perception|status|probe|dry-run [instruction]|soak [seconds] [instruction]|cycles [count] [seconds] [instruction]|stop|anygrasp-check|anygrasp-build|anygrasp-auto|anygrasp-start|anygrasp-stop}" >&2
+    echo "usage: $0 {build|preflight|verify-latest-only|daily [count] [seconds] [instruction]|start|restart-edgetam|restart-rgbd|restart-perception|fingerprint|status|probe|dry-run [instruction]|soak [seconds] [instruction]|cycles [count] [seconds] [instruction]|stop|anygrasp-check|anygrasp-build|anygrasp-auto|anygrasp-start|anygrasp-stop}" >&2
     exit 2
     ;;
 esac

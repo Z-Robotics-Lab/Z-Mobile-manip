@@ -28,6 +28,7 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 DEFAULT_SOCKET = Path("/workspace-artifacts/go2w_real/.perception_runner.sock")
 DRY_RUN = Path("/usr/local/bin/z-manip-go2w-perception-dry-run")
 ARTIFACT_ROOT = Path("/workspace-artifacts")
+WORKER_FINGERPRINT = os.environ.get("Z_MANIP_RUNTIME_FINGERPRINT", "unknown")
 
 
 def _contained(path: Path, root: Path) -> bool:
@@ -117,6 +118,7 @@ def _serve(socket_path: Path, *, max_requests: int | None = None) -> int:
                             "return_code": return_code,
                             "elapsed_s": time.perf_counter() - started,
                             "output": worker_output,
+                            "worker_fingerprint": WORKER_FINGERPRINT,
                         }
                     except (Exception, SystemExit) as error:
                         # A request exception may leave a request-scoped ROS
@@ -130,6 +132,7 @@ def _serve(socket_path: Path, *, max_requests: int | None = None) -> int:
                                 "perception worker rejected request: "
                                 f"{type(error).__name__}: {error}\n"
                             ),
+                            "worker_fingerprint": WORKER_FINGERPRINT,
                         }
                     encoded = json.dumps(response).encode("utf-8")
                     if len(encoded) > MAX_RESPONSE_BYTES:
@@ -137,6 +140,7 @@ def _serve(socket_path: Path, *, max_requests: int | None = None) -> int:
                             "return_code": 70,
                             "elapsed_s": time.perf_counter() - started,
                             "output": "perception worker response exceeded bounded size\n",
+                            "worker_fingerprint": WORKER_FINGERPRINT,
                         }).encode("utf-8")
                     connection.sendall(encoded)
                     completed_requests += 1

@@ -129,6 +129,41 @@ def test_fixed_worker_request_rejects_public_socket(tmp_path):
             )
 
 
+def test_fixed_worker_request_rejects_stale_resident_module(tmp_path):
+    module = _integration_module()
+    socket_path = tmp_path / "worker.sock"
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(socket_path))
+            os.chmod(socket_path, 0o600)
+            server.listen(1)
+            ready.set()
+            connection, _ = server.accept()
+            with connection:
+                while connection.recv(4096):
+                    pass
+                connection.sendall(json.dumps({
+                    "return_code": 0,
+                    "elapsed_s": 0.001,
+                    "output": "stale worker must not be accepted\n",
+                    "worker_fingerprint": "old-source",
+                }).encode("utf-8"))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=1.0)
+    with pytest.raises(RuntimeError, match="fingerprint mismatch"):
+        module._run_fixed_worker_request(
+            socket_path,
+            {"argv": []},
+            tmp_path / "worker.log",
+            expected_fingerprint="current-source",
+        )
+    thread.join(timeout=1.0)
+
+
 class FakeBackend:
     def __init__(self) -> None:
         self.perception_result = BackendResult(0)
@@ -767,6 +802,7 @@ def test_perception_calls_resident_worker_socket_without_client_process(
                     "return_code": 0,
                     "elapsed_s": 0.01,
                     "output": "fixed resident request\n",
+                    "worker_fingerprint": module.runtime_fingerprint(),
                 }).encode("utf-8"))
 
     server_thread = threading.Thread(target=serve, daemon=True)
@@ -1312,6 +1348,7 @@ def test_planning_calls_private_runner_socket_and_promotes_atomic_output(
                     "return_code": 0,
                     "elapsed_s": 0.02,
                     "output": "fixed planning request\n",
+                    "worker_fingerprint": module.runtime_fingerprint(),
                 }).encode("utf-8"))
 
     server_thread = threading.Thread(target=serve, daemon=True)

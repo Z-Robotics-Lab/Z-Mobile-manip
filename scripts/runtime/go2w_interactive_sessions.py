@@ -41,6 +41,7 @@ from z_manip.read_only_sessions import (  # noqa: E402
     ReadOnlySessionService,
     SessionContractError,
 )
+from z_manip_runtime_fingerprint import runtime_fingerprint  # noqa: E402
 
 
 RUN_ROOT = WORKSPACE_ROOT / "artifacts" / "go2w_real" / "interactive_sessions"
@@ -110,6 +111,7 @@ class _WorkerResult:
 
     returncode: int
     worker_elapsed_s: float | None = None
+    worker_fingerprint: str | None = None
 
 
 def _fixed_worker_socket_available(socket_path: Path) -> bool:
@@ -132,6 +134,8 @@ def _run_fixed_worker_request(
     socket_path: Path,
     request: Mapping[str, object],
     log_path: Path,
+    *,
+    expected_fingerprint: str | None = None,
 ) -> _WorkerResult:
     """Call one private local worker without spawning a Python client.
 
@@ -167,8 +171,15 @@ def _run_fixed_worker_request(
     return_code = document.get("return_code")
     output = document.get("output", "")
     worker_elapsed = document.get("elapsed_s")
+    worker_fingerprint = document.get("worker_fingerprint")
     if not isinstance(return_code, int) or not isinstance(output, str):
         raise RuntimeError("resident worker response violates its schema")
+    if expected_fingerprint is not None and worker_fingerprint != expected_fingerprint:
+        raise RuntimeError(
+            "resident worker fingerprint mismatch; restart the perception component "
+            f"(expected {expected_fingerprint[:12]}, got "
+            f"{str(worker_fingerprint)[:12]})",
+        )
     with log_path.open("ab") as log:
         log.write(output.encode("utf-8", errors="replace"))
     return _WorkerResult(
@@ -179,6 +190,9 @@ def _run_fixed_worker_request(
             and math.isfinite(float(worker_elapsed))
             and float(worker_elapsed) >= 0.0
             else None
+        ),
+        worker_fingerprint=(
+            worker_fingerprint if isinstance(worker_fingerprint, str) else None
         ),
     )
 
@@ -1113,6 +1127,11 @@ class FixedReadOnlyBackend:
                             runner_socket,
                             {"argv": list(perception_args)},
                             log_path,
+                            # Recompute from the current checkout for every
+                            # action.  A long-lived UI must reject a worker
+                            # that was started before a source/config update,
+                            # even when the UI itself has not restarted yet.
+                            expected_fingerprint=runtime_fingerprint(),
                         ))
                     except Exception as error:  # surfaced on this request
                         worker_error.append(error)
@@ -1623,6 +1642,7 @@ class FixedReadOnlyBackend:
                         "ik_backend": self.runtime.ik_backend,
                     },
                     log_path,
+                    expected_fingerprint=runtime_fingerprint(),
                 )
             else:
                 planner = _run_logged(

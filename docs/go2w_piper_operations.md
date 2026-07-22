@@ -74,6 +74,23 @@ manip logs ui
 or grasp execution is active. It stops only the loopback UI/API and leaves the
 camera, perception, and passive telemetry components unchanged.
 
+After changing perception, IK, planning code, configuration, or the robot
+URDF, use the following safe reload while no UI action is active:
+
+```bash
+manip bringup
+manip status perception
+```
+
+`bringup` recreates both resident workers, removes their old private Unix
+sockets, and restarts the UI so all three processes import the same checkout.
+The worker code/config/URDF bytes are labeled with one runtime fingerprint;
+the status row is healthy only when both container labels and both private
+sockets match the current checkout. `manip restart` intentionally reloads only
+the UI. To reload only perception and planning workers, use
+`manip component restart perception` and then `manip restart` if the UI code
+also changed.
+
 ## 3. Normal UI workflow
 
 There are two intended workflows.
@@ -318,7 +335,8 @@ environment variable unset and use only **Shadow check**.
 | Passive feedback is degraded after NUC reboot | Run `bringup`, then inspect `status passive-feedback` and `logs passive-feedback 100`. The manager only reports healthy after the service is active and `can0` is `ERROR-ACTIVE`. |
 | Perception succeeds but planning is blocked | Read candidate rejections and the planning artifact. IK/collision rejection is a geometric result, not evidence that restarting perception will help. Capture a fresh view after moving the target/camera, or fix the relevant calibration/model/planner issue. |
 | Direct perform is unavailable | A successful plan for the currently selected perception is required, and the physical arm must match its start. Use **Perception + perform** for a new Home-planned transaction. |
-| UI appears responsive but state no longer advances | Use **Restart UI** or `restart ui`; if camera/tracking also stopped, restart the affected vision component instead of repeatedly polling the dead endpoint. |
+| UI appears responsive but state no longer advances | Use **Restart UI** or `manip restart`; if camera/tracking also stopped, restart the affected vision component instead of repeatedly polling the dead endpoint. After a source/config update use `manip bringup`, because UI-only restart deliberately leaves resident workers unchanged. |
+| `status perception` reports stale/unsafe worker fingerprint | No planning request is sent to that old resident process. Run `manip component restart perception`; if UI source also changed, run `manip restart`, or use one `manip bringup` to reload both. |
 
 ## 8. Controlled shutdown
 

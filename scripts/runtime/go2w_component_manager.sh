@@ -25,6 +25,8 @@ LOCK_FILE="$RUNTIME_DIR/z-manip-component-manager.lock"
 LOG_ROOT="${Z_MANIP_COMPONENT_LOG_ROOT:-$WORKSPACE_ROOT/artifacts/go2w_real/component_logs}"
 MANAGER_LOG="$LOG_ROOT/component-manager.log"
 CAMERA_ARTIFACT="${Z_MANIP_CAMERA_ARTIFACT:-$WORKSPACE_ROOT/artifacts/go2w_real/latest/camera-latest.jpg}"
+PERCEPTION_RUNNER_SOCKET="$WORKSPACE_ROOT/artifacts/go2w_real/.perception_runner.sock"
+PLANNING_RUNNER_SOCKET="$WORKSPACE_ROOT/artifacts/go2w_real/.planning_runner_scratch/.planner.sock"
 WAIT_SECONDS="${Z_MANIP_COMPONENT_WAIT_SECONDS:-30}"
 NUC_SNAPSHOT_LOADED=0
 NUC_CAMERA_STATE="unreachable"
@@ -82,6 +84,36 @@ container_summary() {
   local name="$1"
   $DOCKER inspect "$name" --format '{{.State.Status}}; restarts={{.RestartCount}}' 2>/dev/null \
     || printf 'container missing'
+}
+
+runtime_fingerprint() {
+  "$LAB_SCRIPT" fingerprint
+}
+
+container_runtime_fingerprint() {
+  $DOCKER inspect "$1" \
+    --format '{{ index .Config.Labels "org.zlab.z-manip.runtime-sha256" }}' \
+    2>/dev/null || true
+}
+
+runner_socket_private() {
+  local path="$1" mode owner group
+  [[ -S "$path" && ! -L "$path" ]] || return 1
+  owner="$(stat -c %u "$path" 2>/dev/null)" || return 1
+  group="$(stat -c %g "$path" 2>/dev/null)" || return 1
+  mode="$(stat -c %a "$path" 2>/dev/null)" || return 1
+  [[ "$owner" == "$(id -u)" && "$group" == "$(id -g)" ]] || return 1
+  ((8#$mode & 077 == 0))
+}
+
+resident_runners_current() {
+  local expected perception planning
+  expected="$(runtime_fingerprint)" || return 1
+  perception="$(container_runtime_fingerprint z-manip-perception-runner)"
+  planning="$(container_runtime_fingerprint z-manip-planning-runner)"
+  [[ -n "$expected" && "$perception" == "$expected" && "$planning" == "$expected" ]] \
+    && runner_socket_private "$PERCEPTION_RUNNER_SOCKET" \
+    && runner_socket_private "$PLANNING_RUNNER_SOCKET"
 }
 
 yoloe_source_hash() {
@@ -200,8 +232,17 @@ status_one() {
       if container_running z-manip-hw \
           && container_running z-manip-perception-runner \
           && container_running z-manip-planning-runner; then
-        state="healthy"
-        summary="ROS $(container_summary z-manip-hw); warm runner active"
+        local expected perception_hash planning_hash
+        expected="$(runtime_fingerprint 2>/dev/null || true)"
+        perception_hash="$(container_runtime_fingerprint z-manip-perception-runner)"
+        planning_hash="$(container_runtime_fingerprint z-manip-planning-runner)"
+        if resident_runners_current; then
+          state="healthy"
+          summary="ROS $(container_summary z-manip-hw); warm runners current fingerprint=${expected:0:12}"
+        else
+          state="degraded"
+          summary="warm runner stale/unsafe: expected=${expected:0:12}, perception=${perception_hash:0:12}, planning=${planning_hash:0:12}; run 'manip component restart perception'"
+        fi
       else
         summary="ROS $(container_summary z-manip-hw); perception runner $(container_summary z-manip-perception-runner); planning runner $(container_summary z-manip-planning-runner)"
       fi
@@ -371,6 +412,9 @@ perception_ready() {
   if ! container_running z-manip-planning-runner; then
     return 1
   fi
+  if ! resident_runners_current; then
+    return 1
+  fi
   $DOCKER exec z-manip-hw bash -lc \
     'source /opt/ros/jazzy/setup.bash && timeout 4 ros2 node list 2>/dev/null | grep -Fxq /vlm_edgetam_bridge && timeout 4 ros2 node list 2>/dev/null | grep -Fxq /z_manip_edgetam' \
     >/dev/null 2>&1
@@ -491,7 +535,11 @@ cold_bringup_steps() {
   restart_one perception || return 1
   $SYSTEMCTL --user enable --now "$OBSERVER_UNIT" || return 1
   wait_until "runtime observer" observer_ready || return 1
-  $SYSTEMCTL --user enable --now "$UI_UNIT" || return 1
+  # ``enable --now`` leaves an already-running Python UI on its old imported
+  # modules.  Cold bringup is also the supported post-update reload path, so
+  # force one bounded UI restart after the resident workers are recreated.
+  $SYSTEMCTL --user enable "$UI_UNIT" || return 1
+  $SYSTEMCTL --user restart "$UI_UNIT" || return 1
   wait_until "UI workbench" ui_ready || return 1
   "$REACTIVE_INSTALLER" || return 1
   wait_until "NUC reactive control" remote_service_active "$REACTIVE_NUC_UNIT" || return 1

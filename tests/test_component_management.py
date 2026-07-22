@@ -125,6 +125,10 @@ def test_component_manager_is_syntax_checked_singleton_and_motion_free():
     assert "org.zlab.yoloe.source-sha256" in source
     assert "restart-rgbd" in source
     assert "restart-perception" in source
+    assert "resident_runners_current" in source
+    assert "org.zlab.z-manip.runtime-sha256" in source
+    assert "runner_socket_private" in source
+    assert '$systemctl --user restart "$ui_unit"' in source
     assert "wait_until" in source
     assert "state error-active" in source
     assert "systemctl --user restart d435i.service" in source
@@ -137,6 +141,10 @@ def test_component_manager_is_syntax_checked_singleton_and_motion_free():
     assert "restart-edgetam)" in lab
     assert "restart-rgbd)" in lab
     assert "restart-perception)" in lab
+    assert "z_manip_runtime_fingerprint.py" in lab
+    assert "z_manip_runtime_fingerprint=$fingerprint" in lab
+    assert 'rm -f -- "$perception_runner_socket"' in lab
+    assert 'rm -f -- "$planning_runner_socket"' in lab
     for forbidden in ("cansend", "ip link set", "--execute", "motionenable"):
         assert forbidden not in source
 

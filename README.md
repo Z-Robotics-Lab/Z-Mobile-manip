@@ -94,6 +94,12 @@ manip restart
 manip stop
 ```
 
+更新仓库中的 perception、IK、planning 代码或配置后，运行 `manip bringup`
+以同时重载 UI、perception runner 和 network-disabled planning runner。仅运行
+`manip restart` 只会重载 UI；如果驻留 worker 仍是旧版本，`manip status perception`
+会显示 `degraded` 和 fingerprint mismatch，而不会静默调用旧模块。只需重载两个
+驻留 worker 时可运行 `manip component restart perception`。
+
 实机调参前可启动全链路只读 rosbag；它记录 RGB-D、TF、目标/点云、跟踪、PiPER
 关节反馈以及 whole-body intent/status，并以 Zstd MCAP 每五分钟切片：
 

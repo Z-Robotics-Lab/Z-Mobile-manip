@@ -39,6 +39,7 @@ OUTPUT_ROOT = Path("/workspace-planning-output")
 CONFIG = Path("/opt/z_manip/configs/go2w_piper.json")
 URDF_ROOT = Path("/robot_assets")
 MAX_ALL_IK_FAILURE_CACHE = 32
+WORKER_FINGERPRINT = os.environ.get("Z_MANIP_RUNTIME_FINGERPRINT", "unknown")
 
 
 def _contained(path: Path, root: Path) -> bool:
@@ -195,12 +196,14 @@ def _serve(socket_path: Path) -> int:
                         "return_code": return_code,
                         "elapsed_s": time.perf_counter() - started,
                         "output": planner_output,
+                        "worker_fingerprint": WORKER_FINGERPRINT,
                     }
                 except (Exception, SystemExit) as error:  # keep requests fail-closed
                     response = {
                         "return_code": 70,
                         "elapsed_s": time.perf_counter() - started,
                         "output": f"planner worker rejected request: {type(error).__name__}: {error}\n",
+                        "worker_fingerprint": WORKER_FINGERPRINT,
                     }
                 encoded = json.dumps(response).encode("utf-8")
                 if len(encoded) > MAX_RESPONSE_BYTES:
@@ -208,6 +211,7 @@ def _serve(socket_path: Path) -> int:
                         "return_code": 70,
                         "elapsed_s": time.perf_counter() - started,
                         "output": "planner worker response exceeded bounded size\n",
+                        "worker_fingerprint": WORKER_FINGERPRINT,
                     }).encode("utf-8")
                 connection.sendall(encoded)
 
