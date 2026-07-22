@@ -9,11 +9,10 @@ the testable boundary between reactive target geometry and the NUC transport:
 * Full Stop pre-empts and flushes every queued command;
 * posture commands are rate/step bounded and require fresh body feedback.
 
-The installed Go2W WebRTC connector exposes SPORT API ids 1007 (Euler), 1008
-(Move), 1013 (BodyHeight), and 1024 (GetBodyHeight).  Euler's ``x/y/z``
-parameter contract matches Unitree's official SDK.  BodyHeight uses the
-connector's scalar ``data`` convention and remains behind this adapter so the
-transport representation can be replaced without touching reactive control.
+The legacy connector constants include API ids 1007 (Euler), 1008 (Move),
+1013 (BodyHeight), and 1024 (GetBodyHeight).  Constants are not capability
+evidence: current Go2W ``ai-w`` deployments must keep unconfirmed APIs out of
+the live transport and require an explicit robot code-0 verdict.
 """
 
 from __future__ import annotations
@@ -253,7 +252,8 @@ def _step(current: float, target: float, maximum: float) -> float:
 def sport_response_code(response: Mapping[str, Any]) -> int | None:
     """Extract the robot verdict used by the installed WebRTC connector."""
     try:
-        return int(response["data"]["header"]["status"]["code"])
+        value = response["data"]["header"]["status"]["code"]
+        return None if isinstance(value, bool) else int(value)
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -314,8 +314,11 @@ def get_body_height_from_response(response: Mapping[str, Any]) -> tuple[float, s
     if not isinstance(response, Mapping):
         raise ValueError("GetBodyHeight response must be a mapping")
     code = sport_response_code(response)
-    if code not in (0, None):
-        raise ValueError(f"GetBodyHeight refused by robot (code={code})")
+    if code != 0:
+        raise ValueError(
+            "GetBodyHeight refused: requires an explicit code 0 robot verdict "
+            f"(code={code})"
+        )
     candidates: list[tuple[float, str]] = []
     data = response.get("data")
     if isinstance(data, Mapping):
@@ -454,6 +457,16 @@ class Go2WPostureAdapter:
         self.target = target
         self.phase = PosturePhase.COMMANDING
         self._settled_since_s = None
+        self._last_evidence = CommandEvidence(
+            self._sequence,
+            None,
+            None,
+            {},
+            False,
+            False,
+            None,
+            "new target awaits robot evidence",
+        )
 
     def observe(self, feedback: PostureFeedback) -> None:
         if self.feedback is not None and feedback.stamp_s < self.feedback.stamp_s:
@@ -505,7 +518,7 @@ class Go2WPostureAdapter:
         assert self.transport is not None
         response = self.transport.send(request)
         code = sport_response_code(response)
-        accepted = code in (0, None)
+        accepted = code == 0
         return CommandEvidence(
             self._sequence, request.command.value, request.api_id,
             dict(request.parameter), True, True, accepted,
@@ -528,6 +541,14 @@ class Go2WPostureAdapter:
         if self.arbiter.owner == CommandOwner.FULL_STOP:
             self.phase = PosturePhase.STOPPED
             return self._output(now, reason="full stop owns the command channel")
+        if (
+            self.mode == "live"
+            and self._last_evidence.sent
+            and self._last_evidence.accepted is not True
+        ):
+            self.phase = PosturePhase.FAULT
+            self._settled_since_s = None
+            return self._output(now)
 
         base_quiet = (
             self.feedback.planar_speed_mps <= self.limits.quiet_linear_speed_mps

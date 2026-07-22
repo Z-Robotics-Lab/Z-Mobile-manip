@@ -72,11 +72,12 @@ def feedback_is_fresh(document: dict[str, Any], *, maximum_age_s: float = 0.50) 
 
 
 def euler_is_available(document: dict[str, Any]) -> bool:
-    """Treat an explicit robot capability rejection as persistent this run."""
+    """Require explicit same-epoch robot evidence before publishing Euler."""
     capabilities = document.get("capabilities")
-    return not (
+    return bool(
         isinstance(capabilities, dict)
-        and capabilities.get("euler") is False
+        and capabilities.get("euler") is True
+        and capabilities.get("euler_state") == "SUPPORTED_OBSERVED"
     )
 
 

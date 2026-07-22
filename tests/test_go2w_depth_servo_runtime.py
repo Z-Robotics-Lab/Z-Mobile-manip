@@ -473,6 +473,15 @@ def test_live_posture_reached_requires_fresh_feedback_to_settle():
         "phase": "reached",
         "stop_latched": False,
         "feedback": {"fresh": True, "source": "sport_state"},
+        "capabilities": {
+            "euler": True,
+            "euler_state": "SUPPORTED_OBSERVED",
+        },
+        "command": {
+            "posture_generation": 7,
+            "euler_ack_generation": 7,
+            "euler_ack_code": 0,
+        },
         "detail": "measured pose reached",
     }
 
@@ -485,6 +494,39 @@ def test_live_posture_reached_requires_fresh_feedback_to_settle():
     assert blocked is False
     assert shadow is False
     assert detail == "measured pose reached"
+
+
+def test_old_reached_status_with_euler_3203_never_unlocks_handoff():
+    document = {
+        "schema": "z_manip.go2w_posture_status.v1",
+        "mode": "live",
+        "phase": "reached",
+        "stop_latched": False,
+        "feedback": {"fresh": True, "source": "sport_state"},
+        "capabilities": {
+            "euler": True,
+            "euler_state": "SUPPORTED_OBSERVED",
+        },
+        "command": {
+            "posture_generation": 7,
+            "euler_ack_generation": 7,
+            "euler_ack_code": 3203,
+            "codes": {"Euler": 3203},
+        },
+        "detail": "legacy runtime incorrectly reported reached",
+    }
+
+    settled, blocked, shadow, _ = SERVO._posture_feedback_state(
+        document,
+        age_s=0.10,
+    )
+
+    assert settled is False
+    assert blocked is False
+    assert shadow is False
+
+    document["command"]["euler_ack_code"] = False
+    assert SERVO._posture_ack_matches_target(document) is False
 
 
 def test_shadow_posture_is_diagnostic_and_never_counts_as_settled():
@@ -513,7 +555,10 @@ def test_explicit_euler_not_implemented_uses_nonblocking_base_arm_fallback():
         "phase": "unsupported",
         "stop_latched": False,
         "feedback": {"fresh": True},
-        "capabilities": {"euler": False},
+        "capabilities": {
+            "euler": False,
+            "euler_state": "UNSUPPORTED_FOR_EPOCH",
+        },
         "detail": "Euler 1007 returned RPC 3203",
     }
 

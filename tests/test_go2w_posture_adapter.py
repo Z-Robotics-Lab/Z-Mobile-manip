@@ -38,7 +38,7 @@ def _feedback(
 
 
 class FakeTransport:
-    def __init__(self, code: int = 0) -> None:
+    def __init__(self, code: int | None = 0) -> None:
         self.code = code
         self.requests: list[SportRequest] = []
 
@@ -79,6 +79,39 @@ def test_live_adapter_surfaces_robot_refusal():
     assert output.command.sent is True
     assert output.command.accepted is False
     assert transport.requests[0].command == SportCommand.BODY_HEIGHT
+
+
+def test_live_adapter_never_treats_missing_robot_code_as_acceptance():
+    transport = FakeTransport(code=None)
+    adapter = Go2WPostureAdapter(mode="live", transport=transport)
+    adapter.set_target(PostureTarget(body_height_m=-0.04))
+    adapter.observe(_feedback(2.0))
+
+    output = adapter.tick(now_s=2.0)
+
+    assert output.phase == PosturePhase.FAULT
+    assert output.command.sent is True
+    assert output.command.accepted is False
+
+    boolean_transport = FakeTransport(code=False)
+    boolean_adapter = Go2WPostureAdapter(mode="live", transport=boolean_transport)
+    boolean_adapter.set_target(PostureTarget(body_height_m=-0.04))
+    boolean_adapter.observe(_feedback(2.0))
+    assert boolean_adapter.tick(now_s=2.0).phase == PosturePhase.FAULT
+
+
+def test_refused_command_cannot_later_be_relabelled_reached():
+    transport = FakeTransport(code=3203)
+    adapter = Go2WPostureAdapter(mode="live", transport=transport)
+    adapter.set_target(PostureTarget(body_height_m=-0.04))
+    adapter.observe(_feedback(2.0))
+    assert adapter.tick(now_s=2.0).phase == PosturePhase.FAULT
+
+    adapter.observe(_feedback(2.4, height=-0.04))
+    output = adapter.tick(now_s=2.4)
+
+    assert output.phase == PosturePhase.FAULT
+    assert output.command.accepted is False
 
 
 def test_posture_waits_for_base_quiet_by_default():
@@ -201,7 +234,11 @@ def test_get_body_height_queries_are_coalesced_and_serialized():
             -0.02,
             "data.parameter<json>.body_height",
         ),
-        ({"height": 0.01}, 0.01, "height"),
+        (
+            {"data": {"header": {"status": {"code": 0}}}, "height": 0.01},
+            0.01,
+            "height",
+        ),
     ],
 )
 def test_get_body_height_response_envelopes_are_parsed_strictly(
@@ -213,6 +250,8 @@ def test_get_body_height_response_envelopes_are_parsed_strictly(
 
 
 def test_get_body_height_never_substitutes_status_or_ambiguous_values():
+    with pytest.raises(ValueError, match="explicit code 0"):
+        get_body_height_from_response({"height": -0.04})
     with pytest.raises(ValueError, match="no supported height"):
         get_body_height_from_response(
             {"data": {"header": {"status": {"code": 0}}}},
@@ -223,7 +262,13 @@ def test_get_body_height_never_substitutes_status_or_ambiguous_values():
         )
     with pytest.raises(ValueError, match="conflicting"):
         get_body_height_from_response(
-            {"data": {"data": -0.04, "height": -0.02}},
+            {
+                "data": {
+                    "header": {"status": {"code": 0}},
+                    "data": -0.04,
+                    "height": -0.02,
+                }
+            },
         )
 
 

@@ -66,6 +66,31 @@ def _load_motion_mode_parser():
     return namespace["_motion_mode_evidence"]
 
 
+def _load_mode_identity():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_mode_identity"
+    ]
+    namespace = {"Any": object}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    return namespace["_mode_identity"]
+
+
+def _load_matching_posture_ack():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_has_matching_posture_ack"
+    ]
+    namespace = {}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    return namespace["_has_matching_posture_ack"]
+
+
 def test_shadow_path_cannot_construct_unitree_transport():
     source = SOURCE.read_text(encoding="utf-8")
 
@@ -133,8 +158,17 @@ def test_web_rtc_status_keeps_mode_and_per_command_robot_evidence():
     assert '"StopMove": None' in source
     assert 'self._command_codes["Move"] = self._last_code' in source
     assert 'self._command_codes["StopMove"] = self._last_code' in source
-    assert 'evidence.get("api_family") == "wheeled_sport"' in source
-    assert '"Go2 Euler(1007); robot evidence is 3203"' in source
+    assert "_mode_identity" in source
+    assert '"mode_epoch": self._mode_epoch' in source
+
+    boolean_code = {
+        **response,
+        "data": {
+            **response["data"],
+            "header": {"status": {"code": False}},
+        },
+    }
+    assert parse(boolean_code)["robot_code"] is None
 
 
 def test_body_height_is_explicitly_unsupported_and_never_queried():
@@ -167,6 +201,91 @@ def test_posture_commands_require_an_explicit_zero_ack():
     assert "code in (0, None)" not in source
 
 
+def test_euler_capability_starts_unknown_and_fail_closed():
+    source = SOURCE.read_text(encoding="utf-8")
+
+    assert "self._euler_supported = False" in source
+    assert 'self._euler_capability_state = "UNKNOWN"' in source
+    assert 'self._phase = "capability_unknown"' in source
+    assert "Euler capability is UNKNOWN" in source
+
+
+def test_motion_mode_is_polled_and_mode_epoch_invalidates_pending_work():
+    mode_identity = _load_mode_identity()
+    source = SOURCE.read_text(encoding="utf-8")
+
+    assert mode_identity(
+        {"robot_code": 0, "parse_error": None, "name": "ai-w", "form": "1"}
+    ) == ("ai-w", "1")
+    assert mode_identity(
+        {"robot_code": 3203, "parse_error": None, "name": "ai-w", "form": "1"}
+    ) is None
+    assert mode_identity(
+        {"robot_code": 0, "parse_error": "bad payload", "name": None, "form": None}
+    ) is None
+    assert "_MODE_REFRESH_PERIOD_S = 3.0" in source
+    assert "self._schedule_motion_mode_refresh()" in source
+    assert "self.create_timer(" in source
+    assert "self._MODE_REFRESH_PERIOD_S" in source
+    assert "def _invalidate_mode_epoch(" in source
+    assert "self._mode_epoch += 1" in source
+    assert "self._pending_move = None" in source
+    assert "self._posture_generation += 1" in source
+    assert "self._pending_posture = None" in source
+    assert 'self._move_capability_state = "UNKNOWN"' in source
+    assert 'self._euler_capability_state = "UNKNOWN"' in source
+
+
+def test_move_status_is_observed_evidence_not_a_hardcoded_capability():
+    source = SOURCE.read_text(encoding="utf-8")
+
+    assert '"move": self._move_capability_state == "SUPPORTED_OBSERVED"' in source
+    assert '"move_state": self._move_capability_state' in source
+    assert 'self._move_capability_state = "SUPPORTED_OBSERVED"' in source
+    assert 'self._move_capability_state = "UNSUPPORTED_FOR_EPOCH"' in source
+    assert '"move": True' not in source
+
+
+def test_reached_requires_same_generation_zero_ack_and_post_ack_feedback():
+    matching_ack = _load_matching_posture_ack()
+
+    assert matching_ack(
+        target_generation=4,
+        ack_generation=4,
+        ack_code=0,
+        ack_received_s=10.0,
+        feedback_received_s=10.1,
+    )
+    assert not matching_ack(
+        target_generation=4,
+        ack_generation=3,
+        ack_code=0,
+        ack_received_s=10.0,
+        feedback_received_s=10.1,
+    )
+    assert not matching_ack(
+        target_generation=4,
+        ack_generation=4,
+        ack_code=3203,
+        ack_received_s=10.0,
+        feedback_received_s=10.1,
+    )
+    assert not matching_ack(
+        target_generation=4,
+        ack_generation=4,
+        ack_code=0,
+        ack_received_s=10.0,
+        feedback_received_s=9.9,
+    )
+    assert not matching_ack(
+        target_generation=4,
+        ack_generation=4,
+        ack_code=False,
+        ack_received_s=10.0,
+        feedback_received_s=10.1,
+    )
+
+
 def test_euler_api_not_implemented_degrades_instead_of_faulting_forever():
     classify = _load_euler_classifier()
     source = SOURCE.read_text(encoding="utf-8")
@@ -178,7 +297,7 @@ def test_euler_api_not_implemented_degrades_instead_of_faulting_forever():
     assert 'self._phase = "unsupported"' in source
     assert '"euler": self._euler_supported' in source
     assert '"euler_state": self._euler_capability_state' in source
-    assert 'self._euler_capability_state = "unsupported_for_session"' in source
+    assert 'self._euler_capability_state = "UNSUPPORTED_FOR_EPOCH"' in source
     assert "degraded to base + arm control" in source
 
 
@@ -254,9 +373,17 @@ def test_pc_live_relay_requires_fresh_unlatched_nuc_feedback():
     assert not bridge.feedback_is_fresh(status)
 
 
-def test_pc_relay_suppresses_euler_after_explicit_capability_rejection():
+def test_pc_relay_requires_explicit_same_epoch_euler_support():
     bridge = _load_pc_bridge()
 
-    assert bridge.euler_is_available({})
-    assert bridge.euler_is_available({"capabilities": {"euler": True}})
+    assert not bridge.euler_is_available({})
+    assert not bridge.euler_is_available({"capabilities": {"euler": True}})
+    assert bridge.euler_is_available(
+        {
+            "capabilities": {
+                "euler": True,
+                "euler_state": "SUPPORTED_OBSERVED",
+            }
+        }
+    )
     assert not bridge.euler_is_available({"capabilities": {"euler": False}})

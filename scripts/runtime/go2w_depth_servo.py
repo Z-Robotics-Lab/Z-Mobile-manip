@@ -362,9 +362,19 @@ def _posture_feedback_state(
     detail = str(document.get("detail", ""))
     stop_latched = document.get("stop_latched") is True
     capabilities = document.get("capabilities")
+    euler_supported = (
+        isinstance(capabilities, dict)
+        and capabilities.get("euler") is True
+        and capabilities.get("euler_state") == "SUPPORTED_OBSERVED"
+    )
     euler_unavailable = (
         isinstance(capabilities, dict)
         and capabilities.get("euler") is False
+        and capabilities.get("euler_state") in {
+            "UNKNOWN",
+            "UNSUPPORTED_FOR_EPOCH",
+            "TRANSIENT_FAULT",
+        }
     )
     blocked = stop_latched or phase in {
         "blocked",
@@ -388,9 +398,33 @@ def _posture_feedback_state(
         and phase == "reached"
         and feedback_fresh
         and not stop_latched
+        and euler_supported
+        and _posture_ack_matches_target(document)
     )
     shadow_verified = mode == "shadow" and phase == "shadow" and not blocked
     return settled, blocked, shadow_verified, detail
+
+
+def _posture_ack_matches_target(document: dict[str, Any]) -> bool:
+    """Reject legacy `reached` states without a same-generation code-0 ACK."""
+
+    command = document.get("command")
+    if not isinstance(command, dict):
+        return False
+    target_generation = command.get("posture_generation")
+    ack_generation = command.get("euler_ack_generation")
+    ack_code = command.get("euler_ack_code")
+    return bool(
+        isinstance(target_generation, int)
+        and not isinstance(target_generation, bool)
+        and target_generation >= 0
+        and isinstance(ack_generation, int)
+        and not isinstance(ack_generation, bool)
+        and ack_generation == target_generation
+        and isinstance(ack_code, int)
+        and not isinstance(ack_code, bool)
+        and ack_code == 0
+    )
 
 
 class DepthServoCore:

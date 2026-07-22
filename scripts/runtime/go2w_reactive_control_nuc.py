@@ -48,7 +48,8 @@ MOTION_SWITCHER_CHECK_MODE_API_ID = 1001
 
 def _status_code(response: Any) -> int | None:
     try:
-        return int(response["data"]["header"]["status"]["code"])
+        value = response["data"]["header"]["status"]["code"]
+        return None if isinstance(value, bool) else int(value)
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -124,6 +125,43 @@ def _motion_mode_evidence(response: Any) -> dict[str, Any]:
     }
 
 
+def _mode_identity(evidence: dict[str, Any]) -> tuple[str, str] | None:
+    """Return an epoch key only for a successful, fully parsed CheckMode."""
+
+    if evidence.get("robot_code") != 0 or evidence.get("parse_error") is not None:
+        return None
+    name = evidence.get("name")
+    form = evidence.get("form")
+    if not isinstance(name, str) or not isinstance(form, str):
+        return None
+    return name, form
+
+
+def _has_matching_posture_ack(
+    *,
+    target_generation: int | None,
+    ack_generation: int | None,
+    ack_code: int | None,
+    ack_received_s: float | None,
+    feedback_received_s: float | None,
+) -> bool:
+    """Require a same-generation zero ACK and feedback newer than that ACK."""
+
+    return (
+        isinstance(target_generation, int)
+        and not isinstance(target_generation, bool)
+        and isinstance(ack_generation, int)
+        and not isinstance(ack_generation, bool)
+        and ack_generation == target_generation
+        and isinstance(ack_code, int)
+        and not isinstance(ack_code, bool)
+        and ack_code == 0
+        and ack_received_s is not None
+        and feedback_received_s is not None
+        and feedback_received_s >= ack_received_s
+    )
+
+
 class _StatusNode(Node):
     """Common ROS status/input surface; it owns no transport."""
 
@@ -156,10 +194,18 @@ class _StatusNode(Node):
             "parse_error": "motion mode has not been queried by this owner",
             "raw_response": None,
         }
-        self._euler_supported = True
-        self._euler_capability_state = "unknown"
-        self._euler_reason = "Euler capability has not been rejected by the robot"
+        self._mode_epoch = 0
+        self._active_mode_identity: tuple[str, str] | None = None
+        self._move_capability_state = "UNKNOWN"
+        self._move_reason = "Move capability has not been observed in this mode epoch"
+        self._euler_supported = False
+        self._euler_capability_state = "UNKNOWN"
+        self._euler_reason = "Euler capability is UNKNOWN and therefore fail-closed"
         self._target: tuple[float, float, float, float] | None = None
+        self._target_generation: int | None = None
+        self._euler_ack_generation: int | None = None
+        self._euler_ack_code: int | None = None
+        self._euler_ack_received_s: float | None = None
         self._phase = "idle" if mode == "live" else "shadow"
         self._detail = (
             "single WebRTC owner ready"
@@ -259,6 +305,13 @@ class _StatusNode(Node):
             or self._sport_state is None
             or self._stop_latched
             or not self._euler_supported
+            or not _has_matching_posture_ack(
+                target_generation=self._target_generation,
+                ack_generation=self._euler_ack_generation,
+                ack_code=self._euler_ack_code,
+                ack_received_s=self._euler_ack_received_s,
+                feedback_received_s=self._sport_state_received_s,
+            )
         ):
             return
         fresh, detail = self._fresh_feedback()
@@ -336,7 +389,9 @@ class _StatusNode(Node):
                 "get_body_height_age_s": None,
             },
             "capabilities": {
-                "move": True,
+                "move": self._move_capability_state == "SUPPORTED_OBSERVED",
+                "move_state": self._move_capability_state,
+                "move_reason": self._move_reason,
                 "euler": self._euler_supported,
                 "euler_state": self._euler_capability_state,
                 "body_height": False,
@@ -358,6 +413,9 @@ class _StatusNode(Node):
             },
             "command": {
                 "last_robot_code": self._last_code,
+                "posture_generation": self._target_generation,
+                "euler_ack_generation": self._euler_ack_generation,
+                "euler_ack_code": self._euler_ack_code,
                 "api_ids": {
                     "Move": SPORT_CMD["Move"],
                     "Euler": SPORT_CMD["Euler"],
@@ -377,6 +435,7 @@ class _StatusNode(Node):
                 ],
                 "motion_switcher_topic": RTC_TOPIC["MOTION_SWITCHER"],
                 "motion_mode": dict(self._motion_mode),
+                "mode_epoch": self._mode_epoch,
                 "acceptance_rule": (
                     "robot RPC code 0 plus measured SPORT/IMU convergence"
                 ),
@@ -431,13 +490,17 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
     """The only process allowed to own live Go2W SPORT requests."""
 
     _MIN_COMMAND_PERIOD_S = 0.20
+    _MODE_REFRESH_PERIOD_S = 3.0
 
     def __init__(self) -> None:
         UnitreeControlNode.__init__(self)
         self._sport_request_lock = asyncio.Lock()
         self._posture_lock = threading.Lock()
         self._posture_active = False
-        self._pending_posture: tuple[float, float, float, float] | None = None
+        self._pending_posture: tuple[
+            int,
+            tuple[float, float, float, float],
+        ] | None = None
         self._posture_generation = 0
         self._last_posture_command_s = 0.0
         self._allow_moving_posture = os.environ.get(
@@ -463,7 +526,62 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             "LIVE single-owner bridge enabled: Move + capability-gated Euler "
             "+ StopMove; BodyHeight/GetBodyHeight are not control dependencies"
         )
-        asyncio.run_coroutine_threadsafe(self._refresh_motion_mode(), self.loop)
+        self._motion_mode_refresh_future = None
+        self._schedule_motion_mode_refresh()
+        self.create_timer(
+            self._MODE_REFRESH_PERIOD_S,
+            self._schedule_motion_mode_refresh,
+        )
+
+    def _schedule_motion_mode_refresh(self) -> None:
+        """Schedule at most one read-only CheckMode request at a time."""
+
+        active = self._motion_mode_refresh_future
+        if active is not None and not active.done():
+            return
+        self._motion_mode_refresh_future = asyncio.run_coroutine_threadsafe(
+            self._refresh_motion_mode(),
+            self.loop,
+        )
+
+    def _invalidate_mode_epoch(self, identity: tuple[str, str]) -> None:
+        """Invalidate mode-scoped evidence and discard commands from the old mode."""
+
+        previous_identity = self._active_mode_identity
+        self._active_mode_identity = identity
+        self._mode_epoch += 1
+        with self._move_lock:
+            self._pending_move = None
+        with self._posture_lock:
+            self._posture_generation += 1
+            self._pending_posture = None
+        self._target = None
+        self._target_generation = None
+        self._euler_ack_generation = None
+        self._euler_ack_code = None
+        self._euler_ack_received_s = None
+        self._sport_state = None
+        self._sport_state_received_s = None
+        self._last_code = None
+        self._command_codes = {"Move": None, "Euler": None, "StopMove": None}
+        self._move_capability_state = "UNKNOWN"
+        self._move_reason = "Move capability awaits evidence in the new mode epoch"
+        self._euler_supported = False
+        self._euler_capability_state = "UNKNOWN"
+        self._euler_reason = "Euler capability is UNKNOWN in the new mode epoch"
+        if previous_identity is not None:
+            if self._stop_latched:
+                self._phase = "stopped"
+                self._detail = (
+                    f"motion mode changed from {previous_identity!r} to {identity!r}; "
+                    "Full Stop remains latched"
+                )
+            else:
+                self._phase = "mode_changed"
+                self._detail = (
+                    f"motion mode changed from {previous_identity!r} to {identity!r}; "
+                    "pending commands and capability evidence were invalidated"
+                )
 
     async def _refresh_motion_mode(self) -> None:
         """Read the active Go2W motion service over the owned WebRTC link."""
@@ -474,33 +592,15 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 {},
                 topic=RTC_TOPIC["MOTION_SWITCHER"],
             )
-            previous_name = self._motion_mode.get("name")
             evidence = _motion_mode_evidence(response)
             self._motion_mode = evidence
-            current_name = evidence.get("name")
-            if evidence.get("api_family") == "wheeled_sport":
-                # The public wheeled/B2 SPORT table has no Go2-style Euler
-                # target.  This exact robot also returned 3203 for API 1007
-                # in ai-w.  Lock the unavailable DOFs as soon as CheckMode
-                # identifies the service, rather than sending one known-bad
-                # posture request after every reconnect.
-                self._euler_supported = False
-                self._euler_capability_state = "unsupported_for_session"
-                self._euler_reason = (
-                    f"active {current_name} wheeled_sport service does not expose "
-                    "Go2 Euler(1007); robot evidence is 3203"
-                )
-            elif previous_name and current_name and previous_name != current_name:
-                self._euler_supported = True
-                self._euler_capability_state = "unknown"
-                self._euler_reason = (
-                    "motion service changed; Euler capability awaits a new "
-                    "robot RPC verdict"
-                )
+            identity = _mode_identity(evidence)
+            if identity is not None and identity != self._active_mode_identity:
+                self._invalidate_mode_epoch(identity)
             self.get_logger().info(
                 "WebRTC motion service evidence: "
-                f"name={current_name!r} form={evidence.get('form')!r} "
-                f"code={evidence.get('robot_code')}"
+                f"name={evidence.get('name')!r} form={evidence.get('form')!r} "
+                f"code={evidence.get('robot_code')} epoch={self._mode_epoch}"
             )
         except Exception as error:  # noqa: BLE001
             self._motion_mode = {
@@ -621,17 +721,47 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 if command is None or self._stop_latched:
                     return
                 x, y, yaw = command
+                command_epoch = self._mode_epoch
                 try:
                     self._last_code = await self._request_sport(
                         "Move", {"x": x, "y": y, "z": yaw},
                     )
+                    if command_epoch != self._mode_epoch:
+                        continue
                     self._command_codes["Move"] = self._last_code
+                    if self._last_code == 0:
+                        self._move_capability_state = "SUPPORTED_OBSERVED"
+                        self._move_reason = (
+                            f"Move returned code 0 in mode epoch {self._mode_epoch}"
+                        )
+                    elif self._last_code == RPC_ERR_SERVER_API_NOT_IMPL:
+                        self._move_capability_state = "UNSUPPORTED_FOR_EPOCH"
+                        self._move_reason = (
+                            "Move returned 3203 (RPC_ERR_SERVER_API_NOT_IMPL) "
+                            f"in mode epoch {self._mode_epoch}"
+                        )
+                    else:
+                        self._move_capability_state = "TRANSIENT_FAULT"
+                        self._move_reason = (
+                            f"Move returned code {self._last_code} in mode epoch "
+                            f"{self._mode_epoch}"
+                        )
                     self._move_timeout_count = 0
                     self._move_send_count += 1
                 except asyncio.TimeoutError:
+                    if command_epoch == self._mode_epoch:
+                        self._move_capability_state = "TRANSIENT_FAULT"
+                        self._move_reason = "Move ACK timed out"
                     self._move_timeout_count += 1
-                    self.get_logger().warning("Move ACK timed out; latest-value stream continues")
+                    self.get_logger().warning(
+                        "Move ACK timed out; latest-value stream continues"
+                    )
                 except Exception as error:  # noqa: BLE001
+                    if command_epoch == self._mode_epoch:
+                        self._move_capability_state = "TRANSIENT_FAULT"
+                        self._move_reason = (
+                            f"Move request failed: {type(error).__name__}: {error}"
+                        )
                     self.get_logger().error(f"Move request failed: {error}")
                 finally:
                     self._move_last_sent_s = self.loop.time()
@@ -657,11 +787,19 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             return
         if not self._euler_supported:
             self._target = target
-            self._phase = "unsupported"
-            self._detail = (
-                "Euler unavailable on the active Go2W motion service; "
-                "body posture is bypassed and base + arm remain available"
-            )
+            self._target_generation = None
+            if self._euler_capability_state == "UNSUPPORTED_FOR_EPOCH":
+                self._phase = "unsupported"
+                self._detail = (
+                    "Euler unavailable on the active Go2W motion service; "
+                    "body posture is bypassed and base + arm remain available"
+                )
+            else:
+                self._phase = "capability_unknown"
+                self._detail = (
+                    "Euler capability is UNKNOWN and fail-closed; no posture "
+                    "request was transmitted"
+                )
             return
         fresh, detail = self._fresh_feedback()
         if not fresh:
@@ -676,40 +814,60 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 return
         if time.monotonic() - self._last_posture_command_s < self._MIN_COMMAND_PERIOD_S:
             return
-        self._target = target
         with self._posture_lock:
-            self._pending_posture = target
+            self._posture_generation += 1
+            generation = self._posture_generation
+            self._pending_posture = (generation, target)
+            self._target = target
+            self._target_generation = generation
+            self._euler_ack_generation = None
+            self._euler_ack_code = None
+            self._euler_ack_received_s = None
             if self._posture_active:
                 return
             self._posture_active = True
-            generation = self._posture_generation
         self._phase = "commanding"
         self._detail = "dispatching Euler; BodyHeight is not a control DOF"
-        asyncio.run_coroutine_threadsafe(self._drain_posture(generation), self.loop)
+        asyncio.run_coroutine_threadsafe(self._drain_posture(), self.loop)
 
-    async def _drain_posture(self, generation: int) -> None:
+    async def _drain_posture(self) -> None:
         try:
-            while generation == self._posture_generation and not self._stop_latched:
+            while not self._stop_latched:
                 with self._posture_lock:
-                    target = self._pending_posture
+                    pending = self._pending_posture
                     self._pending_posture = None
-                if target is None:
+                if pending is None:
                     return
+                generation, target = pending
+                if generation != self._posture_generation:
+                    continue
+                command_epoch = self._mode_epoch
                 _height, roll, pitch, yaw = target
                 commands = [("Euler", {"x": roll, "y": pitch, "z": yaw})]
                 for name, parameter in commands:
                     if generation != self._posture_generation or self._stop_latched:
                         return
                     self._last_code = await self._request_sport(name, parameter)
+                    if (
+                        generation != self._posture_generation
+                        or command_epoch != self._mode_epoch
+                        or self._stop_latched
+                    ):
+                        return
                     self._command_codes[name] = self._last_code
                     outcome = _euler_response_outcome(self._last_code)
                     if outcome == "unsupported":
                         self._euler_supported = False
-                        self._euler_capability_state = "unsupported_for_session"
+                        self._euler_capability_state = "UNSUPPORTED_FOR_EPOCH"
                         self._euler_reason = (
                             "robot returned 3203 (RPC_ERR_SERVER_API_NOT_IMPL) "
-                            "for Euler(1007)"
+                            f"for Euler(1007) in mode epoch {self._mode_epoch}"
                         )
+                        self._euler_ack_generation = generation
+                        self._euler_ack_code = self._last_code
+                        self._euler_ack_received_s = time.monotonic()
+                        with self._posture_lock:
+                            self._pending_posture = None
                         self._last_posture_command_s = time.monotonic()
                         self._phase = "unsupported"
                         self._detail = (
@@ -718,10 +876,28 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                         )
                         return
                     if outcome == "fault":
+                        self._euler_supported = False
+                        self._euler_capability_state = "TRANSIENT_FAULT"
+                        self._euler_reason = (
+                            f"Euler returned code {self._last_code} in mode epoch "
+                            f"{self._mode_epoch}"
+                        )
+                        self._euler_ack_generation = generation
+                        self._euler_ack_code = self._last_code
+                        self._euler_ack_received_s = time.monotonic()
+                        with self._posture_lock:
+                            self._pending_posture = None
                         self._phase = "fault"
                         self._detail = f"{name} refused by robot (code={self._last_code})"
                         return
-                    self._euler_capability_state = "supported"
+                    self._euler_supported = True
+                    self._euler_capability_state = "SUPPORTED_OBSERVED"
+                    self._euler_reason = (
+                        f"Euler returned code 0 in mode epoch {self._mode_epoch}"
+                    )
+                    self._euler_ack_generation = generation
+                    self._euler_ack_code = self._last_code
+                    self._euler_ack_received_s = time.monotonic()
                 self._last_posture_command_s = time.monotonic()
                 self._phase = "settling"
                 self._detail = "command accepted; waiting for measured posture"
@@ -735,12 +911,11 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                     self._pending_posture is not None
                     and not self._stop_latched
                     and self._euler_supported
-                    and generation == self._posture_generation
                 )
                 if restart:
                     self._posture_active = True
             if restart:
-                asyncio.create_task(self._drain_posture(generation))
+                asyncio.create_task(self._drain_posture())
 
     def _full_stop(self, _message: Empty) -> None:
         self._stop_latched = True
@@ -750,6 +925,10 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             self._posture_generation += 1
             self._pending_posture = None
         self._target = None
+        self._target_generation = None
+        self._euler_ack_generation = None
+        self._euler_ack_code = None
+        self._euler_ack_received_s = None
         self._phase = "stopping"
         self._detail = "Full Stop latched; queues flushed; StopMove owns next SPORT slot"
 

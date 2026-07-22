@@ -210,8 +210,16 @@ def test_locked_untransported_controls_remain_exactly_stationary():
 
 
 def test_explicit_euler_rejection_reallocates_view_task_to_arm_controls():
-    assert _euler_actuation_available(None)
-    assert _euler_actuation_available({"capabilities": {"euler": True}})
+    assert not _euler_actuation_available(None)
+    assert not _euler_actuation_available({"capabilities": {"euler": True}})
+    assert _euler_actuation_available(
+        {
+            "capabilities": {
+                "euler": True,
+                "euler_state": "SUPPORTED_OBSERVED",
+            }
+        }
+    )
     assert not _euler_actuation_available({"capabilities": {"euler": False}})
 
     locked = _locked_control_indices(

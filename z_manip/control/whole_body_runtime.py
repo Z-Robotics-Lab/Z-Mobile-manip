@@ -34,13 +34,14 @@ RUNTIME_SCHEMA = "z_manip.whole_body_runtime.v1"
 
 
 def _euler_actuation_available(document: dict[str, Any] | None) -> bool:
-    """Return false only after the robot explicitly rejects Euler support."""
+    """Return true only for explicit same-epoch Euler acceptance evidence."""
     if not isinstance(document, dict):
-        return True
+        return False
     capabilities = document.get("capabilities")
-    return not (
+    return bool(
         isinstance(capabilities, dict)
-        and capabilities.get("euler") is False
+        and capabilities.get("euler") is True
+        and capabilities.get("euler_state") == "SUPPORTED_OBSERVED"
     )
 
 
