@@ -314,6 +314,36 @@ def test_near_field_handoff_precedes_another_posture_increment():
     assert "near-field" in decision.reason
 
 
+def test_wrist_camera_near_field_handoffs_before_base_reaches_same_distance():
+    """A wrist-mounted D435 reaches 52 cm before base_link does."""
+
+    controller = ReactiveTargetController(ReactiveServoConfig(
+        handoff_planar_max_m=0.52,
+        camera_handoff_depth_m=0.52,
+        camera_handoff_planar_slack_m=0.15,
+    ))
+    geometry = _geometry(
+        camera_xyz=(0.018, 0.037, 0.476),
+        base_xyz=(0.600, 0.130, 0.074),
+        arm_xyz=(0.480, 0.000, 0.074),
+    )
+
+    decision = controller.update(
+        geometry,
+        now_s=6.0,
+        tracking=True,
+        body_settled=False,
+        ik_feasible=None,
+        desired_target_lateral_m=0.13,
+    )
+
+    assert geometry.base_planar_distance_m > 0.52
+    assert decision.phase is ReactivePhase.HANDOFF_PROBE
+    assert decision.needs_ik_probe
+    assert decision.base.linear_x_mps == decision.base.angular_z_rps == 0.0
+    assert decision.arm_view.mode is ArmViewMode.HOLD
+
+
 def test_hard_camera_floor_stops_view_motion_outside_soft_handoff_corridor():
     controller = ReactiveTargetController()
     geometry = _geometry(

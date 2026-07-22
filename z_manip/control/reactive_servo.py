@@ -192,7 +192,11 @@ class ReactiveServoConfig:
     # soft limit starts close-range planning while depth is still usable; the
     # hard limit stops posture/view motion even if another corridor check has
     # not converged yet.
-    camera_handoff_depth_m: float = 0.42
+    camera_handoff_depth_m: float = 0.52
+    # The wrist camera can be materially closer to the target than base_link.
+    # Allow a bounded amount of base-planar slack for the soft camera handoff,
+    # while retaining the arm range/height and lateral corridor checks below.
+    camera_handoff_planar_slack_m: float = 0.15
     camera_hard_min_depth_m: float = 0.38
     preferred_target_height_m: float = -0.10
     target_height_deadband_m: float = 0.08
@@ -226,6 +230,7 @@ class ReactiveServoConfig:
             self.handoff_arm_min_range_m,
             self.handoff_arm_max_range_m,
             self.camera_handoff_depth_m,
+            self.camera_handoff_planar_slack_m,
             self.camera_hard_min_depth_m,
             self.target_height_deadband_m,
             self.camera_elevation_soft_limit_rad,
@@ -423,11 +428,23 @@ class ReactiveTargetController:
         lateral_aligned = (
             abs(lateral_error_m) <= self.config.handoff_lateral_tolerance_m
         )
+        arm_corridor_ok = (
+            self.config.handoff_arm_min_range_m
+            <= geometry.arm_range_m
+            <= self.config.handoff_arm_max_range_m
+            and self.config.handoff_arm_min_height_m
+            <= geometry.arm_xyz_m[2]
+            <= self.config.handoff_arm_max_height_m
+        )
         near_field_handoff = (
             camera_depth_m <= self.config.camera_handoff_depth_m
             and geometry.base_planar_distance_m
-            <= self.config.handoff_planar_max_m + 0.05
+            <= (
+                self.config.handoff_planar_max_m
+                + self.config.camera_handoff_planar_slack_m
+            )
             and lateral_aligned
+            and arm_corridor_ok
         )
         hard_near_field = camera_depth_m <= self.config.camera_hard_min_depth_m
 

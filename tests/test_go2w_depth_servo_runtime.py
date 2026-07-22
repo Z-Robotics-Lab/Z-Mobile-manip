@@ -415,6 +415,31 @@ def test_reactive_runtime_stops_for_downstream_ik_probe_in_3d_corridor():
     assert reached.done
 
 
+def test_runtime_handoffs_at_wrist_near_field_before_base_52cm():
+    core = SERVO.DepthServoCore(SERVO.DepthServoSettings(
+        mode="live",
+        desired_depth_m=0.50,
+        handoff_depth_m=0.52,
+        handoff_settle_s=0.30,
+    ))
+    sample = {
+        "camera_xyz": (0.018, 0.037, 0.476),
+        "base_xyz": (0.600, 0.130, 0.074),
+        "arm_xyz": (0.480, 0.000, 0.074),
+    }
+    assert _observe_in_frames(core, stamp_s=10.0, **sample)
+    settling = core.tick(now_s=10.01, tracking=True)
+    assert _observe_in_frames(core, stamp_s=10.35, **sample)
+    probe = core.tick(now_s=10.36, tracking=True)
+
+    assert core.geometry is not None
+    assert core.geometry.base_planar_distance_m > 0.52
+    assert settling.phase == "handoff_settle"
+    assert probe.phase == "handoff_probe"
+    assert probe.needs_ik_probe
+    assert probe.published_linear_x == probe.published_angular_z == 0.0
+
+
 def test_handoff_is_latched_across_a_later_body_sway_sample():
     probe = SERVO.DepthServoOutput(
         phase="handoff_probe",

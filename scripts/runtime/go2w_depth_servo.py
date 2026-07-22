@@ -511,6 +511,8 @@ class DepthServoCore:
             posture_entry_planar_m=max(settings.handoff_depth_m + 0.20, 0.80),
             handoff_planar_max_m=settings.handoff_depth_m,
             handoff_lateral_tolerance_m=settings.side_handoff_tolerance_m,
+            camera_handoff_depth_m=settings.handoff_depth_m,
+            camera_handoff_planar_slack_m=0.15,
             linear_gain=settings.linear_gain,
             yaw_gain=settings.yaw_gain,
             max_forward_mps=settings.max_forward_mps,
