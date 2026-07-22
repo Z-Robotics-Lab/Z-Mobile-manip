@@ -23,12 +23,24 @@ This distinction is essential: six captures were 0.875–1.560 m from the arm
 base and were physically outside the handoff workspace. They are not IK
 failures. They now return `NEED_BASE_APPROACH` in about 0.16 s.
 
-For the five genuine handoff captures (0.371–0.507 m):
+For the five genuine handoff captures (0.371–0.507 m), the original
+one-container-per-click replay produced:
 
 - success: **5/5**
 - planner wall time: p50 **2.42 s**, p95/max **3.12 s**
 - search time: p50 **1.23 s**, p95/max **1.88 s**
 - four of five planning calls completed below 3.0 s
+
+The production warm planner runner removes only Docker/Python cold-start
+jitter. It keeps the artifact tree read-only, writes through a unique scratch
+mount, has no network or devices, and atomically promotes the completed report.
+On the same five captures:
+
+- success: **5/5**
+- planner wall times: **2.25, 2.43, 1.75, 1.81, 1.93 s**
+- p95/max: **2.43 s**
+- candidate count, symmetry coverage, selected candidate, and rejection count
+  are unchanged from the cold-run baseline
 
 The replay report is `/tmp/z-mobile-planning-replay-2f8c3d5.json` on the tuning
 machine. Reproduce it with `scripts/offline/planning_replay_benchmark.py` as
@@ -56,7 +68,9 @@ same-target tracked refresh must be reported separately.
   multi-seed IK.
 - Candidate scoring now tests useful symmetries earlier without pruning the
   candidate or symmetry set.
-- Full offline suite: **973 passed, 50 skipped, 0 failed**.
+- A verified `NEED_BASE_APPROACH` result is propagated as a recoverable mobile
+  disposition; incomplete gate evidence remains fail-closed.
+- Full offline suite: **982 passed, 50 skipped, 0 failed**.
 - The skipped tests require unavailable live milestone state or optional host
   Pinocchio/CasADi packages; Docker replay covers the planner used here.
 
@@ -66,5 +80,5 @@ After the operator returns, record a new short bag and check:
 
 1. same-target tracked perception UI time is below 2 s;
 2. every capture inside 0.70 m reaches planning rather than base approach;
-3. all five close-range planner calls complete below 3 s;
+3. close-range warm planner calls remain below 3 s;
 4. no motion command is issued when the disposition is `NEED_BASE_APPROACH`.
