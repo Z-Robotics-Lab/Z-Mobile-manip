@@ -2665,7 +2665,9 @@
         whole_body_approach: "approach", whole_body_shadow: "approach", whole_body_blocked: "posture",
         degraded: "posture", blocked: "posture",
         reacquire: "reacquire", reacquiring: "reacquire", view_recovery: "reacquire",
-        search_required: "search", reached: "handoff", handoff_ready: "handoff", handoff_to_grasp: "handoff",
+        tracking_hold: "reacquire", search_required: "search",
+        reached: "handoff", handoff_settle: "handoff", handoff_probe: "handoff",
+        handoff_ready: "handoff", handoff_to_grasp: "handoff",
         grasp_started: "grasp"
       };
       const activePhase = phaseAliases[workflowPhase] || null;
