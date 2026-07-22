@@ -98,13 +98,20 @@ class WholeBodyOptimizerConfig:
     transition_start_m: float = 1.00
     handoff_planar_m: float = 0.58
     camera_min_depth_m: float = 0.10
-    image_weight: float = 9.0
+    # Camera centering is the arm's primary job while the mobile base is
+    # approaching.  A wrist camera that loses the target cannot support a
+    # fresh close-range grasp, so this remains active over the full range.
+    image_weight: float = 18.0
     # Ground standoff must dominate near the handoff; otherwise the arm/tool
     # residual can incorrectly pull the rolling base inside the 0.5 m zone.
     planar_weight: float = 100.0
     target_height_weight: float = 5.0
     target_lateral_weight: float = 40.0
     tool_position_weight: float = 12.0
+    # Do not turn view keeping into an early reach.  The tool-to-target
+    # residual becomes active only in the narrow final handoff band; before
+    # that the arm follows image u/v while the base owns range closure.
+    tool_transition_start_m: float = 0.64
     control_weight: float = 0.30
     smooth_weight: float = 1.50
     manipulability_weight: float = 0.08
@@ -129,6 +136,7 @@ class WholeBodyOptimizerConfig:
             self.target_height_weight,
             self.target_lateral_weight,
             self.tool_position_weight,
+            self.tool_transition_start_m,
             self.control_weight,
             self.smooth_weight,
             self.base_yaw_max_rps,
@@ -144,6 +152,10 @@ class WholeBodyOptimizerConfig:
             raise ValueError("base forward velocity bounds are reversed")
         if self.transition_start_m <= self.handoff_planar_m:
             raise ValueError("transition start must be outside handoff distance")
+        if self.tool_transition_start_m <= self.handoff_planar_m:
+            raise ValueError("tool transition must be outside handoff distance")
+        if self.tool_transition_start_m > self.transition_start_m:
+            raise ValueError("tool transition must be inside the view transition")
         if self.manipulability_weight < 0.0 or not math.isfinite(
             self.manipulability_weight,
         ):
@@ -160,6 +172,7 @@ class LinearizedWholeBodyProblem:
     jacobian: np.ndarray
     residual_names: tuple[str, ...]
     near_weight: float
+    reach_weight: float
     planar_distance_m: float
     camera_depth_m: float
     manipulability: float
@@ -176,6 +189,7 @@ class WholeBodyOptimizationResult:
     residual_after: tuple[float, ...]
     residual_names: tuple[str, ...]
     near_weight: float
+    reach_weight: float
     planar_distance_m: float
     camera_depth_m: float
     manipulability: float
@@ -202,6 +216,7 @@ class WholeBodyOptimizationResult:
             },
             "schedule": {
                 "near_weight": self.near_weight,
+                "reach_weight": self.reach_weight,
                 "planar_distance_m": self.planar_distance_m,
                 "camera_depth_m": self.camera_depth_m,
                 "minimum_camera_depth_m": self.minimum_camera_depth_m,
@@ -363,6 +378,19 @@ class WholeBodyShadowOptimizer:
             ),
         )
 
+    def _reach_weight(self, planar_distance_m: float) -> float:
+        """Blend tool reach only across the final close-range handoff band."""
+
+        span = self.config.tool_transition_start_m - self.config.handoff_planar_m
+        linear = float(np.clip(
+            (self.config.tool_transition_start_m - planar_distance_m) / span,
+            0.0,
+            1.0,
+        ))
+        # Smoothstep avoids a velocity discontinuity when crossing into the
+        # final reach band.
+        return linear * linear * (3.0 - 2.0 * linear)
+
     def _residual(
         self,
         state: ReducedWholeBodyState,
@@ -396,7 +424,7 @@ class WholeBodyShadowOptimizer:
         )
         return residual, planar, depth, self._near_weight(planar)
 
-    def _weights(self, near: float) -> np.ndarray:
+    def _weights(self, near: float, reach: float) -> np.ndarray:
         # Far away, ground approach dominates.  Near the target, base remains
         # active but body/arm/FOV authority rises continuously—there is no
         # blocking "posture must settle" phase.
@@ -407,9 +435,9 @@ class WholeBodyShadowOptimizer:
                 self.config.planar_weight,
                 self.config.target_lateral_weight * (0.35 + 0.65 * near),
                 self.config.target_height_weight * (0.20 + 0.80 * near),
-                self.config.tool_position_weight * near,
-                self.config.tool_position_weight * near,
-                self.config.tool_position_weight * near,
+                self.config.tool_position_weight * reach,
+                self.config.tool_position_weight * reach,
+                self.config.tool_position_weight * reach,
             ),
             dtype=float,
         )
@@ -494,7 +522,8 @@ class WholeBodyShadowOptimizer:
         # above is with respect to a unit state displacement.
         jacobian *= self.config.horizon_dt_s
 
-        weights = self._weights(near)
+        reach = self._reach_weight(planar)
+        weights = self._weights(near, reach)
         weighted = weights[:, None] * jacobian
         hessian = jacobian.T @ weighted
         gradient = jacobian.T @ (weights * residual)
@@ -536,6 +565,7 @@ class WholeBodyShadowOptimizer:
             jacobian=jacobian,
             residual_names=self._RESIDUAL_NAMES,
             near_weight=near,
+            reach_weight=reach,
             planar_distance_m=planar,
             camera_depth_m=camera_depth,
             manipulability=manipulability,
@@ -634,7 +664,7 @@ class WholeBodyShadowOptimizer:
                 planar_distance_m=problem.planar_distance_m,
                 camera_depth_m=error.camera_depth_m,
             )
-        weights = self._weights(problem.near_weight)
+        weights = self._weights(problem.near_weight, problem.reach_weight)
         objective_before = float(0.5 * np.sum(weights * problem.residual**2))
         objective_after = float(0.5 * np.sum(weights * residual_after**2))
         return WholeBodyOptimizationResult(
@@ -647,6 +677,7 @@ class WholeBodyShadowOptimizer:
             residual_after=tuple(float(item) for item in residual_after),
             residual_names=problem.residual_names,
             near_weight=problem.near_weight,
+            reach_weight=problem.reach_weight,
             planar_distance_m=problem.planar_distance_m,
             camera_depth_m=problem.camera_depth_m,
             manipulability=problem.manipulability,
@@ -686,6 +717,7 @@ class WholeBodyShadowOptimizer:
             residual_after=(),
             residual_names=(),
             near_weight=self._near_weight(planar_distance_m),
+            reach_weight=self._reach_weight(planar_distance_m),
             planar_distance_m=planar_distance_m,
             camera_depth_m=camera_depth_m,
             manipulability=float(self.model.arm_manipulability(state)),

@@ -211,6 +211,52 @@ def test_task_carries_nonzero_body_lateral_setpoint_into_qp_residual():
     assert np.linalg.norm(problem.jacobian[index]) > 0.0
 
 
+def test_tool_reach_is_delayed_until_final_handoff_band():
+    optimizer = WholeBodyShadowOptimizer(
+        ReplayKinematics(),
+        WholeBodyOptimizerConfig(
+            handoff_planar_m=0.52,
+            tool_transition_start_m=0.64,
+        ),
+    )
+
+    assert optimizer._reach_weight(0.70) == pytest.approx(0.0)
+    assert 0.0 < optimizer._reach_weight(0.58) < 1.0
+    assert optimizer._reach_weight(0.52) == pytest.approx(1.0)
+
+
+def test_approach_arm_centers_camera_without_premature_tool_reach():
+    optimizer = WholeBodyShadowOptimizer(
+        ReplayKinematics(),
+        WholeBodyOptimizerConfig(
+            handoff_planar_m=0.52,
+            tool_transition_start_m=0.64,
+        ),
+    )
+    state = _state()
+    task = WholeBodyTask(target_world_xyz_m=(0.80, 0.20, -0.05))
+
+    problem = optimizer.linearize(state, task)
+    result = optimizer.solve(
+        state,
+        task,
+        # The Go2W base and Euler posture are independently transported.
+        # This verifies the PiPER view intent can own image centering alone.
+        locked_control_indices=(0, 1, 2, 3),
+    )
+    weights = optimizer._weights(problem.near_weight, problem.reach_weight)
+
+    assert problem.reach_weight == pytest.approx(0.0)
+    assert np.all(weights[:2] >= 0.55 * optimizer.config.image_weight)
+    assert weights[5:] == pytest.approx((0.0, 0.0, 0.0))
+    assert result.velocity.as_vector()[:4] == pytest.approx(0.0)
+    assert np.linalg.norm(result.velocity.arm_joint_velocity_rps) > 0.01
+    assert np.linalg.norm(result.residual_after[:2]) < np.linalg.norm(
+        result.residual_before[:2],
+    )
+    assert result.status_document()["schedule"]["reach_weight"] == pytest.approx(0.0)
+
+
 def test_locked_untransported_controls_remain_exactly_stationary():
     optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
     result = optimizer.solve(
