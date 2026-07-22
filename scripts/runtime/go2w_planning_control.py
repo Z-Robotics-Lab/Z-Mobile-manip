@@ -3023,13 +3023,19 @@ class PiperGraspRunner:
         archive: Path,
         receipt_dir: Path,
         speed_percent: int,
+        planning_session_id: str,
     ) -> dict[str, Any]:
+        planning_session_id = validate_session_id(planning_session_id)
+        expected_report_sha256 = hashlib.sha256(report.read_bytes()).hexdigest()
+        expected_archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+        expected_artifact_id = self._artifact_id(report, archive)
         arguments = [
             str(self.script),
             "--planning-report", str(report),
             "--planned-grasp", str(archive),
             "--receipt-dir", str(receipt_dir),
             "--speed-percent", str(speed_percent),
+            "--planning-session-id", planning_session_id,
         ]
         with self.log_path.open("a", encoding="utf-8") as log:
             completed = subprocess.run(
@@ -3043,17 +3049,33 @@ class PiperGraspRunner:
                 timeout=430.0,
             )
         start_receipt_path = receipt_dir / "executor-start-receipt.json"
-        start_receipt = self._validate_executor_start_receipt(start_receipt_path)
+        start_receipt = self._validate_executor_start_receipt(
+            start_receipt_path,
+            expected_artifact_id=expected_artifact_id,
+            expected_planning_report_sha256=expected_report_sha256,
+            expected_planned_grasp_sha256=expected_archive_sha256,
+            expected_planning_session_id=planning_session_id,
+        )
         if completed.returncode != 0 or not (receipt_dir / "lift-receipt.json").is_file():
             raise RuntimeError(f"full grasp stopped safely; inspect {self.log_path}")
         return start_receipt
 
     @classmethod
-    def _validate_executor_start_receipt(cls, path: Path) -> dict[str, Any]:
+    def _validate_executor_start_receipt(
+        cls,
+        path: Path,
+        *,
+        expected_artifact_id: str | None = None,
+        expected_planning_report_sha256: str | None = None,
+        expected_planned_grasp_sha256: str | None = None,
+        expected_planning_session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Validate proof produced after real transport open and before motion."""
 
         document = cls._read_handoff_json(path)
         artifact_id = document.get("artifact_id")
+        planning_report_sha256 = document.get("planning_report_sha256")
+        planned_grasp_sha256 = document.get("planned_grasp_sha256")
         if (
             document.get("schema") != "z_manip.piper_executor_start_receipt.v1"
             or document.get("event") != "transport_opened"
@@ -3064,8 +3086,23 @@ class PiperGraspRunner:
             or not isinstance(artifact_id, str)
             or len(artifact_id) != 64
             or any(character not in "0123456789abcdef" for character in artifact_id)
+            or not isinstance(planning_report_sha256, str)
+            or len(planning_report_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in planning_report_sha256)
+            or not isinstance(planned_grasp_sha256, str)
+            or len(planned_grasp_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in planned_grasp_sha256)
         ):
             raise RuntimeError("executor-start receipt failed identity/zero-command checks")
+        expected = {
+            "artifact_id": expected_artifact_id,
+            "planning_report_sha256": expected_planning_report_sha256,
+            "planned_grasp_sha256": expected_planned_grasp_sha256,
+            "planning_session_id": expected_planning_session_id,
+        }
+        for name, value in expected.items():
+            if value is not None and document.get(name) != value:
+                raise RuntimeError(f"executor-start receipt does not match {name}")
         for name in ("executor_started_unix_ns", "executor_started_monotonic_ns"):
             value = document.get(name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -3387,6 +3424,7 @@ class PiperGraspRunner:
                 archive=archive,
                 receipt_dir=action_dir,
                 speed_percent=speed_percent,
+                planning_session_id=planning_session_id,
             )
             lifecycle.update({
                 "executor_transport_started_unix_ns": executor_start[
@@ -3539,10 +3577,11 @@ class PiperGraspRunner:
                 6,
             )
             report, archive = self._planning_artifacts(planning)
+            planning_session_id = validate_session_id(planning.get("session_id"))
 
             self._update(
                 phase="execute_full",
-                planning_session_id=planning.get("session_id"),
+                planning_session_id=planning_session_id,
                 home_mode=home_mode,
                 timings_s=dict(timings),
                 message=f"Executing one continuous checked pick, place-back, and Home return at {speed_percent}%.",
@@ -3552,6 +3591,7 @@ class PiperGraspRunner:
                 archive=archive,
                 receipt_dir=action_dir,
                 speed_percent=speed_percent,
+                planning_session_id=planning_session_id,
             )
             self.session_service.clear_current_context()
             self._update(
@@ -3590,11 +3630,13 @@ class PiperGraspRunner:
                 encoding="utf-8",
             )
             report, archive = self._planning_artifacts(planning)
+            planning_session_id = validate_session_id(planning.get("session_id"))
             self._run_full(
                 report=report,
                 archive=archive,
                 receipt_dir=action_dir,
                 speed_percent=speed_percent,
+                planning_session_id=planning_session_id,
             )
             self.session_service.clear_current_context()
             self._update(

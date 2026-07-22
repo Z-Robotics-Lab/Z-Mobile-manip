@@ -33,6 +33,9 @@ def _executor_start_evidence() -> dict[str, object]:
         "schema": "z_manip.piper_executor_start_receipt.v1",
         "event": "transport_opened",
         "artifact_id": "a" * 64,
+        "planning_report_sha256": "b" * 64,
+        "planned_grasp_sha256": "c" * 64,
+        "planning_session_id": "20260722-120000",
         "executor_started_unix_ns": 1_800_000_001_000_000_000,
         "executor_started_monotonic_ns": 123_456_789,
         "monotonic_clock_domain": "nuc_piper_executor_process",
@@ -62,6 +65,36 @@ def test_executor_start_receipt_fails_closed_for_worker_only_claim(tmp_path):
 
     with pytest.raises(RuntimeError, match="identity/zero-command"):
         CONTROL.PiperGraspRunner._validate_executor_start_receipt(receipt)
+
+
+def test_executor_start_receipt_is_bound_to_exact_plan_files_and_session(tmp_path):
+    document = _executor_start_evidence()
+    receipt = tmp_path / "executor-start-receipt.json"
+    receipt.write_text(json.dumps(document), encoding="utf-8")
+
+    validated = CONTROL.PiperGraspRunner._validate_executor_start_receipt(
+        receipt,
+        expected_artifact_id="a" * 64,
+        expected_planning_report_sha256="b" * 64,
+        expected_planned_grasp_sha256="c" * 64,
+        expected_planning_session_id="20260722-120000",
+    )
+    assert validated == document
+
+    for field in (
+        "artifact_id",
+        "planning_report_sha256",
+        "planned_grasp_sha256",
+        "planning_session_id",
+    ):
+        with pytest.raises(RuntimeError, match=field):
+            CONTROL.PiperGraspRunner._validate_executor_start_receipt(
+                receipt,
+                expected_artifact_id=("d" * 64 if field == "artifact_id" else "a" * 64),
+                expected_planning_report_sha256=("d" * 64 if field == "planning_report_sha256" else "b" * 64),
+                expected_planned_grasp_sha256=("d" * 64 if field == "planned_grasp_sha256" else "c" * 64),
+                expected_planning_session_id=("foreign-session" if field == "planning_session_id" else "20260722-120000"),
+            )
 
 
 def _depth_filter_report() -> dict[str, object]:

@@ -51,6 +51,8 @@ def _write_executor_start_receipt(
         "schema": "z_manip.piper_executor_start_receipt.v1",
         "event": "transport_opened",
         "artifact_id": artifact.artifact_id,
+        "planning_report_sha256": artifact.report_sha256,
+        "planned_grasp_sha256": artifact.npz_sha256,
         "workflow_phase": workflow_phase,
         "planning_session_id": planning_session_id,
         "executor_started_unix_ns": started_unix_ns,

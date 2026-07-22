@@ -44,6 +44,8 @@ Q_LIFT = np.asarray([0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
 def artifact(*, artifact_id: str = ARTIFACT_ID):
     return SimpleNamespace(
         artifact_id=artifact_id,
+        report_sha256="b" * 64,
+        npz_sha256="c" * 64,
         arrays={"approach_raw": np.asarray([Q_PRE, Q_GRASP])},
     )
 
@@ -97,6 +99,9 @@ def test_executor_start_receipt_is_bound_and_pre_motion(tmp_path):
     )
     assert persisted == document
     assert document["artifact_id"] == ARTIFACT_ID
+    assert document["planning_report_sha256"] == "b" * 64
+    assert document["planned_grasp_sha256"] == "c" * 64
+    assert document["planning_session_id"] == SESSION_ID
     assert document["transport_opened"] is True
     assert document["commands_sent"] == 0
     assert document["motion_started"] is False
