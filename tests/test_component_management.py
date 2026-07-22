@@ -118,6 +118,11 @@ def test_component_manager_is_syntax_checked_singleton_and_motion_free():
     assert "default.target.wants" in source
     assert "bringup)" in source
     assert "restart-edgetam" in source
+    assert "z-mobile-manip-yoloe:latest" in source
+    assert "grounding_ready" in source
+    assert "restart_one grounding" in source
+    assert "yoloe_source_hash" in source
+    assert "org.zlab.yoloe.source-sha256" in source
     assert "restart-rgbd" in source
     assert "restart-perception" in source
     assert "wait_until" in source

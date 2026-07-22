@@ -15,6 +15,7 @@ POSTURE_UNIT="z-mobile-manip-go2w-posture-intent-live.service"
 REACTIVE_NUC_UNIT="z-mobile-manip-go2w-reactive-live.service"
 REACTIVE_INSTALLER="$SCRIPT_DIR/install_go2w_reactive_runtime.sh"
 WHOLE_BODY_IMAGE="z-mobile-manip-whole-body:latest"
+YOLOE_IMAGE="z-mobile-manip-yoloe:latest"
 USER_SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UI_PORT="${Z_MANIP_DEBUG_UI_PORT:-8766}"
 NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
@@ -42,9 +43,9 @@ usage() {
   cat >&2 <<'EOF'
 usage: go2w_component_manager.sh bringup
        go2w_component_manager.sh install
-       go2w_component_manager.sh status [all|ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control]
-       go2w_component_manager.sh restart {ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control}
-       go2w_component_manager.sh logs {manager|ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all|reactive-control|posture-bridge|mobile-control} [lines]
+       go2w_component_manager.sh status [all|ui|nuc-camera|passive-feedback|observer|rgbd|grounding|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control]
+       go2w_component_manager.sh restart {ui|nuc-camera|passive-feedback|observer|rgbd|grounding|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control}
+       go2w_component_manager.sh logs {manager|ui|nuc-camera|passive-feedback|observer|rgbd|grounding|edgetam|perception|perception-all|reactive-control|posture-bridge|mobile-control} [lines]
 EOF
   exit 2
 }
@@ -68,7 +69,7 @@ install_pc_units() {
 
 valid_component() {
   case "$1" in
-    ui|nuc-camera|passive-feedback|observer|rgbd|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control) return 0 ;;
+    ui|nuc-camera|passive-feedback|observer|rgbd|grounding|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -81,6 +82,35 @@ container_summary() {
   local name="$1"
   $DOCKER inspect "$name" --format '{{.State.Status}}; restarts={{.RestartCount}}' 2>/dev/null \
     || printf 'container missing'
+}
+
+yoloe_source_hash() {
+  local files=(
+    "$STACK_ROOT/docker/yoloe_service/Dockerfile"
+    "$STACK_ROOT/docker/yoloe_service/requirements.txt"
+    "$STACK_ROOT/scripts/runtime/local_grounding_service.py"
+  )
+  local file
+  for file in "${files[@]}"; do
+    [[ -f "$file" ]] || return 1
+  done
+  sha256sum "${files[@]}" | sha256sum | cut -d' ' -f1
+}
+
+yoloe_image_current() {
+  local expected actual
+  expected="$(yoloe_source_hash)" || return 1
+  actual="$($DOCKER image inspect "$YOLOE_IMAGE" \
+    --format '{{ index .Config.Labels "org.zlab.yoloe.source-sha256" }}' 2>/dev/null || true)"
+  [[ -n "$expected" && "$actual" == "$expected" ]]
+}
+
+build_yoloe_image() {
+  local source_hash
+  source_hash="$(yoloe_source_hash)" || return 1
+  $DOCKER build -f "$STACK_ROOT/docker/yoloe_service/Dockerfile" \
+    --label "org.zlab.yoloe.source-sha256=$source_hash" \
+    -t "$YOLOE_IMAGE" "$STACK_ROOT"
 }
 
 status_one() {
@@ -153,6 +183,19 @@ status_one() {
         summary="$(container_summary z-manip-edgetam)"
       fi
       ;;
+    grounding)
+      if $SYSTEMCTL --user is-active --quiet "$GROUNDING_UNIT" 2>/dev/null; then
+        if grounding_ready; then
+          state="healthy"
+          summary="YOLOE-11S CUDA HTTP health OK"
+        else
+          state="degraded"
+          summary="YOLOE service active but model health unavailable"
+        fi
+      else
+        summary="YOLOE grounding user service inactive"
+      fi
+      ;;
     perception)
       if container_running z-manip-hw; then
         state="healthy"
@@ -162,20 +205,21 @@ status_one() {
       fi
       ;;
     perception-all)
-      local observer_state rgbd_state edgetam_state perception_state
+      local observer_state rgbd_state grounding_state edgetam_state perception_state
       observer_state="$(status_state observer)"
       rgbd_state="$(status_state rgbd)"
+      grounding_state="$(status_state grounding)"
       edgetam_state="$(status_state edgetam)"
       perception_state="$(status_state perception)"
-      if [[ "$observer_state" == healthy && "$rgbd_state" == healthy && "$edgetam_state" == healthy && "$perception_state" == healthy ]]; then
+      if [[ "$observer_state" == healthy && "$rgbd_state" == healthy && "$grounding_state" == healthy && "$edgetam_state" == healthy && "$perception_state" == healthy ]]; then
         state="healthy"
-        summary="observer + RGB-D + EdgeTAM + perception ROS healthy"
-      elif [[ "$observer_state" == offline || "$rgbd_state" == offline || "$edgetam_state" == offline || "$perception_state" == offline ]]; then
+        summary="observer + RGB-D + YOLOE + EdgeTAM + perception ROS healthy"
+      elif [[ "$observer_state" == offline || "$rgbd_state" == offline || "$grounding_state" == offline || "$edgetam_state" == offline || "$perception_state" == offline ]]; then
         state="offline"
-        summary="observer=$observer_state, rgbd=$rgbd_state, edgetam=$edgetam_state, perception=$perception_state"
+        summary="observer=$observer_state, rgbd=$rgbd_state, grounding=$grounding_state, edgetam=$edgetam_state, perception=$perception_state"
       else
         state="degraded"
-        summary="observer=$observer_state, rgbd=$rgbd_state, edgetam=$edgetam_state, perception=$perception_state"
+        summary="observer=$observer_state, rgbd=$rgbd_state, grounding=$grounding_state, edgetam=$edgetam_state, perception=$perception_state"
       fi
       ;;
     reactive-control)
@@ -308,6 +352,13 @@ edgetam_ready() {
     && $CURL -fsS --max-time 2 http://127.0.0.1:8092/health >/dev/null 2>&1
 }
 
+grounding_ready() {
+  local health
+  health="$($CURL -fsS --max-time 3 http://127.0.0.1:8771/health 2>/dev/null || true)"
+  [[ "$health" == *'"ready": true'* || "$health" == *'"ready":true'* ]] \
+    && [[ "$health" == *'"backend": "yoloe"'* || "$health" == *'"backend":"yoloe"'* ]]
+}
+
 perception_ready() {
   if ! container_running z-manip-hw; then
     return 1
@@ -378,6 +429,14 @@ restart_one() {
       "$LAB_SCRIPT" restart-edgetam || return 1
       wait_until "EdgeTAM" edgetam_ready
       ;;
+    grounding)
+      if ! yoloe_image_current; then
+        build_yoloe_image || return 1
+      fi
+      install_pc_units || return 1
+      $SYSTEMCTL --user restart "$GROUNDING_UNIT" || return 1
+      wait_until "YOLOE grounding" grounding_ready
+      ;;
     perception)
       "$LAB_SCRIPT" restart-perception || return 1
       wait_until "perception ROS" perception_ready
@@ -387,6 +446,7 @@ restart_one() {
         printf 'D435 USB device is absent on the NUC; reconnect it before restarting perception-all\n' >&2
         return 1
       fi
+      restart_one grounding || return 1
       restart_one edgetam || return 1
       restart_one rgbd || return 1
       restart_one perception || return 1
@@ -417,6 +477,7 @@ cold_bringup_steps() {
   ensure_remote_bus || return 1
   remote_command 'systemctl --user restart z-manip-piper-passive-feedback.service' || return 1
   wait_until "NUC passive feedback" passive_feedback_ready || return 1
+  restart_one grounding || return 1
   restart_one edgetam || return 1
   restart_one rgbd || return 1
   restart_one perception || return 1
@@ -443,11 +504,12 @@ show_logs() {
     observer) $JOURNALCTL --user -u "$OBSERVER_UNIT" -n "$lines" --no-pager -o cat 2>&1 ;;
     rgbd) $DOCKER logs --tail "$lines" z-manip-rgbd 2>&1 ;;
     edgetam) $DOCKER logs --tail "$lines" z-manip-edgetam 2>&1 ;;
+    grounding) $JOURNALCTL --user -u "$GROUNDING_UNIT" -n "$lines" --no-pager -o cat 2>&1 ;;
     perception) $DOCKER logs --tail "$lines" z-manip-hw 2>&1 ;;
     reactive-control) remote_command "journalctl --user -u $REACTIVE_NUC_UNIT -n $lines --no-pager -o cat" 2>&1 ;;
     posture-bridge) $JOURNALCTL --user -u "$POSTURE_UNIT" -n "$lines" --no-pager -o cat 2>&1 ;;
     perception-all)
-      for item in observer edgetam rgbd perception; do
+      for item in observer grounding edgetam rgbd perception; do
         printf '===== %s =====\n' "$item"
         show_logs "$item" "$lines"
       done
@@ -472,7 +534,7 @@ case "$action" in
     ;;
   status)
     if [[ "$component" == all ]]; then
-      for item in ui nuc-camera passive-feedback observer rgbd edgetam perception perception-all reactive-control posture-bridge whole-body mobile-control; do
+      for item in ui nuc-camera passive-feedback observer rgbd grounding edgetam perception perception-all reactive-control posture-bridge whole-body mobile-control; do
         status_one "$item"
       done
     else
@@ -513,7 +575,7 @@ case "$action" in
       tail -n 50 "$MANAGER_LOG" >&2
       exit "$rc"
     fi
-    for item in ui nuc-camera passive-feedback observer rgbd edgetam perception perception-all reactive-control posture-bridge whole-body mobile-control; do
+    for item in ui nuc-camera passive-feedback observer rgbd grounding edgetam perception perception-all reactive-control posture-bridge whole-body mobile-control; do
       status_one "$item"
     done
     ;;

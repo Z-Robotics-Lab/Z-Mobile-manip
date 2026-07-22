@@ -1,15 +1,15 @@
 [Unit]
-Description=Z-Manip loopback-only GPU grounding service
+Description=Z-Mobile-Manip loopback-only YOLOE GPU grounding service
 After=default.target docker.service
 
 [Service]
 Type=simple
 ExecStartPre=-/usr/bin/docker rm -f z-manip-local-grounding
-ExecStart=/usr/bin/docker run --rm --name z-manip-local-grounding --gpus all --network host --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e HF_HOME=/models -v %h/.cache/huggingface/hub:/models/hub:ro -v %h/Z-Robotics-Lab/Z-Mobile-manip/scripts/runtime/local_grounding_service.py:/app/local_grounding_service.py:ro z-manip-edgetam:latest python3 /app/local_grounding_service.py --host 127.0.0.1 --port 8771
+ExecStart=/usr/bin/docker run --rm --name z-manip-local-grounding --gpus all --network host --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m -e MPLCONFIGDIR=/tmp/matplotlib z-mobile-manip-yoloe:latest
 ExecStop=-/usr/bin/docker stop -t 5 z-manip-local-grounding
 Restart=on-failure
 RestartSec=2
-TimeoutStartSec=90
+TimeoutStartSec=120
 
 [Install]
 WantedBy=default.target

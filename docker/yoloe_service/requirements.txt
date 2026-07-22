@@ -1,0 +1,3 @@
+ultralytics==8.4.104
+https://github.com/ultralytics/CLIP/archive/c4b6ea0932a2c0f39a0fa528af5ec4982ff15cab.zip
+Pillow>=10.4,<13

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Loopback-only, GPU-resident GroundingDINO service for fast 2-D seeding.
+"""Loopback-only, GPU-resident YOLOE service for fast 2-D/mask seeding.
 
 The process reads pixels and text only.  It has no ROS, CAN, robot, planning, or
-actuator imports.  Model weights are required to exist in the local Hugging Face
-cache; network access is disabled by the service unit.
+actuator imports. Model weights are baked into the service image; network access
+is disabled by the service unit.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import time
 from typing import Any, Mapping
 
 
-MODEL_ID = "IDEA-Research/grounding-dino-tiny"
+MODEL_ID = "yoloe-11s-seg.pt"
 REQUEST_SCHEMA = "z_manip.local_grounding_request.v1"
 RESPONSE_SCHEMA = "z_manip.local_grounding_response.v1"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
@@ -65,7 +65,7 @@ _ZH_COLORS: tuple[tuple[str, str], ...] = (
 
 
 def grounding_prompt(instruction: str) -> str | None:
-    """Return a GroundingDINO noun phrase, or None for remote-VLM fallback."""
+    """Return one concise English YOLOE class, or None for VLM fallback."""
 
     query = " ".join(str(instruction).strip().lower().split())
     if not query:
@@ -74,14 +74,20 @@ def grounding_prompt(instruction: str) -> str | None:
     color = next((english for chinese, english in _ZH_COLORS if chinese in query), None)
     if noun is not None:
         phrase = f"{color} {noun}" if color else noun
-        return f"a {phrase}."
+        return phrase
     if any("\u4e00" <= character <= "\u9fff" for character in query):
         return None
     cleaned = re.sub(r"[^a-z0-9\s_-]+", " ", query)
     cleaned = " ".join(cleaned.split())
+    cleaned = re.sub(
+        r"^(?:please\s+)?(?:pick(?:\s+up)?|grasp|grab|find|track|locate|approach)\s+",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned)
     if not cleaned:
         return None
-    return f"a {cleaned}."
+    return cleaned
 
 
 def select_detection(
@@ -169,7 +175,7 @@ def select_detection(
 
 
 class GroundingRuntime:
-    """One lazily initialized CUDA model guarded against concurrent forwards."""
+    """One persistent CUDA YOLOE model guarded against concurrent forwards."""
 
     def __init__(
         self,
@@ -182,36 +188,22 @@ class GroundingRuntime:
         self.minimum_confidence = minimum_confidence
         self.maximum_area_ratio = maximum_area_ratio
         self._lock = threading.Lock()
-        self._processor: Any = None
         self._model: Any = None
-        self._torch: Any = None
         self._device = "unloaded"
+        self._classes: tuple[str, ...] = ()
 
     def load(self) -> None:
         if self._model is not None:
             return
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         import torch
-        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+        from ultralytics import YOLO
 
         if not torch.cuda.is_available():
             raise RuntimeError("local grounding requires CUDA")
         torch.backends.cuda.matmul.allow_tf32 = True
-        self._device = "cuda"
-        self._processor = AutoProcessor.from_pretrained(
-            self.model_id,
-            local_files_only=True,
-        )
-        self._model = (
-            AutoModelForZeroShotObjectDetection.from_pretrained(
-                self.model_id,
-                local_files_only=True,
-            )
-            .to(self._device)
-            .eval()
-        )
-        self._torch = torch
+        self._device = "cuda:0"
+        self._model = YOLO(self.model_id, task="segment")
+        self._model.to(self._device)
 
     def ground(self, image_bytes: bytes, instruction: str) -> dict[str, object]:
         prompt = grounding_prompt(instruction)
@@ -224,27 +216,38 @@ class GroundingRuntime:
         started = time.perf_counter()
         with self._lock:
             self.load()
-            inputs = self._processor(
-                images=image,
-                text=prompt,
-                return_tensors="pt",
-            ).to(self._device)
-            with self._torch.inference_mode():
-                outputs = self._model(**inputs)
-            result = self._processor.post_process_grounded_object_detection(
-                outputs,
-                inputs["input_ids"],
-                threshold=0.15,
-                text_threshold=0.15,
-                target_sizes=[(height, width)],
+            requested_classes = (prompt,)
+            if self._classes != requested_classes:
+                self._model.set_classes(list(requested_classes))
+                self._classes = requested_classes
+            result = self._model.predict(
+                source=image,
+                device=self._device,
+                imgsz=640,
+                conf=min(0.20, self.minimum_confidence),
+                iou=0.55,
+                # YOLOE builds new text embeddings whenever the prompt changes.
+                # Ultralytics' half=True path permanently converts the detection
+                # head to FP16, while a later MobileCLIP embedding is FP32.  The
+                # next dynamic prompt then fails inside the head with a
+                # Float/Half matmul mismatch.  Keep the persistent model in FP32;
+                # TF32 is enabled in load(), so RTX inference remains fast and
+                # arbitrary successive prompts remain type-stable.
+                half=False,
+                max_det=24,
+                retina_masks=False,
+                verbose=False,
             )[0]
-        boxes = result.get("boxes")
-        scores = result.get("scores")
-        labels = result.get("text_labels", result.get("labels"))
+        boxes = getattr(result, "boxes", None)
+        xyxy = [] if boxes is None else boxes.xyxy.detach().cpu().tolist()
+        scores = [] if boxes is None else boxes.conf.detach().cpu().tolist()
+        class_ids = [] if boxes is None else boxes.cls.detach().cpu().tolist()
+        names = getattr(result, "names", {0: prompt})
+        labels = [str(names.get(int(class_id), prompt)) for class_id in class_ids]
         selected = select_detection(
-            [] if boxes is None else boxes.detach().cpu().tolist(),
-            [] if scores is None else scores.detach().cpu().tolist(),
-            [] if labels is None else list(labels),
+            xyxy,
+            scores,
+            labels,
             width=width,
             height=height,
             minimum_confidence=self.minimum_confidence,
@@ -254,7 +257,7 @@ class GroundingRuntime:
             raise LookupError("local detector produced no qualified object box")
         return {
             "schema": RESPONSE_SCHEMA,
-            "model": f"local/{self.model_id}",
+            "model": f"local/yoloe/{os.path.basename(self.model_id)}",
             "prompt": prompt,
             "target": selected,
             "latency_s": time.perf_counter() - started,
@@ -265,11 +268,11 @@ class GroundingRuntime:
 
         from PIL import Image
 
-        image = Image.new("RGB", (64, 64), color=(127, 127, 127))
+        image = Image.new("RGB", (640, 480), color=(127, 127, 127))
         encoded = io.BytesIO()
         image.save(encoded, format="JPEG")
         try:
-            self.ground(encoded.getvalue(), "object")
+            self.ground(encoded.getvalue(), "bottle")
         except LookupError:
             # A blank image should normally have no qualified detection; the
             # CUDA kernels and processor caches are warm regardless.
@@ -310,6 +313,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {
             "schema": "z_manip.local_grounding_health.v1",
             "ready": self.server.runtime.loaded,
+            "backend": "yoloe",
+            "model": self.server.runtime.model_id,
             "device": self.server.runtime.device,
             "read_only": True,
             "motion_commands_published": 0,

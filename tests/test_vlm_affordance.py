@@ -34,7 +34,7 @@ def test_local_grounding_fast_path_returns_without_remote_provider():
         assert timeout_s == pytest.approx(1.25)
         return {
             "schema": "z_manip.local_grounding_response.v1",
-            "model": "local/IDEA-Research/grounding-dino-tiny",
+            "model": "local/yoloe/yoloe-11s-seg.pt",
             "target": {
                 "label": "white charger",
                 "bbox_xyxy": [0.55, 0.49, 0.65, 0.71],
@@ -51,13 +51,13 @@ def test_local_grounding_fast_path_returns_without_remote_provider():
         attempt_callback=events.append,
     ).locate_and_reason(b"jpeg-data", "白色充电器")
 
-    assert result.model == "local/IDEA-Research/grounding-dino-tiny"
+    assert result.model == "local/yoloe/yoloe-11s-seg.pt"
     assert result.target_label == "white charger"
     assert result.target_bbox.to_pixels(640, 480) == (352, 235, 416, 341)
     assert remote_calls == []
     assert [(event.model, event.outcome) for event in events] == [
-        ("local/grounding-dino-tiny", "start"),
-        ("local/grounding-dino-tiny", "success"),
+        ("local/yoloe-11s-seg", "start"),
+        ("local/yoloe-11s-seg", "success"),
     ]
 
 
@@ -97,8 +97,8 @@ def test_local_grounding_failure_falls_back_to_remote_vlm():
     assert result.model == "qwen/remote"
     assert remote_calls == ["qwen/remote"]
     assert [(event.model, event.outcome) for event in events] == [
-        ("local/grounding-dino-tiny", "start"),
-        ("local/grounding-dino-tiny", "fallback"),
+        ("local/yoloe-11s-seg", "start"),
+        ("local/yoloe-11s-seg", "fallback"),
         ("qwen/remote", "start"),
         ("qwen/remote", "success"),
     ]
@@ -108,7 +108,7 @@ def test_grasp_grounding_rejects_partial_target_at_image_border():
     def local_transport(_url, _payload, _headers, _timeout, _cancel_event):
         return {
             "schema": "z_manip.local_grounding_response.v1",
-            "model": "local/IDEA-Research/grounding-dino-tiny",
+            "model": "local/yoloe/yoloe-11s-seg.pt",
             "target": {
                 "label": "a charger",
                 "bbox_xyxy": [0.67, 0.29, 0.999, 0.69],

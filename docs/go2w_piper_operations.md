@@ -126,9 +126,10 @@ component has independent **Restart** and **Logs** controls:
 - `passive-feedback`: receive-only PiPER telemetry;
 - `observer`: PC subscribe-only runtime observer;
 - `rgbd`: RGB-D decode bridge;
+- `grounding`: resident YOLOE-11S open-vocabulary detector;
 - `edgetam`: EdgeTAM service;
 - `perception`: perception ROS container;
-- `perception-all`: observer + RGB-D + EdgeTAM + perception ROS.
+- `perception-all`: observer + RGB-D + YOLOE + EdgeTAM + perception ROS.
 
 Restarts are refused while Home, perception, planning, or grasp execution is
 active. A vision restart clears the selected perception and plan context so an
@@ -255,9 +256,10 @@ floor avoids the observed Go2W low-speed gait dead zone, while the 0.18 m/s cap
 keeps the far-field approach smooth. The NUC guard permits up to 0.20 m/s so it
 does not silently clip this server-owned profile.
 
-The current detector adapter calls the resident local Grounding DINO service;
-the search policy is detector-neutral, so YOLOE can replace that adapter later
-without changing wrist motion, EdgeTAM, servo, or grasp handoff. Target x/z is
+The detector adapter calls the resident local YOLOE-11S segmentation service;
+the HTTP contract remains detector-neutral, so tracking code is decoupled from
+the detector implementation without changing wrist motion, EdgeTAM, servo, or
+grasp handoff. Target x/z is
 filtered with a five-sample median plus EMA. A single jump above 0.20 m is
 rejected. Tracking loss commands zero immediately, allows a stationary 0.75 s
 reacquisition window, then runs at most three fresh perception attempts. It

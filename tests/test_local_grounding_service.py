@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,10 +19,11 @@ SPEC.loader.exec_module(SERVICE)
 @pytest.mark.parametrize(
     ("instruction", "expected"),
     (
-        ("白色充电器", "a white charger."),
-        ("抓取黑色盒子", "a black box."),
-        ("white power adapter", "a white power adapter."),
-        ("charger", "a charger."),
+        ("白色充电器", "white charger"),
+        ("抓取黑色盒子", "black box"),
+        ("white power adapter", "white power adapter"),
+        ("charger", "charger"),
+        ("pick up the red bottle", "red bottle"),
     ),
 )
 def test_grounding_prompt_maps_grasp_instruction_to_noun_phrase(instruction, expected):
@@ -77,3 +80,57 @@ def test_select_detection_rejects_partial_object_clipped_by_image_border():
 
     assert selected is not None
     assert selected["label"] == "white charger"
+
+
+class _FakeTensor:
+    def __init__(self, values):
+        self._values = values
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def tolist(self):
+        return self._values
+
+
+class _FakeBoxes:
+    xyxy = _FakeTensor([[10, 10, 30, 30]])
+    conf = _FakeTensor([0.9])
+    cls = _FakeTensor([0])
+
+
+class _FakeResult:
+    boxes = _FakeBoxes()
+    names = {0: "target"}
+
+
+class _FakeModel:
+    def __init__(self):
+        self.classes = []
+
+    def set_classes(self, classes):
+        self.classes.append(tuple(classes))
+
+    def predict(self, **kwargs):
+        assert kwargs["half"] is False
+        return [_FakeResult()]
+
+
+def test_runtime_keeps_dynamic_prompt_inference_fp32():
+    runtime = SERVICE.GroundingRuntime(
+        model_id="unused.pt",
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+    )
+    runtime._model = _FakeModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (64, 64), color=(127, 127, 127))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+
+    assert runtime.ground(encoded.getvalue(), "bottle")["prompt"] == "bottle"
+    assert runtime.ground(encoded.getvalue(), "red bottle")["prompt"] == "red bottle"
+    assert runtime._model.classes == [("bottle",), ("red bottle",)]

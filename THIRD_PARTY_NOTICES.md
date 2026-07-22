@@ -11,7 +11,7 @@ components are not relicensed by this repository and remain subject to their own
 | Pinocchio | Kinematics and IK support | BSD-2-Clause |
 | Intel RealSense ROS | D435 color and aligned-depth transport | Apache-2.0 |
 | EdgeTAM | Target mask tracking | Upstream Apache-2.0 release/model terms apply |
-| Grounding DINO | Open-vocabulary target grounding | Apache-2.0 |
+| Ultralytics YOLOE | Open-vocabulary target grounding and instance masks | AGPL-3.0; review Ultralytics licensing before non-AGPL distribution or commercial deployment |
 | AnyGrasp | Optional dense grasp backend | Commercial/research terms apply; SDK, license, activation data, and weights are not included |
 
 Redistributions must preserve the applicable upstream licenses and notices. Hardware and product

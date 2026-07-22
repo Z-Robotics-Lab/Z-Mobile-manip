@@ -25,7 +25,7 @@ Usage:
   manip component restart NAME   Restart one fixed vision component
   manip url                      Print the UI address
 
-Components: ui, nuc-camera, passive-feedback, observer, rgbd, edgetam,
+Components: ui, nuc-camera, passive-feedback, observer, rgbd, grounding, edgetam,
             perception, perception-all
 
 Home and grasp are intentionally not CLI commands. Use the UI while beside

@@ -941,7 +941,7 @@ class OpenRouterVLM:
             raise VLMError(f"unsupported image MIME type {mime_type!r}")
         failures: list[str] = []
         if self.local_grounding_url and grounding_scope == "grasp_only":
-            local_model = "local/grounding-dino-tiny"
+            local_model = "local/yoloe-11s-seg"
             local_started = time.monotonic()
             self._emit_attempt(local_model, 1, "start", 0.0)
             try:
@@ -979,7 +979,7 @@ class OpenRouterVLM:
                     "placement_avoid_regions": [],
                     "placement_verification": None,
                     "constraints": [
-                        "local open-vocabulary detector; use full observed object geometry",
+                        "local YOLOE open-vocabulary instance detector; use full observed object geometry",
                     ],
                 }
                 local_result = self._result(
