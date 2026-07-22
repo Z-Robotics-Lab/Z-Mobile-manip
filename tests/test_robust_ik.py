@@ -65,7 +65,13 @@ def test_fixed_arm_mount_is_read_from_deployed_urdf():
         "base",
         "piper_base_link",
     )
-    np.testing.assert_allclose(transform[:3, 3], (0.06, 0.0, 0.067), atol=1e-9)
+    # This is the measured mount written by the base-to-arm calibration tool,
+    # not the old nominal CAD placement (0.06, 0, 0.067).
+    np.testing.assert_allclose(
+        transform[:3, 3],
+        (0.128526599, 0.0, 0.081794287),
+        atol=1e-9,
+    )
     np.testing.assert_allclose(transform[:3, :3], np.eye(3), atol=1e-9)
 
 
