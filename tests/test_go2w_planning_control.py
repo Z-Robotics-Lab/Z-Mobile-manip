@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "runtime" / "go2w_planning_control.py"
@@ -1665,6 +1667,136 @@ def test_depth_servo_mirrors_recoverable_handoff_disposition(tmp_path):
     assert status["workflow"]["recovery_action"] == "approach_only"
     assert status["workflow"]["failure"] is None
     assert "resume Approach Only" in status["message"]
+
+
+@pytest.mark.parametrize(
+    ("grasp_status", "expected_phase", "expected_failure"),
+    [
+        (
+            {
+                "running": False,
+                "phase": "returned_home",
+                "outcome": "passed",
+                "message": "fresh handoff completed",
+            },
+            "grasp_completed",
+            None,
+        ),
+        (
+            {
+                "running": False,
+                "phase": "handoff_planning",
+                "outcome": "blocked",
+                "message": "fresh planning did not produce a valid plan",
+            },
+            "blocked",
+            "fresh planning did not produce a valid plan",
+        ),
+    ],
+)
+def test_depth_servo_mirrors_terminal_handoff_result(
+    tmp_path,
+    grasp_status,
+    expected_phase,
+    expected_failure,
+):
+    class TerminalGrasp:
+        def status(self):
+            return dict(grasp_status)
+
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "idle"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        grasp_runner=TerminalGrasp(),
+    )
+    boundary = 1_800_000_000_000_000_001
+    runner._set_workflow(
+        active=False,
+        phase="grasp_started",
+        handoff_boundary_unix_ns=boundary,
+    )
+
+    runner._watch_mobile_handoff(
+        handoff_boundary_unix_ns=boundary,
+        cancel=threading.Event(),
+        timeout_s=0.1,
+    )
+
+    status = runner.status()
+    assert status["running"] is False
+    assert status["phase"] == expected_phase
+    assert status["workflow"]["failure"] == expected_failure
+    assert status["message"] == grasp_status["message"]
+
+
+@pytest.mark.parametrize("grasp_running", [False, True])
+def test_depth_servo_rejects_second_approach_during_mobile_handoff(
+    tmp_path,
+    grasp_running,
+):
+    class HandoffGrasp:
+        def status(self):
+            return {"running": grasp_running, "phase": "handoff_planning"}
+
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "idle"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        grasp_runner=HandoffGrasp(),
+    )
+    runner._set_workflow(
+        active=False,
+        phase="grasp_started",
+        handoff_boundary_unix_ns=1_800_000_000_000_000_002,
+    )
+
+    result = runner.start(
+        "live",
+        target="floor bottle",
+        acquire_target=True,
+        auto_handoff=True,
+        operator_present=True,
+    )
+
+    assert result["started"] is False
+    assert result["error"]["code"] == "APPROACH_ACTION_BUSY"
+    assert result["approach"]["running"] is True
+    assert result["approach"]["phase"] == "grasp_started"
+
+
+def test_depth_servo_recovery_start_clears_typed_handoff_state(tmp_path):
+    class IdleGrasp:
+        def status(self):
+            return {"running": False, "phase": "needs_base_approach"}
+
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "idle"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        grasp_runner=IdleGrasp(),
+    )
+    runner._set_workflow(
+        active=False,
+        phase="needs_base_approach",
+        planning_disposition="NEED_BASE_APPROACH",
+        recovery_action="approach_only",
+        handoff_boundary_unix_ns=1_800_000_000_000_000_003,
+    )
+
+    result = runner.start(
+        "shadow",
+        target="floor bottle",
+        acquire_target=False,
+        auto_handoff=False,
+    )
+
+    assert result["started"] is True
+    workflow = result["approach"]["workflow"]
+    assert workflow["planning_disposition"] is None
+    assert workflow["recovery_action"] is None
+    assert "handoff_boundary_unix_ns" not in workflow
+    runner.stop()
 
 
 def test_mobile_handoff_rejects_reused_pre_servo_perception_session(tmp_path):

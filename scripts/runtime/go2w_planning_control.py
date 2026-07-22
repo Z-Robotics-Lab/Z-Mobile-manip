@@ -1638,16 +1638,25 @@ class DepthServoRunner:
         terminal_workflow = workflow_phase in {
             "blocked",
             "degraded",
+            "grasp_completed",
             "needs_base_approach",
+        }
+        handoff_in_progress = workflow_phase in {
+            "handoff_to_grasp",
+            "grasp_started",
         }
         return {
             "schema": "z_manip.depth_servo_action.v1",
             "available": True,
-            "running": running or workflow_active,
+            # The depth-servo subprocess is already stopped while the fresh
+            # mobile-handoff grasp owns planning/execution.  Keep the parent
+            # action busy until its passive watcher records a terminal grasp
+            # result so a second approach cannot start concurrently.
+            "running": running or workflow_active or handoff_in_progress,
             "mode": mode,
             "phase": (
                 workflow_phase
-                if workflow_active or terminal_workflow
+                if workflow_active or terminal_workflow or handoff_in_progress
                 else runtime.get("phase", "starting" if running else "idle")
             ),
             "revision": revision,
@@ -1728,9 +1737,34 @@ class DepthServoRunner:
                 "error": {"code": "HANDOFF_UNAVAILABLE", "message": "automatic handoff requires live mode and a grasp runner"},
                 "approach": self.status(),
             }
+        grasp_running = False
+        if self._grasp_runner is not None:
+            try:
+                grasp_running = self._grasp_runner.status().get("running") is True
+            except Exception:
+                # The workflow phase below remains the authoritative owner for
+                # handoffs started by this runner.  A foreign status failure
+                # must not erase that ownership evidence.
+                grasp_running = False
         with self._lock:
-            if self._process_running_locked() or self._workflow.get("active") is True:
-                return {"started": False, "approach": self.status()}
+            workflow_phase = str(self._workflow.get("phase", "idle"))
+            if (
+                self._process_running_locked()
+                or self._workflow.get("active") is True
+                or workflow_phase in {"handoff_to_grasp", "grasp_started"}
+                or grasp_running
+            ):
+                return {
+                    "started": False,
+                    "error": {
+                        "code": "APPROACH_ACTION_BUSY",
+                        "message": (
+                            "visual approach or mobile-handoff grasp is still "
+                            "running; wait for its terminal result or use Full Stop"
+                        ),
+                    },
+                    "approach": self.status(),
+                }
             self._mode = mode
             self._cancel = threading.Event()
             self._reactive_watchdog.reset()
@@ -1923,7 +1957,58 @@ class DepthServoRunner:
                         "Fresh handoff geometry is still outside arm reach; "
                         "resume Approach Only, then retry the close-range handoff."
                     )
+            elif grasp.get("outcome") == "passed":
+                self._set_workflow(
+                    active=False,
+                    phase="grasp_completed",
+                    failure=None,
+                    planning_disposition=None,
+                    recovery_action=None,
+                )
+                with self._lock:
+                    self._message = str(
+                        grasp.get("message")
+                        or "Fresh mobile-handoff grasp completed."
+                    )
+            else:
+                failure = str(
+                    grasp.get("message")
+                    or (
+                        "mobile-handoff grasp stopped without a typed terminal "
+                        "outcome"
+                    )
+                )
+                self._set_workflow(
+                    active=False,
+                    phase="blocked",
+                    failure=failure,
+                    planning_disposition=(
+                        str(grasp.get("planning_disposition"))
+                        if grasp.get("planning_disposition") is not None
+                        else None
+                    ),
+                    recovery_action=None,
+                )
+                with self._lock:
+                    self._message = failure
             return
+        if cancel.is_set():
+            return
+        with self._lock:
+            same_handoff = (
+                self._workflow.get("handoff_boundary_unix_ns")
+                == handoff_boundary_unix_ns
+            )
+        if same_handoff:
+            failure = "timed out waiting for the mobile-handoff grasp result"
+            self._set_workflow(
+                active=False,
+                phase="blocked",
+                failure=failure,
+                recovery_action=None,
+            )
+            with self._lock:
+                self._message = failure
 
     def _recover_view_with_stationary_base(
         self,
