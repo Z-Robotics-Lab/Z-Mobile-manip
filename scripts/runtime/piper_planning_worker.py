@@ -10,6 +10,7 @@ writable scratch mount, and execute the same fail-closed dry-run entrypoint.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 from importlib.machinery import SourceFileLoader
@@ -21,7 +22,12 @@ import socket
 import stat
 import sys
 import time
-from typing import Sequence
+from typing import Any, Sequence
+
+from z_manip.planning.handoff_disposition import (
+    cached_failure_report,
+    classify_planning_report,
+)
 
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -32,6 +38,7 @@ ARTIFACT_ROOT = Path("/workspace-artifacts")
 OUTPUT_ROOT = Path("/workspace-planning-output")
 CONFIG = Path("/opt/z_manip/configs/go2w_piper.json")
 URDF_ROOT = Path("/robot_assets")
+MAX_ALL_IK_FAILURE_CACHE = 32
 
 
 def _contained(path: Path, root: Path) -> bool:
@@ -66,8 +73,88 @@ def _validate(module: object, argv: Sequence[str]) -> None:
         raise ValueError("planner calibration escapes the immutable artifact root")
 
 
+def _request_cache_key(module: object, argv: Sequence[str], backend: str) -> tuple[object, ...]:
+    """Identify immutable planning inputs while deliberately excluding output."""
+
+    args = module._arguments(argv)
+    artifact_files = (
+        args.artifacts / "grasp_candidates.npz",
+        args.artifacts / "target_points.npy",
+        args.artifacts / "scene_points.npy",
+    )
+    identities: list[tuple[str, int, int]] = []
+    for path in artifact_files:
+        resolved = path.expanduser().resolve()
+        metadata = resolved.stat()
+        identities.append((str(resolved), int(metadata.st_mtime_ns), int(metadata.st_size)))
+    normalized_argv: list[str] = []
+    skip_output_value = False
+    for value in argv:
+        if skip_output_value:
+            normalized_argv.append("<OUTPUT>")
+            skip_output_value = False
+            continue
+        normalized_argv.append(value)
+        if value == "--output":
+            skip_output_value = True
+    return backend, tuple(normalized_argv), tuple(identities)
+
+
+def _write_cached_failure(module: object, argv: Sequence[str], report: dict[str, Any], started: float) -> str:
+    args = module._arguments(argv)
+    output = args.output.expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    document = cached_failure_report(report, elapsed_s=time.perf_counter() - started)
+    encoded = json.dumps(document, indent=2) + "\n"
+    (output / "planning_report.json").write_text(encoded, encoding="utf-8")
+    return encoded
+
+
+def _run_validated_request(
+    module: object,
+    argv: Sequence[str],
+    backend: str,
+    failure_cache: OrderedDict[tuple[object, ...], dict[str, Any]],
+) -> tuple[int, str]:
+    """Run once, or return a typed cached all-IK failure for the same source."""
+
+    started = time.perf_counter()
+    key = _request_cache_key(module, argv, backend)
+    prior = failure_cache.get(key)
+    if prior is not None:
+        failure_cache.move_to_end(key)
+        return 1, _write_cached_failure(module, argv, prior, started)
+
+    previous_backend = os.environ.get("Z_MANIP_IK_BACKEND")
+    os.environ["Z_MANIP_IK_BACKEND"] = backend
+    output = io.StringIO()
+    try:
+        with redirect_stdout(output), redirect_stderr(output):
+            return_code = int(module.main(argv))
+    finally:
+        if previous_backend is None:
+            os.environ.pop("Z_MANIP_IK_BACKEND", None)
+        else:
+            os.environ["Z_MANIP_IK_BACKEND"] = previous_backend
+
+    args = module._arguments(argv)
+    report_path = args.output.expanduser().resolve() / "planning_report.json"
+    if return_code != 0 and report_path.is_file():
+        try:
+            report: Any = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            report = None
+        if classify_planning_report(report) is not None:
+            failure_cache[key] = dict(report)
+            failure_cache.move_to_end(key)
+            while len(failure_cache) > MAX_ALL_IK_FAILURE_CACHE:
+                failure_cache.popitem(last=False)
+    return return_code, output.getvalue()
+
+
 def _serve(socket_path: Path) -> int:
     module = _load_dry_run()
+    failure_cache: OrderedDict[tuple[object, ...], dict[str, Any]] = OrderedDict()
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         socket_path.unlink()
@@ -101,21 +188,13 @@ def _serve(socket_path: Path) -> int:
                     if backend not in {"pinocchio", "robust"}:
                         raise ValueError("unsupported planner IK backend")
                     _validate(module, argv)
-                    previous_backend = os.environ.get("Z_MANIP_IK_BACKEND")
-                    os.environ["Z_MANIP_IK_BACKEND"] = backend
-                    output = io.StringIO()
-                    try:
-                        with redirect_stdout(output), redirect_stderr(output):
-                            return_code = int(module.main(argv))
-                    finally:
-                        if previous_backend is None:
-                            os.environ.pop("Z_MANIP_IK_BACKEND", None)
-                        else:
-                            os.environ["Z_MANIP_IK_BACKEND"] = previous_backend
+                    return_code, planner_output = _run_validated_request(
+                        module, argv, backend, failure_cache,
+                    )
                     response = {
                         "return_code": return_code,
                         "elapsed_s": time.perf_counter() - started,
-                        "output": output.getvalue(),
+                        "output": planner_output,
                     }
                 except (Exception, SystemExit) as error:  # keep requests fail-closed
                     response = {

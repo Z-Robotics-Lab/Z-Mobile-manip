@@ -374,6 +374,38 @@ def _planning_failure_message(output_dir: Path) -> str:
     return fallback
 
 
+def _planning_failure_disposition(output_dir: Path) -> str | None:
+    """Read a typed planner disposition from a bounded regular report."""
+
+    from z_manip.planning.handoff_disposition import classify_planning_report
+
+    report_path = output_dir / "planning" / "planning_report.json"
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(report_path, flags)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_PLANNING_REPORT_BYTES
+        ):
+            return None
+        encoded = os.read(descriptor, MAX_PLANNING_REPORT_BYTES + 1)
+        if len(encoded) > MAX_PLANNING_REPORT_BYTES:
+            return None
+        document: Any = json.loads(encoded.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    finally:
+        os.close(descriptor)
+    disposition = classify_planning_report(document)
+    return None if disposition is None else disposition.state
+
+
 class FixedReadOnlyBackend:
     """Production adapter containing only repository-owned fixed commands."""
 
@@ -1373,7 +1405,12 @@ class FixedReadOnlyBackend:
         )
         return BackendResult(
             planner.returncode,
-            None if planner.returncode == 0 else "OFFLINE_PLANNER_BLOCKED",
+            (
+                None
+                if planner.returncode == 0
+                else _planning_failure_disposition(output_dir)
+                or "OFFLINE_PLANNER_BLOCKED"
+            ),
             "" if planner.returncode == 0 else _planning_failure_message(output_dir),
         )
 

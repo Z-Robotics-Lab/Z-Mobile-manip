@@ -1335,6 +1335,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         report["rejection_count"] = len(failures)
         report["rejections_truncated"] = False
         report["rejections"] = _failure_records(failures, witnesses)
+        from z_manip.planning.handoff_disposition import classify_planning_report
+
+        disposition = classify_planning_report(report)
+        if disposition is not None:
+            report["planning_disposition"] = disposition.state
+            report["planning_retryable"] = disposition.retryable
+            report["planning_disposition_evidence"] = disposition.document()
         timings_s["total"] = time.perf_counter() - total_started
         (output / "planning_report.json").write_text(
             json.dumps(report, indent=2) + "\n",
