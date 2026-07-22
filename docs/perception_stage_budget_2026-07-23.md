@@ -104,3 +104,31 @@ requested object. Lowering confidence to 0.05 and increasing input size to
 960/1280 were tested offline and rejected: both admitted support/gripper/screw
 false positives without reliably recovering the charger. A post-change live
 artifact set is still required to certify end-to-end p50/p95.
+
+## Mobile Find local-miss routing
+
+The multi-second fallback above was also on the critical path of Mobile Find.
+Its supervisor formerly ran one complete perception transaction first. A local
+YOLOE miss therefore waited for the remote provider chain; only after that
+transaction failed did it enter the bounded wrist search, followed by a second
+complete perception transaction. This ordering did not add target evidence and
+could pay the grounding delay twice.
+
+Mobile Find now probes the current view and, if needed, searches the finite
+wrist-view envelope with its local YOLOE adapter first. A confirmed hit starts
+exactly one complete perception transaction to seed EdgeTAM. An exhausted local
+search is a terminal miss: it does not call the remote-backed perception path,
+does not report success, and does not start the base. Ordinary manual
+perception is unchanged and retains its provider fallback.
+
+The recorded pre-change exact-seed-to-`init_bbox` cost was 3.035 s p50 and
+5.083 s p95. The warmed local detector takes about 8--15 ms per inference; the
+finite search requires two qualifying observations and spaces observations at
+5 Hz, so a target already visible in the current view has a policy floor of
+about 0.2 s plus local HTTP/image overhead before the single full transaction.
+The deterministic local-miss supervisor regression terminates in under 0.5 s
+when the bounded search reports exhaustion and proves that complete perception
+was never invoked. Physical wrist motion can make a genuine off-screen search
+longer, but that time is observable active acquisition rather than an opaque
+provider timeout. These stage measurements still do not certify a post-change
+full perception p50/p95 below two seconds.

@@ -1048,15 +1048,18 @@ def test_depth_servo_server_reacquires_after_bounded_tracking_loss(tmp_path):
     runner.stop()
 
 
-def test_depth_servo_uses_bounded_wrist_search_after_initial_detection_miss(tmp_path):
+def test_depth_servo_uses_local_search_before_one_complete_perception(tmp_path):
+    events = []
+
     class Sessions:
         def __init__(self):
             self.calls = 0
 
         def start_perception(self, target):
             self.calls += 1
+            events.append("perception")
             return {
-                "status": "failed" if self.calls == 1 else "succeeded",
+                "status": "succeeded",
                 "target": target,
             }
 
@@ -1065,6 +1068,7 @@ def test_depth_servo_uses_bounded_wrist_search_after_initial_detection_miss(tmp_
             self.calls = []
 
         def run(self, target, *, mode, speed_percent, cancel, operator_present=False):
+            events.append("search")
             self.calls.append((
                 target, mode, speed_percent, cancel.is_set(), operator_present,
             ))
@@ -1093,14 +1097,70 @@ def test_depth_servo_uses_bounded_wrist_search_after_initial_detection_miss(tmp_
         speed_percent=8,
     )
     deadline = time.monotonic() + 3.0
-    while sessions.calls < 2 and time.monotonic() < deadline:
+    while sessions.calls < 1 and time.monotonic() < deadline:
         time.sleep(0.02)
 
     assert result["started"] is True
-    assert sessions.calls == 2
+    assert sessions.calls == 1
+    assert events[:2] == ["search", "perception"]
     assert search.calls == [("charger", "shadow", 8, False, False)]
     assert runner.status()["wrist_search"]["phase"] == "found"
     runner.stop()
+
+
+def test_depth_servo_local_search_miss_never_enters_remote_backed_perception(tmp_path):
+    class Sessions:
+        def __init__(self):
+            self.calls = 0
+
+        def start_perception(self, target):
+            self.calls += 1
+            raise AssertionError("complete perception must not run after local search miss")
+
+    class Search:
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, target, *, mode, speed_percent, cancel, operator_present=False):
+            self.calls += 1
+            return False
+
+        def status(self):
+            return {"phase": "exhausted", "failure": "bounded local search exhausted"}
+
+        def stop(self):
+            return None
+
+    sessions = Sessions()
+    search = Search()
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=sessions,
+        wrist_search=search,
+    )
+
+    started = time.monotonic()
+    result = runner.start(
+        "shadow",
+        target="charger",
+        acquire_target=True,
+        speed_percent=8,
+    )
+    deadline = time.monotonic() + 1.0
+    while runner.status()["workflow"]["active"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    elapsed = time.monotonic() - started
+
+    status = runner.status()
+    assert result["started"] is True
+    assert search.calls == 1
+    assert sessions.calls == 0
+    assert status["workflow"]["phase"] == "blocked"
+    assert status["workflow"]["failure"] == "bounded local search exhausted"
+    assert runner._process is None
+    assert elapsed < 0.5
 
 
 def test_depth_servo_view_recovery_stops_base_before_wrist_search(tmp_path):

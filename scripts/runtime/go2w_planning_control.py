@@ -2101,15 +2101,18 @@ class DepthServoRunner:
             cancel = self._cancel
         assert isinstance(target, str)
         if acquire_target:
-            if not self._run_perception(target, reacquisition=False):
-                if self._wrist_search is None:
-                    self._set_workflow(active=False, phase="blocked", failure="initial perception failed")
-                    with self._lock:
-                        self._message = "Initial target detection failed; base was never started."
-                    return
+            # Mobile Find has a local, bounded detector in the wrist-search
+            # coordinator.  Probe/search with it before starting the complete
+            # perception transaction: a local YOLOE miss must transition to
+            # active acquisition instead of blocking for the remote VLM
+            # fallback and then repeating perception after search.
+            if self._wrist_search is not None:
                 self._set_workflow(phase="wrist_search", failure=None)
                 with self._lock:
-                    self._message = "Target is outside the current D435 view; starting bounded wrist search."
+                    self._message = (
+                        "Checking the current D435 view with local YOLOE; "
+                        "a miss starts bounded wrist search."
+                    )
                 try:
                     found = self._wrist_search.run(
                         target,
@@ -2142,6 +2145,13 @@ class DepthServoRunner:
                     with self._lock:
                         self._message = "Detector found the target, but stable 3-D tracking did not initialize."
                     return
+            elif not self._run_perception(target, reacquisition=False):
+                # Preserve the ordinary complete-perception behavior for
+                # deployments that do not configure the bounded local search.
+                self._set_workflow(active=False, phase="blocked", failure="initial perception failed")
+                with self._lock:
+                    self._message = "Initial target detection failed; base was never started."
+                return
             if cancel.is_set():
                 return
             with self._lock:
