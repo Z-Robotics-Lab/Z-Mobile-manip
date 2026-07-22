@@ -1508,6 +1508,33 @@ class DepthServoRunner:
             runtime = {}
         return runtime
 
+    @staticmethod
+    def _runtime_requests_handoff(runtime: dict[str, Any]) -> bool:
+        """Accept all explicit close-range handoff evidence in the status.
+
+        Older supervision only inspected the top-level phase.  Preserve that
+        contract while also recognizing the structured output/reactive fields
+        so a schema-compatible producer cannot hide a valid IK handoff behind
+        a later presentation phase.
+        """
+
+        phase = runtime.get("phase")
+        if phase in {"reached", "handoff_probe", "handoff_ready"}:
+            return True
+        output = runtime.get("output")
+        if isinstance(output, dict):
+            if output.get("needs_ik_probe") is True:
+                return True
+            if output.get("phase") in {"reached", "handoff_probe", "handoff_ready"}:
+                return True
+            if output.get("reactive_phase") in {"handoff_probe", "handoff_ready"}:
+                return True
+        reactive = runtime.get("reactive")
+        return isinstance(reactive, dict) and (
+            reactive.get("needs_ik_probe") is True
+            or reactive.get("phase") in {"handoff_probe", "handoff_ready"}
+        )
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             running = self._process_running_locked()
@@ -1904,7 +1931,7 @@ class DepthServoRunner:
                         "Base is stopped; inspect feedback age and actuator owners."
                     )
                 return
-            if phase in {"reached", "handoff_probe", "handoff_ready"}:
+            if self._runtime_requests_handoff(runtime):
                 self._handoff_after_base_stop(
                     process,
                     target=target,

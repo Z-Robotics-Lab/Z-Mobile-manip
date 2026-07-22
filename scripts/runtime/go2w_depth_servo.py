@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import os
@@ -157,6 +157,40 @@ class DepthServoOutput:
     reason: str = ""
     reactive_phase: str | None = None
     needs_ik_probe: bool = False
+
+
+HANDOFF_TERMINAL_PHASES = frozenset({"reached", "handoff_probe", "handoff_ready"})
+
+
+def _latch_handoff_output(
+    latched: DepthServoOutput | None,
+    candidate: DepthServoOutput,
+) -> DepthServoOutput | None:
+    """Keep the base stopped once close-range planning has been requested.
+
+    A handoff is a transaction boundary, not another visual-servo sample.  In
+    real Go2W traces body sway made the next RGB-D sample leave the handoff
+    corridor before the 5 Hz supervisor observed it.  Returning to approach
+    at that point both moves the base again and loses the only signal that
+    starts fresh close-range perception/planning.
+    """
+
+    if latched is not None:
+        return latched
+    if not (
+        candidate.phase in HANDOFF_TERMINAL_PHASES
+        or candidate.needs_ik_probe
+        or candidate.reactive_phase
+        in {ReactivePhase.HANDOFF_PROBE.value, ReactivePhase.HANDOFF_READY.value}
+    ):
+        return None
+    return replace(
+        candidate,
+        proposed_linear_x=0.0,
+        proposed_angular_z=0.0,
+        published_linear_x=0.0,
+        published_angular_z=0.0,
+    )
 
 
 def _whole_body_posture_rate_converged(
@@ -1039,6 +1073,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.whole_body_command: WholeBodyRuntimeCommand | None = None
             self.whole_body_error: str | None = None
             self.whole_body_handoff_settle_cycles = 0
+            self.handoff_latched_output: DepthServoOutput | None = None
             if args.whole_body == "casadi":
                 if (
                     args.whole_body_urdf is None
@@ -1718,6 +1753,15 @@ def _run_ros(args: argparse.Namespace) -> int:
             )
 
         def _tick(self) -> None:
+            # Handoff is one-way for this process.  Keep publishing a hard zero
+            # and preserve the terminal status until the 5 Hz supervisor has
+            # stopped this launcher and opened the fresh grasp transaction.
+            if self.handoff_latched_output is not None:
+                self.last_output = self.handoff_latched_output
+                if settings.mode == "live":
+                    self._publish(0.0, 0.0)
+                self._write_status()
+                return
             settled, blocked, shadow_verified, detail = self._posture_feedback()
             fallback = self.core.tick(
                 now_s=time.monotonic(),
@@ -1727,10 +1771,19 @@ def _run_ros(args: argparse.Namespace) -> int:
                 posture_shadow_verified=shadow_verified,
                 posture_detail=detail,
             )
-            self.last_output = self._whole_body_output(
+            candidate = self._whole_body_output(
                 fallback,
                 posture_settled=settled,
             )
+            handoff = _latch_handoff_output(None, candidate)
+            if handoff is not None:
+                self.handoff_latched_output = handoff
+                self.last_output = handoff
+                if settings.mode == "live":
+                    self._publish(0.0, 0.0)
+                self._write_status()
+                return
+            self.last_output = candidate
             self._publish_posture_intent(blocked=blocked)
             _arm_ready, _arm_reached, arm_blocked, _arm_detail = self._arm_feedback()
             self._publish_arm_view_intent(blocked=arm_blocked)

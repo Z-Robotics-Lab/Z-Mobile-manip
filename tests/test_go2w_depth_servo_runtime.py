@@ -405,6 +405,40 @@ def test_reactive_runtime_stops_for_downstream_ik_probe_in_3d_corridor():
     assert reached.done
 
 
+def test_handoff_is_latched_across_a_later_body_sway_sample():
+    probe = SERVO.DepthServoOutput(
+        phase="handoff_probe",
+        proposed_linear_x=0.0,
+        proposed_angular_z=0.0,
+        published_linear_x=0.0,
+        published_angular_z=0.0,
+        depth_error_m=0.02,
+        yaw_error_rad=0.03,
+        target_age_s=0.01,
+        reactive_phase="handoff_probe",
+        needs_ik_probe=True,
+    )
+    body_sway = SERVO.DepthServoOutput(
+        phase="approach",
+        proposed_linear_x=0.10,
+        proposed_angular_z=-0.05,
+        published_linear_x=0.10,
+        published_angular_z=-0.05,
+        depth_error_m=0.08,
+        yaw_error_rad=-0.12,
+        target_age_s=0.01,
+        reactive_phase="base_approach",
+    )
+
+    latched = SERVO._latch_handoff_output(None, probe)
+    assert latched is not None
+    replayed = SERVO._latch_handoff_output(latched, body_sway)
+
+    assert replayed is latched
+    assert replayed.phase == "handoff_probe"
+    assert replayed.published_linear_x == replayed.published_angular_z == 0.0
+
+
 def test_side_choice_is_latched_until_terminal_tracking_loss():
     core = _reactive_core(target_timeout_s=0.25)
     assert _observe_in_frames(

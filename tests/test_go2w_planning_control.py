@@ -925,6 +925,24 @@ def test_depth_servo_handoff_phases_stop_base_before_fresh_grasp(tmp_path):
         assert runner.status()["workflow"]["phase"] == "grasp_started"
 
 
+def test_depth_servo_supervisor_accepts_structured_handoff_evidence(tmp_path):
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+    )
+
+    assert runner._runtime_requests_handoff({"phase": "approach"}) is False
+    assert runner._runtime_requests_handoff({
+        "phase": "approach",
+        "output": {"needs_ik_probe": True},
+    }) is True
+    assert runner._runtime_requests_handoff({
+        "phase": "whole_body_approach",
+        "reactive": {"phase": "handoff_ready"},
+    }) is True
+
+
 def test_depth_servo_server_reacquires_after_bounded_tracking_loss(tmp_path):
     interactive = _FakeInteractiveService()
     runner = CONTROL.DepthServoRunner(
