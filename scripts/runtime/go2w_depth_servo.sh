@@ -154,6 +154,10 @@ docker run --rm \
   --min-forward-mps 0.10 \
   --max-forward-mps 0.18 \
   --max-yaw-rps 0.12 \
-  --target-timeout-s 0.25 \
-  --tracking-loss-grace-s 0.75 \
+  --yaw-deadband-deg 10 \
+  --max-yaw-step-rps 0.015 \
+  --target-timeout-s 0.40 \
+  --tracking-hold-s 0.55 \
+  --tracking-loss-grace-s 1.25 \
+  --handoff-settle-s 0.30 \
   --rate-hz 20

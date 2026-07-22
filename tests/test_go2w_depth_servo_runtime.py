@@ -389,8 +389,18 @@ def test_reactive_runtime_stops_for_downstream_ik_probe_in_3d_corridor():
         stamp_s=3.0,
     )
 
-    probe = core.tick(now_s=3.05, tracking=True)
+    settling = core.tick(now_s=3.05, tracking=True)
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.0, 0.55),
+        base_xyz=(0.55, 0.13, -0.10),
+        arm_xyz=(0.50, 0.0, 0.10),
+        stamp_s=3.35,
+    )
+    probe = core.tick(now_s=3.36, tracking=True)
 
+    assert settling.phase == "handoff_settle"
+    assert settling.published_linear_x == settling.published_angular_z == 0.0
     assert probe.phase == "handoff_probe"
     assert probe.needs_ik_probe
     assert probe.published_linear_x == probe.published_angular_z == 0.0
@@ -400,7 +410,7 @@ def test_reactive_runtime_stops_for_downstream_ik_probe_in_3d_corridor():
     assert core.reactive_status["desired_target_lateral_m"] == pytest.approx(0.13)
 
     core.set_ik_probe_result(True)
-    reached = core.tick(now_s=3.10, tracking=True)
+    reached = core.tick(now_s=3.37, tracking=True)
     assert reached.phase == "reached"
     assert reached.done
 
@@ -510,9 +520,12 @@ def test_stale_target_with_tracking_true_is_tracking_loss_not_tf_outage():
 
     output = core.tick(now_s=6.30, tracking=True)
 
-    assert output.phase == "view_recovery"
+    assert output.phase == "tracking_hold"
     assert output.published_linear_x == output.published_angular_z == 0.0
-    assert output.reactive_phase == "view_recovery"
+    assert output.reactive_phase == "tracking_hold"
+
+    recovery = core.tick(now_s=6.70, tracking=True)
+    assert recovery.phase == "view_recovery"
 
 
 def test_ros_style_quaternion_transform_builder_rotates_and_translates():

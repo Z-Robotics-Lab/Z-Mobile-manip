@@ -123,9 +123,11 @@ class ReactivePhase(str, Enum):
     BASE_APPROACH = "base_approach"
     POSTURE_ADJUST = "posture_adjust"
     REACQUIRE = "reacquire"
+    TRACKING_HOLD = "tracking_hold"
     VIEW_RECOVERY = "view_recovery"
     SEARCH_REQUIRED = "search_required"
     HANDOFF_PROBE = "handoff_probe"
+    HANDOFF_SETTLE = "handoff_settle"
     HANDOFF_READY = "handoff_ready"
 
 
@@ -209,7 +211,11 @@ class ReactiveServoConfig:
     preferred_arm_range_m: float = 0.55
     max_arm_view_extension_fraction: float = 0.65
     tracking_loss_grace_s: float = 0.75
+    # Zero preserves the controller's transport-agnostic legacy behaviour;
+    # real stepping-base deployments opt into a short hold explicitly.
+    tracking_hold_s: float = 0.0
     reacquire_stable_s: float = 0.25
+    handoff_settle_s: float = 0.0
 
     def __post_init__(self) -> None:
         positive = (
@@ -250,6 +256,14 @@ class ReactiveServoConfig:
             raise ValueError("camera soft elevation limit must precede hard limit")
         if not 0.0 <= self.max_arm_view_extension_fraction <= 1.0:
             raise ValueError("arm extension fraction must be within [0, 1]")
+        if (
+            not math.isfinite(self.tracking_hold_s)
+            or self.tracking_hold_s < 0.0
+            or self.tracking_hold_s >= self.tracking_loss_grace_s
+        ):
+            raise ValueError("tracking hold must be shorter than loss grace")
+        if not math.isfinite(self.handoff_settle_s) or self.handoff_settle_s < 0.0:
+            raise ValueError("handoff settle time must be finite and non-negative")
 
 
 class ReactiveTargetController:
@@ -270,6 +284,7 @@ class ReactiveTargetController:
         self._last_seen_s: float | None = None
         self._posture_requested = False
         self._reacquire_since_s: float | None = None
+        self._handoff_since_s: float | None = None
 
     def _arm_view(self, geometry: TargetGeometry, *, search: bool = False) -> ArmViewIntent:
         error = geometry.camera_elevation_rad - self.config.desired_camera_elevation_rad
@@ -345,7 +360,21 @@ class ReactiveTargetController:
                 reason="no 3-D target is available; start bounded search",
             )
         age_s = max(0.0, now_s - self._last_seen_s)
+        if age_s <= self.config.tracking_hold_s:
+            self.phase = ReactivePhase.TRACKING_HOLD
+            return ReactiveServoDecision(
+                phase=self.phase,
+                base=BaseMotionIntent(),
+                posture=PostureIntent(),
+                arm_view=ArmViewIntent(mode=ArmViewMode.HOLD),
+                geometry=geometry,
+                reason=(
+                    "brief tracker gap; freeze base/posture commands and retain "
+                    "the last filtered viewing ray"
+                ),
+            )
         if age_s <= self.config.tracking_loss_grace_s:
+            self._handoff_since_s = None
             self.phase = ReactivePhase.VIEW_RECOVERY
             return ReactiveServoDecision(
                 phase=self.phase,
@@ -356,6 +385,7 @@ class ReactiveTargetController:
                 reason="hold the base and recover the last observed viewing ray",
             )
         self.phase = ReactivePhase.SEARCH_REQUIRED
+        self._handoff_since_s = None
         return ReactiveServoDecision(
             phase=self.phase,
             base=BaseMotionIntent(),
@@ -401,6 +431,34 @@ class ReactiveTargetController:
         )
         hard_near_field = camera_depth_m <= self.config.camera_hard_min_depth_m
 
+        handoff_geometry_ok = self._handoff_geometry_ok(
+            geometry,
+            desired_target_lateral_m=desired_lateral,
+        )
+        handoff_candidate = (
+            near_field_handoff or hard_near_field or handoff_geometry_ok
+        )
+        if handoff_candidate:
+            if self._handoff_since_s is None:
+                self._handoff_since_s = now
+            if now - self._handoff_since_s + 1e-9 < self.config.handoff_settle_s:
+                self._posture_requested = False
+                self._reacquire_since_s = None
+                self.phase = ReactivePhase.HANDOFF_SETTLE
+                return ReactiveServoDecision(
+                    phase=self.phase,
+                    base=BaseMotionIntent(),
+                    posture=PostureIntent(),
+                    arm_view=ArmViewIntent(mode=ArmViewMode.HOLD),
+                    geometry=geometry,
+                    reason=(
+                        "handoff corridor reached; wait for stepping/image motion "
+                        "to settle before the close-range capture"
+                    ),
+                )
+        else:
+            self._handoff_since_s = None
+
         # Handoff must precede another posture increment.  Once the wrist
         # camera reaches its near-field boundary, continuing to move the arm
         # destroys the depth evidence that the grasp planner needs.  HOLD is
@@ -410,10 +468,7 @@ class ReactiveTargetController:
             self._posture_requested = False
             self._reacquire_since_s = None
             hold_view = ArmViewIntent(mode=ArmViewMode.HOLD)
-            corridor_ok = self._handoff_geometry_ok(
-                geometry,
-                desired_target_lateral_m=desired_lateral,
-            )
+            corridor_ok = handoff_geometry_ok
             if corridor_ok and ik_feasible is True:
                 self.phase = ReactivePhase.HANDOFF_READY
                 return ReactiveServoDecision(
@@ -491,10 +546,7 @@ class ReactiveTargetController:
                 reason="target height/elevation risks leaving the wrist-camera view",
             )
 
-        if self._handoff_geometry_ok(
-            geometry,
-            desired_target_lateral_m=desired_lateral,
-        ):
+        if handoff_geometry_ok:
             if ik_feasible is True:
                 self.phase = ReactivePhase.HANDOFF_READY
                 return ReactiveServoDecision(

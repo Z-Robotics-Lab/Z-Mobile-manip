@@ -5,6 +5,7 @@ import pytest
 
 from z_manip.control.reactive_servo import (
     ArmViewMode,
+    PostureIntent,
     ReactivePhase,
     ReactiveServoConfig,
     ReactiveTargetController,
@@ -206,6 +207,28 @@ def test_short_tracking_loss_holds_base_and_recovers_last_viewing_ray():
     assert decision.phase is ReactivePhase.VIEW_RECOVERY
     assert decision.base.linear_x_mps == decision.base.angular_z_rps == 0.0
     assert decision.arm_view.mode is ArmViewMode.SEARCH
+    assert decision.geometry is geometry
+
+
+def test_stepping_base_tracking_hole_freezes_without_triggering_recovery():
+    controller = ReactiveTargetController(ReactiveServoConfig(
+        tracking_hold_s=0.40,
+        tracking_loss_grace_s=0.90,
+    ))
+    geometry = _geometry()
+    controller.update(geometry, now_s=4.0, tracking=True, body_settled=True)
+
+    decision = controller.update(
+        None,
+        now_s=4.25,
+        tracking=False,
+        body_settled=True,
+    )
+
+    assert decision.phase is ReactivePhase.TRACKING_HOLD
+    assert decision.base.linear_x_mps == decision.base.angular_z_rps == 0.0
+    assert decision.posture == PostureIntent()
+    assert decision.arm_view.mode is ArmViewMode.HOLD
     assert decision.geometry is geometry
 
 

@@ -82,9 +82,12 @@ class DepthServoSettings:
     max_reverse_mps: float = 0.05
     max_yaw_rps: float = 0.12
     rotate_only_bearing_rad: float = math.radians(25.0)
-    yaw_deadband_rad: float = math.radians(6.0)
-    target_timeout_s: float = 0.25
-    tracking_loss_grace_s: float = 0.75
+    yaw_deadband_rad: float = math.radians(10.0)
+    max_yaw_step_rps: float = 0.015
+    target_timeout_s: float = 0.40
+    tracking_hold_s: float = 0.55
+    tracking_loss_grace_s: float = 1.25
+    handoff_settle_s: float = 0.30
     target_filter_window: int = 5
     target_filter_alpha: float = 0.55
     max_target_jump_m: float = 0.20
@@ -104,6 +107,15 @@ class DepthServoSettings:
             raise ValueError("target timeout must be finite and positive")
         if not math.isfinite(self.tracking_loss_grace_s) or self.tracking_loss_grace_s < self.target_timeout_s:
             raise ValueError("tracking-loss grace must be at least the target timeout")
+        if (
+            not math.isfinite(self.tracking_hold_s)
+            or not 0.0 <= self.tracking_hold_s < self.tracking_loss_grace_s
+        ):
+            raise ValueError("tracking hold must be non-negative and below loss grace")
+        if not math.isfinite(self.handoff_settle_s) or self.handoff_settle_s <= 0.0:
+            raise ValueError("handoff settle time must be finite and positive")
+        if not math.isfinite(self.max_yaw_step_rps) or self.max_yaw_step_rps <= 0.0:
+            raise ValueError("maximum yaw step must be finite and positive")
         if self.target_filter_window < 1:
             raise ValueError("target filter window must be positive")
         if not 0.0 < self.target_filter_alpha <= 1.0:
@@ -505,6 +517,8 @@ class DepthServoCore:
             max_yaw_rps=settings.max_yaw_rps,
             yaw_deadband_rad=settings.yaw_deadband_rad,
             tracking_loss_grace_s=settings.tracking_loss_grace_s,
+            tracking_hold_s=settings.tracking_hold_s,
+            handoff_settle_s=settings.handoff_settle_s,
         ))
         self._target: tuple[float, float, float] | None = None
         self._raw_target: tuple[float, float, float] | None = None
@@ -1002,8 +1016,12 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--min-forward-mps", type=float, default=0.10)
     parser.add_argument("--max-forward-mps", type=float, default=0.18)
     parser.add_argument("--max-yaw-rps", type=float, default=0.12)
-    parser.add_argument("--target-timeout-s", type=float, default=0.25)
-    parser.add_argument("--tracking-loss-grace-s", type=float, default=0.75)
+    parser.add_argument("--yaw-deadband-deg", type=float, default=10.0)
+    parser.add_argument("--max-yaw-step-rps", type=float, default=0.015)
+    parser.add_argument("--target-timeout-s", type=float, default=0.40)
+    parser.add_argument("--tracking-hold-s", type=float, default=0.55)
+    parser.add_argument("--tracking-loss-grace-s", type=float, default=1.25)
+    parser.add_argument("--handoff-settle-s", type=float, default=0.30)
     parser.add_argument("--transform-timeout-s", type=float, default=0.25)
     parser.add_argument("--rate-hz", type=float, default=20.0)
     parser.add_argument("--whole-body", choices=("off", "casadi"), default="casadi")
@@ -1040,8 +1058,12 @@ def _run_ros(args: argparse.Namespace) -> int:
         min_forward_mps=args.min_forward_mps,
         max_forward_mps=args.max_forward_mps,
         max_yaw_rps=args.max_yaw_rps,
+        yaw_deadband_rad=math.radians(args.yaw_deadband_deg),
+        max_yaw_step_rps=args.max_yaw_step_rps,
         target_timeout_s=args.target_timeout_s,
+        tracking_hold_s=args.tracking_hold_s,
         tracking_loss_grace_s=args.tracking_loss_grace_s,
+        handoff_settle_s=args.handoff_settle_s,
         base_frame=args.base_frame,
         arm_base_frame=args.arm_base_frame,
         transform_timeout_s=args.transform_timeout_s,
@@ -1073,6 +1095,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.whole_body_command: WholeBodyRuntimeCommand | None = None
             self.whole_body_error: str | None = None
             self.whole_body_handoff_settle_cycles = 0
+            self.last_conditioned_yaw_rps = 0.0
             self.handoff_latched_output: DepthServoOutput | None = None
             if args.whole_body == "casadi":
                 if (
@@ -1574,6 +1597,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 fallback.needs_ik_probe
                 or fallback.reactive_phase
                 in {
+                    ReactivePhase.HANDOFF_SETTLE.value,
                     ReactivePhase.HANDOFF_PROBE.value,
                     ReactivePhase.HANDOFF_READY.value,
                 }
@@ -1729,11 +1753,33 @@ def _run_ros(args: argparse.Namespace) -> int:
             # the handoff; CasADi still chooses whether forward motion helps.
             if linear > 1e-3:
                 linear = max(linear, settings.min_forward_mps)
-            yaw = float(np.clip(
+            yaw_target = float(np.clip(
                 command.base_yaw_rps,
                 -settings.max_yaw_rps,
                 settings.max_yaw_rps,
             ))
+            side_error_m = self.core.side_lateral_error_m
+            steering_bearing = (
+                geometry.base_bearing_rad
+                if side_error_m is None
+                else math.atan2(side_error_m, max(geometry.base_xyz_m[0], 0.05))
+            )
+            # A stepping Go2W produces large single-frame bearing spikes.  The
+            # QP may legitimately alternate signs while the chassis rocks,
+            # but forwarding those reversals makes the robot pivot in place
+            # and repeatedly loses the target.  Use the measured side-work
+            # error, a deliberately broad deadband, and a per-tick slew limit.
+            if abs(steering_bearing) <= settings.yaw_deadband_rad:
+                yaw_target = 0.0
+            yaw_delta = float(np.clip(
+                yaw_target - self.last_conditioned_yaw_rps,
+                -settings.max_yaw_step_rps,
+                settings.max_yaw_step_rps,
+            ))
+            yaw = self.last_conditioned_yaw_rps + yaw_delta
+            if abs(yaw) < 1e-6:
+                yaw = 0.0
+            self.last_conditioned_yaw_rps = yaw
             executable = command.executable
             return DepthServoOutput(
                 phase=("whole_body_approach" if executable else "whole_body_shadow"),
@@ -1742,7 +1788,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 published_linear_x=linear if executable else 0.0,
                 published_angular_z=yaw if executable else 0.0,
                 depth_error_m=geometry.base_planar_distance_m - settings.desired_depth_m,
-                yaw_error_rad=geometry.base_bearing_rad,
+                yaw_error_rad=steering_bearing,
                 target_age_s=fallback.target_age_s,
                 reason=(
                     "Pinocchio/CasADi coupled base-body intent"
