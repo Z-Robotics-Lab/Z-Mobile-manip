@@ -913,7 +913,20 @@ class GraspPlanGenerator:
             search_control,
         )
 
-        for candidate_index in order:
+        # Build one deterministic hypothesis schedule before exact IK.  When
+        # the cheap reachability pass is available, try the best symmetry of
+        # every non-leading candidate before spending time on its second and
+        # third equivalent wrist rotations.  The former candidate-major loop
+        # could burn three exact IK solves on each unreachable pose family and
+        # reach a feasible lower-ranked candidate only near the global budget.
+        # No hypothesis is removed: the remaining symmetries form a second
+        # pass, ordered by the same cached advisory cost.
+        hypothesis_groups: dict[
+            int,
+            list[tuple[int, np.ndarray, float | None, float]],
+        ] = {}
+        for candidate_index_raw in order:
+            candidate_index = int(candidate_index_raw)
             checkpoint(control, "grasp candidate search")
             width = None if widths is None else float(widths[candidate_index])
             if width is not None and not self.config.min_width_m <= width <= self.config.max_width_m:
@@ -931,11 +944,11 @@ class GraspPlanGenerator:
                 ))
                 continue
             indexed_family = list(enumerate(family))
-            if hypotheses_evaluated >= self.config.max_hypotheses:
-                stop_search = True
-                break
-            if pose_ranker is not None:
-                symmetry_costs: list[tuple[bool, float, int]] = []
+            if pose_ranker is not None and (
+                self.config.max_feasible_plans == 1
+                or candidate_index == int(order[0])
+            ):
+                symmetry_costs: dict[int, float] = {}
                 ranking_control = refinement_control or search_control
                 for symmetry_index, grasp in indexed_family:
                     cached_cost = reachability_costs.get((
@@ -965,101 +978,191 @@ class GraspPlanGenerator:
                             cost = float("inf")
                     else:
                         cost = cached_cost
-                    symmetry_costs.append((
-                        not np.isfinite(cost),
-                        cost if np.isfinite(cost) else 0.0,
-                        symmetry_index,
-                    ))
+                    symmetry_costs[symmetry_index] = cost
                 if stop_search:
                     break
-                indexed_family.sort(key=lambda item: symmetry_costs[item[0]])
-            for symmetry_index, grasp in indexed_family:
-                if hypotheses_evaluated >= self.config.max_hypotheses:
-                    stop_search = True
-                    break
-                checkpoint(control, "grasp symmetry search")
-                active_control = refinement_control or search_control
+                indexed_family.sort(key=lambda item: (
+                    not np.isfinite(symmetry_costs[item[0]]),
+                    (
+                        symmetry_costs[item[0]]
+                        if np.isfinite(symmetry_costs[item[0]])
+                        else 0.0
+                    ),
+                    item[0],
+                ))
+            else:
+                symmetry_costs = {
+                    symmetry_index: float("inf")
+                    for symmetry_index, _ in indexed_family
+                }
+            hypothesis_groups[candidate_index] = [
+                (
+                    symmetry_index,
+                    grasp,
+                    width,
+                    symmetry_costs[symmetry_index],
+                )
+                for symmetry_index, grasp in indexed_family
+            ]
+        if stop_search:
+            hypothesis_schedule: list[
+                tuple[int, int, np.ndarray, float | None]
+            ] = []
+        elif reachability_costs and self.config.max_feasible_plans == 1:
+            first_candidate = int(order[0])
+            first_group = hypothesis_groups.get(first_candidate, [])
+            first_pass = [
+                (candidate_index, *group[0])
+                for candidate_index_raw in order[1:]
+                if (group := hypothesis_groups.get(
+                    int(candidate_index_raw),
+                    [],
+                ))
+                for candidate_index in (int(candidate_index_raw),)
+            ]
+            later_pass = [
+                (int(candidate_index_raw), *item)
+                for candidate_index_raw in order[1:]
+                for item in hypothesis_groups.get(int(candidate_index_raw), [])[1:]
+            ]
+            later_pass.sort(key=lambda item: (
+                not np.isfinite(item[4]),
+                item[4] if np.isfinite(item[4]) else 0.0,
+                int(global_ranks[item[0]]),
+                item[1],
+            ))
+            scheduled_with_cost = [
+                (first_candidate, *item) for item in first_group
+            ] + first_pass + later_pass
+            hypothesis_schedule = [
+                (candidate_index, symmetry_index, grasp, width)
+                for candidate_index, symmetry_index, grasp, width, _ in scheduled_with_cost
+            ]
+        else:
+            hypothesis_schedule = [
+                (int(candidate_index_raw), symmetry_index, grasp, width)
+                for candidate_index_raw in order
+                for symmetry_index, grasp, width, _ in hypothesis_groups.get(
+                    int(candidate_index_raw),
+                    [],
+                )
+            ]
+
+        for candidate_index, symmetry_index, grasp, width in hypothesis_schedule:
+            if hypotheses_evaluated >= self.config.max_hypotheses:
+                stop_search = True
+                break
+            checkpoint(control, "grasp symmetry search")
+            active_control = refinement_control or search_control
+            if (
+                pose_ranker is not None
+                and self.config.max_feasible_plans > 1
+                and candidate_index != int(order[0])
+            ):
+                # Multi-plan refinement preserves its historical lazy ranking
+                # semantics: once a complete plan exists, ranking subsequent
+                # hypotheses consumes only the optional refinement window.
+                # First-feasible searches use the cached two-pass schedule
+                # above and never repeat this work.
                 try:
-                    hypothesis_control = active_control.limited_to(
-                        self.config.hypothesis_timeout_s,
-                        "grasp hypothesis budget",
-                    )
+                    target = self._tip_pose(grasp_pregrasp_pose(
+                        grasp,
+                        self.config.pregrasp_distance_m,
+                    ))
+                    pose_ranker(target, control=active_control)
                 except PlanningDeadlineExceeded:
-                    checkpoint(control, "grasp hypothesis budget")
+                    checkpoint(control, "grasp symmetry ranking")
                     failures.append(CandidateFailure(
                         int(candidate_index),
                         symmetry_index,
                         "budget",
-                        "grasp search/refinement budget expired",
+                        "grasp symmetry ranking budget expired",
                     ))
                     stop_search = True
                     break
-                hypotheses_evaluated += 1
-                try:
-                    result = self._evaluate_hypothesis(
-                        candidate_index=int(candidate_index),
-                        symmetry_index=symmetry_index,
-                        grasp=grasp,
-                        width=width,
-                        candidate_score=float(scores[candidate_index]),
-                        current=current,
-                        lift_direction=lift_direction,
-                        control=hypothesis_control,
-                    )
-                except PlanningDeadlineExceeded as error:
-                    checkpoint(control, "grasp hypothesis evaluation")
-                    try:
-                        checkpoint(search_control, "grasp candidate search budget")
-                    except PlanningDeadlineExceeded:
-                        failures.append(CandidateFailure(
-                            int(candidate_index),
-                            symmetry_index,
-                            "budget",
-                            "grasp candidate search budget expired",
-                        ))
-                        stop_search = True
-                        break
-                    if refinement_control is not None:
-                        try:
-                            checkpoint(
-                                refinement_control,
-                                "grasp solution refinement",
-                            )
-                        except PlanningDeadlineExceeded:
-                            stop_search = True
-                            break
-                    failures.append(CandidateFailure(
-                        int(candidate_index),
-                        symmetry_index,
-                        "budget",
-                        str(error),
-                    ))
-                    continue
                 except PlanningAborted:
                     raise
-                except _HypothesisRejected as error:
+                except Exception:
+                    pass
+            try:
+                hypothesis_control = active_control.limited_to(
+                    self.config.hypothesis_timeout_s,
+                    "grasp hypothesis budget",
+                )
+            except PlanningDeadlineExceeded:
+                checkpoint(control, "grasp hypothesis budget")
+                failures.append(CandidateFailure(
+                    int(candidate_index),
+                    symmetry_index,
+                    "budget",
+                    "grasp search/refinement budget expired",
+                ))
+                stop_search = True
+                break
+            hypotheses_evaluated += 1
+            try:
+                result = self._evaluate_hypothesis(
+                    candidate_index=int(candidate_index),
+                    symmetry_index=symmetry_index,
+                    grasp=grasp,
+                    width=width,
+                    candidate_score=float(scores[candidate_index]),
+                    current=current,
+                    lift_direction=lift_direction,
+                    control=hypothesis_control,
+                )
+            except PlanningDeadlineExceeded as error:
+                checkpoint(control, "grasp hypothesis evaluation")
+                try:
+                    checkpoint(search_control, "grasp candidate search budget")
+                except PlanningDeadlineExceeded:
                     failures.append(CandidateFailure(
-                        int(candidate_index), symmetry_index, error.stage, str(error),
+                        int(candidate_index),
+                        symmetry_index,
+                        "budget",
+                        "grasp candidate search budget expired",
                     ))
-                    continue
-                feasible.append(result)
-                if len(feasible) >= self.config.max_feasible_plans:
                     stop_search = True
                     break
-                if refinement_control is None:
+                if refinement_control is not None:
                     try:
-                        refinement_control = search_control.limited_to(
-                            self.config.solution_refinement_timeout_s,
+                        checkpoint(
+                            refinement_control,
                             "grasp solution refinement",
                         )
                     except PlanningDeadlineExceeded:
-                        # The first complete plan remains usable when only the
-                        # optional local improvement budget has elapsed.
-                        checkpoint(control, "grasp solution refinement")
                         stop_search = True
                         break
-            if stop_search:
+                failures.append(CandidateFailure(
+                    int(candidate_index),
+                    symmetry_index,
+                    "budget",
+                    str(error),
+                ))
+                continue
+            except PlanningAborted:
+                raise
+            except _HypothesisRejected as error:
+                failures.append(CandidateFailure(
+                    int(candidate_index), symmetry_index, error.stage, str(error),
+                ))
+                continue
+            feasible.append(result)
+            if len(feasible) >= self.config.max_feasible_plans:
+                stop_search = True
                 break
+            if refinement_control is None:
+                try:
+                    refinement_control = search_control.limited_to(
+                        self.config.solution_refinement_timeout_s,
+                        "grasp solution refinement",
+                    )
+                except PlanningDeadlineExceeded:
+                    # The first complete plan remains usable when only the
+                    # optional local improvement budget has elapsed.
+                    checkpoint(control, "grasp solution refinement")
+                    stop_search = True
+                    break
         checkpoint(control, "grasp solution selection")
         if feasible:
             # Candidate score is the user-visible global rank and remains the

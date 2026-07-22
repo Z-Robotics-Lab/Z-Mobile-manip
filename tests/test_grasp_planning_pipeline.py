@@ -396,6 +396,50 @@ def test_first_feasible_search_uses_reachability_after_top_score_fails():
     assert len(rank_calls) == 4
 
 
+def test_first_feasible_search_interleaves_best_symmetry_across_candidates():
+    poses = tuple(
+        _pose((x, 0.0, 0.2), approach=(0.0, 0.0, 1.0))
+        for x in (0.40, 0.50, 0.60)
+    )
+    ik = FakeIK(reject_x=(0.40, 0.50))
+
+    def pose_ranker(target, *, control=None):
+        del control
+        return {0.40: 0.0, 0.50: 1.0, 0.60: 2.0}[
+            round(float(target[0, 3]), 2)
+        ]
+
+    result = GraspPlanGenerator(
+        ik,
+        FakePlanner(),
+        GraspPlanConfig(
+            pregrasp_distance_m=0.02,
+            approach_steps=2,
+            lift_steps=2,
+            symmetry_samples=2,
+            max_candidates=3,
+            max_hypotheses=6,
+            max_feasible_plans=1,
+            tool_from_tip=np.eye(4),
+        ),
+    ).plan(
+        _candidates(poses),
+        current_joints=np.zeros(2),
+        pose_ranker=pose_ranker,
+    )
+
+    assert result.candidate_index == 2
+    # The highest-score family still gets both chances first.  Afterwards the
+    # planner tries one symmetry from each remaining family, so candidate 2 is
+    # reached before candidate 1 consumes its second equivalent wrist pose.
+    assert [round(float(call[0, 3]), 2) for call in ik.calls[:4]] == [
+        0.40,
+        0.40,
+        0.50,
+        0.60,
+    ]
+
+
 @pytest.mark.parametrize(
     ("failed_call", "expected_phase"),
     ((0, "pregrasp"), (1, "approach"), (2, "lift")),
