@@ -30,6 +30,8 @@ ANYGRASP_SERVER_IMAGE="${ANYGRASP_SERVER_IMAGE:-z-manip-anygrasp:cu128}"
 ANYGRASP_LICENSE_DIR="${ANYGRASP_LICENSE_DIR:-$ANYGRASP_DIR/license_YusenXie}"
 ANYGRASP_CHECKPOINT="${ANYGRASP_CHECKPOINT:-$ANYGRASP_DIR/checkpoint_detection.tar}"
 ARTIFACT_DIR="${Z_MANIP_ARTIFACT_DIR:-$ROOT_DIR/../artifacts/go2w_real/latest}"
+PERCEPTION_RUNNER_ARTIFACT_ROOT="$ROOT_DIR/../artifacts"
+PERCEPTION_RUNNER="z-manip-perception-runner"
 SOAK_MAX_RECOVERIES="${Z_MANIP_SOAK_MAX_RECOVERIES:-2}"
 SOAK_RECOVERY_TIMEOUT="${Z_MANIP_SOAK_RECOVERY_TIMEOUT:-25}"
 
@@ -231,6 +233,24 @@ start_perception() {
       stop_cmd_topic:=/z_manip/disabled/read_only_stop_cmd >/dev/null
 }
 
+start_perception_runner() {
+  # Keep only the ROS/Python userspace warm between UI clicks.  This container
+  # has no CAN/device mount, no actuator environment, and its only executable
+  # action is supplied by the fixed server-side interactive adapter.
+  mkdir -p "$PERCEPTION_RUNNER_ARTIFACT_ROOT"
+  docker rm -f "$PERCEPTION_RUNNER" >/dev/null 2>&1 || true
+  docker run -d --name "$PERCEPTION_RUNNER" --restart unless-stopped \
+    --user "$(id -u):$(id -g)" "${docker_env[@]}" \
+    -e HOME=/tmp/z-manip \
+    -e ROS_LOG_DIR=/tmp/z-manip-ros-logs \
+    -e PYTHONPATH=/opt/z_manip_ws/install/lib/python3.12/site-packages:/opt/ros/jazzy/lib/python3.12/site-packages:/opt/z_manip/python \
+    -e LD_LIBRARY_PATH=/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib \
+    -v "$ROOT_DIR/scripts/runtime/go2w_perception_dry_run.py:/usr/local/bin/z-manip-go2w-perception-dry-run:ro" \
+    -v "$ROOT_DIR/z_manip:/opt/z_manip/python/z_manip:ro" \
+    -v "$PERCEPTION_RUNNER_ARTIFACT_ROOT:/workspace-artifacts" \
+    "$IMAGE" sleep infinity >/dev/null
+}
+
 wait_anygrasp_healthy() {
   for _ in $(seq 1 120); do
     if [[ "$(docker inspect z-manip-anygrasp --format '{{.State.Health.Status}}' 2>/dev/null || true)" == healthy ]]; then
@@ -290,7 +310,8 @@ probe() {
 status() {
   echo "NUC camera: $(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST" 'systemctl --user is-active d435i.service' 2>/dev/null || echo unreachable)"
   docker ps --filter name=z-manip-edgetam --filter name=z-manip-rgbd \
-    --filter name=z-manip-hw --filter name=z-manip-anygrasp \
+    --filter name=z-manip-hw --filter name=z-manip-perception-runner \
+    --filter name=z-manip-anygrasp \
     --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
   if [[ "$(docker inspect z-manip-anygrasp --format '{{.State.Health.Status}}' 2>/dev/null || true)" == healthy ]]; then
     echo "Grasp proposal backend: AnyGrasp"
@@ -320,6 +341,7 @@ case "${1:-status}" in
     start_edgetam
     start_rgbd_bridge
     start_perception
+    start_perception_runner
     sleep 5
     status
     ;;
@@ -335,6 +357,7 @@ case "${1:-status}" in
   restart-perception)
     require_file "$DDS_CONFIG"
     start_perception
+    start_perception_runner
     ;;
   preflight)
     preflight
@@ -343,7 +366,7 @@ case "${1:-status}" in
     status
     ;;
   stop)
-    docker stop z-manip-hw z-manip-rgbd >/dev/null 2>&1 || true
+    docker stop z-manip-hw z-manip-rgbd "$PERCEPTION_RUNNER" >/dev/null 2>&1 || true
     echo "Stopped perception containers only; no actuator command was sent."
     ;;
   anygrasp-check)

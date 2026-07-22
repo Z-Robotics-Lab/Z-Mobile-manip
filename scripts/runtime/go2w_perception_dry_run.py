@@ -262,11 +262,16 @@ def main() -> int:
                 detail = values.get("failure_detail", "").strip()
                 perception_failure = failure + (f": {detail}" if detail else "")
 
+    latched_qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
     node.create_subscription(
         Bool,
         "/z_manip/perception/valid",
         valid_callback,
-        qos_profile_sensor_data,
+        latched_qos,
     )
     node.create_subscription(
         Image,
@@ -308,7 +313,7 @@ def main() -> int:
         DiagnosticArray,
         "/z_manip/perception/status",
         status_callback,
-        qos_profile_sensor_data,
+        latched_qos,
     )
     request_qos = QoSProfile(
         depth=1,
@@ -320,11 +325,17 @@ def main() -> int:
         "/z_manip/grounding/request",
         request_qos,
     )
+    stage_timings: dict[str, float] = {}
+    stage_started = time.monotonic()
     connection_deadline = time.monotonic() + 5.0
     while publisher.get_subscription_count() == 0 and time.monotonic() < connection_deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
     if publisher.get_subscription_count() == 0:
         raise RuntimeError("grounding request has no subscriber")
+    stage_timings["subscriber_discovery_s"] = round(
+        time.monotonic() - stage_started,
+        6,
+    )
     def publish_grounding(active_request_id: str) -> None:
         request = {
             "schema": "z_manip.grounding_request.v2",
@@ -338,16 +349,22 @@ def main() -> int:
     deadline = started + args.timeout
     grounding_reused = False
     if args.reuse_valid_tracking:
-        # Status is published at 10 Hz. Two cycles are enough to discover an
-        # exact instruction match without taxing every fresh request with a
-        # three-quarter-second preflight delay.
-        reuse_deadline = min(deadline, started + 0.20)
+        # Status is transient-local, so a late-joining warm runner receives the
+        # current instruction hash immediately.  A single short discovery spin
+        # is enough; mismatches publish fresh grounding without a fixed 200 ms
+        # delay on every first request.
+        reuse_probe_started = time.monotonic()
+        reuse_deadline = min(deadline, started + 0.05)
         while time.monotonic() < reuse_deadline:
             rclpy.spin_once(node, timeout_sec=0.05)
             if matching_tracking_valid and matching_tracking_request_id:
                 grounding_reused = True
                 accepted_source_request_id = matching_tracking_request_id
                 break
+        stage_timings["tracking_reuse_probe_s"] = round(
+            time.monotonic() - reuse_probe_started,
+            6,
+        )
     if not grounding_reused:
         overlays.clear()
         masks.clear()
@@ -358,6 +375,7 @@ def main() -> int:
         accepted_source_request_id = request_id
         publish_grounding(request_id)
 
+    bundle_wait_started = time.monotonic()
     selected_stamp: int | None = None
     selected_passive_report: dict[str, object] | None = None
     passive_window_error = "waiting for first passive capture window"
@@ -428,6 +446,10 @@ def main() -> int:
                 ) as error:
                     passive_window_error = f"{type(error).__name__}: {error}"
     if selected_stamp is None:
+        stage_timings["bundle_wait_s"] = round(
+            time.monotonic() - bundle_wait_started,
+            6,
+        )
         report = {
             "read_only": True,
             "request_id": request_id,
@@ -451,6 +473,7 @@ def main() -> int:
             "perception_failure": perception_failure or None,
             "minimum_bundle_target_points": args.min_bundle_target_points,
             "largest_bundle_target_points": largest_bundle_target_points,
+            "timings": stage_timings,
         }
         (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2))
@@ -477,12 +500,17 @@ def main() -> int:
             "report_sha256": hashlib.sha256(encoded_report.encode()).hexdigest(),
         }
     selected_at = time.monotonic()
+    stage_timings["bundle_wait_s"] = round(
+        selected_at - bundle_wait_started,
+        6,
+    )
     counts_at_selection = dict(message_counts)
     freshness_samples_s = [
         max(0, max(infos) - selected_stamp) * 1e-9,
     ]
     latest_freshness_stamp = selected_stamp
 
+    postprocess_started = time.monotonic()
     overlay_message = overlays[selected_stamp]
     mask_message = masks[selected_stamp]
     cloud_message = clouds[selected_stamp]
@@ -518,6 +546,11 @@ def main() -> int:
         ),
         dtype=np.float32,
     ).reshape(-1, 3)
+    stage_timings["bundle_decode_s"] = round(
+        time.monotonic() - postprocess_started,
+        6,
+    )
+    filter_started = time.monotonic()
     filtered_points = filter_object_cloud(
         points,
         viewpoint=(0.0, 0.0, 0.0),
@@ -532,6 +565,10 @@ def main() -> int:
         pixel_excluded_scene_points[~geometric_target_labels],
         dtype=np.float32,
     )
+    stage_timings["pointcloud_filter_s"] = round(
+        time.monotonic() - filter_started,
+        6,
+    )
     context = GraspContext(
         object_points=filtered_points,
         bbox=None,
@@ -544,6 +581,7 @@ def main() -> int:
     learned_error = ""
     grasp_error = ""
     candidates = None
+    grasp_started = time.monotonic()
     if args.learned_endpoint.strip():
         import os
 
@@ -567,7 +605,12 @@ def main() -> int:
             ).generate(context)
         except GraspGenerationError as error:
             grasp_error = str(error)
+    stage_timings["grasp_generation_s"] = round(
+        time.monotonic() - grasp_started,
+        6,
+    )
 
+    visualization_started = time.monotonic()
     visual = overlay.copy()
     intrinsic = np.asarray(info_message.k, dtype=float).reshape(3, 3)
     colors = ((0, 255, 255), (0, 200, 0), (255, 120, 0), (255, 0, 255), (0, 120, 255))
@@ -658,6 +701,11 @@ def main() -> int:
     mask_u8 = np.asarray(mask, dtype=np.uint8)
     if mask_u8.max(initial=0) <= 1:
         mask_u8 *= 255
+    stage_timings["visualization_s"] = round(
+        time.monotonic() - visualization_started,
+        6,
+    )
+    artifact_write_started = time.monotonic()
     cv2.imwrite(str(args.output / "edgetam_overlay.png"), overlay)
     cv2.imwrite(str(args.output / "edgetam_mask.png"), mask_u8)
     cv2.imwrite(str(args.output / "grasp_candidates_overlay.png"), visual)
@@ -678,6 +726,10 @@ def main() -> int:
             num_raw=np.asarray(candidates.num_raw, dtype=np.int64),
             stamp_ns=np.asarray(selected_stamp, dtype=np.int64),
         )
+    stage_timings["artifact_write_s"] = round(
+        time.monotonic() - artifact_write_started,
+        6,
+    )
     report = {
         "read_only": True,
         "request_id": request_id,
@@ -711,6 +763,7 @@ def main() -> int:
         "result_freshness": _freshness_summary(freshness_samples_s),
         "max_observed_result_lag_s": args.max_observed_result_lag,
         "passive_capture": passive_capture_summary,
+        "timings": stage_timings,
     }
     if args.soak_duration > 0.0:
         soak_deadline = time.monotonic() + args.soak_duration

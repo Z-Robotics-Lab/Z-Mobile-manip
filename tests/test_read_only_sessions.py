@@ -476,13 +476,79 @@ def test_perception_passes_immutable_output_and_captures_synchronized_joints(
     assert "--selected-passive-window" in argv
     assert argv[argv.index("--timeout") + 1] == "15"
     assert argv[argv.index("--min-bundle-target-points") + 1] == "400"
-    assert "--reuse-valid-tracking" not in argv
+    assert "--reuse-valid-tracking" in argv
     assert captured["environment"]["Z_MANIP_ARTIFACT_DIR"] == str(output)
     assert captured["environment"]["Z_MANIP_REQUIRE_PASSIVE_WINDOW"] == "1"
     assert captured["environment"]["Z_MANIP_RUNTIME_IMAGE"] == (
         "z-manip-runtime:pinocchio"
     )
     assert (output / "selected_passive_joint_report.json").is_file()
+
+
+def test_perception_uses_warm_runner_for_workspace_artifacts(tmp_path, monkeypatch):
+    module = _integration_module()
+    key = tmp_path / "server-key"
+    key.write_text("test", encoding="utf-8")
+    artifact_root = tmp_path / "artifacts"
+    output = artifact_root / "go2w_real" / "interactive_sessions" / "sample"
+    output.mkdir(parents=True)
+    log = tmp_path / "perception.log"
+    for name in (
+        "report.json",
+        "edgetam_mask.png",
+        "edgetam_overlay.png",
+        "grasp_candidates_overlay.png",
+    ):
+        (output / name).write_bytes(b"fixed")
+    captured = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.polls = iter((None, 0))
+
+        def poll(self):
+            return next(self.polls, 0)
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = tuple(argv)
+        return FakeProcess()
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+
+    def fake_capture(output_dir, _log_path, _environment):
+        payload = json.dumps(_passive_report())
+        (output_dir / "live_passive_joint_report.json").write_text(payload)
+        (output_dir / "selected_passive_joint_report.json").write_text(payload)
+        return module.BackendResult(0)
+
+    monkeypatch.setattr(module, "NUC_KEY", key)
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(backend, "_perception_runner_running", lambda: True)
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(backend, "_capture_passive_window", fake_capture)
+
+    result = backend.run_perception(
+        target="white adapter",
+        output_dir=output,
+        log_path=log,
+    )
+
+    assert result.exit_code == 0
+    argv = captured["argv"]
+    assert argv[:3] == (
+        "/usr/bin/docker",
+        "exec",
+        module.PERCEPTION_RUNNER_CONTAINER,
+    )
+    assert "run" not in argv[:4]
+    assert argv[argv.index("--output") + 1] == (
+        "/workspace-artifacts/go2w_real/interactive_sessions/sample"
+    )
 
 
 def test_perception_retries_one_geometric_mask_failure(tmp_path, monkeypatch):

@@ -39,6 +39,7 @@ from z_manip.read_only_sessions import (  # noqa: E402
 
 
 RUN_ROOT = WORKSPACE_ROOT / "artifacts" / "go2w_real" / "interactive_sessions"
+ARTIFACT_ROOT = WORKSPACE_ROOT / "artifacts"
 PERCEPTION = SCRIPT_DIR / "go2w_perception_dry_run.py"
 SESSION_GATE = SCRIPT_DIR / "piper_planning_session_gate.py"
 PLANNER = SCRIPT_DIR / "piper_planning_dry_run.py"
@@ -58,6 +59,8 @@ ROBOT_ASSETS = URDF.parent.parent
 CONTAINER_URDF = f"/robot_assets/urdf/{URDF.name}"
 DEFAULT_RUNTIME_IMAGE = "z-manip-runtime:pinocchio"
 DEFAULT_IK_BACKEND = "pinocchio"
+PERCEPTION_RUNNER_CONTAINER = "z-manip-perception-runner"
+PERCEPTION_RUNNER_ARTIFACT_ROOT = Path("/workspace-artifacts")
 SAFE_RUNTIME_IMAGE = re.compile(
     r"z-manip-runtime:[a-z0-9][a-z0-9._-]{0,63}\Z",
 )
@@ -539,6 +542,27 @@ class FixedReadOnlyBackend:
             and counts["info"] >= 5
         )
 
+    @staticmethod
+    def _perception_runner_running() -> bool:
+        """Return whether the fixed read-only warm runner is available."""
+
+        completed = subprocess.run(
+            (
+                "/usr/bin/docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                PERCEPTION_RUNNER_CONTAINER,
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_server_environment(),
+            shell=False,
+            check=False,
+        )
+        return completed.returncode == 0 and completed.stdout.strip() == b"true"
+
     def run_perception(
         self,
         *,
@@ -564,51 +588,82 @@ class FixedReadOnlyBackend:
             "Z_MANIP_REQUIRE_PASSIVE_WINDOW": "1",
         })
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        command = (
-            "/usr/bin/docker",
-            "run",
-            "--rm",
-            "--user",
-            f"{os.geteuid()}:{os.getegid()}",
-            "--network",
-            "host",
-            "-e",
-            "HOME=/tmp/z-manip",
-            "-e",
-            "ROS_LOG_DIR=/tmp/z-manip-ros-logs",
-            "-e",
-            "ROS_DOMAIN_ID=20",
-            "-e",
-            "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp",
-            "-e",
-            "CYCLONEDDS_URI=file:///config/cyclonedds.xml",
-            "-e",
-            "PYTHONPATH=/opt/z_manip/python",
-            "-v",
-            f"{DDS_CONFIG}:/config/cyclonedds.xml:ro",
-            "-v",
-            (
-                f"{PERCEPTION}:"
-                "/usr/local/bin/z-manip-go2w-perception-dry-run:ro"
-            ),
-            "-v",
-            f"{STACK_ROOT / 'z_manip'}:/opt/z_manip/python/z_manip:ro",
-            "-v",
-            f"{output_dir}:/artifacts",
-            self.runtime.runtime_image,
+        runner_output: Path | None = None
+        try:
+            relative_output = output_dir.resolve().relative_to(
+                ARTIFACT_ROOT.resolve(),
+            )
+            candidate = PERCEPTION_RUNNER_ARTIFACT_ROOT / relative_output
+            if self._perception_runner_running():
+                runner_output = candidate
+        except ValueError:
+            # Tests and explicitly isolated callers may use a temporary output
+            # outside the shared immutable artifact tree. Keep the former
+            # one-shot container as a safe compatibility fallback.
+            pass
+        if runner_output is not None:
+            command_prefix = (
+                "/usr/bin/docker",
+                "exec",
+                PERCEPTION_RUNNER_CONTAINER,
+            )
+            artifact_output = str(runner_output)
+        else:
+            command_prefix = (
+                "/usr/bin/docker",
+                "run",
+                "--rm",
+                "--user",
+                f"{os.geteuid()}:{os.getegid()}",
+                "--network",
+                "host",
+                "-e",
+                "HOME=/tmp/z-manip",
+                "-e",
+                "ROS_LOG_DIR=/tmp/z-manip-ros-logs",
+                "-e",
+                "ROS_DOMAIN_ID=20",
+                "-e",
+                "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp",
+                "-e",
+                "CYCLONEDDS_URI=file:///config/cyclonedds.xml",
+                "-e",
+                "PYTHONPATH=/opt/z_manip/python",
+                "-v",
+                f"{DDS_CONFIG}:/config/cyclonedds.xml:ro",
+                "-v",
+                (
+                    f"{PERCEPTION}:"
+                    "/usr/local/bin/z-manip-go2w-perception-dry-run:ro"
+                ),
+                "-v",
+                f"{STACK_ROOT / 'z_manip'}:/opt/z_manip/python/z_manip:ro",
+                "-v",
+                f"{output_dir}:/artifacts",
+                self.runtime.runtime_image,
+            )
+            artifact_output = "/artifacts"
+        command = command_prefix + (
             "z-manip-go2w-perception-dry-run",
             "--instruction",
             target,
             "--output",
-            "/artifacts",
+            artifact_output,
             "--passive-window",
-            "/artifacts/live_passive_joint_report.json",
+            f"{artifact_output}/live_passive_joint_report.json",
             "--selected-passive-window",
-            "/artifacts/selected_passive_joint_report.json",
+            f"{artifact_output}/selected_passive_joint_report.json",
             "--timeout",
             "15",
             "--min-bundle-target-points",
             "400",
+            # A close-range handoff commonly asks for the exact same target
+            # that EdgeTAM is already tracking.  The dry-run accepts reuse only
+            # when the bridge reports a valid track with the exact instruction
+            # SHA-256; otherwise it publishes a fresh grounding transaction.
+            # This removes a redundant YOLOE forward and tracker re-seed without
+            # allowing stale or semantically different geometry through.
+            "--reuse-valid-tracking",
         )
         total_started = time.monotonic()
         return_code = 1

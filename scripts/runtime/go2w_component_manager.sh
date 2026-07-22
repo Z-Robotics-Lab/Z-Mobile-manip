@@ -197,11 +197,12 @@ status_one() {
       fi
       ;;
     perception)
-      if container_running z-manip-hw; then
+      if container_running z-manip-hw \
+          && container_running z-manip-perception-runner; then
         state="healthy"
-        summary="$(container_summary z-manip-hw)"
+        summary="ROS $(container_summary z-manip-hw); warm runner active"
       else
-        summary="$(container_summary z-manip-hw)"
+        summary="ROS $(container_summary z-manip-hw); runner $(container_summary z-manip-perception-runner)"
       fi
       ;;
     perception-all)
@@ -361,6 +362,9 @@ grounding_ready() {
 
 perception_ready() {
   if ! container_running z-manip-hw; then
+    return 1
+  fi
+  if ! container_running z-manip-perception-runner; then
     return 1
   fi
   $DOCKER exec z-manip-hw bash -lc \
