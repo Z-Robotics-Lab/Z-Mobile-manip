@@ -975,6 +975,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--whole-body", choices=("off", "casadi"), default="casadi")
     parser.add_argument("--whole-body-urdf", type=Path)
     parser.add_argument("--whole-body-calibration", type=Path)
+    parser.add_argument("--whole-body-collision-model", type=Path)
     return parser.parse_args()
 
 
@@ -1039,15 +1040,21 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.whole_body_error: str | None = None
             self.whole_body_handoff_settle_cycles = 0
             if args.whole_body == "casadi":
-                if args.whole_body_urdf is None or args.whole_body_calibration is None:
+                if (
+                    args.whole_body_urdf is None
+                    or args.whole_body_calibration is None
+                    or args.whole_body_collision_model is None
+                ):
                     self.whole_body_error = (
-                        "CasADi whole-body controller requires URDF and calibration"
+                        "CasADi whole-body controller requires URDF, calibration, "
+                        "and collision model"
                     )
                 else:
                     try:
                         self.whole_body = WholeBodyRuntimeController(
                             urdf_path=args.whole_body_urdf,
                             calibration_path=args.whole_body_calibration,
+                            collision_model_path=args.whole_body_collision_model,
                             desired_standoff_m=settings.desired_depth_m,
                         )
                     except Exception as error:

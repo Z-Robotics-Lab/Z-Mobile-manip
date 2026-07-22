@@ -387,6 +387,20 @@ def test_previous_velocity_penalty_reduces_command_discontinuity():
     )
 
 
+def test_optimizer_can_replay_a_collision_adjusted_velocity():
+    optimizer = WholeBodyShadowOptimizer(ReplayKinematics())
+    state = _state()
+    task = WholeBodyTask(target_world_xyz_m=(0.72, 0.12, -0.05))
+    primary = optimizer.solve(state, task)
+
+    replayed = optimizer.evaluate_velocity(state, task, primary.velocity)
+
+    assert replayed.success
+    assert replayed.backend == "replay-scipy-lbfgsb-reference"
+    assert replayed.objective_after == pytest.approx(primary.objective_after)
+    assert replayed.predicted_state == primary.predicted_state
+
+
 def test_casadi_and_reference_qp_agree_when_optional_runtime_is_present():
     pytest.importorskip("casadi")
     optimizer = WholeBodyShadowOptimizer(ReplayKinematics())

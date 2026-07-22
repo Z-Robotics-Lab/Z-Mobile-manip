@@ -28,6 +28,7 @@ DDS_CONFIG="$STACK_ROOT/docker/runtime/cyclonedds-go2w-pc.xml"
 RUNTIME_IMAGE="${Z_MANIP_WHOLE_BODY_IMAGE:-z-mobile-manip-whole-body:latest}"
 WHOLE_BODY_URDF="${Z_MANIP_WHOLE_BODY_URDF:-$STACK_ROOT/../go2W_Sim/assets/urdf/go2w_sensored.urdf}"
 WHOLE_BODY_CALIBRATION="${Z_MANIP_WHOLE_BODY_CALIBRATION:-$STACK_ROOT/../artifacts/go2w_real/calibration/piper_wrist_camera_calibration.json}"
+WHOLE_BODY_COLLISION_MODEL="${Z_MANIP_WHOLE_BODY_COLLISION_MODEL:-$STACK_ROOT/configs/piper_collision_capsules.json}"
 CONTAINER_NAME="z-manip-go2w-depth-servo"
 NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
 NUC_KEY="${GO2W_NUC_SSH_KEY:-$HOME/.ssh/id_ed25519_codex_nuc}"
@@ -91,6 +92,10 @@ fi
   printf 'missing measured hand-eye calibration: %s\n' "$WHOLE_BODY_CALIBRATION" >&2
   exit 1
 }
+[[ -r "$WHOLE_BODY_COLLISION_MODEL" ]] || {
+  printf 'missing whole-body collision model: %s\n' "$WHOLE_BODY_COLLISION_MODEL" >&2
+  exit 1
+}
 if ! docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1; then
   printf 'building one-time CasADi whole-body runtime image: %s\n' "$RUNTIME_IMAGE" >&2
   docker build -t "$RUNTIME_IMAGE" \
@@ -127,6 +132,7 @@ docker run --rm \
   -v "$STACK_ROOT:$STACK_ROOT:ro" \
   -v "$WHOLE_BODY_URDF:/robot/go2w_sensored.urdf:ro" \
   -v "$WHOLE_BODY_CALIBRATION:/robot/piper_wrist_camera_calibration.json:ro" \
+  -v "$WHOLE_BODY_COLLISION_MODEL:/robot/piper_collision_capsules.json:ro" \
   -v "$(dirname -- "$STATUS_PATH"):$(dirname -- "$STATUS_PATH"):rw" \
   "$RUNTIME_IMAGE" \
   python3 "$SCRIPT_DIR/go2w_depth_servo.py" \
@@ -141,6 +147,7 @@ docker run --rm \
   --whole-body casadi \
   --whole-body-urdf /robot/go2w_sensored.urdf \
   --whole-body-calibration /robot/piper_wrist_camera_calibration.json \
+  --whole-body-collision-model /robot/piper_collision_capsules.json \
   --desired-depth-m 0.50 \
   --handoff-depth-m 0.52 \
   --handoff-bearing-deg 20 \

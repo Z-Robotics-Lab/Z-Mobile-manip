@@ -7,7 +7,7 @@ adapter cannot move either robot.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -17,11 +17,13 @@ from typing import Any, Sequence
 import numpy as np
 
 from .whole_body_model import (
+    CONTROL_DOF,
     PinocchioReducedWholeBodyModel,
     PinocchioWholeBodyFrames,
     ReducedWholeBodyState,
     ReducedWholeBodyVelocity,
 )
+from .whole_body_collision import select_collision_safe_arm_step
 from .whole_body_optimizer import (
     CasadiBoxQP,
     WholeBodyOptimizerConfig,
@@ -107,8 +109,11 @@ class WholeBodyRuntimeController:
         *,
         urdf_path: Path,
         calibration_path: Path,
+        collision_model_path: Path,
         desired_standoff_m: float = 0.52,
     ) -> None:
+        from z_manip.fixed_self_collision import FixedSelfCollisionGuard
+
         calibration = _json_document(calibration_path)
         if calibration.get("calibrated") is not True or calibration.get("synthetic") is not False:
             raise ValueError("whole-body runtime requires measured accepted hand-eye calibration")
@@ -144,6 +149,10 @@ class WholeBodyRuntimeController:
             self.model,
             config,
             solver=CasadiBoxQP(),
+        )
+        self.collision_guard = FixedSelfCollisionGuard(
+            urdf_path=urdf_path,
+            model_path=collision_model_path,
         )
         self.desired_standoff_m = float(desired_standoff_m)
         self.previous_velocity: ReducedWholeBodyVelocity | None = None
@@ -249,17 +258,83 @@ class WholeBodyRuntimeController:
                 desired_target_lateral_in_body_m
             ),
         )
+        locked_control_indices = _locked_control_indices(
+            freeze_base=freeze_base,
+            euler_available=euler_available,
+            mode=mode,
+            arm_ready=arm_ready,
+        )
         result = self.optimizer.solve(
             state,
             task,
             previous_velocity=self.previous_velocity,
-            locked_control_indices=_locked_control_indices(
-                freeze_base=freeze_base,
-                euler_available=euler_available,
-                mode=mode,
-                arm_ready=arm_ready,
-            ),
+            locked_control_indices=locked_control_indices,
         )
+        collision_document: dict[str, Any]
+        if result.residual_names:
+            primary_value = result.velocity.as_vector()
+            replayed: dict[tuple[float, ...], Any] = {}
+
+            def candidate_improves_task(arm_velocity: np.ndarray) -> bool:
+                value = primary_value.copy()
+                value[4:] = arm_velocity
+                key = tuple(float(item) for item in arm_velocity)
+                if np.array_equal(arm_velocity, primary_value[4:]):
+                    replayed[key] = result
+                    return bool(result.success)
+                candidate = self.optimizer.evaluate_velocity(
+                    state,
+                    task,
+                    ReducedWholeBodyVelocity.from_vector(value),
+                    previous_velocity=self.previous_velocity,
+                    locked_control_indices=locked_control_indices,
+                )
+                replayed[key] = candidate
+                return bool(candidate.success)
+
+            world_lateral = np.asarray(
+                (-math.sin(state.base_yaw_rad), math.cos(state.base_yaw_rad), 0.0),
+            )
+            arm_linear_jacobian = np.asarray(
+                self.model.frame_jacobian(state, self.model.tool_frame)[:3, 4:],
+                dtype=float,
+            )
+            selection = select_collision_safe_arm_step(
+                current_joints=joints,
+                primary_arm_velocity=primary_value[4:],
+                horizon_dt_s=self.optimizer.config.horizon_dt_s,
+                tool_lateral_jacobian=world_lateral @ arm_linear_jacobian,
+                guard=self.collision_guard,
+                candidate_improves_task=candidate_improves_task,
+            )
+            collision_document = selection.document()
+            if selection.allowed:
+                result = replayed[
+                    tuple(float(item) for item in selection.arm_velocity_rps)
+                ]
+            else:
+                zero = ReducedWholeBodyVelocity.from_vector(np.zeros(CONTROL_DOF))
+                result = replace(
+                    result,
+                    velocity=zero,
+                    predicted_state=state,
+                    backend="fixed-fixture-collision-gate",
+                    objective_after=result.objective_before,
+                    residual_after=result.residual_before,
+                    success=False,
+                    reason=(
+                        "no continuous fixed-fixture-safe arm step also lowered "
+                        "the nonlinear whole-body objective; stationary intent returned"
+                    ),
+                    failure_code="FIXED_FIXTURE_COLLISION",
+                )
+        else:
+            collision_document = {
+                "checked": False,
+                "allowed": False,
+                "reason": "optimizer rejected target before arm-step prediction",
+                "attempts": [],
+            }
         self.previous_velocity = result.velocity if result.success else None
         velocity = result.velocity
         dt = self.optimizer.config.horizon_dt_s
@@ -284,6 +359,7 @@ class WholeBodyRuntimeController:
             "schema": RUNTIME_SCHEMA,
             "mode": mode,
             "executable": executable,
+            "fixed_fixture_collision": collision_document,
             "measured_state": {
                 "posture_fresh": posture_fresh,
                 "posture_detail": posture_detail,

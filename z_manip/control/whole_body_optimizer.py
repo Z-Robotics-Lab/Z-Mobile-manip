@@ -564,20 +564,66 @@ class WholeBodyShadowOptimizer:
             task,
             previous_velocity=previous_velocity,
         )
-        if locked_control_indices:
-            lower = problem.lower.copy()
-            upper = problem.upper.copy()
-            for raw_index in locked_control_indices:
-                index = int(raw_index)
-                if index < 0 or index >= CONTROL_DOF:
-                    raise ValueError(f"locked control index is out of range: {index}")
-                lower[index] = 0.0
-                upper[index] = 0.0
-            problem = replace(problem, lower=lower, upper=upper)
+        problem = self._lock_problem(problem, locked_control_indices)
         value = np.asarray(self.solver.solve(problem), dtype=float)
         if value.shape != (CONTROL_DOF,) or not np.isfinite(value).all():
             raise RuntimeError("whole-body QP backend returned an invalid velocity")
         value = np.clip(value, problem.lower, problem.upper)
+        return self._evaluate_value(state, task, problem, value, self.solver.name)
+
+    def evaluate_velocity(
+        self,
+        state: ReducedWholeBodyState,
+        task: WholeBodyTask,
+        velocity: ReducedWholeBodyVelocity,
+        *,
+        previous_velocity: ReducedWholeBodyVelocity | None = None,
+        locked_control_indices: Sequence[int] = (),
+    ) -> WholeBodyOptimizationResult:
+        """Replay a proposed bounded velocity against the nonlinear task."""
+
+        problem = self._lock_problem(
+            self.linearize(state, task, previous_velocity=previous_velocity),
+            locked_control_indices,
+        )
+        value = np.asarray(velocity.as_vector(), dtype=float)
+        if value.shape != (CONTROL_DOF,) or not np.isfinite(value).all():
+            raise ValueError("replayed whole-body velocity is invalid")
+        if np.any(value < problem.lower - 1e-9) or np.any(value > problem.upper + 1e-9):
+            raise ValueError("replayed whole-body velocity exceeds active bounds")
+        return self._evaluate_value(
+            state,
+            task,
+            problem,
+            np.clip(value, problem.lower, problem.upper),
+            f"replay-{self.solver.name}",
+        )
+
+    @staticmethod
+    def _lock_problem(
+        problem: LinearizedWholeBodyProblem,
+        locked_control_indices: Sequence[int],
+    ) -> LinearizedWholeBodyProblem:
+        if not locked_control_indices:
+            return problem
+        lower = problem.lower.copy()
+        upper = problem.upper.copy()
+        for raw_index in locked_control_indices:
+            index = int(raw_index)
+            if index < 0 or index >= CONTROL_DOF:
+                raise ValueError(f"locked control index is out of range: {index}")
+            lower[index] = 0.0
+            upper[index] = 0.0
+        return replace(problem, lower=lower, upper=upper)
+
+    def _evaluate_value(
+        self,
+        state: ReducedWholeBodyState,
+        task: WholeBodyTask,
+        problem: LinearizedWholeBodyProblem,
+        value: np.ndarray,
+        backend: str,
+    ) -> WholeBodyOptimizationResult:
         velocity = ReducedWholeBodyVelocity.from_vector(value)
         predicted = self.model.integrate(state, velocity, self.config.horizon_dt_s)
         try:
@@ -585,7 +631,7 @@ class WholeBodyShadowOptimizer:
         except WholeBodyVisibilityError as error:
             return self._visibility_failure(
                 state,
-                planar_distance_m=planar,
+                planar_distance_m=problem.planar_distance_m,
                 camera_depth_m=error.camera_depth_m,
             )
         weights = self._weights(problem.near_weight)
@@ -594,7 +640,7 @@ class WholeBodyShadowOptimizer:
         return WholeBodyOptimizationResult(
             velocity=velocity,
             predicted_state=predicted,
-            backend=self.solver.name,
+            backend=backend,
             objective_before=objective_before,
             objective_after=objective_after,
             residual_before=tuple(float(item) for item in problem.residual),
