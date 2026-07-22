@@ -16,6 +16,18 @@
   reliability: best_effort
   durability: volatile
 
+/nuc/camera/color/image_raw/compressed:
+  history: keep_last
+  depth: 5
+  reliability: best_effort
+  durability: volatile
+
+/nuc/camera/aligned_depth_to_color/image_raw/compressedDepth:
+  history: keep_last
+  depth: 5
+  reliability: best_effort
+  durability: volatile
+
 /track_3d/selected_target_pointcloud:
   history: keep_last
   depth: 5

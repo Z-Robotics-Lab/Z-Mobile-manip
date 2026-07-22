@@ -94,6 +94,18 @@ manip restart
 manip stop
 ```
 
+实机调参前可启动全链路只读 rosbag；它记录 RGB-D、TF、目标/点云、跟踪、PiPER
+关节反馈以及 whole-body intent/status，并以 Zstd MCAP 每五分钟切片：
+
+```bash
+manip bag start floor-bottle
+manip bag status
+# 完成若干次 UI/遥控测试后
+manip bag stop
+```
+
+包保存在 `../artifacts/go2w_real/rosbags/`。录制器仅订阅 ROS 话题，不发布运动命令。
+
 离线检查今天的最新 rosbag、API 状态和深度伺服 trace（不会导入 ROS/WebRTC/CAN，
 也不会发送运动命令）：
 
