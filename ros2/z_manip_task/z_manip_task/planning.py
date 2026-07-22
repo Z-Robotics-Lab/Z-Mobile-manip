@@ -21,6 +21,7 @@ from z_manip.collision.pointcloud import (
 )
 from z_manip.collision.pinocchio_self import PinocchioSelfCollisionChecker
 from z_manip.configuration import StackConfig
+from z_manip.fixed_self_collision import FixedSelfCollisionGuard
 from z_manip.ik.symmetry import expand_symmetry
 from z_manip.kinematics import (
     fixed_transform_from_urdf,
@@ -54,6 +55,7 @@ from z_manip.planning.work_pose import (
     WorkPoseOptimizationError,
 )
 from z_manip.planning_control import checkpoint, PlanningControl
+from z_manip.trajectory_clearance import evaluate_fixed_fixture_trajectory
 
 
 @dataclass(frozen=True, eq=False)
@@ -363,6 +365,16 @@ class OnlinePlanner:
             )
         model_data = json.loads(config.collision_model_path.read_text())
         self.collision_model = RobotCollisionModel.from_mapping(model_data)
+        # Keep fixed Go2W fixtures on their calibrated geometry regardless of
+        # any perception-noise profile applied to the point-cloud checker.
+        # In particular, planning-only gripper-radius scaling must never make
+        # Mid360/platform collisions disappear and reappear at execution.
+        self.fixed_fixture_guard = FixedSelfCollisionGuard(
+            urdf_path=config.robot.urdf_path,
+            model_path=config.collision_model_path,
+            base_link=config.robot.base_link,
+            tip_link=config.robot.tip_link,
+        )
         self.ik_backend = os.environ.get(
             'Z_MANIP_IK_BACKEND',
             'robust',
@@ -392,6 +404,29 @@ class OnlinePlanner:
             config.robot.base_link,
         )
         self.grasp_generate = grasp_generate
+
+    def _fixed_fixture_state_valid(self, joints: object) -> bool:
+        """Planner callback for immutable robot-mounted fixture geometry."""
+
+        return bool(self.fixed_fixture_guard.check_state(joints).valid)
+
+    def _fixed_fixture_path_valid(self, path: object) -> bool:
+        """Continuously validate a joint path against mounted fixtures."""
+
+        values = np.asarray(path, dtype=float)
+        if values.ndim != 2 or values.shape != (len(values), self.chain.dof):
+            return False
+        if len(values) < 2 or not np.all(np.isfinite(values)):
+            return False
+        evidence = evaluate_fixed_fixture_trajectory(
+            values,
+            guard=self.fixed_fixture_guard,
+            max_joint_step_rad=min(
+                0.01,
+                float(self.config.rrt.collision_resolution),
+            ),
+        )
+        return bool(evidence.valid)
 
     def grasp_collision_aperture(self, required_width_m: object) -> float:
         """Return the plan-specific PiPER collision aperture."""
@@ -541,6 +576,8 @@ class OnlinePlanner:
             if not approach.valid:
                 return False
             positions = np.asarray(path, dtype=float)
+            if not self._fixed_fixture_path_valid(positions):
+                return False
             checkpoint(path_control, 'closed-gripper final contact audit')
             valid = contact_checker.check_state(positions[-1]).valid
             checkpoint(path_control, 'closed-gripper final contact audit')
@@ -571,13 +608,27 @@ class OnlinePlanner:
                 attached_at = attachment.copy()
                 attached_aperture = aperture
             assert attached_checker is not None
-            return attached_checker.is_segment_valid(first, second)
+            return bool(
+                attached_checker.is_segment_valid(first, second)
+                and self._fixed_fixture_path_valid(
+                    np.vstack((
+                        np.asarray(first, dtype=float),
+                        np.asarray(second, dtype=float),
+                    )),
+                )
+            )
+
+        def transit_state_valid(joints: object) -> bool:
+            return bool(
+                self._fixed_fixture_state_valid(joints)
+                and transit_checker.is_state_valid(joints)
+            )
 
         joint_planner = JointSpaceRRTConnect(
             joint_names=self.chain.joint_names,
             lower_limits=self.chain.lower_limits,
             upper_limits=self.chain.upper_limits,
-            state_valid=transit_checker.is_state_valid,
+            state_valid=transit_state_valid,
             config=self.config.rrt,
         )
         if pose_ranker is None:
