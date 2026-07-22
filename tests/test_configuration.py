@@ -75,6 +75,7 @@ def test_deployment_config_resolves_robot_path_and_builds_typed_settings():
     )
     assert config.work_pose.radial_distances_m == pytest.approx((0.56, 0.50, 0.62))
     assert config.work_pose.preferred_target_x_m == pytest.approx(0.56)
+    assert config.work_pose.preferred_target_abs_y_m == pytest.approx(0.14)
     assert config.work_pose.max_base_translation_m == pytest.approx(1.5)
     # Objects smaller than 30 mm are outside the current picking scope.  Keep
     # a sub-centimetre position gate while avoiding false IK rejection from
@@ -84,8 +85,8 @@ def test_deployment_config_resolves_robot_path_and_builds_typed_settings():
     assert config.ik.continuation_timeout_s == pytest.approx(0.18)
     assert config.ik.continuation_seed_timeout_s == pytest.approx(0.08)
     assert config.ik.continuation_fallback_seeds == 2
-    assert config.grasp_plan.pregrasp_distance_m == pytest.approx(0.06)
-    assert config.grasp_plan.approach_steps == 4
+    assert config.grasp_plan.pregrasp_distance_m == pytest.approx(0.10)
+    assert config.grasp_plan.approach_steps == 6
     assert config.grasp_plan.lift_distance_m == pytest.approx(0.07)
     assert config.grasp_plan.lift_steps == 4
     assert config.grasp_plan.symmetry_samples == 4

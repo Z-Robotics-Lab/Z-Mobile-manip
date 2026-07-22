@@ -148,6 +148,11 @@ class WorkPoseConfig:
     corridor_max_z_m: float = 1.25
     preferred_target_x_m: float = 0.52
     preferred_target_y_m: float = 0.0
+    # Optional symmetric lateral preference.  A non-zero value keeps the
+    # target beside the arm pedestal instead of directly over the platform
+    # centreline, while still allowing either side to win on motion/IK cost.
+    # ``None`` preserves the original signed-y behaviour.
+    preferred_target_abs_y_m: float | None = None
     max_base_translation_m: float = 1.45
     max_abs_base_yaw_rad: float = math.pi * 0.75
     target_alignment_weight: float = 1.0
@@ -195,6 +200,20 @@ class WorkPoseConfig:
             <= self.corridor_max_y_m
         ):
             raise ValueError("preferred target must lie inside manipulator corridor")
+        if self.preferred_target_abs_y_m is not None:
+            preferred_abs_y = float(self.preferred_target_abs_y_m)
+            if not np.isfinite(preferred_abs_y) or preferred_abs_y < 0.0:
+                raise ValueError(
+                    "preferred absolute target y must be finite and non-negative",
+                )
+            if not (
+                self.corridor_min_y_m <= preferred_abs_y <= self.corridor_max_y_m
+                or self.corridor_min_y_m <= -preferred_abs_y <= self.corridor_max_y_m
+            ):
+                raise ValueError(
+                    "preferred absolute target y must have at least one side "
+                    "inside the manipulator corridor",
+                )
         positive_finite = (
             self.max_base_translation_m,
             self.max_abs_base_yaw_rad,
@@ -492,7 +511,19 @@ class BoundedSE2WorkPoseOptimizer:
         x_width = self.config.corridor_max_x_m - self.config.corridor_min_x_m
         y_width = self.config.corridor_max_y_m - self.config.corridor_min_y_m
         x_error = (predicted_target[0, 3] - self.config.preferred_target_x_m) / x_width
-        y_error = (predicted_target[1, 3] - self.config.preferred_target_y_m) / y_width
+        if self.config.preferred_target_abs_y_m is None:
+            y_error = (
+                predicted_target[1, 3] - self.config.preferred_target_y_m
+            ) / y_width
+        else:
+            # A magnitude target is deliberately sign-agnostic: the platform
+            # may place the object on whichever side requires less base motion
+            # and yields the better exact IK result.  This avoids steering the
+            # arm through the Go2W head/Mid360 centreline by default.
+            y_error = (
+                abs(float(predicted_target[1, 3]))
+                - float(self.config.preferred_target_abs_y_m)
+            ) / y_width
         alignment_cost = self.config.target_alignment_weight * (
             x_error * x_error + y_error * y_error
         )

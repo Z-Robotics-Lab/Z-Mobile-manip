@@ -72,6 +72,29 @@ def test_off_axis_target_requires_lateral_motion_and_yaw_to_enter_arm_corridor()
     assert choice.scene_points[:, 3] == pytest.approx(observation.scene_points[:, 3])
 
 
+def test_symmetric_lateral_preference_keeps_target_off_platform_centreline():
+    observation = _observation()
+    config = WorkPoseConfig(
+        radial_distances_m=(0.52,),
+        target_lateral_offsets_m=(-0.14, 0.14, 0.0),
+        yaw_offsets_rad=(0.0,),
+        preferred_target_abs_y_m=0.14,
+        max_sampled_hypotheses=3,
+        max_ranked_candidates=3,
+        max_exact_evaluations=3,
+        max_feasible_choices=1,
+    )
+
+    choice = BoundedSE2WorkPoseOptimizer(config).select(observation)
+
+    assert abs(float(choice.predicted_target_pose[1, 3])) == pytest.approx(0.14)
+
+
+def test_symmetric_lateral_preference_rejects_invalid_magnitude():
+    with pytest.raises(ValueError, match="preferred absolute target y"):
+        WorkPoseConfig(preferred_target_abs_y_m=0.50)
+
+
 def test_mount_is_conjugated_for_complete_target_grasp_and_scene_transforms():
     mount = np.eye(4)
     mount_yaw = math.radians(18.0)

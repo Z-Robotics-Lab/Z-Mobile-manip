@@ -92,7 +92,7 @@
   },
   "work_pose": {
     "radial_distances_m": [0.56, 0.50, 0.62],
-    "target_lateral_offsets_m": [0.0, -0.14, 0.14],
+    "target_lateral_offsets_m": [-0.14, 0.14, 0.0],
     "yaw_offsets_rad": [0.0, -0.1745329252, 0.1745329252, -0.3490658504, 0.3490658504],
     "corridor_min_x_m": 0.48,
     "corridor_max_x_m": 0.78,
@@ -102,6 +102,7 @@
     "corridor_max_z_m": 1.25,
     "preferred_target_x_m": 0.56,
     "preferred_target_y_m": 0.0,
+    "preferred_target_abs_y_m": 0.14,
     "max_base_translation_m": 1.5,
     "max_abs_base_yaw_rad": 2.3561944902,
     "target_alignment_weight": 1.0,
@@ -119,8 +120,8 @@
     "max_diagnostic_failures": 12
   },
   "grasp_plan": {
-    "pregrasp_distance_m": 0.06,
-    "approach_steps": 4,
+    "pregrasp_distance_m": 0.10,
+    "approach_steps": 6,
     "lift_distance_m": 0.07,
     "lift_steps": 4,
     "lift_direction_base": [0.0, 0.0, 1.0],
