@@ -365,6 +365,23 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert 'id="approach-optimizer"' in lowered
     assert 'id="approach-handoff"' in lowered
     assert 'id="approach-reactive"' in lowered
+    assert 'id="approach-sport-proof"' in lowered
+    assert 'id="approach-posture-proof"' in lowered
+    assert 'id="approach-arm-proof"' in lowered
+    assert 'id="approach-fixed-guard"' in lowered
+    assert "calculated" in lowered
+    assert "gated" in lowered
+    assert "acked" in lowered
+    assert "measured" in lowered
+    assert "transport.mode_epoch" in lowered
+    assert "posturecommand.euler_ack_generation" in lowered
+    assert "posturecommand.euler_ack_code" in lowered
+    assert "armstatus.accepted_seq" in lowered
+    assert "armstatus.actual_joints_rad" in lowered
+    assert "armstatus.fixed_collision_guard" in lowered
+    assert "armstatus.collision_rejections" in lowered
+    assert "armstatus.unsafe_target_forwarded" in lowered
+    assert "forwarding evidence —" in lowered
     assert "geometry.base_planar_distance_m" in lowered
     assert "geometry.camera_range_m" in lowered
     assert "geometry.target_height_m" in lowered

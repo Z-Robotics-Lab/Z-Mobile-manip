@@ -866,6 +866,10 @@
           <div class="approach-metric"><span>Command vx / wz</span><strong id="approach-command">—</strong></div>
           <div class="approach-metric"><span>Reactive view</span><strong id="approach-reactive">—</strong></div>
           <div class="approach-metric"><span>Wrist search</span><strong id="approach-search">idle</strong></div>
+          <div class="approach-metric"><span>SPORT transport / Euler</span><strong id="approach-sport-proof">—</strong></div>
+          <div class="approach-metric"><span>Posture execution proof</span><strong id="approach-posture-proof">CALCULATED — · GATED — · ACKED — · MEASURED —</strong></div>
+          <div class="approach-metric"><span>Arm execution proof</span><strong id="approach-arm-proof">CALCULATED — · GATED — · ACKED — · MEASURED —</strong></div>
+          <div class="approach-metric"><span>Fixed fixture guard</span><strong id="approach-fixed-guard">UNAVAILABLE · forwarding evidence —</strong></div>
         </div>
         <div class="approach-progress" id="approach-progress" aria-label="Mobile grasp workflow progress">
           <span class="approach-phase" data-approach-phase="detect">Detect</span>
@@ -2294,6 +2298,134 @@
       return `${heightText} / ${pitchText}`;
     }
 
+    function statusDocument(envelope) {
+      if (!envelope || typeof envelope !== "object") return {};
+      return envelope.document && typeof envelope.document === "object"
+        ? envelope.document : envelope;
+    }
+
+    function finiteSequence(value) {
+      return Number.isInteger(value) && value >= 0 ? value : null;
+    }
+
+    function renderExecutionEvidence({ runtime, postureEnvelope, postureStatus, feedbackFresh, wholeBody, optimizer, armView }) {
+      const transport = postureStatus.transport || {};
+      const motionMode = transport.motion_mode || {};
+      const modeEpoch = finiteSequence(transport.mode_epoch);
+      const eulerState = postureStatus.capabilities?.euler_state || "UNKNOWN";
+      const transportConnected = transport.connected === true;
+      const sportText = [
+        `SPORT ${motionMode.name || "—"}/${motionMode.api_family || "—"}`,
+        `epoch ${modeEpoch === null ? "—" : modeEpoch}`,
+        `WebRTC ${transportConnected ? "UP" : "UNPROVEN"}`,
+        `Euler ${eulerState}`,
+      ].join(" · ");
+      setApproachMetric("approach-sport-proof", sportText,
+        transportConnected && postureStatus.capabilities?.euler === true ? "ready"
+          : postureStatus.capabilities?.euler === false ? "waiting" : "unavailable");
+      byId("approach-sport-proof").title = [
+        postureStatus.capabilities?.euler_reason,
+        motionMode.parse_error,
+      ].filter(Boolean).join(" · ");
+
+      const postureCommand = postureStatus.command || {};
+      const postureGeneration = finiteSequence(postureCommand.posture_generation);
+      const eulerAckGeneration = finiteSequence(postureCommand.euler_ack_generation);
+      const eulerAckCode = firstFinite(postureCommand.euler_ack_code, postureCommand.codes?.Euler);
+      const postureCalculated = Boolean(
+        postureEnvelope?.last_intent
+        || finiteNumber(postureStatus.attitude?.target_roll_rad)
+        || finiteNumber(postureStatus.attitude?.target_pitch_rad)
+        || finiteNumber(optimizer.intent?.body_roll_rps)
+        || finiteNumber(optimizer.intent?.body_pitch_rps)
+      );
+      const postureGateOpen = postureStatus.mode === "live"
+        && transportConnected
+        && postureStatus.capabilities?.euler === true
+        && postureStatus.stop_latched !== true;
+      const postureAcked = postureGeneration !== null
+        && eulerAckGeneration === postureGeneration
+        && eulerAckCode === 0;
+      const postureMeasured = postureAcked
+        && feedbackFresh
+        && postureStatus.phase === "reached";
+      const postureGateReason = postureGateOpen ? "PASS"
+        : postureStatus.mode !== "live" ? `mode ${postureStatus.mode || "—"}`
+          : !transportConnected ? "WebRTC unproven"
+            : postureStatus.capabilities?.euler !== true ? `Euler ${eulerState}`
+              : postureStatus.stop_latched === true ? "Full Stop" : "blocked";
+      const postureProof = [
+        `CALCULATED ${postureCalculated ? "YES" : "—"}`,
+        `GATED ${postureGateReason}`,
+        `ACKED ${postureAcked ? `gen ${postureGeneration} code 0` : `—${finiteNumber(eulerAckCode) ? ` code ${eulerAckCode}` : ""}`}`,
+        `MEASURED ${postureMeasured ? "CONVERGED" : feedbackFresh ? `fresh / ${postureStatus.phase || "waiting"}` : "—"}`,
+      ].join(" · ");
+      setApproachMetric("approach-posture-proof", postureProof,
+        postureMeasured ? "ready" : postureCalculated ? "waiting" : "unavailable");
+      byId("approach-posture-proof").title = postureStatus.detail || "";
+
+      const armEnvelope = runtime.arm_view_status || {};
+      const armStatus = statusDocument(armEnvelope);
+      const armIntent = armEnvelope.last_intent || {};
+      const acceptedSeq = finiteSequence(armStatus.accepted_seq);
+      const intentSeq = finiteSequence(armIntent.seq);
+      const armEnvelopeAge = firstFinite(armEnvelope.age_s);
+      const armFeedbackAge = firstFinite(armStatus.feedback_age_s);
+      const armFeedbackFresh = finiteNumber(armFeedbackAge)
+        && armFeedbackAge <= 0.50
+        && (!finiteNumber(armEnvelopeAge) || armEnvelopeAge <= 0.75);
+      const measuredJoints = Array.isArray(armStatus.actual_joints_rad)
+        && armStatus.actual_joints_rad.length === 6
+        && armStatus.actual_joints_rad.every(finiteNumber);
+      const armCalculated = Boolean(
+        intentSeq !== null
+        || armView.mode
+        || Object.keys(optimizer.intent || {}).some(key => key.startsWith("piper_joint"))
+      );
+      const armAcked = acceptedSeq !== null
+        && (intentSeq === null || acceptedSeq >= intentSeq);
+      const armMeasured = armAcked && armFeedbackFresh && measuredJoints;
+      const armGateReason = !armStatus.schema ? "no executor status"
+        : armStatus.stop_latched === true ? "Full Stop"
+          : armStatus.fault ? "fault"
+            : !armFeedbackFresh ? "stale feedback"
+              : armStatus.owner ? "PASS" : "owner unproven";
+      const armProof = [
+        `CALCULATED ${armCalculated ? (intentSeq === null ? "YES" : `seq ${intentSeq}`) : "—"}`,
+        `GATED ${armGateReason}`,
+        `ACKED ${armAcked ? `seq ${acceptedSeq}` : "—"}`,
+        `MEASURED ${armMeasured ? `${(armFeedbackAge * 1000).toFixed(0)} ms` : "—"}`,
+        `owner ${armStatus.owner || "—"}`,
+      ].join(" · ");
+      setApproachMetric("approach-arm-proof", armProof,
+        armMeasured ? "ready" : armCalculated ? "waiting" : "unavailable");
+      byId("approach-arm-proof").title = armStatus.fault || armStatus.last_intent_error || "";
+
+      const guardFieldPresent = Object.prototype.hasOwnProperty.call(armStatus, "fixed_collision_guard")
+        || Object.prototype.hasOwnProperty.call(armStatus, "collision_rejections");
+      const guard = armStatus.fixed_collision_guard;
+      const rejectionCount = finiteSequence(armStatus.collision_rejections);
+      const forwarding = typeof armStatus.unsafe_target_forwarded === "boolean"
+        ? armStatus.unsafe_target_forwarded
+        : typeof guard?.unsafe_target_forwarded === "boolean" ? guard.unsafe_target_forwarded : null;
+      const safeHold = armStatus.safe_hold_sent === true || guard?.safe_hold_sent === true;
+      const guardDecision = !guard ? "awaiting step"
+        : guard.allowed === false ? "BLOCK"
+          : guard.escaping === true ? "ESCAPE" : guard.allowed === true ? "PASS" : "UNKNOWN";
+      const guardPair = Array.isArray(guard?.pair) ? guard.pair.join("↔") : "—";
+      const guardMargin = finiteNumber(guard?.margin_m) ? `${(guard.margin_m * 1000).toFixed(1)} mm` : "—";
+      const forwardingText = forwarding === false ? `unsafe NOT FORWARDED${safeHold ? " · HOLD SENT" : ""}`
+        : forwarding === true ? "unsafe FORWARDED"
+          : "forwarding evidence —";
+      const guardText = guardFieldPresent
+        ? `ACTIVE · ${guardDecision} · ${guardPair} · margin ${guardMargin} · rejects ${rejectionCount ?? 0} · ${forwardingText}`
+        : `UNAVAILABLE · ${forwardingText}`;
+      setApproachMetric("approach-fixed-guard", guardText,
+        forwarding === true || guard?.allowed === false ? "waiting"
+          : guardFieldPresent && forwarding === false ? "ready" : "unavailable");
+      byId("approach-fixed-guard").title = guard?.reason || "";
+    }
+
     function renderApproachStatus(approach = state.approach) {
       state.approach = approach || state.approach;
       state.approachWorkflow = state.approach?.workflow?.active ? state.approach.workflow : null;
@@ -2445,6 +2577,15 @@
         finiteNumber(extension) ? `extend ${(extension * 100).toFixed(0)}%` : null,
       ].filter(Boolean).join(" · ");
       setApproachMetric("approach-reactive", viewDetails, viewDetails === "—" ? "unavailable" : "");
+      renderExecutionEvidence({
+        runtime,
+        postureEnvelope,
+        postureStatus,
+        feedbackFresh,
+        wholeBody,
+        optimizer,
+        armView,
+      });
       const confidence = finiteNumber(search.confidence) ? `${(search.confidence * 100).toFixed(0)}%` : "—";
       const view = Number.isInteger(search.view_index) ? `${search.view_index + 1}/${search.view_count || "?"}` : "—";
       byId("approach-search").textContent = search.live_enabled === false
