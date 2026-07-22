@@ -1209,6 +1209,12 @@ def main() -> int:
         "planning_max_hypotheses": config.grasp_plan.max_hypotheses,
         "planning_max_feasible_plans": config.grasp_plan.max_feasible_plans,
         "support_approach_prior_weight": args.support_approach_prior_weight,
+        "lateral_approach_prior_weight": (
+            config.grasp_plan.lateral_approach_prior_weight
+        ),
+        "overhead_approach_penalty_weight": (
+            config.grasp_plan.overhead_approach_penalty_weight
+        ),
         "grasp_centrality_method": "robust_object_frame_gaussian",
         "planning_pregrasp_distance_m": config.grasp_plan.pregrasp_distance_m,
         "planning_approach_steps": config.grasp_plan.approach_steps,
@@ -1330,6 +1336,11 @@ def main() -> int:
         "support_approach_bonus": float(
             support_approach_bonuses[planned.candidate_index]
         ),
+        "lateral_approach_bonus": float(planned.lateral_approach_bonus),
+        "overhead_approach_penalty": float(
+            planned.overhead_approach_penalty
+        ),
+        "approach_preference": "either_body_side_before_overhead",
         "grasp_centrality": float(grasp_centralities[planned.candidate_index]),
         "final_contact_fk_error": {
             "position_m": contact_position_error_m,

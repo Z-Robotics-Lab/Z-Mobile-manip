@@ -857,7 +857,7 @@ def test_planning_reuses_capture_time_report_and_pinocchio_runtime(
     assert planner_command[planner_command.index("--max-feasible-plans") + 1] == "1"
     assert (
         planner_command[planner_command.index("--support-approach-prior-weight") + 1]
-        == "0.5"
+        == "0.05"
     )
     assert planner_command[planner_command.index("--user") + 1] == (
         f"{os.geteuid()}:{os.getegid()}"

@@ -14,7 +14,10 @@ PLANNING_ONLY_SEARCH_TIMEOUT_S="${Z_MANIP_PLANNING_ONLY_SEARCH_TIMEOUT_S:-6}"
 PLANNING_ONLY_SYMMETRY_SAMPLES="${Z_MANIP_PLANNING_ONLY_SYMMETRY_SAMPLES:-4}"
 PLANNING_ONLY_MAX_HYPOTHESES="${Z_MANIP_PLANNING_ONLY_MAX_HYPOTHESES:-64}"
 PLANNING_ONLY_MAX_FEASIBLE_PLANS="${Z_MANIP_PLANNING_ONLY_MAX_FEASIBLE_PLANS:-1}"
-SUPPORT_APPROACH_PRIOR_WEIGHT="${Z_MANIP_SUPPORT_APPROACH_PRIOR_WEIGHT:-0.5}"
+# A small supported-object prior remains useful, but the mobile robot must not
+# buy that preference by sweeping the wrist over its centreline lidar.  The
+# stronger side/overhead policy lives in grasp_plan and is applied before IK.
+SUPPORT_APPROACH_PRIOR_WEIGHT="${Z_MANIP_SUPPORT_APPROACH_PRIOR_WEIGHT:-0.05}"
 PASSIVE_CAPTURE_SECONDS="${Z_MANIP_PASSIVE_CAPTURE_SECONDS:-0.25}"
 REMOTE_PASSIVE_PROBE="/usr/local/libexec/z-manip/piper_passive_probe.py"
 REMOTE_PASSIVE_REPORT="/tmp/z-manip-passive-live.json"

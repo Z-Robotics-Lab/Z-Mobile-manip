@@ -13,7 +13,10 @@ import numpy as np
 from z_manip.ik.symmetry import expand_symmetry
 from z_manip.kinematics.robust_ik import IKFailure, IKSolution
 from z_manip.models.grasp_source import GraspCandidates
-from z_manip.models.grasp_ordering import directionally_diverse_indices
+from z_manip.models.grasp_ordering import (
+    directionally_diverse_indices,
+    lateral_approach_scores,
+)
 from z_manip.models.planner import JointTrajectory, PlanningError
 from z_manip.planning_control import (
     PlanningAborted,
@@ -90,6 +93,8 @@ class GraspPlanConfig:
     hypothesis_timeout_s: float = 2.5
     solution_refinement_timeout_s: float = 0.35
     joint_limit_penalty: float = 0.02
+    lateral_approach_prior_weight: float = 0.0
+    overhead_approach_penalty_weight: float = 0.0
     tool_from_tip: tuple[tuple[float, float, float, float], ...] = (
         (1.0, 0.0, 0.0, 0.0),
         (0.0, 1.0, 0.0, 0.0),
@@ -116,6 +121,11 @@ class GraspPlanConfig:
             raise ValueError("grasp family and candidate counts must be positive")
         if not 0.0 <= self.min_width_m < self.max_width_m:
             raise ValueError("invalid gripper aperture range")
+        if not (
+            0.0 <= self.lateral_approach_prior_weight <= 1.0
+            and 0.0 <= self.overhead_approach_penalty_weight <= 1.0
+        ):
+            raise ValueError("grasp approach preference weights must be within [0, 1]")
         timeouts = (
             self.planning_timeout_s,
             self.search_timeout_s,
@@ -270,6 +280,8 @@ class PlannedGrasp:
     higher_rank_rejection_count: int = 0
     lift_pose: np.ndarray | None = None
     trajectory_refinement: object | None = None
+    lateral_approach_bonus: float = 0.0
+    overhead_approach_penalty: float = 0.0
 
 
 class GraspPlanningError(PlanningError):
@@ -759,6 +771,14 @@ class GraspPlanGenerator:
             raise PlanningError("grasp poses must be finite")
         if scores.shape != (len(grasps),) or not np.all(np.isfinite(scores)):
             raise PlanningError("grasp scores do not align with grasp poses")
+        scores, lateral_bonuses, overhead_penalties = lateral_approach_scores(
+            grasps,
+            scores,
+            lateral_weight=self.config.lateral_approach_prior_weight,
+            overhead_penalty_weight=(
+                self.config.overhead_approach_penalty_weight
+            ),
+        )
         widths = None if candidates.widths is None else np.asarray(candidates.widths, dtype=float)
         if widths is not None and (
             widths.shape != (len(grasps),) or not np.all(np.isfinite(widths))
@@ -978,6 +998,10 @@ class GraspPlanGenerator:
                     < global_ranks[candidate_index]
                 }),
                 lift_pose=lift,
+                lateral_approach_bonus=float(lateral_bonuses[candidate_index]),
+                overhead_approach_penalty=float(
+                    overhead_penalties[candidate_index]
+                ),
             )
         raise GraspPlanningError(
             "no grasp candidate survived aperture/IK/planning; "

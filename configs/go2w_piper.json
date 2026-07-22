@@ -139,6 +139,8 @@
     "hypothesis_timeout_s": 2.5,
     "solution_refinement_timeout_s": 0.35,
     "joint_limit_penalty": 0.02,
+    "lateral_approach_prior_weight": 0.50,
+    "overhead_approach_penalty_weight": 0.40,
     "tool_from_tip": [
       [0.0, -1.0, 0.0, 0.0],
       [1.0, 0.0, 0.0, 0.0],

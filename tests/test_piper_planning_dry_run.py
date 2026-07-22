@@ -17,6 +17,46 @@ DRY_RUN = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DRY_RUN)
 
 
+def test_mobile_grasp_config_prefers_side_entries_and_penalizes_overhead():
+    from z_manip.models.grasp_ordering import lateral_approach_scores
+
+    grasps = np.repeat(np.eye(4)[None, :, :], 4, axis=0)
+    grasps[0, :3, 2] = (0.0, 1.0, 0.0)   # left/right side
+    grasps[1, :3, 2] = (0.0, -1.0, 0.0)  # opposite side
+    grasps[2, :3, 2] = (1.0, 0.0, 0.0)   # horizontal, but centreline
+    grasps[3, :3, 2] = (0.0, 0.0, -1.0)  # overhead/downward
+
+    ranked, bonuses, penalties = lateral_approach_scores(
+        grasps,
+        np.ones(4),
+        lateral_weight=0.5,
+        overhead_penalty_weight=0.4,
+    )
+
+    assert ranked[0] == pytest.approx(ranked[1])
+    assert ranked[0] > ranked[2] > ranked[3]
+    np.testing.assert_allclose(bonuses, (0.5, 0.5, 0.125, 0.0))
+    np.testing.assert_allclose(penalties, (0.0, 0.0, 0.0, 0.4))
+
+
+def test_mobile_grasp_config_keeps_side_preference_soft():
+    from z_manip.models.grasp_ordering import lateral_approach_scores
+
+    grasps = np.repeat(np.eye(4)[None, :, :], 2, axis=0)
+    grasps[0, :3, 2] = (0.0, 1.0, 0.0)
+    grasps[1, :3, 2] = (0.0, 0.0, -1.0)
+    ranked, _bonuses, _penalties = lateral_approach_scores(
+        grasps,
+        (0.8, 2.0),
+        lateral_weight=0.5,
+        overhead_penalty_weight=0.4,
+    )
+
+    # A very strong upstream candidate is not hard-rejected. Continuous IK and
+    # fixture collision validation stay authoritative after this soft ranking.
+    assert ranked[1] > ranked[0]
+
+
 def test_load_transform_and_transform_geometry(tmp_path):
     transform = np.eye(4)
     transform[:3, 3] = (1.0, -2.0, 0.5)
