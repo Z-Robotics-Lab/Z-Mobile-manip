@@ -347,6 +347,55 @@ def test_candidate_diversity_never_runs_lower_global_rank_first():
     np.testing.assert_allclose(ik.calls[1], expected_second)
 
 
+def test_first_feasible_search_uses_reachability_after_top_score_fails():
+    class TopCandidateFails(FakeIK):
+        def solve(self, target, current=None, *, control=None):
+            self.calls.append(np.asarray(target).copy())
+            if len(self.calls) == 1:
+                raise IKFailure("highest-ranked candidate is unreachable")
+            x = float(target[0, 3])
+            return IKSolution(np.full(2, x), 0.0, 0.0, 0.2, 1, 0, 0.25)
+
+    poses = tuple(
+        _pose((x, 0.0, 0.2), approach=(0.0, 0.0, 1.0))
+        for x in (0.40, 0.50, 0.60, 0.70)
+    )
+    reachability_cost = {0.40: 0.0, 0.50: 8.0, 0.60: 4.0, 0.70: 1.0}
+    rank_calls = []
+
+    def pose_ranker(target, *, control=None):
+        del control
+        x = float(target[0, 3])
+        rank_calls.append(x)
+        return reachability_cost[round(x, 2)]
+
+    ik = TopCandidateFails()
+    result = GraspPlanGenerator(
+        ik,
+        FakePlanner(),
+        GraspPlanConfig(
+            pregrasp_distance_m=0.02,
+            approach_steps=2,
+            lift_steps=2,
+            symmetry_samples=1,
+            max_candidates=4,
+            max_hypotheses=4,
+            max_feasible_plans=1,
+            tool_from_tip=np.eye(4),
+        ),
+    ).plan(
+        _candidates(poses),
+        current_joints=np.zeros(2),
+        pose_ranker=pose_ranker,
+    )
+
+    assert result.candidate_index == 3
+    assert [round(float(call[0, 3]), 2) for call in ik.calls[:2]] == [0.40, 0.70]
+    # The advisory batch ranking is cached for the per-candidate symmetry
+    # ordering instead of repeating the same FK work during exact search.
+    assert len(rank_calls) == 4
+
+
 @pytest.mark.parametrize(
     ("failed_call", "expected_phase"),
     ((0, "pregrasp"), (1, "approach"), (2, "lift")),

@@ -436,6 +436,90 @@ class GraspPlanGenerator:
     def _tip_pose(self, tool_pose: np.ndarray) -> np.ndarray:
         return tool_tip_pose(tool_pose, self.config.tool_from_tip)
 
+    def _reachability_order(
+        self,
+        grasps: np.ndarray,
+        order: np.ndarray,
+        pose_ranker: Callable[..., float] | None,
+        search_control: PlanningControl,
+    ) -> tuple[np.ndarray, dict[tuple[int, int], float]]:
+        """Use the cheap FK seed ranker to schedule expensive exact IK.
+
+        Candidate zero remains the highest-scored retained grasp.  If it does
+        not work, the remaining candidates are ordered by their best symmetry
+        cost instead of spending the whole anytime budget walking score order.
+        This is deliberately enabled only for first-feasible searches: a
+        multi-plan refinement search must retain score order so that it can
+        compare the requested number of high-quality complete programs.
+
+        The ranker is advisory.  It receives a small child budget, and any
+        timeout falls back to the original deterministic score order.  The
+        per-symmetry values are returned so the inner loop does not repeat the
+        same FK calculations.
+        """
+
+        if (
+            pose_ranker is None
+            or len(order) < 2
+            or self.config.max_feasible_plans != 1
+        ):
+            return order, {}
+        try:
+            ranking_control = search_control.limited_to(
+                self.config.solution_refinement_timeout_s,
+                "grasp reachability ordering budget",
+            )
+        except PlanningDeadlineExceeded:
+            return order, {}
+
+        costs: dict[tuple[int, int], float] = {}
+        candidate_costs: dict[int, float] = {}
+        try:
+            for candidate_index_raw in order:
+                candidate_index = int(candidate_index_raw)
+                family = expand_symmetry(
+                    grasps[candidate_index],
+                    n_about_axis=self.config.symmetry_samples,
+                )
+                best = float("inf")
+                for symmetry_index, grasp in enumerate(family):
+                    checkpoint(ranking_control, "grasp reachability ordering")
+                    target = self._tip_pose(grasp_pregrasp_pose(
+                        grasp,
+                        self.config.pregrasp_distance_m,
+                    ))
+                    try:
+                        cost = float(pose_ranker(target, control=ranking_control))
+                    except PlanningDeadlineExceeded:
+                        raise
+                    except PlanningAborted:
+                        raise
+                    except Exception:
+                        cost = float("inf")
+                    costs[(candidate_index, symmetry_index)] = cost
+                    if np.isfinite(cost):
+                        best = min(best, cost)
+                candidate_costs[candidate_index] = best
+        except PlanningDeadlineExceeded:
+            return order, {}
+        except PlanningAborted:
+            raise
+        except ValueError:
+            # Invalid families are reported by the normal evaluation path.
+            return order, {}
+
+        first = int(order[0])
+        original_rank = {int(index): rank for rank, index in enumerate(order)}
+        remainder = sorted(
+            (int(index) for index in order[1:]),
+            key=lambda index: (
+                not np.isfinite(candidate_costs.get(index, float("inf"))),
+                candidate_costs.get(index, float("inf")),
+                original_rank[index],
+            ),
+        )
+        return np.asarray((first, *remainder), dtype=int), costs
+
     def _cartesian_ik(
         self,
         poses: list[np.ndarray],
@@ -822,6 +906,13 @@ class GraspPlanGenerator:
             raise PlanningError("lift direction must be nonzero")
         lift_direction /= lift_norm
 
+        order, reachability_costs = self._reachability_order(
+            grasps,
+            order,
+            pose_ranker,
+            search_control,
+        )
+
         for candidate_index in order:
             checkpoint(control, "grasp candidate search")
             width = None if widths is None else float(widths[candidate_index])
@@ -847,26 +938,33 @@ class GraspPlanGenerator:
                 symmetry_costs: list[tuple[bool, float, int]] = []
                 ranking_control = refinement_control or search_control
                 for symmetry_index, grasp in indexed_family:
-                    try:
-                        target = self._tip_pose(grasp_pregrasp_pose(
-                            grasp,
-                            self.config.pregrasp_distance_m,
-                        ))
-                        cost = float(pose_ranker(target, control=ranking_control))
-                    except PlanningDeadlineExceeded:
-                        checkpoint(control, "grasp symmetry ranking")
-                        failures.append(CandidateFailure(
-                            int(candidate_index),
-                            symmetry_index,
-                            "budget",
-                            "grasp symmetry ranking budget expired",
-                        ))
-                        stop_search = True
-                        break
-                    except PlanningAborted:
-                        raise
-                    except Exception:
-                        cost = float("inf")
+                    cached_cost = reachability_costs.get((
+                        int(candidate_index),
+                        symmetry_index,
+                    ))
+                    if cached_cost is None:
+                        try:
+                            target = self._tip_pose(grasp_pregrasp_pose(
+                                grasp,
+                                self.config.pregrasp_distance_m,
+                            ))
+                            cost = float(pose_ranker(target, control=ranking_control))
+                        except PlanningDeadlineExceeded:
+                            checkpoint(control, "grasp symmetry ranking")
+                            failures.append(CandidateFailure(
+                                int(candidate_index),
+                                symmetry_index,
+                                "budget",
+                                "grasp symmetry ranking budget expired",
+                            ))
+                            stop_search = True
+                            break
+                        except PlanningAborted:
+                            raise
+                        except Exception:
+                            cost = float("inf")
+                    else:
+                        cost = cached_cost
                     symmetry_costs.append((
                         not np.isfinite(cost),
                         cost if np.isfinite(cost) else 0.0,
