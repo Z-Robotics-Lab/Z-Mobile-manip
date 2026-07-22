@@ -61,6 +61,16 @@ expected steady UI path is about **1.68 s**, but the `< 2 s` claim must be
 validated with a new post-change real capture. Fresh YOLOE acquisition and
 same-target tracked refresh must be reported separately.
 
+An additional 4090-only benchmark isolated dynamic YOLOE prompt setup. The
+detector, 640-pixel input, confidence threshold, and box selection remained
+unchanged. Persisting MobileCLIP and caching only the exact normalized phrase
+reduced a new prompt request from **0.251–0.328 s** of prompt setup plus
+inference to **0.010–0.015 s** end to end after service warmup. Embeddings for
+`white charger`, `red bottle`, and `black box` were elementwise identical to
+the former implementation (`max_abs_diff = 0`). Historical fresh perception
+still contains about 1.46 s of capture/wrapper overhead, so this optimization
+does not by itself establish the fresh `< 2 s` target.
+
 ## Safety and regression checks
 
 - Final IK position/orientation acceptance and collision checks were retained.
@@ -70,7 +80,12 @@ same-target tracked refresh must be reported separately.
   candidate or symmetry set.
 - A verified `NEED_BASE_APPROACH` result is propagated as a recoverable mobile
   disposition; incomplete gate evidence remains fail-closed.
-- Full offline suite: **982 passed, 50 skipped, 0 failed**.
+- The mobile-handoff lifecycle remains owned until its passive watcher records
+  success, typed recovery, failure, or timeout; a second approach cannot race
+  the fresh planning/execution worker.
+- Warm-planner reports are bounded, non-symlink JSON files and are promoted
+  atomically. Missing output or runner failure cannot masquerade as success.
+- Full offline suite: **991 passed, 50 skipped, 0 failed**.
 - The skipped tests require unavailable live milestone state or optional host
   Pinocchio/CasADi packages; Docker replay covers the planner used here.
 
