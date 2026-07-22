@@ -125,6 +125,8 @@
     "lift_distance_m": 0.07,
     "lift_steps": 4,
     "lift_direction_base": [0.0, 0.0, 1.0],
+    "fallback_lift_vertical_m": 0.045,
+    "fallback_lift_retreat_m": 0.025,
     "symmetry_samples": 4,
     "min_width_m": 0.012,
     "max_width_m": 0.068,

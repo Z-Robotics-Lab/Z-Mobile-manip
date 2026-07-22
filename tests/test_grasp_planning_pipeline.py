@@ -177,6 +177,57 @@ def test_pipeline_uses_global_ik_once_then_bounded_cartesian_continuation():
     assert result.lift_joints.shape == (3, 2)
 
 
+def test_pipeline_uses_up_and_back_lift_at_outer_workspace_boundary():
+    class BoundaryIK:
+        @staticmethod
+        def _solution(target):
+            joints = np.asarray((target[0, 3], target[2, 3]), dtype=float)
+            return IKSolution(joints, 0.0, 0.0, 0.2, 1, 0, 0.25)
+
+        def solve(self, target, current=None, *, control=None):
+            del current, control
+            return self._solution(target)
+
+        def solve_continuation(
+            self,
+            target,
+            current,
+            *,
+            max_joint_step_rad,
+            control=None,
+        ):
+            del current, max_joint_step_rad, control
+            if float(target[2, 3]) > 0.25:
+                raise IKFailure("vertical lift leaves the reachable workspace")
+            return self._solution(target)
+
+    generator = GraspPlanGenerator(
+        BoundaryIK(),
+        FakePlanner(),
+        GraspPlanConfig(
+            pregrasp_distance_m=0.08,
+            approach_steps=3,
+            lift_distance_m=0.07,
+            lift_steps=3,
+            fallback_lift_vertical_m=0.045,
+            fallback_lift_retreat_m=0.025,
+            symmetry_samples=1,
+            tool_from_tip=np.eye(4),
+        ),
+    )
+    grasp = _pose((0.5, 0.0, 0.2), approach=(1.0, 0.0, 0.0))
+
+    result = generator.plan(
+        _candidates((grasp,), widths=(0.04,)),
+        current_joints=np.zeros(2),
+    )
+
+    # The nominal endpoint (0.50, 0.27) is unreachable.  The selected
+    # fallback keeps 45 mm of vertical clearance and retreats 25 mm toward
+    # the arm base instead of rejecting an otherwise valid contact pose.
+    np.testing.assert_allclose(result.lift_joints[-1], (0.475, 0.245), atol=1e-9)
+
+
 def test_pipeline_tries_next_candidate_after_motion_planning_failure():
     blocked = _pose((0.35, 0.0, 0.2))
     clear = _pose((0.55, 0.0, 0.2))
@@ -333,6 +384,8 @@ def test_ik_rejections_report_the_exact_cartesian_phase(failed_call, expected_ph
         GraspPlanConfig(
             pregrasp_distance_m=0.02,
             approach_steps=2,
+            fallback_lift_vertical_m=0.10,
+            fallback_lift_retreat_m=0.0,
             lift_steps=2,
             symmetry_samples=1,
             max_hypotheses=1,

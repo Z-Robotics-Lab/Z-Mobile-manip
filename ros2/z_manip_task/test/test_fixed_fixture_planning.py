@@ -16,8 +16,10 @@ ROOT = Path(__file__).resolve().parents[3]
 URDF = ROOT.parent / "go2W_Sim/assets/urdf/go2w_sensored.urdf"
 
 # Both endpoints are clear.  Linear interpolation passes through a measured
-# Mid360/palm collision near alpha=0.4.  This regression is deliberately not a
-# two-endpoint test: the planner must sample the complete joint-space edge.
+# robot-mounted sensor/head collision near alpha=0.4.  This regression is
+# deliberately not a two-endpoint test: the planner must sample the complete
+# joint-space edge.  The closest fixture can change when calibrated fixture
+# geometry is made more accurate, so the contract must not name one witness.
 EDGE_START = np.asarray((
     1.2827352660515232,
     1.6711694229138814,
@@ -95,7 +97,7 @@ class _FixturePhaseProbe:
         assert not self.joint_planner.state_valid(EDGE_COLLISION)
 
         # Safe endpoints are insufficient: RRT must continuously sample the
-        # edge and reject its Mid360/palm interior collision.
+        # edge and reject its immutable-fixture interior collision.
         assert self.joint_planner.state_valid(EDGE_START)
         assert self.joint_planner.state_valid(EDGE_END)
         assert not self.joint_planner.segment_valid(EDGE_START, EDGE_END)
@@ -127,6 +129,7 @@ def test_fixed_fixture_model_keeps_body_lidar_camera_and_plate_geometry():
 
     assert {
         "platform_head",
+        "platform_head_lower",
         "mid360",
         "d435_body",
         "gripper_camera_plate",
@@ -146,7 +149,9 @@ def test_fixed_fixture_path_checks_interiors_not_only_safe_endpoints():
     )
 
     witness = planner.fixed_fixture_guard.check_state(EDGE_COLLISION).witness
-    assert "mid360" in witness.pair
+    assert {"mid360", "platform_head", "platform_head_lower"}.intersection(
+        witness.pair
+    )
     assert witness.margin_m < 0.0
 
 

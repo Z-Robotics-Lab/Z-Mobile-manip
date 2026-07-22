@@ -76,6 +76,8 @@ class GraspPlanConfig:
     lift_distance_m: float = 0.10
     lift_steps: int = 5
     lift_direction_base: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    fallback_lift_vertical_m: float = 0.045
+    fallback_lift_retreat_m: float = 0.025
     symmetry_samples: int = 2
     min_width_m: float = 0.008
     max_width_m: float = 0.075
@@ -98,6 +100,11 @@ class GraspPlanConfig:
     def __post_init__(self) -> None:
         if self.pregrasp_distance_m <= 0.0 or self.lift_distance_m <= 0.0:
             raise ValueError("grasp approach and lift distances must be positive")
+        if (
+            self.fallback_lift_vertical_m <= 0.0
+            or self.fallback_lift_retreat_m < 0.0
+        ):
+            raise ValueError("fallback lift distances must be positive/non-negative")
         if self.approach_steps < 2 or self.lift_steps < 2:
             raise ValueError("Cartesian approach and lift need at least two samples")
         if (
@@ -538,8 +545,6 @@ class GraspPlanGenerator:
         """Fully validate one 6-DoF grasp under its local child budget."""
 
         pregrasp = grasp_pregrasp_pose(grasp, self.config.pregrasp_distance_m)
-        lift = grasp.copy()
-        lift[:3, 3] += self.config.lift_distance_m * lift_direction
         try:
             pregrasp_solution = self._solve(
                 self._tip_pose(pregrasp),
@@ -616,48 +621,86 @@ class GraspPlanGenerator:
                 "Cartesian approach intersects the planning scene",
             )
 
-        # Do not solve the lift for an approach that is already obstructed.
-        # Apart from wasting most of a hypothesis budget, the former order
-        # surfaced a later lift-IK error for a grasp that could never reach
-        # contact.  The simple grasp program is deliberately sequential:
-        # pregrasp -> straight approach -> straight lift.
-        try:
-            lift_joints, lift_solution = self._cartesian_ik(
-                _interpolate_pose(grasp, lift, self.config.lift_steps),
-                grasp_solution.joints,
-                control,
-            )
-        except PlanningAborted:
-            raise
-        except IKFailure as error:
-            raise _HypothesisRejected(
-                "ik",
-                f"lift IK failed: {error}",
-            ) from error
+        # Contact reachability is not enough: the arm must also be able to
+        # leave contact while holding the object.  Near the outer workspace a
+        # fixed world-Z lift can be infeasible even though contact itself is
+        # accurate.  Try that nominal program first, then one shorter
+        # up-and-back lift that preserves vertical clearance while moving the
+        # wrist toward the arm base and away from the reach boundary.
+        nominal_lift = grasp.copy()
+        nominal_lift[:3, 3] += self.config.lift_distance_m * lift_direction
+        horizontal_to_base = -np.asarray(grasp[:3, 3], dtype=float)
+        horizontal_to_base[2] = 0.0
+        horizontal_norm = float(np.linalg.norm(horizontal_to_base))
+        if horizontal_norm > 1e-9:
+            horizontal_to_base /= horizontal_norm
+        fallback_lift = grasp.copy()
+        fallback_lift[:3, 3] += (
+            self.config.fallback_lift_vertical_m * lift_direction
+            + self.config.fallback_lift_retreat_m * horizontal_to_base
+        )
+        lift_attempts = (("nominal", nominal_lift),)
+        if not np.allclose(fallback_lift, nominal_lift, atol=1e-9):
+            lift_attempts += (("up-and-back", fallback_lift),)
 
-        lift_path = np.vstack((grasp_solution.joints, lift_joints))
-        for first, second in zip(lift_path, lift_path[1:]):
-            checkpoint(control, "grasp lift collision checking")
-            if self.lift_segment_valid is None:
-                valid = self._segment_valid(first, second, control=control)
-            else:
-                width_kwargs = (
-                    {"required_width_m": width}
-                    if self._lift_accepts_width
-                    else {}
-                )
-                valid = self.lift_segment_valid(
-                    first,
-                    second,
+        lift_failures: list[tuple[str, str]] = []
+        lift_joints = None
+        lift_solution = None
+        for lift_name, lift in lift_attempts:
+            try:
+                candidate_lift_joints, candidate_lift_solution = self._cartesian_ik(
+                    _interpolate_pose(grasp, lift, self.config.lift_steps),
                     grasp_solution.joints,
-                    **width_kwargs,
+                    control,
                 )
+            except PlanningAborted:
+                raise
+            except IKFailure as error:
+                lift_failures.append(("ik", f"lift IK failed: {lift_name}: {error}"))
+                continue
+
+            lift_path = np.vstack((grasp_solution.joints, candidate_lift_joints))
+            lift_valid = True
+            for first, second in zip(lift_path, lift_path[1:]):
                 checkpoint(control, "grasp lift collision checking")
-            if not valid:
-                raise _HypothesisRejected(
+                if self.lift_segment_valid is None:
+                    valid = self._segment_valid(first, second, control=control)
+                else:
+                    width_kwargs = (
+                        {"required_width_m": width}
+                        if self._lift_accepts_width
+                        else {}
+                    )
+                    valid = self.lift_segment_valid(
+                        first,
+                        second,
+                        grasp_solution.joints,
+                        **width_kwargs,
+                    )
+                    checkpoint(control, "grasp lift collision checking")
+                if not valid:
+                    lift_valid = False
+                    break
+            if not lift_valid:
+                lift_failures.append((
                     "lift_collision",
-                    "Cartesian lift intersects the planning scene",
-                )
+                    f"{lift_name} Cartesian lift intersects the planning scene",
+                ))
+                continue
+            lift_joints = candidate_lift_joints
+            lift_solution = candidate_lift_solution
+            break
+
+        if lift_joints is None or lift_solution is None:
+            stage = (
+                "lift_collision"
+                if lift_failures and all(item[0] == "lift_collision" for item in lift_failures)
+                else "ik"
+            )
+            raise _HypothesisRejected(
+                stage,
+                "; ".join(reason for _kind, reason in lift_failures),
+            )
 
         try:
             transit = self._plan_joint(
