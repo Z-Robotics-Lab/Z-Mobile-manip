@@ -217,7 +217,8 @@ python3 scripts/offline/mobile_handoff_benchmark.py \
   the fresh planning/execution worker.
 - Warm-planner reports are bounded, non-symlink JSON files and are promoted
   atomically. Missing output or runner failure cannot masquerade as success.
-- Full offline suite: **991 passed, 50 skipped, 0 failed**.
+- Full offline suite after the tracked-reuse, passive-watcher, and persistent-
+  planner changes: **1023 passed, 50 skipped, 0 failed**.
 - The skipped tests require unavailable live milestone state or optional host
   Pinocchio/CasADi packages; Docker replay covers the planner used here.
 
