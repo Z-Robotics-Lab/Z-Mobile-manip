@@ -28,6 +28,7 @@ from z_manip.kinematics import (
     PinocchioIKSolver,
 )
 from z_manip.kinematics.robust_ik import IKFailure, RobustIKSolver
+from z_manip.models.grasp_ordering import directionally_diverse_indices
 from z_manip.models.grasp_source import (
     cascade_generate,
     GraspCandidates,
@@ -660,8 +661,14 @@ class OnlinePlanner:
             control: PlanningControl | None = None,
         ) -> dict[str, object]:
             checkpoint(control, 'work-pose pregrasp IK evaluation')
+            grasps = np.asarray(candidate.candidates.grasps, dtype=float)
             scores = np.asarray(candidate.candidates.scores, dtype=float)
-            order = np.argsort(-scores, kind='stable')[:2]
+            # A side work pose must not be rejected only because the two
+            # highest-scoring raw grasps share the same (often inward-facing)
+            # approach direction.  Probe the two quality leaders plus one
+            # directionally distinct hypothesis.  The full close-range plan
+            # remains authoritative and performs all collision/path checks.
+            order = directionally_diverse_indices(grasps, scores, limit=3)
             joint_span = np.maximum(
                 self.chain.upper_limits - self.chain.lower_limits,
                 1e-9,
@@ -670,7 +677,7 @@ class OnlinePlanner:
             failures: list[str] = []
             for candidate_index in order:
                 raw_grasp = np.asarray(
-                    candidate.candidates.grasps[int(candidate_index)],
+                    grasps[int(candidate_index)],
                     dtype=float,
                 )
                 family = expand_symmetry(
