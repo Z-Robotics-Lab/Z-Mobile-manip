@@ -56,6 +56,12 @@ MAX_CAMERA_JPEG_BYTES = 512 * 1024
 CAMERA_STALE_AFTER_S = 2.0
 HOME_FAST_VERIFY_TOLERANCE_RAD = math.radians(1.0)
 MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 2.0
+# The passive observer publishes at 20 Hz, while recorded delivery can lag its
+# source stamp by about 0.2 s.  Poll frequently enough to avoid adding another
+# full observer period after a strictly post-stop sample has actually arrived.
+# This changes detection latency only; the source epoch, six-joint, freshness,
+# read-only, zero-command, and downstream limit gates remain unchanged.
+MOBILE_HANDOFF_JOINT_READY_POLL_S = 0.01
 MOBILE_HANDOFF_CAPTURE_MAX_SKEW_S = 1.0
 MAX_HANDOFF_EVIDENCE_BYTES = 512 * 1024
 MAX_CAMERA_FUTURE_S = 0.25
@@ -3360,7 +3366,7 @@ class PiperGraspRunner:
                     f"within {timeout_s:.1f}s: {last_detail}; "
                     f"evidence={last_evidence}",
                 )
-            time.sleep(0.05)
+            time.sleep(MOBILE_HANDOFF_JOINT_READY_POLL_S)
 
     def _run(self, target: str, speed_percent: int) -> None:
         action_dir = self.receipt_root / f"grasp-{time.time_ns()}"

@@ -142,6 +142,33 @@ The depth-servo transition itself is small but intentional:
 - handoff settle -> probe: p50 **0.300 s**, p95 **0.354 s**;
 - probe -> stopped: p50 **0.150 s**, p95 **0.200 s**.
 
+### Strict post-stop passive-joint latency
+
+The bag contains **17,045** `/piper/state` messages. All 17,045 have the exact
+six PiPER joint names and six finite positions. Source-stamp inter-arrival is
+50.06 ms at p50, 54.77 ms at p95, and 54.80 ms at p99. Long ownership/offline
+gaps are kept separate from normal observer cadence rather than hidden by a
+larger acceptance window.
+
+Across the six recorded `stopped` lifecycle boundaries, the first complete
+joint message whose **source stamp is strictly newer than stop** was actually
+delivered after 190.3–219.8 ms (p50 about 201.4 ms). The source stamp itself
+crossed the boundary within 0.8–32.5 ms, but the bag shows a median
+record-minus-source delay of 191.8 ms. Accepting the first message delivered
+after stop would therefore be unsafe: its source can still predate stop.
+
+The readiness watcher now polls its unchanged strict gate every **10 ms**
+instead of 50 ms. This removes up to 40 ms of avoidable detection delay after
+the valid sample arrives. It does not change the 2 s fail-closed timeout or
+relax the post-stop source epoch, complete-six-joint, read-only, freshness,
+zero-command, URDF-limit, or stationary-range requirements.
+
+The direct receive-only CAN evidence window remains **0.25 s**. Recent reports
+contain 150–151 filtered frames (50–51 per joint feedback CAN ID), with a
+4.84–4.91 ms joint snapshot span and zero measured joint range. Shortening that
+window would weaken slow-motion detection, and it already runs in parallel
+with perception, so it is not a successful-handoff critical-path saving.
+
 The 10–14 ms perception/planner orchestration gap is negligible. The actionable
 critical path is the post-stop joint-readiness wait, fresh perception, and IK
 search. The safe latency change is to start the read-only fresh capture and

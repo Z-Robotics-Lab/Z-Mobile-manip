@@ -2111,6 +2111,48 @@ def test_mobile_handoff_blocks_before_capture_without_post_stop_joints(tmp_path)
         raise AssertionError("stale passive feedback unexpectedly passed")
 
 
+def test_mobile_handoff_joint_wait_polls_quickly_without_relaxing_epoch(tmp_path, monkeypatch):
+    boundary = 1_800_000_000_000_000_000
+    calls = []
+
+    class DelayedFreshJoints:
+        def current_joint_snapshot(self, *, not_before_unix_ns):
+            calls.append(not_before_unix_ns)
+            if len(calls) < 3:
+                return False, "predates stop", {
+                    "source_timestamp_ns": not_before_unix_ns - 1,
+                    "joint_positions_rad": [0.0] * 6,
+                    "read_only": True,
+                }
+            return True, "fresh", {
+                "sequence": 44,
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            }
+
+    sleeps = []
+    monkeypatch.setattr(CONTROL.time, "sleep", sleeps.append)
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.home_verifier = DelayedFreshJoints()
+
+    evidence = runner._wait_mobile_handoff_joints(
+        not_before_unix_ns=boundary,
+        timeout_s=1.0,
+    )
+
+    assert calls == [boundary, boundary, boundary]
+    assert sleeps == [
+        CONTROL.MOBILE_HANDOFF_JOINT_READY_POLL_S,
+        CONTROL.MOBILE_HANDOFF_JOINT_READY_POLL_S,
+    ]
+    assert CONTROL.MOBILE_HANDOFF_JOINT_READY_POLL_S == 0.01
+    assert evidence["source_timestamp_ns"] > boundary
+    assert len(evidence["joint_positions_rad"]) == 6
+    assert evidence["read_only"] is True
+
+
 def test_grasp_post_requires_exact_loopback_origin_header_and_target_body(tmp_path):
     class FakeControl:
         def status(self):
