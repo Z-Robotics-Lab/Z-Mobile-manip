@@ -15,6 +15,18 @@ from pathlib import Path
 from typing import Iterable
 
 
+DEFAULT_BUDGETS = {
+    "passive_capture_window_p95_s": 0.30,
+    "fresh_internal_p50_s": 1.50,
+    "fresh_internal_p95_s": 1.70,
+    "fresh_wrapper_overhead_p50_s": 0.20,
+    "fresh_wrapper_overhead_p95_s": 0.30,
+    "fresh_wrapper_total_p50_s": 1.80,
+    "fresh_wrapper_total_p95_s": 2.00,
+    "successful_candidate_count_p50_min": 32.0,
+}
+
+
 def _percentile(values: list[float], quantile: float) -> float | None:
     if not values:
         return None
@@ -40,6 +52,18 @@ def _summary(values: Iterable[float]) -> dict[str, float | int | None]:
     }
 
 
+def _value_summary(values: Iterable[float]) -> dict[str, float | int | None]:
+    samples = [float(value) for value in values if math.isfinite(float(value))]
+    return {
+        "samples": len(samples),
+        "min": min(samples) if samples else None,
+        "p50": _percentile(samples, 0.50),
+        "p90": _percentile(samples, 0.90),
+        "p95": _percentile(samples, 0.95),
+        "max": max(samples) if samples else None,
+    }
+
+
 def _json_lines(path: Path) -> Iterable[dict[str, object]]:
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -54,12 +78,33 @@ def _json_lines(path: Path) -> Iterable[dict[str, object]]:
             yield value
 
 
-def collect(root: Path) -> dict[str, object]:
+def _session_dir(path: Path) -> Path:
+    parent = path.parent
+    if parent.name == "perception":
+        parent = parent.parent
+    return parent
+
+
+def _session_selected(path: Path, not_before_session: str | None) -> bool:
+    return (
+        not_before_session is None
+        or _session_dir(path).name >= not_before_session
+    )
+
+
+def collect(
+    root: Path,
+    *,
+    not_before_session: str | None = None,
+) -> dict[str, object]:
     reports = sorted(root.rglob("report.json"))
     internal: list[float] = []
     successful_internal: list[float] = []
     reused: list[float] = []
     fresh: list[float] = []
+    unclassified: list[float] = []
+    candidate_counts: list[float] = []
+    passive_capture_windows: list[float] = []
     internal_by_session: dict[Path, float] = {}
     mode_by_session: dict[Path, str] = {}
     failures = 0
@@ -67,6 +112,8 @@ def collect(root: Path) -> dict[str, object]:
     legacy_reports = 0
     stage_values: dict[str, list[float]] = {}
     for path in reports:
+        if not _session_selected(path, not_before_session):
+            continue
         try:
             report = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -82,19 +129,35 @@ def collect(root: Path) -> dict[str, object]:
             internal.append(elapsed_s)
             if not failed:
                 successful_internal.append(elapsed_s)
-                (reused if report.get("grounding_reused") is True else fresh).append(
-                    elapsed_s,
-                )
-                session_dir = path.parent
-                if session_dir.name == "perception":
-                    session_dir = session_dir.parent
+                if report.get("grounding_reused") is True:
+                    reused.append(elapsed_s)
+                    grounding_mode = "reused_tracking"
+                elif report.get("grounding_reused") is False:
+                    fresh.append(elapsed_s)
+                    grounding_mode = "fresh_grounding"
+                else:
+                    unclassified.append(elapsed_s)
+                    grounding_mode = "unclassified"
+                session_dir = _session_dir(path)
                 resolved_session = session_dir.resolve()
                 internal_by_session[resolved_session] = elapsed_s
-                mode_by_session[resolved_session] = (
-                    "reused_tracking"
-                    if report.get("grounding_reused") is True
-                    else "fresh_grounding"
-                )
+                mode_by_session[resolved_session] = grounding_mode
+                candidate_count = report.get("grasp_candidates")
+                if (
+                    report.get("grasp_generation_valid") is True
+                    and isinstance(candidate_count, (int, float))
+                ):
+                    candidate_counts.append(float(candidate_count))
+        passive_capture = report.get("passive_capture")
+        if isinstance(passive_capture, dict):
+            start_ns = passive_capture.get("observation_start_unix_ns")
+            end_ns = passive_capture.get("observation_end_unix_ns")
+            if (
+                isinstance(start_ns, int)
+                and isinstance(end_ns, int)
+                and end_ns >= start_ns
+            ):
+                passive_capture_windows.append((end_ns - start_ns) * 1e-9)
         timings = report.get("timings")
         if isinstance(timings, dict):
             instrumented_reports += 1
@@ -113,6 +176,8 @@ def collect(root: Path) -> dict[str, object]:
     fresh_wrapper_overhead: list[float] = []
     wrapper_stage_values: dict[str, list[float]] = {}
     for log_path in root.rglob("perception.log"):
+        if not _session_selected(log_path, not_before_session):
+            continue
         session_total: float | None = None
         for event in _json_lines(log_path):
             event_stage = event.get("stage")
@@ -152,7 +217,8 @@ def collect(root: Path) -> dict[str, object]:
         "schema": "z_manip.perception_latency_benchmark.v1",
         "offline": True,
         "root": str(root.resolve()),
-        "reports": len(reports),
+        "not_before_session": not_before_session,
+        "reports": len(internal),
         "failures": failures,
         "instrumentation": {
             "instrumented_reports": instrumented_reports,
@@ -162,6 +228,9 @@ def collect(root: Path) -> dict[str, object]:
         "successful_internal": _summary(successful_internal),
         "fresh_grounding": _summary(fresh),
         "reused_tracking": _summary(reused),
+        "unclassified_grounding": _summary(unclassified),
+        "successful_candidate_count": _value_summary(candidate_counts),
+        "passive_capture_window": _summary(passive_capture_windows),
         "wrapper_attempt": _summary(attempts),
         "wrapper_total": _summary(totals),
         "fresh_grounding_wrapper_total": _summary(fresh_totals),
@@ -187,18 +256,92 @@ def collect(root: Path) -> dict[str, object]:
     }
 
 
+def evaluate_budget(
+    result: dict[str, object],
+    *,
+    budgets: dict[str, float] | None = None,
+    minimum_samples: int = 5,
+) -> dict[str, object]:
+    """Evaluate the two-second target without inventing missing evidence."""
+
+    limits = dict(DEFAULT_BUDGETS if budgets is None else budgets)
+    metric_paths = {
+        "passive_capture_window_p95_s": ("passive_capture_window", "p95_s", "max"),
+        "fresh_internal_p50_s": ("fresh_grounding", "p50_s", "max"),
+        "fresh_internal_p95_s": ("fresh_grounding", "p95_s", "max"),
+        "fresh_wrapper_overhead_p50_s": (
+            "fresh_grounding_wrapper_overhead", "p50_s", "max"
+        ),
+        "fresh_wrapper_overhead_p95_s": (
+            "fresh_grounding_wrapper_overhead", "p95_s", "max"
+        ),
+        "fresh_wrapper_total_p50_s": (
+            "fresh_grounding_wrapper_total", "p50_s", "max"
+        ),
+        "fresh_wrapper_total_p95_s": (
+            "fresh_grounding_wrapper_total", "p95_s", "max"
+        ),
+        "successful_candidate_count_p50_min": (
+            "successful_candidate_count", "p50", "min"
+        ),
+    }
+    checks: dict[str, object] = {}
+    passed = True
+    for name, limit in limits.items():
+        section_name, value_name, direction = metric_paths[name]
+        section = result.get(section_name)
+        samples = section.get("samples", 0) if isinstance(section, dict) else 0
+        measured = section.get(value_name) if isinstance(section, dict) else None
+        enough = isinstance(samples, int) and samples >= minimum_samples
+        if not enough or not isinstance(measured, (int, float)):
+            ok = False
+            reason = "insufficient_samples"
+        elif direction == "max":
+            ok = float(measured) <= limit
+            reason = "within_budget" if ok else "over_budget"
+        else:
+            ok = float(measured) >= limit
+            reason = "within_budget" if ok else "below_quality_floor"
+        passed = passed and ok
+        checks[name] = {
+            "passed": ok,
+            "reason": reason,
+            "samples": samples,
+            "measured": measured,
+            "limit": limit,
+            "direction": direction,
+        }
+    return {
+        "schema": "z_manip.perception_stage_budget.v1",
+        "passed": passed,
+        "minimum_samples": minimum_samples,
+        "checks": checks,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--not-before-session")
+    parser.add_argument("--minimum-samples", type=int, default=5)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 2 unless every latency and candidate-quality budget passes",
+    )
     args = parser.parse_args()
-    result = collect(args.root)
+    result = collect(args.root, not_before_session=args.not_before_session)
+    result["budget"] = evaluate_budget(
+        result,
+        minimum_samples=max(1, args.minimum_samples),
+    )
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(encoded, encoding="utf-8")
     print(encoded, end="")
-    return 0
+    return 0 if not args.check or result["budget"]["passed"] else 2
 
 
 if __name__ == "__main__":
