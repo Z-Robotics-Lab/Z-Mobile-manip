@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -27,6 +28,7 @@ MODEL_ID = "yoloe-11s-seg.pt"
 REQUEST_SCHEMA = "z_manip.local_grounding_request.v1"
 RESPONSE_SCHEMA = "z_manip.local_grounding_response.v1"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
+DEFAULT_TEXT_EMBEDDING_CACHE_SIZE = 64
 
 _ZH_NOUNS: tuple[tuple[str, str], ...] = (
     ("电源适配器", "power adapter"),
@@ -183,14 +185,19 @@ class GroundingRuntime:
         model_id: str,
         minimum_confidence: float,
         maximum_area_ratio: float,
+        text_embedding_cache_size: int = DEFAULT_TEXT_EMBEDDING_CACHE_SIZE,
     ) -> None:
+        if text_embedding_cache_size < 1:
+            raise ValueError("text_embedding_cache_size must be positive")
         self.model_id = model_id
         self.minimum_confidence = minimum_confidence
         self.maximum_area_ratio = maximum_area_ratio
+        self.text_embedding_cache_size = text_embedding_cache_size
         self._lock = threading.Lock()
         self._model: Any = None
         self._device = "unloaded"
         self._classes: tuple[str, ...] = ()
+        self._text_embeddings: OrderedDict[tuple[str, ...], Any] = OrderedDict()
 
     def load(self) -> None:
         if self._model is not None:
@@ -205,7 +212,40 @@ class GroundingRuntime:
         self._model = YOLO(self.model_id, task="segment")
         self._model.to(self._device)
 
+    def _embedding_for(self, classes: tuple[str, ...]) -> tuple[Any, bool]:
+        """Return exact text embeddings without rebuilding MobileCLIP.
+
+        Ultralytics' public ``YOLOE.set_classes`` calls ``get_text_pe`` without
+        ``cache_clip_model=True``.  That rebuilds MobileCLIP for every new
+        prompt even though the detector process is persistent.  Cache both the
+        encoder and its tiny exact-phrase outputs.  The key includes the full
+        normalized class phrase, so this does not merge semantically distinct
+        targets such as ``red bottle`` and ``black bottle``.
+        """
+
+        cached = self._text_embeddings.get(classes)
+        if cached is not None:
+            self._text_embeddings.move_to_end(classes)
+            return cached, True
+        backend = getattr(self._model, "model", None)
+        encoder = getattr(backend, "get_text_pe", None)
+        if encoder is not None:
+            try:
+                embedding = encoder(list(classes), cache_clip_model=True)
+            except TypeError:
+                # Compatibility with older Ultralytics builds that expose the
+                # backend encoder but not the persistent-CLIP argument.
+                embedding = encoder(list(classes))
+        else:
+            embedding = self._model.get_text_pe(list(classes))
+        self._text_embeddings[classes] = embedding
+        self._text_embeddings.move_to_end(classes)
+        while len(self._text_embeddings) > self.text_embedding_cache_size:
+            self._text_embeddings.popitem(last=False)
+        return embedding, False
+
     def ground(self, image_bytes: bytes, instruction: str) -> dict[str, object]:
+        request_started = time.perf_counter()
         prompt = grounding_prompt(instruction)
         if prompt is None:
             raise LookupError("instruction has no supported local noun phrase")
@@ -213,13 +253,20 @@ class GroundingRuntime:
 
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         width, height = image.size
-        started = time.perf_counter()
+        decode_finished = time.perf_counter()
+        embedding_cache_hit = False
         with self._lock:
             self.load()
             requested_classes = (prompt,)
+            embedding_cache_hit = self._classes == requested_classes
             if self._classes != requested_classes:
-                self._model.set_classes(list(requested_classes))
+                embedding, embedding_cache_hit = self._embedding_for(requested_classes)
+                self._model.set_classes(
+                    list(requested_classes),
+                    embeddings=embedding,
+                )
                 self._classes = requested_classes
+            embedding_finished = time.perf_counter()
             result = self._model.predict(
                 source=image,
                 device=self._device,
@@ -238,6 +285,7 @@ class GroundingRuntime:
                 retina_masks=False,
                 verbose=False,
             )[0]
+        inference_finished = time.perf_counter()
         boxes = getattr(result, "boxes", None)
         xyxy = [] if boxes is None else boxes.xyxy.detach().cpu().tolist()
         scores = [] if boxes is None else boxes.conf.detach().cpu().tolist()
@@ -255,12 +303,21 @@ class GroundingRuntime:
         )
         if selected is None:
             raise LookupError("local detector produced no qualified object box")
+        finished = time.perf_counter()
         return {
             "schema": RESPONSE_SCHEMA,
             "model": f"local/yoloe/{os.path.basename(self.model_id)}",
             "prompt": prompt,
             "target": selected,
-            "latency_s": time.perf_counter() - started,
+            "latency_s": finished - request_started,
+            "embedding_cache_hit": embedding_cache_hit,
+            "timings_s": {
+                "decode": decode_finished - request_started,
+                "prompt_embedding": embedding_finished - decode_finished,
+                "inference": inference_finished - embedding_finished,
+                "postprocess": finished - inference_finished,
+                "total": finished - request_started,
+            },
         }
 
     def warmup(self) -> None:
@@ -271,12 +328,17 @@ class GroundingRuntime:
         image = Image.new("RGB", (640, 480), color=(127, 127, 127))
         encoded = io.BytesIO()
         image.save(encoded, format="JPEG")
-        try:
-            self.ground(encoded.getvalue(), "bottle")
-        except LookupError:
-            # A blank image should normally have no qualified detection; the
-            # CUDA kernels and processor caches are warm regardless.
-            pass
+        # The first class initializes MobileCLIP and the first dynamic class
+        # switch initializes the auxiliary prompt head.  Absorb both costs at
+        # service startup so the first real, possibly different target does
+        # not pay either one.
+        for prompt in ("bottle", "red bottle"):
+            try:
+                self.ground(encoded.getvalue(), prompt)
+            except LookupError:
+                # A blank image should normally have no qualified detection;
+                # CUDA kernels and prompt caches are warm regardless.
+                pass
 
     @property
     def loaded(self) -> bool:
@@ -365,6 +427,11 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--minimum-confidence", type=float, default=0.35)
     parser.add_argument("--maximum-area-ratio", type=float, default=0.45)
+    parser.add_argument(
+        "--text-embedding-cache-size",
+        type=int,
+        default=DEFAULT_TEXT_EMBEDDING_CACHE_SIZE,
+    )
     return parser.parse_args()
 
 
@@ -376,6 +443,7 @@ def main() -> int:
         model_id=args.model,
         minimum_confidence=args.minimum_confidence,
         maximum_area_ratio=args.maximum_area_ratio,
+        text_embedding_cache_size=args.text_embedding_cache_size,
     )
     runtime.load()
     runtime.warmup()

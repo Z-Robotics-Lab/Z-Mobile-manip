@@ -110,9 +110,15 @@ class _FakeResult:
 class _FakeModel:
     def __init__(self):
         self.classes = []
+        self.embedding_requests = []
+        self.model = self
 
-    def set_classes(self, classes):
-        self.classes.append(tuple(classes))
+    def get_text_pe(self, classes, *, cache_clip_model=False):
+        self.embedding_requests.append((tuple(classes), cache_clip_model))
+        return ("embedding", *classes)
+
+    def set_classes(self, classes, embeddings=None):
+        self.classes.append((tuple(classes), embeddings))
 
     def predict(self, **kwargs):
         assert kwargs["half"] is False
@@ -131,6 +137,49 @@ def test_runtime_keeps_dynamic_prompt_inference_fp32():
     encoded = io.BytesIO()
     image.save(encoded, format="JPEG")
 
-    assert runtime.ground(encoded.getvalue(), "bottle")["prompt"] == "bottle"
-    assert runtime.ground(encoded.getvalue(), "red bottle")["prompt"] == "red bottle"
-    assert runtime._model.classes == [("bottle",), ("red bottle",)]
+    bottle = runtime.ground(encoded.getvalue(), "bottle")
+    assert bottle["prompt"] == "bottle"
+    assert bottle["embedding_cache_hit"] is False
+    assert bottle["timings_s"]["total"] == pytest.approx(bottle["latency_s"])
+    repeated_bottle = runtime.ground(encoded.getvalue(), "bottle")
+    assert repeated_bottle["embedding_cache_hit"] is True
+    red_bottle = runtime.ground(encoded.getvalue(), "red bottle")
+    assert red_bottle["prompt"] == "red bottle"
+    assert red_bottle["embedding_cache_hit"] is False
+    cached_bottle = runtime.ground(encoded.getvalue(), "bottle")
+    assert cached_bottle["prompt"] == "bottle"
+    assert cached_bottle["embedding_cache_hit"] is True
+    assert runtime._model.embedding_requests == [
+        (("bottle",), True),
+        (("red bottle",), True),
+    ]
+    assert runtime._model.classes == [
+        (("bottle",), ("embedding", "bottle")),
+        (("red bottle",), ("embedding", "red bottle")),
+        (("bottle",), ("embedding", "bottle")),
+    ]
+
+
+def test_runtime_text_embedding_cache_is_bounded_and_exact():
+    runtime = SERVICE.GroundingRuntime(
+        model_id="unused.pt",
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+        text_embedding_cache_size=2,
+    )
+    runtime._model = _FakeModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (64, 64), color=(127, 127, 127))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+
+    for prompt in ("red bottle", "black bottle", "charger", "red bottle"):
+        runtime.ground(encoded.getvalue(), prompt)
+
+    assert runtime._model.embedding_requests == [
+        (("red bottle",), True),
+        (("black bottle",), True),
+        (("charger",), True),
+        (("red bottle",), True),
+    ]
+    assert tuple(runtime._text_embeddings) == (("charger",), ("red bottle",))
