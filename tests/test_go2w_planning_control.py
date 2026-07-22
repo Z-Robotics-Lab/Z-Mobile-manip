@@ -164,6 +164,9 @@ class _FakeGraspRunner:
         self.target = None
         self.home_resets = 0
         self.home_starts = 0
+        self.mobile_handoff_starts = 0
+        self.superseded_perception_session_id = None
+        self.base_stopped_unix_ns = None
 
     def status(self):
         return {
@@ -178,6 +181,25 @@ class _FakeGraspRunner:
         self.starts += 1
         self.target = target
         self.speed_percent = speed_percent
+        if self.running:
+            return {"started": False, "grasp": self.status()}
+        self.running = True
+        return {"started": True, "grasp": self.status()}
+
+    def start_at_mobile_handoff(
+        self,
+        target,
+        speed_percent=5,
+        *,
+        superseded_perception_session_id=None,
+        base_stopped_unix_ns=None,
+    ):
+        self.mobile_handoff_starts += 1
+        self.starts += 1
+        self.target = target
+        self.speed_percent = speed_percent
+        self.superseded_perception_session_id = superseded_perception_session_id
+        self.base_stopped_unix_ns = base_stopped_unix_ns
         if self.running:
             return {"started": False, "grasp": self.status()}
         self.running = True
@@ -837,8 +859,10 @@ def test_depth_servo_server_hands_reached_target_to_grasp(tmp_path):
 
     assert result["started"] is True
     assert grasp.starts == 1
+    assert grasp.mobile_handoff_starts == 1
     assert grasp.target == "charger"
     assert grasp.speed_percent == 17
+    assert isinstance(grasp.base_stopped_unix_ns, int)
     assert runner.status()["workflow"]["phase"] == "grasp_started"
 
 
@@ -894,6 +918,8 @@ def test_depth_servo_handoff_phases_stop_base_before_fresh_grasp(tmp_path):
 
         assert result["started"] is True
         assert grasp.starts == 1
+        assert grasp.mobile_handoff_starts == 1
+        assert isinstance(grasp.base_stopped_unix_ns, int)
         assert runner._process is not None
         assert runner._process.poll() is not None
         assert runner.status()["workflow"]["phase"] == "grasp_started"
@@ -1400,6 +1426,162 @@ def test_full_grasp_runner_perceives_target_exactly_once_before_planning(tmp_pat
     assert runner.status()["phase"] == "returned_home"
 
 
+def test_mobile_handoff_invalidates_old_capture_and_plans_from_fresh_session(tmp_path):
+    events: list[object] = []
+
+    class FakeSessions:
+        def clear_current_context(self):
+            events.append("clear")
+
+        def start_perception(self, target):
+            events.append(("perception", target))
+            return {"status": "succeeded", "session_id": "20260722-120010"}
+
+        def start_planning(self):
+            events.append("planning")
+            return {"status": "succeeded", "session_id": "20260722-120011"}
+
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir()
+    runner.session_service = FakeSessions()
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+    runner._planning_artifacts = lambda attempt: (
+        tmp_path / "planning_report.json",
+        tmp_path / "planned_grasp.npz",
+    )
+
+    class FreshJoints:
+        def current_joint_snapshot(self, *, not_before_unix_ns):
+            events.append("joint_ready")
+            return True, "fresh", {
+                "sequence": 42,
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            }
+
+    runner.home_verifier = FreshJoints()
+
+    def execute(**kwargs):
+        events.append(("execute", kwargs["speed_percent"]))
+
+    runner._run_full = execute
+    # No home_runner/_wait_home is installed: a call to either would fail the
+    # test and prove that the handoff discarded the current arm/view pose.
+    runner._run_mobile_handoff(
+        "floor bottle",
+        9,
+        "20260722-115900",
+        1_800_000_000_000_000_000,
+    )
+
+    assert events == [
+        "joint_ready",
+        "clear",
+        ("perception", "floor bottle"),
+        "planning",
+        ("execute", 9),
+        "clear",
+    ]
+    status = runner.status()
+    assert status["outcome"] == "passed"
+    assert status["phase"] == "returned_home"
+    assert status["fresh_perception_session_id"] == "20260722-120010"
+    assert status["planning_session_id"] == "20260722-120011"
+    assert status["handoff_joint_evidence"]["sequence"] == 42
+
+
+def test_mobile_handoff_rejects_reused_pre_servo_perception_session(tmp_path):
+    class FakeSessions:
+        def clear_current_context(self):
+            return None
+
+        def start_perception(self, _target):
+            return {"status": "succeeded", "session_id": "20260722-120010"}
+
+        def start_planning(self):
+            raise AssertionError("reused perception must never reach planning")
+
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir()
+    runner.session_service = FakeSessions()
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+    runner.home_verifier = type("FreshJoints", (), {
+        "current_joint_snapshot": lambda self, *, not_before_unix_ns: (
+            True,
+            "fresh",
+            {
+                "sequence": 43,
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            },
+        ),
+    })()
+    runner._run_mobile_handoff(
+        "floor bottle",
+        5,
+        "20260722-120010",
+        1_800_000_000_000_000_000,
+    )
+
+    status = runner.status()
+    assert status["outcome"] == "blocked"
+    assert "reused the pre-servo perception session" in status["message"]
+
+
+def test_mobile_handoff_blocks_before_capture_without_post_stop_joints(tmp_path):
+    class Sessions:
+        def clear_current_context(self):
+            raise AssertionError("stale joints must block before clearing/capture")
+
+    class StaleJoints:
+        def current_joint_snapshot(self, *, not_before_unix_ns):
+            return False, "predates stop", {
+                "source_timestamp_ns": not_before_unix_ns - 1,
+            }
+
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir()
+    runner.session_service = Sessions()
+    runner.home_verifier = StaleJoints()
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+
+    try:
+        runner._wait_mobile_handoff_joints(
+            not_before_unix_ns=1_800_000_000_000_000_000,
+            timeout_s=0.01,
+        )
+    except RuntimeError as error:
+        assert "not observed after base stop" in str(error)
+    else:
+        raise AssertionError("stale passive feedback unexpectedly passed")
+
+
 def test_grasp_post_requires_exact_loopback_origin_header_and_target_body(tmp_path):
     class FakeControl:
         def status(self):
@@ -1701,6 +1883,18 @@ def test_measured_home_verifier_accepts_only_fresh_read_only_joint_feedback(
 
     assert verified is True
     assert "verify Home" in detail
+    ready, detail, evidence = verifier.current_joint_snapshot(
+        not_before_unix_ns=now_ns - 200_000_000,
+    )
+    assert ready is True
+    assert evidence["source_timestamp_ns"] == now_ns - 100_000_000
+    assert evidence["joint_positions_rad"] == [value + 0.001 for value in joints]
+
+    ready, detail, evidence = verifier.current_joint_snapshot(
+        not_before_unix_ns=now_ns,
+    )
+    assert ready is False
+    assert "predates" in detail
 
     verifier.reader._clock_ns = lambda: now_ns + 2_000_000_000
     verified, detail = verifier.verify()

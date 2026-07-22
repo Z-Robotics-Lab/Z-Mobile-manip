@@ -54,6 +54,7 @@ MAX_RUNTIME_FUTURE_S = 0.25
 MAX_CAMERA_JPEG_BYTES = 512 * 1024
 CAMERA_STALE_AFTER_S = 2.0
 HOME_FAST_VERIFY_TOLERANCE_RAD = math.radians(1.0)
+MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 2.0
 MAX_CAMERA_FUTURE_S = 0.25
 MAX_INTERACTIVE_REQUEST_BYTES = 512
 MAX_INTERACTIVE_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -862,6 +863,64 @@ class MeasuredHomeVerifier:
             return False, f"measured Home error is {math.degrees(maximum_error):.3f}deg"
         return True, f"fresh read-only joints verify Home within {math.degrees(maximum_error):.3f}deg"
 
+    def current_joint_snapshot(
+        self,
+        *,
+        not_before_unix_ns: int,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Return proof of a fresh, passive six-joint sample after a boundary.
+
+        Mobile handoff must plan from the arm pose that exists *after* the
+        depth-servo process has released its actuator ownership.  This method
+        intentionally checks only freshness and read-only provenance; unlike
+        :meth:`verify`, it does not compare the joints with Home.
+        """
+
+        if isinstance(not_before_unix_ns, bool) or not isinstance(
+            not_before_unix_ns,
+            int,
+        ) or not_before_unix_ns <= 0:
+            raise ValueError("joint freshness boundary must be a positive integer")
+        snapshot, _etag = self.reader.snapshot()
+        evidence = {
+            "status": snapshot.get("status"),
+            "sequence": snapshot.get("sequence"),
+            "source_timestamp_ns": snapshot.get("source_timestamp_ns"),
+            "not_before_unix_ns": not_before_unix_ns,
+            "joint_state_available": snapshot.get("joint_state_available"),
+        }
+        if snapshot.get("status") != "live":
+            return False, "runtime joint feedback is not live", evidence
+        telemetry = snapshot.get("telemetry")
+        if (
+            not isinstance(telemetry, dict)
+            or telemetry.get("read_only") is not True
+            or telemetry.get("motion_commands_published") != 0
+            or snapshot.get("joint_state_available") is not True
+        ):
+            return False, "runtime joint feedback lacks read-only evidence", evidence
+        source_timestamp_ns = snapshot.get("source_timestamp_ns")
+        if (
+            isinstance(source_timestamp_ns, bool)
+            or not isinstance(source_timestamp_ns, int)
+            or source_timestamp_ns < not_before_unix_ns
+        ):
+            return False, "runtime joint feedback predates the stopped-base handoff", evidence
+        joints = snapshot.get("joint_positions_rad")
+        if not isinstance(joints, list) or len(joints) != 6:
+            return False, "runtime joint vector is unavailable", evidence
+        try:
+            normalized_joints = [
+                _finite_number(value, "runtime joint")
+                for value in joints
+            ]
+        except (TypeError, ValueError):
+            return False, "runtime joint vector is invalid", evidence
+        evidence["joint_positions_rad"] = normalized_joints
+        evidence["read_only"] = True
+        evidence["motion_commands_published"] = 0
+        return True, "fresh passive joints observed after base stop", evidence
+
 
 class CameraSnapshotReader:
     """Read one fixed, bounded, recent JPEG written by the ROS observer."""
@@ -1641,15 +1700,30 @@ class DepthServoRunner:
         """Latch zero base motion before starting the fresh grasp transaction."""
 
         self._terminate_process(process, keep_status=True)
+        base_stopped_unix_ns = time.time_ns()
         with self._lock:
             auto_handoff = self._workflow.get("auto_handoff") is True
             speed = int(self._workflow.get("speed_percent", 5))
+        session_state = (
+            self._session_service.status()
+            if self._session_service is not None
+            else {}
+        )
+        superseded_session_id = session_state.get(
+            "selected_perception_session_id",
+        ) if isinstance(session_state, dict) else None
         if auto_handoff and not cancel.is_set():
             self._set_workflow(phase="handoff_to_grasp")
-            # GraspRunner.start() owns a fresh close-range perception, IK,
-            # planning, and execution transaction; no approach artifact is
-            # reused after the base has moved.
-            result = self._grasp_runner.start(target, speed)
+            # The mobile handoff is intentionally not the ordinary Home-first
+            # grasp action.  It keeps the current wrist-camera pose, discards
+            # the pre-servo perception, captures new close-range geometry and
+            # plans from synchronized measured joints before execution.
+            result = self._grasp_runner.start_at_mobile_handoff(
+                target,
+                speed,
+                superseded_perception_session_id=superseded_session_id,
+                base_stopped_unix_ns=base_stopped_unix_ns,
+            )
             if result.get("started"):
                 self._set_workflow(active=False, phase="grasp_started", failure=None)
                 with self._lock:
@@ -2259,6 +2333,107 @@ class PiperGraspRunner:
         worker.start()
         return {"started": True, "grasp": self.status()}
 
+    def start_at_mobile_handoff(
+        self,
+        target: str,
+        speed_percent: int = 5,
+        *,
+        superseded_perception_session_id: str | None = None,
+        base_stopped_unix_ns: int,
+    ) -> dict[str, Any]:
+        """Capture, plan, and execute from the measured close-range arm pose.
+
+        Mobile approach may deliberately move the wrist camera away from Home
+        to keep the target visible.  Returning Home before recapturing loses
+        both that view and the measured arm start state.  This entry point is
+        therefore distinct from :meth:`start`: it invalidates the pre-servo
+        perception context, captures a new synchronized RGB-D/joint bundle at
+        the stopped-base handoff, plans from those measured joints, and then
+        invokes the same immutable receipt-bound executor as a normal grasp.
+        """
+
+        try:
+            validated_target = validate_target_description(target)
+        except SessionContractError as error:
+            return {
+                "started": False,
+                "error": {"code": error.code, "message": str(error)},
+                "grasp": self.status(),
+            }
+        invalid = self._invalid_speed(speed_percent)
+        if invalid is not None:
+            invalid["grasp"] = self.status()
+            return invalid
+        if superseded_perception_session_id is not None:
+            try:
+                superseded_perception_session_id = validate_session_id(
+                    superseded_perception_session_id,
+                )
+            except (SessionContractError, TypeError, ValueError):
+                return {
+                    "started": False,
+                    "error": {
+                        "code": "INVALID_SUPERSEDED_SESSION",
+                        "message": "mobile handoff supplied an invalid pre-servo perception session",
+                    },
+                    "grasp": self.status(),
+                }
+        if (
+            isinstance(base_stopped_unix_ns, bool)
+            or not isinstance(base_stopped_unix_ns, int)
+            or base_stopped_unix_ns <= 0
+        ):
+            return {
+                "started": False,
+                "error": {
+                    "code": "INVALID_HANDOFF_BOUNDARY",
+                    "message": "mobile handoff requires the stopped-base timestamp",
+                },
+                "grasp": self.status(),
+            }
+        with self._lock:
+            if self._status["running"]:
+                return {"started": False, "grasp": dict(self._status)}
+            if self._workflow.get("holding_object") is True:
+                return {
+                    "started": False,
+                    "error": {
+                        "code": "OBJECT_ALREADY_HELD",
+                        "message": "cannot begin a mobile handoff while an object is held",
+                    },
+                    "grasp": {**self._status, "workflow": dict(self._workflow)},
+                }
+            self._status.update({
+                "running": True,
+                "state": "running",
+                "phase": "handoff_settle",
+                "outcome": None,
+                "target": validated_target,
+                "speed_percent": speed_percent,
+                "superseded_perception_session_id": superseded_perception_session_id,
+                "base_stopped_unix_ns": base_stopped_unix_ns,
+                "revision": int(self._status["revision"]) + 1,
+                "started_unix_ns": time.time_ns(),
+                "finished_unix_ns": None,
+                "message": (
+                    "Base stopped at close range; capturing a new grasp from "
+                    "the current measured arm/view pose."
+                ),
+            })
+        worker = threading.Thread(
+            target=self._run_mobile_handoff,
+            args=(
+                validated_target,
+                speed_percent,
+                superseded_perception_session_id,
+                base_stopped_unix_ns,
+            ),
+            name="z-manip-piper-mobile-handoff-grasp",
+            daemon=True,
+        )
+        worker.start()
+        return {"started": True, "grasp": self.status()}
+
     def start_selected(self, speed_percent: int = 5) -> dict[str, Any]:
         """Execute the current successful plan without Home/perception/replanning."""
         invalid = self._invalid_speed(speed_percent)
@@ -2562,6 +2737,177 @@ class PiperGraspRunner:
             )
         if completed.returncode != 0 or not (receipt_dir / "lift-receipt.json").is_file():
             raise RuntimeError(f"full grasp stopped safely; inspect {self.log_path}")
+
+    def _run_mobile_handoff(
+        self,
+        target: str,
+        speed_percent: int,
+        superseded_perception_session_id: str | None,
+        base_stopped_unix_ns: int,
+    ) -> None:
+        """Run a fresh close-range transaction without commanding Home first."""
+
+        action_dir = self.receipt_root / f"mobile-handoff-grasp-{time.time_ns()}"
+        action_started = time.monotonic()
+        timings: dict[str, float] = {}
+        try:
+            self.log_path.write_text(
+                "Starting mobile handoff grasp from the measured close-range arm pose; "
+                "pre-servo perception is invalidated.\n",
+                encoding="utf-8",
+            )
+            self._update(
+                phase="handoff_joint_ready",
+                message=(
+                    "Waiting for a fresh passive joint sample after base and "
+                    "reactive-view ownership stopped."
+                ),
+            )
+            joint_evidence = self._wait_mobile_handoff_joints(
+                not_before_unix_ns=base_stopped_unix_ns,
+            )
+            timings["handoff_joint_ready"] = round(
+                time.monotonic() - action_started,
+                6,
+            )
+            self._update(
+                handoff_joint_evidence=joint_evidence,
+                timings_s=dict(timings),
+            )
+            # clear_current_context invalidates the detector/tracker seed and
+            # all old candidate/plan selections before the new capture starts.
+            self.session_service.clear_current_context()
+            self._update(
+                phase="handoff_perception",
+                message=(
+                    "Capturing fresh close-range RGB-D, EdgeTAM mask, candidates, "
+                    "and synchronized passive joints at the current arm pose."
+                ),
+            )
+
+            phase_started = time.monotonic()
+            perception = self.session_service.start_perception(target)
+            timings["handoff_perception"] = round(
+                time.monotonic() - phase_started,
+                6,
+            )
+            if perception.get("status") != "succeeded":
+                error = perception.get("error")
+                detail = error.get("message") if isinstance(error, dict) else None
+                raise RuntimeError(detail or "fresh close-range perception failed")
+            fresh_perception_session_id = validate_session_id(
+                perception.get("session_id"),
+            )
+            if fresh_perception_session_id == superseded_perception_session_id:
+                raise RuntimeError(
+                    "close-range capture reused the pre-servo perception session",
+                )
+
+            self._update(
+                phase="handoff_planning",
+                fresh_perception_session_id=fresh_perception_session_id,
+                timings_s=dict(timings),
+                message=(
+                    "Generating new close-range grasp poses and planning from "
+                    "the current measured arm joints."
+                ),
+            )
+            phase_started = time.monotonic()
+            planning = self.session_service.start_planning()
+            timings["handoff_planning"] = round(
+                time.monotonic() - phase_started,
+                6,
+            )
+            timings["pre_execution_total"] = round(
+                time.monotonic() - action_started,
+                6,
+            )
+            report, archive = self._planning_artifacts(planning)
+            planning_session_id = validate_session_id(planning.get("session_id"))
+            self._update(
+                phase="handoff_execute",
+                planning_session_id=planning_session_id,
+                timings_s=dict(timings),
+                message=(
+                    f"Executing the fresh close-range receipt-bound plan at "
+                    f"{speed_percent}%."
+                ),
+            )
+            self._run_full(
+                report=report,
+                archive=archive,
+                receipt_dir=action_dir,
+                speed_percent=speed_percent,
+            )
+            self.session_service.clear_current_context()
+            self._update(
+                running=False,
+                state="finished",
+                phase="returned_home",
+                outcome="passed",
+                finished_unix_ns=time.time_ns(),
+                receipt_dir=str(action_dir),
+                timings_s=dict(timings),
+                message=(
+                    "Fresh mobile-handoff grasp executed; object placed back "
+                    "and arm returned Home."
+                ),
+            )
+        except Exception as error:  # pragma: no cover - hardware boundary
+            self._update(
+                running=False,
+                state="finished",
+                outcome="blocked",
+                finished_unix_ns=time.time_ns(),
+                timings_s={
+                    **timings,
+                    "pre_execution_total": round(
+                        time.monotonic() - action_started,
+                        6,
+                    ),
+                },
+                message=(
+                    "Mobile handoff grasp stopped during "
+                    f"{self.status().get('phase')}: {error}"
+                ),
+            )
+
+    def _wait_mobile_handoff_joints(
+        self,
+        *,
+        not_before_unix_ns: int,
+        timeout_s: float = MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S,
+    ) -> dict[str, Any]:
+        """Wait a bounded time for measured joints newer than base stop."""
+
+        if self.home_verifier is None:
+            raise RuntimeError(
+                "fresh passive-joint verifier is unavailable at mobile handoff",
+            )
+        deadline = time.monotonic() + timeout_s
+        last_detail = "no passive joint sample received"
+        last_evidence: dict[str, Any] = {}
+        while True:
+            ready, last_detail, last_evidence = (
+                self.home_verifier.current_joint_snapshot(
+                    not_before_unix_ns=not_before_unix_ns,
+                )
+            )
+            if ready:
+                with self.log_path.open("a", encoding="utf-8") as log:
+                    log.write(
+                        "Mobile handoff joint readiness passed: "
+                        f"sequence={last_evidence.get('sequence')} "
+                        f"source_timestamp_ns={last_evidence.get('source_timestamp_ns')}\n"
+                    )
+                return last_evidence
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "fresh passive joints were not observed after base stop "
+                    f"within {timeout_s:.1f}s: {last_detail}; "
+                    f"evidence={last_evidence}",
+                )
+            time.sleep(0.05)
 
     def _run(self, target: str, speed_percent: int) -> None:
         action_dir = self.receipt_root / f"grasp-{time.time_ns()}"
