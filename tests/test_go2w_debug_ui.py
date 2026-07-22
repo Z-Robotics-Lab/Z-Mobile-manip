@@ -316,6 +316,14 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert 'id="show-all-candidates"' in lowered
     assert "item.frame === displayframe" in lowered
     assert 'id="collision-evidence"' in lowered
+    assert 'id="trajectory-refinement-evidence"' in lowered
+    assert "function rendertrajectoryrefinementevidence()" in lowered
+    assert "selected.trajectory_refinement" in lowered
+    assert "selected.lift_pose_base" in lowered
+    assert "fixed clearance" in lowered
+    assert "safe rrt seed retained" in lowered
+    assert "refined path accepted" in lowered
+    assert "rendertrajectoryrefinementevidence();" in lowered
     assert "drawcollisionwitness(context, project)" in lowered
     assert '"no feasible candidate"' in lowered
     assert "state.selectedcandidate = candidateid" not in lowered

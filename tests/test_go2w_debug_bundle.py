@@ -94,6 +94,31 @@ def _planning(directory: Path, *, motion_commands: int = 0) -> None:
         {"candidate_index": 0, "symmetry_index": 1, "stage": "ik", "reason": "no solution"},
         {"candidate_index": 1, "symmetry_index": 0, "stage": "approach_collision", "reason": "collision"},
     ]
+    lift_pose = np.eye(4)
+    lift_pose[:3, 3] = [0.41, -0.03, 0.28]
+    trajectory_refinement = {
+        "schema": "z_manip.trajectory_refinement.v1",
+        "accepted": True,
+        "backend": "casadi-qrqp",
+        "reason": "safe objective improvement",
+        "objective_before": 12.0,
+        "objective_after": 7.5,
+        "blend_alpha": 1.0,
+        "generic_before": {"valid": True, "state_checks": 21},
+        "generic_after": {"valid": True, "state_checks": 21},
+        "fixed_before": {
+            "valid": True,
+            "minimum_margin_m": 0.012,
+            "minimum_segment_index": 3,
+            "witness": {"pair": ["piper_link5", "mid360"]},
+        },
+        "fixed_after": {
+            "valid": True,
+            "minimum_margin_m": 0.016,
+            "minimum_segment_index": 4,
+            "witness": {"pair": ["piper_gripper_base", "go2w_chassis"]},
+        },
+    }
     (directory / "planning_report.json").write_text(json.dumps({
         "read_only": True,
         "planning_only": True,
@@ -110,6 +135,8 @@ def _planning(directory: Path, *, motion_commands: int = 0) -> None:
         "required_width_m": 0.03,
         "grasp_pose": np.eye(4).tolist(),
         "pregrasp_pose": np.eye(4).tolist(),
+        "lift_pose": lift_pose.tolist(),
+        "trajectory_refinement": trajectory_refinement,
         "transit_waypoints": 2,
         "approach_waypoints": 3,
         "lift_waypoints": 2,
@@ -246,6 +273,15 @@ def test_complete_bundle_preserves_rejections_and_trajectory(tmp_path):
     assert bundle["selected_plan"]["segments"]["approach"]["duration_s"] == 0.2
     assert bundle["selected_plan"]["segments"]["lift"]["positions_rad"][-1] == [0.2] * 6
     assert bundle["selected_plan"]["selected_global_rank"] == 1
+    assert bundle["selected_plan"]["lift_pose_base"][:3][0][3] == 0.41
+    assert bundle["selected_plan"]["trajectory_refinement"]["backend"] == "casadi-qrqp"
+    assert bundle["selected_plan"]["fixed_fixture_minimum_margin_m"] == 0.016
+    assert bundle["planning"]["trajectory_refinement"]["accepted"] is True
+    assert bundle["planning"]["fixed_fixture_minimum_margin_m"] == 0.016
+    assert bundle["planning"]["fixed_fixture_evidence"]["witness"]["pair"] == [
+        "piper_gripper_base",
+        "go2w_chassis",
+    ]
     assert bundle["visualization"]["robot_overlay_allowed"] is True
     assert len(bundle["visualization"]["robot_overlay"]["links_xyz_m"]) == 7
     assert len(bundle["visualization"]["trajectory_xyz_m"]["approach"]) == 3

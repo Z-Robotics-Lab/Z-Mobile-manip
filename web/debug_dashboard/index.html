@@ -615,7 +615,11 @@
 
     .collision-card { border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 4px; padding: 8px; background: #11181c; }
     .collision-card.empty { border-left-color: var(--line-strong); color: var(--muted); font: 10px var(--mono); }
+    .trajectory-card { border-left-color: var(--cyan); }
+    .trajectory-card.accepted { border-left-color: var(--green); }
     .collision-title { color: var(--amber); font: 700 10px var(--mono); text-transform: uppercase; }
+    .trajectory-card .collision-title { color: var(--cyan); }
+    .trajectory-card.accepted .collision-title { color: var(--green); }
     .collision-metrics { margin-top: 7px; display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
     .collision-metric { border: 1px solid var(--line); border-radius: 3px; padding: 5px; }
     .collision-metric span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
@@ -973,6 +977,10 @@
           <section class="section">
             <h2>Frame gate</h2>
             <div class="gate-box" id="calibration-gate"></div>
+          </section>
+          <section class="section">
+            <h2>Trajectory optimization</h2>
+            <div id="trajectory-refinement-evidence"></div>
           </section>
           <section class="section">
             <h2>Selected collision witness</h2>
@@ -1487,6 +1495,57 @@
 
     function selectedCollisionWitness() {
       return state.selectedRejection?.collision_witness || null;
+    }
+
+    function renderTrajectoryRefinementEvidence() {
+      const root = byId("trajectory-refinement-evidence");
+      clear(root);
+      const selected = state.bundle?.selected_plan || {};
+      const refinement = selected.trajectory_refinement || state.bundle?.planning?.trajectory_refinement;
+      const fixed = selected.fixed_fixture_evidence || state.bundle?.planning?.fixed_fixture_evidence;
+      const lift = selected.lift_pose_base;
+      const liftPosition = Array.isArray(lift) && lift.length === 4
+        && lift.slice(0, 3).every(row => Array.isArray(row) && finiteNumber(row[3]))
+        ? lift.slice(0, 3).map(row => row[3])
+        : null;
+      if (!refinement && !liftPosition) {
+        root.append(make("div", "collision-card empty", "No trajectory-refinement evidence in this planning report."));
+        return;
+      }
+      const accepted = refinement?.accepted === true;
+      const card = make("div", `collision-card trajectory-card${accepted ? " accepted" : ""}`);
+      const outcome = refinement
+        ? accepted ? "REFINED PATH ACCEPTED" : "SAFE RRT SEED RETAINED"
+        : "LIFT TARGET RECORDED";
+      card.append(make("div", "collision-title", outcome));
+      const beforeObjective = refinement?.objective_before;
+      const afterObjective = refinement?.objective_after;
+      const beforeMargin = refinement?.fixed_before?.minimum_margin_m;
+      const afterMargin = fixed?.minimum_margin_m;
+      const witnessPair = Array.isArray(fixed?.witness?.pair)
+        ? fixed.witness.pair.join(" ↔ ")
+        : "—";
+      const metrics = make("div", "collision-metrics");
+      const items = [
+        ["backend", refinement?.backend || "—", ""],
+        ["objective", finiteNumber(beforeObjective) && finiteNumber(afterObjective)
+          ? `${beforeObjective.toFixed(3)} → ${afterObjective.toFixed(3)}` : "—", ""],
+        ["fixed clearance", finiteNumber(afterMargin)
+          ? `${finiteNumber(beforeMargin) ? `${(beforeMargin * 1000).toFixed(1)} → ` : ""}${(afterMargin * 1000).toFixed(1)} mm`
+          : "—", finiteNumber(afterMargin) ? afterMargin > 0 ? "safe" : "unsafe" : ""],
+        ["blend", finiteNumber(refinement?.blend_alpha) ? refinement.blend_alpha.toFixed(3) : "—", ""],
+        ["lift target xyz", liftPosition ? liftPosition.map(value => value.toFixed(3)).join(" / ") + " m" : "—", ""],
+        ["nearest fixed pair", witnessPair, ""],
+      ];
+      for (const [label, value, className] of items) {
+        const item = make("div", "collision-metric");
+        item.append(make("span", "", label));
+        item.append(make("strong", className, value));
+        metrics.append(item);
+      }
+      card.append(metrics);
+      if (refinement?.reason) card.append(make("p", "collision-note", refinement.reason));
+      root.append(card);
     }
 
     function selectCandidateRejection(candidateId) {
@@ -3294,6 +3353,7 @@
       renderStages();
       renderImages();
       renderSafety();
+      renderTrajectoryRefinementEvidence();
       renderCollisionEvidence();
       renderRejections();
       renderTrajectoryStrip();

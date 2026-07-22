@@ -506,6 +506,22 @@ def build_bundle(
 
     planned_archive_path = None if planning_dir is None else planning_dir.expanduser().resolve() / "planned_grasp.npz"
     trajectory_error = None
+    trajectory_refinement = None
+    fixed_fixture_evidence = None
+    lift_pose = None
+    if planning is not None:
+        refinement_value = planning.get("trajectory_refinement")
+        if isinstance(refinement_value, dict):
+            trajectory_refinement = dict(refinement_value)
+            fixed_after = trajectory_refinement.get("fixed_after")
+            fixed_before = trajectory_refinement.get("fixed_before")
+            if isinstance(fixed_after, dict):
+                fixed_fixture_evidence = dict(fixed_after)
+            elif isinstance(fixed_before, dict):
+                fixed_fixture_evidence = dict(fixed_before)
+        lift_transform = _rigid_transform(planning.get("lift_pose"))
+        if lift_transform is not None:
+            lift_pose = lift_transform.tolist()
     if planning_valid:
         selected_plan = {
             "candidate_id": planning.get("candidate_index"),
@@ -518,6 +534,14 @@ def build_bundle(
             "required_width_m": planning.get("required_width_m"),
             "grasp_pose_base": planning.get("grasp_pose"),
             "pregrasp_pose_base": planning.get("pregrasp_pose"),
+            "lift_pose_base": lift_pose,
+            "trajectory_refinement": trajectory_refinement,
+            "fixed_fixture_evidence": fixed_fixture_evidence,
+            "fixed_fixture_minimum_margin_m": (
+                None
+                if fixed_fixture_evidence is None
+                else fixed_fixture_evidence.get("minimum_margin_m")
+            ),
             "joint_names": [f"joint{i}" for i in range(1, 7)],
             "segments": {},
         }
@@ -841,6 +865,13 @@ def build_bundle(
             "source_rejection_count": source_rejection_count,
             "included_rejection_count": len(rejections),
             "source_rejections_may_be_truncated": source_rejection_count > len(rejections),
+            "trajectory_refinement": trajectory_refinement,
+            "fixed_fixture_evidence": fixed_fixture_evidence,
+            "fixed_fixture_minimum_margin_m": (
+                None
+                if fixed_fixture_evidence is None
+                else fixed_fixture_evidence.get("minimum_margin_m")
+            ),
             "rejections": rejections,
         },
         "selected_plan": selected_plan,
