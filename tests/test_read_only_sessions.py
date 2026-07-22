@@ -204,6 +204,25 @@ def test_planning_consumes_only_selected_verified_success(tmp_path):
     json.dumps(state)
 
 
+def test_planning_attempt_preserves_recoverable_backend_disposition(tmp_path):
+    backend = FakeBackend()
+    service = _service(tmp_path, backend)
+    service.start_perception("floor bottle")
+    backend.planning_result = BackendResult(
+        8,
+        "NEED_BASE_APPROACH",
+        "continue base approach before close-range planning",
+    )
+
+    planning = service.start_planning()
+
+    assert planning["status"] == "blocked"
+    assert planning["error"] == {
+        "code": "NEED_BASE_APPROACH",
+        "message": "continue base approach before close-range planning",
+    }
+
+
 def test_home_context_clear_invalidates_current_tasks_but_retains_history(tmp_path):
     backend = FakeBackend()
     service = _service(tmp_path, backend)
@@ -394,6 +413,47 @@ def test_passive_ssh_reuses_only_the_fixed_nuc_transport(tmp_path, monkeypatch):
     assert "ControlPersist=60" in prefix
     assert f"ControlPath={tmp_path / 'z-manip-%C'}" in prefix
     assert prefix[-1] == module.NUC_HOST
+
+
+def test_passive_capture_uses_probe_stdout_without_second_ssh_fetch(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    output = tmp_path / "capture"
+    output.mkdir()
+    log = tmp_path / "capture.log"
+    calls = []
+
+    class Completed:
+        returncode = 0
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        kwargs["stdout"].write(
+            (json.dumps(_passive_report()) + "\n").encode("utf-8"),
+        )
+        return Completed()
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_ssh_prefix",
+        lambda: ("/usr/bin/ssh", "fixed-nuc"),
+    )
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = backend._capture_passive_window(output, log, {})
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    assert module.REMOTE_PASSIVE_PROBE in calls[0]
+    assert "cat" not in calls[0]
+    assert backend._passive_report_valid(
+        output / "live_passive_joint_report.json",
+    )
 
 
 def test_perception_passes_immutable_output_and_captures_synchronized_joints(
@@ -928,6 +988,206 @@ def test_planning_reuses_capture_time_report_and_pinocchio_runtime(
     assert planner_command[planner_command.index("--user") + 1] == (
         f"{os.geteuid()}:{os.getegid()}"
     )
+
+
+def test_planning_warm_runner_uses_read_only_inputs_and_atomic_scratch(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    artifact_root = tmp_path / "artifacts"
+    perception = artifact_root / "sessions" / "capture" / "perception"
+    perception.mkdir(parents=True)
+    joint_report = perception / "selected_passive_joint_report.json"
+    joint_report.write_text(json.dumps(_passive_report()), encoding="utf-8")
+    output = artifact_root / "sessions" / "planning-attempt"
+    output.mkdir(parents=True)
+    calibration = artifact_root / "calibration.json"
+    calibration.write_text("{}", encoding="utf-8")
+    scratch_root = artifact_root / ".planning-runner-scratch"
+    log = tmp_path / "planning.log"
+    commands = []
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(module, "CALIBRATION", calibration)
+    monkeypatch.setattr(module, "PLANNING_RUNNER_SCRATCH_ROOT", scratch_root)
+    monkeypatch.setattr(backend, "_required_planning_files", lambda: ())
+    monkeypatch.setattr(backend, "_planning_runner_running", lambda: True)
+    monkeypatch.setattr(
+        backend,
+        "_build_visualization_bundle",
+        lambda **_kwargs: module.BackendResult(0),
+    )
+
+    def fake_run(argv, _log_path, *, environment):
+        command = tuple(argv)
+        commands.append(command)
+        if str(module.SESSION_GATE) in command:
+            destination = Path(command[command.index("--output") + 1])
+            destination.write_text(json.dumps({
+                "planning_ready": True,
+                "measured_joints_rad": [0.0] * 6,
+                "planning_start_joints_rad": [0.0] * 6,
+            }))
+        else:
+            container_output = Path(command[command.index("--output") + 1])
+            host_output = scratch_root / container_output.name
+            (host_output / "planning_report.json").write_text(
+                '{"success": true}',
+                encoding="utf-8",
+            )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "_run_logged", fake_run)
+
+    result = backend.run_planning(
+        perception_dir=perception,
+        output_dir=output,
+        log_path=log,
+    )
+
+    assert result.exit_code == 0
+    _, planner_command = commands
+    assert planner_command[:5] == (
+        "/usr/bin/docker",
+        "exec",
+        "-e",
+        "Z_MANIP_IK_BACKEND=pinocchio",
+        module.PLANNING_RUNNER_CONTAINER,
+    )
+    assert planner_command[planner_command.index("--artifacts") + 1] == (
+        "/workspace-artifacts/sessions/capture/perception"
+    )
+    assert planner_command[planner_command.index("--camera-calibration") + 1] == (
+        "/workspace-artifacts/calibration.json"
+    )
+    assert (output / "planning" / "planning_report.json").is_file()
+    assert list(scratch_root.iterdir()) == []
+
+
+def test_planning_runner_bringup_keeps_artifacts_read_only():
+    source = (
+        ROOT / "scripts" / "runtime" / "go2w_perception_lab.sh"
+    ).read_text(encoding="utf-8")
+
+    function = source.split("start_planning_runner() {", 1)[1].split("\n}", 1)[0]
+    assert "--network none" in function
+    assert "--cap-drop ALL" in function
+    assert "--security-opt no-new-privileges" in function
+    assert '$PERCEPTION_RUNNER_ARTIFACT_ROOT:/workspace-artifacts:ro' in function
+    assert '$PLANNING_RUNNER_SCRATCH_ROOT:/workspace-planning-output' in function
+    assert "--device" not in function
+
+
+def test_planning_propagates_verified_need_base_approach_disposition(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    perception = tmp_path / "perception"
+    perception.mkdir()
+    (perception / "selected_passive_joint_report.json").write_text(
+        json.dumps(_passive_report()),
+        encoding="utf-8",
+    )
+    output = tmp_path / "planning-attempt"
+    output.mkdir()
+    log = tmp_path / "planning.log"
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(backend, "_required_planning_files", lambda: ())
+    monkeypatch.setattr(
+        backend,
+        "_build_visualization_bundle",
+        lambda **_kwargs: module.BackendResult(0),
+    )
+
+    def fake_run(argv, _log_path, *, environment):
+        command = tuple(argv)
+        assert str(module.SESSION_GATE) in command
+        destination = Path(command[command.index("--output") + 1])
+        destination.write_text(json.dumps({
+            "schema": "z_manip.piper_planning_session_gate.v1",
+            "planning_ready": False,
+            "read_only": True,
+            "planning_only": True,
+            "motion_commands_published": 0,
+            "transport_opened": False,
+            "planning_disposition": "NEED_BASE_APPROACH",
+            "handoff_workspace": {
+                "state": "NEED_BASE_APPROACH",
+                "planning_allowed": False,
+                "frame": "piper_base_link",
+                "target_range_m": 0.83,
+                "maximum_handoff_range_m": 0.70,
+            },
+            "errors": [{"code": "NEED_BASE_APPROACH"}],
+        }), encoding="utf-8")
+        return SimpleNamespace(returncode=8)
+
+    monkeypatch.setattr(module, "_run_logged", fake_run)
+
+    result = backend.run_planning(
+        perception_dir=perception,
+        output_dir=output,
+        log_path=log,
+    )
+
+    assert result.exit_code == 8
+    assert result.error_code == "NEED_BASE_APPROACH"
+    assert "0.830 m > 0.700 m" in result.message
+
+
+def test_planning_does_not_trust_incomplete_need_base_approach_report(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    perception = tmp_path / "perception"
+    perception.mkdir()
+    (perception / "selected_passive_joint_report.json").write_text(
+        json.dumps(_passive_report()),
+        encoding="utf-8",
+    )
+    output = tmp_path / "planning-attempt"
+    output.mkdir()
+    log = tmp_path / "planning.log"
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(backend, "_required_planning_files", lambda: ())
+    monkeypatch.setattr(
+        backend,
+        "_build_visualization_bundle",
+        lambda **_kwargs: module.BackendResult(0),
+    )
+
+    def fake_run(argv, _log_path, *, environment):
+        command = tuple(argv)
+        destination = Path(command[command.index("--output") + 1])
+        # The typed string alone is insufficient: missing zero-motion safety
+        # evidence and workspace/error agreement must remain fail-closed.
+        destination.write_text(json.dumps({
+            "schema": "z_manip.piper_planning_session_gate.v1",
+            "planning_ready": False,
+            "planning_disposition": "NEED_BASE_APPROACH",
+        }), encoding="utf-8")
+        return SimpleNamespace(returncode=8)
+
+    monkeypatch.setattr(module, "_run_logged", fake_run)
+
+    result = backend.run_planning(
+        perception_dir=perception,
+        output_dir=output,
+        log_path=log,
+    )
+
+    assert result.exit_code == 8
+    assert result.error_code == "SESSION_GATE_BLOCKED"
 
 
 def test_planning_failure_surfaces_bounded_report_rejection_summary(

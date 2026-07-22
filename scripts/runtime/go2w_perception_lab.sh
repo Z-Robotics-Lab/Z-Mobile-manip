@@ -32,6 +32,8 @@ ANYGRASP_CHECKPOINT="${ANYGRASP_CHECKPOINT:-$ANYGRASP_DIR/checkpoint_detection.t
 ARTIFACT_DIR="${Z_MANIP_ARTIFACT_DIR:-$ROOT_DIR/../artifacts/go2w_real/latest}"
 PERCEPTION_RUNNER_ARTIFACT_ROOT="$ROOT_DIR/../artifacts"
 PERCEPTION_RUNNER="z-manip-perception-runner"
+PLANNING_RUNNER="z-manip-planning-runner"
+PLANNING_RUNNER_SCRATCH_ROOT="$PERCEPTION_RUNNER_ARTIFACT_ROOT/go2w_real/.planning_runner_scratch"
 SOAK_MAX_RECOVERIES="${Z_MANIP_SOAK_MAX_RECOVERIES:-2}"
 SOAK_RECOVERY_TIMEOUT="${Z_MANIP_SOAK_RECOVERY_TIMEOUT:-25}"
 
@@ -234,9 +236,9 @@ start_perception() {
 }
 
 start_perception_runner() {
-  # Keep only the ROS/Python userspace warm between UI clicks.  This container
-  # has no CAN/device mount, no actuator environment, and its only executable
-  # action is supplied by the fixed server-side interactive adapter.
+  # Keep the runtime image and container filesystem warm between UI clicks.
+  # Each click still starts the fixed Python entrypoint via docker exec.  This
+  # container has no CAN/device mount and no actuator environment.
   mkdir -p "$PERCEPTION_RUNNER_ARTIFACT_ROOT"
   docker rm -f "$PERCEPTION_RUNNER" >/dev/null 2>&1 || true
   docker run -d --name "$PERCEPTION_RUNNER" --restart unless-stopped \
@@ -248,6 +250,30 @@ start_perception_runner() {
     -v "$ROOT_DIR/scripts/runtime/go2w_perception_dry_run.py:/usr/local/bin/z-manip-go2w-perception-dry-run:ro" \
     -v "$ROOT_DIR/z_manip:/opt/z_manip/python/z_manip:ro" \
     -v "$PERCEPTION_RUNNER_ARTIFACT_ROOT:/workspace-artifacts" \
+    "$IMAGE" sleep infinity >/dev/null
+}
+
+start_planning_runner() {
+  # Warm only the fixed offline planning filesystem.  The runner has no
+  # network, ROS environment, hardware device, CAN socket, or actuator mount.
+  # Interactive requests execute the same fixed planner and full safety checks
+  # through docker exec, avoiding per-click image/container cold-start jitter.
+  mkdir -p "$PERCEPTION_RUNNER_ARTIFACT_ROOT" "$PLANNING_RUNNER_SCRATCH_ROOT"
+  docker rm -f "$PLANNING_RUNNER" >/dev/null 2>&1 || true
+  docker run -d --name "$PLANNING_RUNNER" --restart unless-stopped \
+    --user "$(id -u):$(id -g)" \
+    --network none \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    -e HOME=/tmp/z-manip \
+    -e PYTHONPATH=/opt/z_manip_ws/install/lib/python3.12/site-packages:/opt/ros/jazzy/lib/python3.12/site-packages:/opt/z_manip/python \
+    -e LD_LIBRARY_PATH=/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib \
+    -v "$ROOT_DIR/scripts/runtime/piper_planning_dry_run.py:/usr/local/bin/z-manip-piper-planning-dry-run:ro" \
+    -v "$ROOT_DIR/z_manip:/opt/z_manip/python/z_manip:ro" \
+    -v "$ROOT_DIR/configs/go2w_piper.json:/opt/z_manip/configs/go2w_piper.json:ro" \
+    -v "$ROOT_DIR/../go2W_Sim/assets:/robot_assets:ro" \
+    -v "$PERCEPTION_RUNNER_ARTIFACT_ROOT:/workspace-artifacts:ro" \
+    -v "$PLANNING_RUNNER_SCRATCH_ROOT:/workspace-planning-output" \
     "$IMAGE" sleep infinity >/dev/null
 }
 
@@ -311,6 +337,7 @@ status() {
   echo "NUC camera: $(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST" 'systemctl --user is-active d435i.service' 2>/dev/null || echo unreachable)"
   docker ps --filter name=z-manip-edgetam --filter name=z-manip-rgbd \
     --filter name=z-manip-hw --filter name=z-manip-perception-runner \
+    --filter name=z-manip-planning-runner \
     --filter name=z-manip-anygrasp \
     --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
   if [[ "$(docker inspect z-manip-anygrasp --format '{{.State.Health.Status}}' 2>/dev/null || true)" == healthy ]]; then
@@ -342,6 +369,7 @@ case "${1:-status}" in
     start_rgbd_bridge
     start_perception
     start_perception_runner
+    start_planning_runner
     sleep 5
     status
     ;;
@@ -358,6 +386,7 @@ case "${1:-status}" in
     require_file "$DDS_CONFIG"
     start_perception
     start_perception_runner
+    start_planning_runner
     ;;
   preflight)
     preflight
@@ -366,7 +395,7 @@ case "${1:-status}" in
     status
     ;;
   stop)
-    docker stop z-manip-hw z-manip-rgbd "$PERCEPTION_RUNNER" >/dev/null 2>&1 || true
+    docker stop z-manip-hw z-manip-rgbd "$PERCEPTION_RUNNER" "$PLANNING_RUNNER" >/dev/null 2>&1 || true
     echo "Stopped perception containers only; no actuator command was sent."
     ;;
   anygrasp-check)

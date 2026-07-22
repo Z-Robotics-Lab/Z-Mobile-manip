@@ -22,6 +22,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Mapping, Sequence
 
@@ -61,6 +62,12 @@ DEFAULT_RUNTIME_IMAGE = "z-manip-runtime:pinocchio"
 DEFAULT_IK_BACKEND = "pinocchio"
 PERCEPTION_RUNNER_CONTAINER = "z-manip-perception-runner"
 PERCEPTION_RUNNER_ARTIFACT_ROOT = Path("/workspace-artifacts")
+PLANNING_RUNNER_CONTAINER = "z-manip-planning-runner"
+PLANNING_RUNNER_ARTIFACT_ROOT = Path("/workspace-artifacts")
+PLANNING_RUNNER_SCRATCH_ROOT = (
+    ARTIFACT_ROOT / "go2w_real" / ".planning_runner_scratch"
+)
+PLANNING_RUNNER_CONTAINER_SCRATCH_ROOT = Path("/workspace-planning-output")
 SAFE_RUNTIME_IMAGE = re.compile(
     r"z-manip-runtime:[a-z0-9][a-z0-9._-]{0,63}\Z",
 )
@@ -71,6 +78,7 @@ REMOTE_PASSIVE_PROBE = "/usr/local/libexec/z-manip/piper_passive_probe.py"
 PASSIVE_CAPTURE_SECONDS = "0.25"
 PERCEPTION_ATTEMPTS = 2
 MAX_PASSIVE_REPORT_BYTES = 1024 * 1024
+MAX_SESSION_GATE_REPORT_BYTES = 256 * 1024
 MAX_PLANNING_REPORT_BYTES = 4 * 1024 * 1024
 MAX_PLANNER_ERROR_CHARS = 600
 MAX_PERCEPTION_REPORT_BYTES = 256 * 1024
@@ -331,16 +339,87 @@ class FixedReadOnlyBackend:
             and document.get("interface_tx_packet_delta") == 0
         )
 
+    @staticmethod
+    def _typed_session_gate_block(path: Path) -> BackendResult | None:
+        """Return a recoverable gate disposition only from complete evidence.
+
+        A non-zero gate process is normally fail-closed as
+        ``SESSION_GATE_BLOCKED``.  ``NEED_BASE_APPROACH`` is the sole typed
+        exception because it is not an IK failure: the immutable target cloud
+        is simply outside the handoff workspace.  Validate the entire safety
+        envelope before trusting that disposition so a truncated or forged
+        report cannot downgrade another gate failure into a recoverable one.
+        """
+
+        try:
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or not 1 <= path.stat().st_size <= MAX_SESSION_GATE_REPORT_BYTES
+            ):
+                return None
+            document: Any = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(document, dict):
+            return None
+        workspace = document.get("handoff_workspace")
+        errors = document.get("errors")
+        safety_valid = bool(
+            document.get("schema") == "z_manip.piper_planning_session_gate.v1"
+            and document.get("planning_ready") is False
+            and document.get("read_only") is True
+            and document.get("planning_only") is True
+            and document.get("motion_commands_published") == 0
+            and document.get("transport_opened") is False
+            and document.get("planning_disposition") == "NEED_BASE_APPROACH"
+        )
+        workspace_valid = bool(
+            isinstance(workspace, dict)
+            and workspace.get("state") == "NEED_BASE_APPROACH"
+            and workspace.get("planning_allowed") is False
+            and workspace.get("frame") == "piper_base_link"
+        )
+        error_valid = bool(
+            isinstance(errors, list)
+            and any(
+                isinstance(error, dict)
+                and error.get("code") == "NEED_BASE_APPROACH"
+                for error in errors
+            )
+        )
+        if not (safety_valid and workspace_valid and error_valid):
+            return None
+        try:
+            target_range_m = float(workspace["target_range_m"])
+            maximum_range_m = float(workspace["maximum_handoff_range_m"])
+            if not (
+                math.isfinite(target_range_m)
+                and math.isfinite(maximum_range_m)
+                and target_range_m > maximum_range_m > 0.0
+            ):
+                return None
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        return BackendResult(
+            1,
+            "NEED_BASE_APPROACH",
+            "target remains outside the manipulation handoff workspace "
+            f"({target_range_m:.3f} m > {maximum_range_m:.3f} m); "
+            "continue base approach before retrying close-range planning",
+        )
+
     def _capture_passive_window(
         self,
         output_dir: Path,
         log_path: Path,
         environment: dict[str, str],
     ) -> BackendResult:
-        # The probe prints its full JSON report on every 250 ms sample. The
-        # immutable report is fetched below, so duplicating it into the action
-        # log only creates megabytes of noise and makes UI inspection appear
-        # stuck. Preserve stderr for actionable SSH/probe failures.
+        # The probe atomically writes the remote report and prints the exact
+        # same JSON document to stdout. Capture that stdout directly into the
+        # local inflight file: a second SSH ``cat`` round-trip used to dominate
+        # the warm-track UI path even though it added no safety evidence.
+        # stderr remains in the action log for actionable SSH/probe failures.
         passive_command = self._ssh_prefix() + (
             "/usr/bin/python3",
             REMOTE_PASSIVE_PROBE,
@@ -351,29 +430,12 @@ class FixedReadOnlyBackend:
             "--output",
             REMOTE_PASSIVE_REPORT,
         )
-        with log_path.open("ab") as log:
-            passive = subprocess.run(
-                passive_command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=log,
-                env=environment,
-                shell=False,
-                check=False,
-            )
-        if passive.returncode != 0:
-            return BackendResult(
-                passive.returncode,
-                "PASSIVE_JOINT_GATE_FAILED",
-                "fixed receive-only passive joint gate failed",
-            )
-
         live_report = output_dir / "live_passive_joint_report.json"
         temporary_report = output_dir / ".passive_joint_report.inflight"
         temporary_report.unlink(missing_ok=True)
         with temporary_report.open("xb") as report_output, log_path.open("ab") as log:
-            fetched = subprocess.run(
-                self._ssh_prefix() + ("cat", REMOTE_PASSIVE_REPORT),
+            passive = subprocess.run(
+                passive_command,
                 stdin=subprocess.DEVNULL,
                 stdout=report_output,
                 stderr=log,
@@ -381,12 +443,12 @@ class FixedReadOnlyBackend:
                 shell=False,
                 check=False,
             )
-        if fetched.returncode != 0:
+        if passive.returncode != 0:
             temporary_report.unlink(missing_ok=True)
             return BackendResult(
-                fetched.returncode,
-                "PASSIVE_JOINT_REPORT_UNAVAILABLE",
-                "passive joint report could not be retrieved",
+                passive.returncode,
+                "PASSIVE_JOINT_GATE_FAILED",
+                "fixed receive-only passive joint gate failed",
             )
         if (
             not 1 <= temporary_report.stat().st_size <= MAX_PASSIVE_REPORT_BYTES
@@ -553,6 +615,27 @@ class FixedReadOnlyBackend:
                 "--format",
                 "{{.State.Running}}",
                 PERCEPTION_RUNNER_CONTAINER,
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_server_environment(),
+            shell=False,
+            check=False,
+        )
+        return completed.returncode == 0 and completed.stdout.strip() == b"true"
+
+    @staticmethod
+    def _planning_runner_running() -> bool:
+        """Return whether the fixed network-disabled planner runner is warm."""
+
+        completed = subprocess.run(
+            (
+                "/usr/bin/docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                PLANNING_RUNNER_CONTAINER,
             ),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -910,6 +993,13 @@ class FixedReadOnlyBackend:
             )
             if visualization.exit_code != 0:
                 return visualization
+            typed_block = self._typed_session_gate_block(session_gate_report)
+            if typed_block is not None:
+                return BackendResult(
+                    gate.returncode,
+                    typed_block.error_code,
+                    typed_block.message,
+                )
             return BackendResult(
                 gate.returncode,
                 "SESSION_GATE_BLOCKED",
@@ -949,9 +1039,88 @@ class FixedReadOnlyBackend:
 
         planning_dir = output_dir / "planning"
         planning_dir.mkdir(mode=0o700)
-        planner_started = time.monotonic()
-        planner = _run_logged(
+        runner_perception: Path | None = None
+        runner_planning: Path | None = None
+        runner_scratch: Path | None = None
+        try:
+            relative_perception = perception_dir.resolve().relative_to(
+                ARTIFACT_ROOT.resolve(),
+            )
+            if self._planning_runner_running():
+                runner_perception = (
+                    PLANNING_RUNNER_ARTIFACT_ROOT / relative_perception
+                )
+                # The warm runner sees all immutable perception/calibration
+                # evidence read-only.  It can write only a fresh, server-owned
+                # scratch directory; the host atomically promotes that output
+                # into this action after the planner process exits.
+                PLANNING_RUNNER_SCRATCH_ROOT.mkdir(
+                    mode=0o700,
+                    parents=True,
+                    exist_ok=True,
+                )
+                runner_scratch = Path(tempfile.mkdtemp(
+                    prefix="planning-",
+                    dir=PLANNING_RUNNER_SCRATCH_ROOT,
+                ))
+                runner_planning = (
+                    PLANNING_RUNNER_CONTAINER_SCRATCH_ROOT
+                    / runner_scratch.name
+                )
+        except ValueError:
+            # Tests and isolated callers outside the fixed artifact root retain
+            # the former one-shot, network-disabled compatibility path.
+            pass
+
+        planner_args = (
+            "z-manip-piper-planning-dry-run",
+            "--artifacts",
+            str(runner_perception or Path("/session/perception")),
+            "--config",
+            "/opt/z_manip/configs/go2w_piper.json",
+            "--urdf",
+            CONTAINER_URDF,
+            f"--joints={measured_csv}",
+            f"--planning-joints={planning_csv}",
+            "--search-timeout-s",
+            SEARCH_TIMEOUT_S,
+            "--symmetry-samples",
+            SYMMETRY_SAMPLES,
+            "--max-hypotheses",
+            MAX_HYPOTHESES,
+            "--max-feasible-plans",
+            MAX_FEASIBLE_PLANS,
+            "--support-approach-prior-weight",
+            SUPPORT_APPROACH_PRIOR_WEIGHT,
+            "--scene-clearance-m",
+            SUPERVISED_SCENE_CLEARANCE_M,
+            "--scene-point-radius-m",
+            SUPERVISED_SCENE_POINT_RADIUS_M,
+            "--gripper-scene-radius-scale",
+            SUPERVISED_GRIPPER_SCENE_RADIUS_SCALE,
+            "--camera-calibration",
             (
+                str(
+                    PLANNING_RUNNER_ARTIFACT_ROOT
+                    / CALIBRATION.resolve().relative_to(ARTIFACT_ROOT.resolve())
+                )
+                if runner_perception is not None
+                else "/session/calibration.json"
+            ),
+            "--output",
+            str(runner_planning or Path("/session/planning")),
+        )
+        if runner_perception is not None:
+            planner_command = (
+                "/usr/bin/docker",
+                "exec",
+                "-e",
+                f"Z_MANIP_IK_BACKEND={self.runtime.ik_backend}",
+                PLANNING_RUNNER_CONTAINER,
+                *planner_args,
+            )
+        else:
+            planner_command = (
                 "/usr/bin/docker",
                 "run",
                 "--rm",
@@ -978,39 +1147,29 @@ class FixedReadOnlyBackend:
                 "-v",
                 f"{STACK_ROOT / 'z_manip'}:/opt/z_manip/python/z_manip:ro",
                 self.runtime.runtime_image,
-                "z-manip-piper-planning-dry-run",
-                "--artifacts",
-                "/session/perception",
-                "--config",
-                "/opt/z_manip/configs/go2w_piper.json",
-                "--urdf",
-                CONTAINER_URDF,
-                f"--joints={measured_csv}",
-                f"--planning-joints={planning_csv}",
-                "--search-timeout-s",
-                SEARCH_TIMEOUT_S,
-                "--symmetry-samples",
-                SYMMETRY_SAMPLES,
-                "--max-hypotheses",
-                MAX_HYPOTHESES,
-                "--max-feasible-plans",
-                MAX_FEASIBLE_PLANS,
-                "--support-approach-prior-weight",
-                SUPPORT_APPROACH_PRIOR_WEIGHT,
-                "--scene-clearance-m",
-                SUPERVISED_SCENE_CLEARANCE_M,
-                "--scene-point-radius-m",
-                SUPERVISED_SCENE_POINT_RADIUS_M,
-                "--gripper-scene-radius-scale",
-                SUPERVISED_GRIPPER_SCENE_RADIUS_SCALE,
-                "--camera-calibration",
-                "/session/calibration.json",
-                "--output",
-                "/session/planning",
-            ),
+                *planner_args,
+            )
+        planner_started = time.monotonic()
+        planner = _run_logged(
+            planner_command,
             log_path,
             environment=_server_environment(),
         )
+        if runner_scratch is not None:
+            try:
+                # ``planning_dir`` is still empty: no consumer can observe a
+                # partially copied report, and inputs were never writable by
+                # the container.  Both paths share the artifact filesystem.
+                planning_dir.rmdir()
+                os.replace(runner_scratch, planning_dir)
+            except OSError as error:
+                if not planning_dir.exists():
+                    planning_dir.mkdir(mode=0o700)
+                return BackendResult(
+                    1,
+                    "PLANNING_RUNNER_OUTPUT_INVALID",
+                    f"warm planner output could not be promoted: {error}",
+                )
         _append_timing(
             log_path,
             "planning_search",

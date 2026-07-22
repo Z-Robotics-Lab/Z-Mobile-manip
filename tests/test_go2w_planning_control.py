@@ -1559,6 +1559,114 @@ def test_mobile_handoff_invalidates_old_capture_and_plans_from_fresh_session(tmp
     assert status["handoff_joint_evidence"]["sequence"] == 42
 
 
+def test_mobile_handoff_surfaces_need_base_approach_without_execution(tmp_path):
+    events: list[object] = []
+
+    class FakeSessions:
+        def clear_current_context(self):
+            events.append("clear")
+
+        def start_perception(self, target):
+            events.append(("perception", target))
+            return {"status": "succeeded", "session_id": "20260722-120020"}
+
+        def start_planning(self):
+            events.append("planning")
+            return {
+                "status": "blocked",
+                "session_id": "20260722-120021",
+                "error": {
+                    "code": "NEED_BASE_APPROACH",
+                    "message": "target remains outside handoff workspace",
+                },
+            }
+
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir()
+    runner.session_service = FakeSessions()
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+    runner.home_verifier = type("FreshJoints", (), {
+        "current_joint_snapshot": lambda self, *, not_before_unix_ns: (
+            True,
+            "fresh",
+            {
+                "sequence": 44,
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            },
+        ),
+    })()
+    runner._planning_artifacts = lambda _attempt: (_ for _ in ()).throw(
+        AssertionError("typed base-approach disposition must bypass artifacts"),
+    )
+    runner._run_full = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("typed base-approach disposition must not execute"),
+    )
+
+    runner._run_mobile_handoff(
+        "floor bottle",
+        5,
+        "20260722-120010",
+        1_800_000_000_000_000_000,
+    )
+
+    assert events == ["clear", ("perception", "floor bottle"), "planning"]
+    status = runner.status()
+    assert status["running"] is False
+    assert status["outcome"] == "recoverable"
+    assert status["phase"] == "needs_base_approach"
+    assert status["planning_disposition"] == "NEED_BASE_APPROACH"
+    assert status["recovery_action"] == "approach_only"
+    assert status["retryable"] is True
+    assert "no execution was started" in status["message"]
+
+
+def test_depth_servo_mirrors_recoverable_handoff_disposition(tmp_path):
+    class RecoverableGrasp:
+        def status(self):
+            return {
+                "running": False,
+                "phase": "needs_base_approach",
+                "outcome": "recoverable",
+                "planning_disposition": "NEED_BASE_APPROACH",
+            }
+
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "idle"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        grasp_runner=RecoverableGrasp(),
+    )
+    boundary = 1_800_000_000_000_000_000
+    runner._set_workflow(
+        active=False,
+        phase="grasp_started",
+        handoff_boundary_unix_ns=boundary,
+    )
+
+    runner._watch_mobile_handoff(
+        handoff_boundary_unix_ns=boundary,
+        cancel=threading.Event(),
+        timeout_s=0.1,
+    )
+
+    status = runner.status()
+    assert status["phase"] == "needs_base_approach"
+    assert status["workflow"]["planning_disposition"] == "NEED_BASE_APPROACH"
+    assert status["workflow"]["recovery_action"] == "approach_only"
+    assert status["workflow"]["failure"] is None
+    assert "resume Approach Only" in status["message"]
+
+
 def test_mobile_handoff_rejects_reused_pre_servo_perception_session(tmp_path):
     class FakeSessions:
         def clear_current_context(self):

@@ -1576,6 +1576,8 @@ class DepthServoRunner:
             "reacquisition_attempts": 0,
             "last_reacquisition": None,
             "failure": None,
+            "planning_disposition": None,
+            "recovery_action": None,
         }
 
     def _process_running_locked(self) -> bool:
@@ -1633,7 +1635,11 @@ class DepthServoRunner:
             None if self._wrist_search is None else self._wrist_search.status()
         )
         workflow_phase = str(workflow.get("phase", "idle"))
-        terminal_workflow = workflow_phase in {"blocked", "degraded"}
+        terminal_workflow = workflow_phase in {
+            "blocked",
+            "degraded",
+            "needs_base_approach",
+        }
         return {
             "schema": "z_manip.depth_servo_action.v1",
             "available": True,
@@ -1738,6 +1744,8 @@ class DepthServoRunner:
                 "reacquisition_attempts": 0,
                 "last_reacquisition": None,
                 "failure": None,
+                "planning_disposition": None,
+                "recovery_action": None,
             }
             self._revision += 1
             self._message = (
@@ -1836,12 +1844,28 @@ class DepthServoRunner:
                 base_stopped_unix_ns=base_stopped_unix_ns,
             )
             if result.get("started"):
-                self._set_workflow(active=False, phase="grasp_started", failure=None)
+                self._set_workflow(
+                    active=False,
+                    phase="grasp_started",
+                    failure=None,
+                    planning_disposition=None,
+                    recovery_action=None,
+                    handoff_boundary_unix_ns=base_stopped_unix_ns,
+                )
                 with self._lock:
                     self._message = (
                         "Base is stopped; fresh close-range perception, IK, "
                         "planning, and grasp started."
                     )
+                threading.Thread(
+                    target=self._watch_mobile_handoff,
+                    kwargs={
+                        "handoff_boundary_unix_ns": base_stopped_unix_ns,
+                        "cancel": cancel,
+                    },
+                    name="z-manip-mobile-handoff-result",
+                    daemon=True,
+                ).start()
             else:
                 self._set_workflow(
                     active=False,
@@ -1852,6 +1876,54 @@ class DepthServoRunner:
             self._set_workflow(active=False, phase=terminal_phase, failure=None)
             with self._lock:
                 self._message = "Visual approach stopped at the manipulation handoff."
+
+    def _watch_mobile_handoff(
+        self,
+        *,
+        handoff_boundary_unix_ns: int,
+        cancel: threading.Event,
+        timeout_s: float = 600.0,
+    ) -> None:
+        """Mirror a typed asynchronous grasp result into mobile supervision.
+
+        The handoff grasp owns its own worker thread.  Keep this observer
+        strictly passive and bounded: it never emits motion or automatically
+        retries.  A far target is exposed as an operator-recoverable approach
+        disposition instead of a terminal IK/planning failure, while all
+        unknown failures retain their original fail-closed behavior.
+        """
+
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+        while not cancel.is_set() and time.monotonic() < deadline:
+            grasp = self._grasp_runner.status()
+            if grasp.get("running") is True:
+                time.sleep(0.05)
+                continue
+            with self._lock:
+                same_handoff = (
+                    self._workflow.get("handoff_boundary_unix_ns")
+                    == handoff_boundary_unix_ns
+                )
+            if not same_handoff:
+                return
+            if (
+                grasp.get("phase") == "needs_base_approach"
+                and grasp.get("planning_disposition") == "NEED_BASE_APPROACH"
+                and grasp.get("outcome") == "recoverable"
+            ):
+                self._set_workflow(
+                    active=False,
+                    phase="needs_base_approach",
+                    failure=None,
+                    planning_disposition="NEED_BASE_APPROACH",
+                    recovery_action="approach_only",
+                )
+                with self._lock:
+                    self._message = (
+                        "Fresh handoff geometry is still outside arm reach; "
+                        "resume Approach Only, then retry the close-range handoff."
+                    )
+            return
 
     def _recover_view_with_stationary_base(
         self,
@@ -2933,6 +3005,33 @@ class PiperGraspRunner:
                 time.monotonic() - action_started,
                 6,
             )
+            planning_error = planning.get("error")
+            planning_error_code = (
+                planning_error.get("code")
+                if isinstance(planning_error, dict)
+                else None
+            )
+            if (
+                planning.get("status") != "succeeded"
+                and planning_error_code == "NEED_BASE_APPROACH"
+            ):
+                self._update(
+                    running=False,
+                    state="finished",
+                    phase="needs_base_approach",
+                    outcome="recoverable",
+                    planning_disposition="NEED_BASE_APPROACH",
+                    recovery_action="approach_only",
+                    retryable=True,
+                    finished_unix_ns=time.time_ns(),
+                    timings_s=dict(timings),
+                    message=(
+                        "Fresh close-range capture is still outside the arm "
+                        "handoff workspace; no execution was started. Resume "
+                        "base Approach Only and retry the handoff."
+                    ),
+                )
+                return
             report, archive = self._planning_artifacts(planning)
             planning_session_id = validate_session_id(planning.get("session_id"))
             self._update(
