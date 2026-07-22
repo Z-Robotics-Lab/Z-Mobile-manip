@@ -40,6 +40,10 @@ from z_manip.perception.rgbd import (
     filter_object_cloud,
     target_exclusion_mask,
 )
+from z_manip.perception.tracked_reuse import (
+    TrackingReuseContract,
+    parse_tracking_reuse_contract,
+)
 from z_manip.verification.passive_capture import validate_passive_capture
 
 
@@ -107,6 +111,15 @@ def main() -> int:
             "instruction hash exactly matches this request"
         ),
     )
+    parser.add_argument(
+        "--tracking-reuse-probe-timeout",
+        type=float,
+        default=0.05,
+        help=(
+            "bounded wait for the transient-local exact tracker identity; "
+            "returns immediately after a matching or mismatching status"
+        ),
+    )
     parser.add_argument("--learned-endpoint", default="")
     parser.add_argument("--soak-duration", type=float, default=0.0)
     parser.add_argument("--max-recoveries", type=int, default=0)
@@ -157,6 +170,7 @@ def main() -> int:
         or args.min_bundle_target_points < 40
         or args.max_recoveries < 0
         or args.recovery_timeout <= 5.0
+        or not 0.0 <= args.tracking_reuse_probe_timeout <= 0.25
         or not math.isfinite(args.max_observed_result_lag)
         or args.max_observed_result_lag <= 0.0
         or not 1.0 <= args.fallback_contact_angle_deg <= 89.0
@@ -167,7 +181,8 @@ def main() -> int:
             "instruction must be non-empty; timeouts must exceed 5 s; "
             "minimum bundle target points must be at least 40; "
             "max recoveries must be non-negative; observed result lag must be "
-            "positive; fallback contact angle must be in [1, 89] degrees; "
+            "positive; tracking reuse probe timeout must be in [0, 0.25] s; "
+            "fallback contact angle must be in [1, 89] degrees; "
             "and target exclusion radius must be positive"
         )
     if (args.passive_window is None) != (args.selected_passive_window is None):
@@ -200,6 +215,9 @@ def main() -> int:
     instruction_sha256 = hashlib.sha256(instruction.encode("utf-8")).hexdigest()
     matching_tracking_request_id = ""
     matching_tracking_valid = False
+    tracking_status_observed = False
+    reuse_contract: TrackingReuseContract | None = None
+    rejected_reuse_bundle_stamps: set[int] = set()
     accepted_source_request_id = ""
     reused_source_request_id = ""
 
@@ -239,30 +257,37 @@ def main() -> int:
     def status_callback(message: DiagnosticArray) -> None:
         nonlocal perception_failure
         nonlocal matching_tracking_request_id, matching_tracking_valid
+        nonlocal tracking_status_observed, reuse_contract
         message_counts["status"] += 1
         for status in message.status:
             values = {item.key: item.value for item in status.values}
             if values.get("schema") != "z_manip.perception_status.v1":
                 continue
+            tracking_status_observed = True
             status_request_id = values.get("request_id", "")
-            instruction_matches = (
-                values.get("instruction_sha256") == instruction_sha256
+            candidate_contract = parse_tracking_reuse_contract(
+                values,
+                expected_instruction_sha256=instruction_sha256,
             )
-            matching_tracking_valid = bool(
-                instruction_matches and values.get("valid") == "true"
-            )
+            if reused_source_request_id:
+                if (
+                    candidate_contract is None
+                    or reuse_contract is None
+                    or not reuse_contract.same_identity(candidate_contract)
+                ):
+                    matching_tracking_valid = False
+                    matching_tracking_request_id = ""
+                    perception_failure = (
+                        "tracker_identity_changed: the exact reused producer, "
+                        "request, generation, track, or frame is no longer active"
+                    )
+                    continue
+            matching_tracking_valid = candidate_contract is not None
             matching_tracking_request_id = (
                 status_request_id if matching_tracking_valid else ""
             )
-            if reused_source_request_id and (
-                status_request_id != reused_source_request_id
-                or not matching_tracking_valid
-            ):
-                perception_failure = (
-                    "tracker_identity_changed: the exact reused instruction "
-                    "is no longer the active valid tracking contract"
-                )
-                continue
+            if candidate_contract is not None and not reused_source_request_id:
+                reuse_contract = candidate_contract
             failure = values.get("failure", "").strip()
             failure_matches = status_request_id == request_id or (
                 accepted_source_request_id
@@ -359,18 +384,29 @@ def main() -> int:
     deadline = started + args.timeout
     grounding_reused = False
     if args.reuse_valid_tracking:
-        # Status is transient-local, so a late-joining warm runner receives the
-        # current instruction hash immediately.  A single short discovery spin
-        # is enough; mismatches publish fresh grounding without a fixed 200 ms
-        # delay on every first request.
+        # Subscriber discovery above already spins this status subscription.
+        # Drain at most the existing 50 ms budget and return immediately after
+        # the first authoritative status, so the fresh path is never lengthened.
         reuse_probe_started = time.monotonic()
-        reuse_deadline = min(deadline, started + 0.05)
+        reuse_deadline = min(
+            deadline,
+            reuse_probe_started + args.tracking_reuse_probe_timeout,
+        )
         while time.monotonic() < reuse_deadline:
-            rclpy.spin_once(node, timeout_sec=0.05)
-            if matching_tracking_valid and matching_tracking_request_id:
+            rclpy.spin_once(node, timeout_sec=0.025)
+            if (
+                matching_tracking_valid
+                and matching_tracking_request_id
+                and reuse_contract is not None
+            ):
                 grounding_reused = True
                 accepted_source_request_id = matching_tracking_request_id
                 reused_source_request_id = matching_tracking_request_id
+                break
+            if tracking_status_observed:
+                # The active identity is known and is not this exact target.
+                # Publish fresh grounding immediately rather than waiting out
+                # the probe budget.
                 break
         stage_timings["tracking_reuse_probe_s"] = round(
             time.monotonic() - reuse_probe_started,
@@ -406,6 +442,16 @@ def main() -> int:
             if common:
                 supported = []
                 for stamp in common:
+                    if grounding_reused:
+                        assert reuse_contract is not None
+                        cloud_frame_id = str(clouds[stamp].header.frame_id)
+                        if not reuse_contract.accepts_bundle(
+                            manifests[stamp],
+                            stamp_ns=stamp,
+                            frame_id=cloud_frame_id,
+                        ):
+                            rejected_reuse_bundle_stamps.add(stamp)
+                            continue
                     point_count = int(
                         getattr(clouds[stamp], "width", 0)
                         * getattr(clouds[stamp], "height", 1)
@@ -466,6 +512,7 @@ def main() -> int:
             "request_id": request_id,
             "source_grounding_request_id": accepted_source_request_id,
             "grounding_reused": grounding_reused,
+            "rejected_reuse_bundles": len(rejected_reuse_bundle_stamps),
             "instruction": instruction,
             "elapsed_s": round(time.monotonic() - started, 3),
             "stage": "perception_bundle",
@@ -746,6 +793,7 @@ def main() -> int:
         "request_id": request_id,
         "source_grounding_request_id": accepted_source_request_id,
         "grounding_reused": grounding_reused,
+        "rejected_reuse_bundles": len(rejected_reuse_bundle_stamps),
         "instruction": instruction,
         "elapsed_s": round(time.monotonic() - started, 3),
         "frame": candidates.frame if candidates is not None else cloud_message.header.frame_id,
