@@ -299,14 +299,41 @@ def run_trial(
     )
     gate = _load_json(gate_path)
     if gate_timeout or gate_rc != 0 or not gate or gate.get("planning_ready") is not True:
+        target_range_m = None
+        if isinstance(gate, dict):
+            handoff_workspace = gate.get("handoff_workspace")
+            if isinstance(handoff_workspace, dict):
+                value = handoff_workspace.get("target_range_m")
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    target_range_m = round(float(value), 6)
+            if target_range_m is None:
+                target_range_m = target_base_range_m(artifacts, gate)
+        handoff_eligible = (
+            target_range_m <= options.handoff_reach_m
+            if target_range_m is not None
+            else None
+        )
+        gate_errors = (gate or {}).get("errors", [])
+        error_codes = {
+            str(item.get("code"))
+            for item in gate_errors
+            if isinstance(item, dict)
+        }
+        status = (
+            "needs_base_approach"
+            if "NEED_BASE_APPROACH" in error_codes
+            else "gate_blocked"
+        )
         return {
             **session,
-            "status": "gate_blocked",
+            "status": status,
             "gate_return_code": gate_rc,
             "gate_timeout": gate_timeout,
             "gate_wall_s": round(gate_wall_s, 6),
             "total_wall_s": round(time.perf_counter() - total_started, 6),
-            "gate_errors": (gate or {}).get("errors", []),
+            "target_base_range_m": target_range_m,
+            "handoff_eligible": handoff_eligible,
+            "gate_errors": gate_errors,
             "rejection_stages": {},
         }
     command = planner_command(

@@ -175,6 +175,40 @@ def test_handoff_summary_separates_far_perception_from_close_planning():
     assert summary["handoff"]["planner_wall_s"]["p95"] == 2.2
 
 
+def test_gate_blocked_far_target_is_reported_as_needing_base_approach(tmp_path):
+    artifacts = tmp_path / "perception"
+    artifacts.mkdir()
+    np.save(artifacts / "target_points.npy", [[1.1, 0.0, 0.0]])
+    output = tmp_path / "output"
+    output.mkdir()
+    options = _options(tmp_path)
+
+    def fake_runner(argv, _timeout_s, _log_path):
+        destination = Path(argv[argv.index("--output") + 1])
+        destination.write_text(json.dumps({
+            "planning_ready": False,
+            "base_from_camera": np.eye(4).tolist(),
+            "handoff_workspace": {
+                "target_range_m": 1.1,
+                "planning_allowed": False,
+                "state": "NEED_BASE_APPROACH",
+            },
+            "errors": [{"code": "NEED_BASE_APPROACH"}],
+        }), encoding="utf-8")
+        return 1, 0.05, False
+
+    trial = BENCH.run_trial(
+        {"session_id": "far", "artifacts": str(artifacts)},
+        output,
+        options,
+        runner=fake_runner,
+    )
+
+    assert trial["status"] == "needs_base_approach"
+    assert trial["target_base_range_m"] == 1.1
+    assert trial["handoff_eligible"] is False
+
+
 def test_thresholds_compare_against_baseline():
     current = {
         "success_rate": 0.7,
