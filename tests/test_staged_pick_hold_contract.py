@@ -79,6 +79,29 @@ def write_workflow(
     return path
 
 
+def test_executor_start_receipt_is_bound_and_pre_motion(tmp_path):
+    receipt_dir = tmp_path / "receipts"
+    receipt_dir.mkdir()
+
+    document = EXECUTOR._write_executor_start_receipt(
+        receipt_dir,
+        artifact=artifact(),
+        workflow_phase="full",
+        planning_session_id=SESSION_ID,
+        started_unix_ns=1_800_000_000_000_000_000,
+        started_monotonic_ns=987_654_321,
+    )
+
+    persisted = json.loads(
+        (receipt_dir / "executor-start-receipt.json").read_text(encoding="utf-8"),
+    )
+    assert persisted == document
+    assert document["artifact_id"] == ARTIFACT_ID
+    assert document["transport_opened"] is True
+    assert document["commands_sent"] == 0
+    assert document["motion_started"] is False
+
+
 def patch_paths(monkeypatch, events: list[tuple[str, np.ndarray]]):
     # Holding feedback has its own focused executor tests. Keep this contract
     # test concerned with which already-checked paths a continuation executes.

@@ -148,17 +148,30 @@ def main() -> int:
             executed = run([*ssh, remote_shell], timeout=420.0)
             if executed.stdout:
                 print(executed.stdout, end="" if executed.stdout.endswith("\n") else "\n")
+            # Preserve executor-start evidence even when a later motion stage
+            # blocks.  Do not manufacture a local receipt directory when the
+            # NUC never opened the real transport.
+            start_receipt = f"{remote_receipts}/executor-start-receipt.json"
+            started = run(
+                [*ssh, f"test -f {shlex.quote(start_receipt)}"],
+                timeout=10.0,
+            )
+            if started.returncode == 0:
+                args.receipt_dir.parent.mkdir(parents=True, exist_ok=True)
+                args.receipt_dir.mkdir(mode=0o700)
+                fetched = run([
+                    *scp,
+                    f"{NUC_HOST}:{remote_receipts}/*.json",
+                    f"{args.receipt_dir}/",
+                ], timeout=20.0)
+                if fetched.returncode != 0:
+                    raise RuntimeError(
+                        f"cannot fetch full-grasp receipts: {fetched.stdout.strip()}",
+                    )
             if executed.returncode != 0:
                 raise RuntimeError(f"NUC full grasp stopped safely (exit {executed.returncode})")
-            args.receipt_dir.parent.mkdir(parents=True, exist_ok=True)
-            args.receipt_dir.mkdir(mode=0o700)
-            fetched = run([
-                *scp,
-                f"{NUC_HOST}:{remote_receipts}/*.json",
-                f"{args.receipt_dir}/",
-            ], timeout=20.0)
-            if fetched.returncode != 0:
-                raise RuntimeError(f"cannot fetch full-grasp receipts: {fetched.stdout.strip()}")
+            if started.returncode != 0:
+                raise RuntimeError("NUC executor succeeded without transport-start evidence")
             print(json.dumps({
                 "schema": "z_manip.piper_full_grasp_remote.v1",
                 "success": True,

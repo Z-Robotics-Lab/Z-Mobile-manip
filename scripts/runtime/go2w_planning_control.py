@@ -1652,6 +1652,7 @@ class DepthServoRunner:
         }
         handoff_in_progress = workflow_phase in {
             "handoff_to_grasp",
+            "grasp_preparing",
             "grasp_started",
         }
         return {
@@ -1760,7 +1761,7 @@ class DepthServoRunner:
             if (
                 self._process_running_locked()
                 or self._workflow.get("active") is True
-                or workflow_phase in {"handoff_to_grasp", "grasp_started"}
+                or workflow_phase in {"handoff_to_grasp", "grasp_preparing", "grasp_started"}
                 or grasp_running
             ):
                 return {
@@ -1862,6 +1863,7 @@ class DepthServoRunner:
         """Latch zero base motion before starting the fresh grasp transaction."""
 
         self._terminate_process(process, keep_status=True)
+        base_stopped_monotonic_ns = time.monotonic_ns()
         base_stopped_unix_ns = time.time_ns()
         with self._lock:
             auto_handoff = self._workflow.get("auto_handoff") is True
@@ -1885,20 +1887,22 @@ class DepthServoRunner:
                 speed,
                 superseded_perception_session_id=superseded_session_id,
                 base_stopped_unix_ns=base_stopped_unix_ns,
+                base_stopped_monotonic_ns=base_stopped_monotonic_ns,
             )
             if result.get("started"):
                 self._set_workflow(
                     active=False,
-                    phase="grasp_started",
+                    phase="grasp_preparing",
                     failure=None,
                     planning_disposition=None,
                     recovery_action=None,
                     handoff_boundary_unix_ns=base_stopped_unix_ns,
+                    handoff_boundary_monotonic_ns=base_stopped_monotonic_ns,
                 )
                 with self._lock:
                     self._message = (
                         "Base is stopped; fresh close-range perception, IK, "
-                        "planning, and grasp started."
+                        "planning, and executor verification started."
                     )
                 threading.Thread(
                     target=self._watch_mobile_handoff,
@@ -2617,6 +2621,7 @@ class PiperGraspRunner:
         *,
         superseded_perception_session_id: str | None = None,
         base_stopped_unix_ns: int,
+        base_stopped_monotonic_ns: int,
     ) -> dict[str, Any]:
         """Capture, plan, and execute from the measured close-range arm pose.
 
@@ -2668,6 +2673,19 @@ class PiperGraspRunner:
                 },
                 "grasp": self.status(),
             }
+        if (
+            isinstance(base_stopped_monotonic_ns, bool)
+            or not isinstance(base_stopped_monotonic_ns, int)
+            or base_stopped_monotonic_ns <= 0
+        ):
+            return {
+                "started": False,
+                "error": {
+                    "code": "INVALID_HANDOFF_MONOTONIC_BOUNDARY",
+                    "message": "mobile handoff requires the stopped-base monotonic timestamp",
+                },
+                "grasp": self.status(),
+            }
         with self._lock:
             if self._status["running"]:
                 return {"started": False, "grasp": dict(self._status)}
@@ -2689,6 +2707,7 @@ class PiperGraspRunner:
                 "speed_percent": speed_percent,
                 "superseded_perception_session_id": superseded_perception_session_id,
                 "base_stopped_unix_ns": base_stopped_unix_ns,
+                "base_stopped_monotonic_ns": base_stopped_monotonic_ns,
                 "revision": int(self._status["revision"]) + 1,
                 "started_unix_ns": time.time_ns(),
                 "finished_unix_ns": None,
@@ -2704,6 +2723,7 @@ class PiperGraspRunner:
                 speed_percent,
                 superseded_perception_session_id,
                 base_stopped_unix_ns,
+                base_stopped_monotonic_ns,
             ),
             name="z-manip-piper-mobile-handoff-grasp",
             daemon=True,
@@ -2993,7 +3013,7 @@ class PiperGraspRunner:
         archive: Path,
         receipt_dir: Path,
         speed_percent: int,
-    ) -> None:
+    ) -> dict[str, Any]:
         arguments = [
             str(self.script),
             "--planning-report", str(report),
@@ -3012,8 +3032,37 @@ class PiperGraspRunner:
                 shell=False,
                 timeout=430.0,
             )
+        start_receipt_path = receipt_dir / "executor-start-receipt.json"
+        start_receipt = self._validate_executor_start_receipt(start_receipt_path)
         if completed.returncode != 0 or not (receipt_dir / "lift-receipt.json").is_file():
             raise RuntimeError(f"full grasp stopped safely; inspect {self.log_path}")
+        return start_receipt
+
+    @classmethod
+    def _validate_executor_start_receipt(cls, path: Path) -> dict[str, Any]:
+        """Validate proof produced after real transport open and before motion."""
+
+        document = cls._read_handoff_json(path)
+        artifact_id = document.get("artifact_id")
+        if (
+            document.get("schema") != "z_manip.piper_executor_start_receipt.v1"
+            or document.get("event") != "transport_opened"
+            or document.get("transport") != "piper_can"
+            or document.get("transport_opened") is not True
+            or document.get("commands_sent") != 0
+            or document.get("motion_started") is not False
+            or not isinstance(artifact_id, str)
+            or len(artifact_id) != 64
+            or any(character not in "0123456789abcdef" for character in artifact_id)
+        ):
+            raise RuntimeError("executor-start receipt failed identity/zero-command checks")
+        for name in ("executor_started_unix_ns", "executor_started_monotonic_ns"):
+            value = document.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise RuntimeError(f"executor-start receipt omitted {name}")
+        if document.get("monotonic_clock_domain") != "nuc_piper_executor_process":
+            raise RuntimeError("executor-start receipt has an unknown monotonic clock domain")
+        return document
 
     @staticmethod
     def _read_handoff_json(path: Path) -> dict[str, Any]:
@@ -3158,11 +3207,23 @@ class PiperGraspRunner:
         speed_percent: int,
         superseded_perception_session_id: str | None,
         base_stopped_unix_ns: int,
+        base_stopped_monotonic_ns: int | None = None,
     ) -> None:
         """Run a fresh close-range transaction without commanding Home first."""
 
         action_dir = self.receipt_root / f"mobile-handoff-grasp-{time.time_ns()}"
         action_started = time.monotonic()
+        if base_stopped_monotonic_ns is None:
+            # Backward-compatible direct/offline callers cannot establish the
+            # exact stop edge; mark the worker boundary instead.  The live
+            # DepthServoRunner always supplies the exact monotonic stop stamp.
+            base_stopped_monotonic_ns = time.monotonic_ns()
+        lifecycle: dict[str, Any] = {
+            "schema": "z_manip.mobile_handoff_lifecycle.v1",
+            "base_stopped_unix_ns": base_stopped_unix_ns,
+            "base_stopped_monotonic_ns": base_stopped_monotonic_ns,
+            "host_monotonic_clock_domain": "pc_planning_control_process",
+        }
         timings: dict[str, float] = {}
         try:
             self.log_path.write_text(
@@ -3184,6 +3245,10 @@ class PiperGraspRunner:
                 ),
             )
             parallel_started = time.monotonic()
+            lifecycle.update({
+                "perception_started_unix_ns": time.time_ns(),
+                "perception_started_monotonic_ns": time.monotonic_ns(),
+            })
 
             def wait_for_joints() -> tuple[dict[str, Any], float]:
                 started = time.monotonic()
@@ -3214,6 +3279,10 @@ class PiperGraspRunner:
                 time.monotonic() - parallel_started,
                 6,
             )
+            lifecycle.update({
+                "perception_finished_unix_ns": time.time_ns(),
+                "perception_finished_monotonic_ns": time.monotonic_ns(),
+            })
             if perception.get("status") != "succeeded":
                 error = perception.get("error")
                 detail = error.get("message") if isinstance(error, dict) else None
@@ -3238,6 +3307,7 @@ class PiperGraspRunner:
                 fresh_perception_session_id=fresh_perception_session_id,
                 handoff_joint_evidence=joint_evidence,
                 handoff_capture_evidence=capture_evidence,
+                handoff_lifecycle=dict(lifecycle),
                 timings_s=dict(timings),
                 message=(
                     "Generating new close-range grasp poses and planning from "
@@ -3245,7 +3315,15 @@ class PiperGraspRunner:
                 ),
             )
             phase_started = time.monotonic()
+            lifecycle.update({
+                "planning_started_unix_ns": time.time_ns(),
+                "planning_started_monotonic_ns": time.monotonic_ns(),
+            })
             planning = self.session_service.start_planning()
+            lifecycle.update({
+                "planning_finished_unix_ns": time.time_ns(),
+                "planning_finished_monotonic_ns": time.monotonic_ns(),
+            })
             timings["handoff_planning"] = round(
                 time.monotonic() - phase_started,
                 6,
@@ -3273,6 +3351,7 @@ class PiperGraspRunner:
                     recovery_action="approach_only",
                     retryable=True,
                     finished_unix_ns=time.time_ns(),
+                    handoff_lifecycle=dict(lifecycle),
                     timings_s=dict(timings),
                     message=(
                         "Fresh close-range capture is still outside the arm "
@@ -3286,18 +3365,32 @@ class PiperGraspRunner:
             self._update(
                 phase="handoff_execute",
                 planning_session_id=planning_session_id,
+                handoff_lifecycle=dict(lifecycle),
                 timings_s=dict(timings),
                 message=(
                     f"Executing the fresh close-range receipt-bound plan at "
                     f"{speed_percent}%."
                 ),
             )
-            self._run_full(
+            executor_start = self._run_full(
                 report=report,
                 archive=archive,
                 receipt_dir=action_dir,
                 speed_percent=speed_percent,
             )
+            lifecycle.update({
+                "executor_transport_started_unix_ns": executor_start[
+                    "executor_started_unix_ns"
+                ],
+                "executor_transport_started_monotonic_ns": executor_start[
+                    "executor_started_monotonic_ns"
+                ],
+                "executor_monotonic_clock_domain": executor_start[
+                    "monotonic_clock_domain"
+                ],
+                "executor_transport_opened": True,
+                "executor_commands_sent_at_start": 0,
+            })
             self.session_service.clear_current_context()
             self._update(
                 running=False,
@@ -3306,6 +3399,7 @@ class PiperGraspRunner:
                 outcome="passed",
                 finished_unix_ns=time.time_ns(),
                 receipt_dir=str(action_dir),
+                handoff_lifecycle=dict(lifecycle),
                 timings_s=dict(timings),
                 message=(
                     "Fresh mobile-handoff grasp executed; object placed back "
@@ -3313,11 +3407,35 @@ class PiperGraspRunner:
                 ),
             )
         except Exception as error:  # pragma: no cover - hardware boundary
+            start_receipt_path = action_dir / "executor-start-receipt.json"
+            if start_receipt_path.is_file() and not start_receipt_path.is_symlink():
+                try:
+                    executor_start = self._validate_executor_start_receipt(
+                        start_receipt_path,
+                    )
+                    lifecycle.update({
+                        "executor_transport_started_unix_ns": executor_start[
+                            "executor_started_unix_ns"
+                        ],
+                        "executor_transport_started_monotonic_ns": executor_start[
+                            "executor_started_monotonic_ns"
+                        ],
+                        "executor_monotonic_clock_domain": executor_start[
+                            "monotonic_clock_domain"
+                        ],
+                        "executor_transport_opened": True,
+                        "executor_commands_sent_at_start": 0,
+                    })
+                except RuntimeError:
+                    # Invalid evidence remains invalid; the original failure is
+                    # retained and no executor-start claim is surfaced.
+                    pass
             self._update(
                 running=False,
                 state="finished",
                 outcome="blocked",
                 finished_unix_ns=time.time_ns(),
+                handoff_lifecycle=dict(lifecycle),
                 timings_s={
                     **timings,
                     "pre_execution_total": round(

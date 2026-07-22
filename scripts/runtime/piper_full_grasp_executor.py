@@ -31,6 +31,43 @@ MAX_CONTINUATION_AGE_S = 12 * 60 * 60.0
 WORKFLOW_PHASES = ("full", "pick-hold", "return-home-holding", "place-back")
 
 
+def _write_executor_start_receipt(
+    receipt_dir: Path,
+    *,
+    artifact: stage_executor.PlanningArtifact,
+    workflow_phase: str,
+    planning_session_id: str,
+    started_unix_ns: int,
+    started_monotonic_ns: int,
+) -> dict[str, object]:
+    """Persist proof that the real PiPER transport opened, before motion.
+
+    This receipt is deliberately written only after ``connect_real_arm`` has
+    returned successfully.  Starting the SSH wrapper or its worker thread is
+    not executor-start evidence.
+    """
+
+    document: dict[str, object] = {
+        "schema": "z_manip.piper_executor_start_receipt.v1",
+        "event": "transport_opened",
+        "artifact_id": artifact.artifact_id,
+        "workflow_phase": workflow_phase,
+        "planning_session_id": planning_session_id,
+        "executor_started_unix_ns": started_unix_ns,
+        "executor_started_monotonic_ns": started_monotonic_ns,
+        "monotonic_clock_domain": "nuc_piper_executor_process",
+        "transport": "piper_can",
+        "transport_opened": True,
+        "commands_sent": 0,
+        "motion_started": False,
+    }
+    stage_executor.atomic_write_json(
+        receipt_dir / "executor-start-receipt.json",
+        document,
+    )
+    return document
+
+
 def full_token(artifact_id: str) -> str:
     artifact_id = stage_executor._require_sha256(artifact_id, "artifact_id")
     return f"PIPER-FULL-{artifact_id[:16]}"
@@ -184,10 +221,21 @@ def execute_full_grasp(
     segment_timeout_s: float,
     gripper_force_n: float,
     lift_hold_s: float,
+    executor_start: tuple[int, int] | None = None,
+    planning_session_id: str = "",
 ) -> dict[str, object]:
     """Run the complete pick, visible lift, place-back and checked return."""
 
     receipt_dir.mkdir(parents=True, exist_ok=False)
+    if executor_start is not None:
+        _write_executor_start_receipt(
+            receipt_dir,
+            artifact=artifact,
+            workflow_phase="full",
+            planning_session_id=planning_session_id,
+            started_unix_ns=executor_start[0],
+            started_monotonic_ns=executor_start[1],
+        )
     pregrasp_path = stage_executor.validate_stage_context(
         artifact,
         "pregrasp",
@@ -357,10 +405,20 @@ def execute_workflow_phase(
     speed_percent: int,
     segment_timeout_s: float,
     gripper_force_n: float,
+    executor_start: tuple[int, int] | None = None,
 ) -> dict[str, object]:
     """Execute one durable pick/hold/return/place-back workflow transition."""
     if workflow_phase == "pick-hold":
         receipt_dir.mkdir(parents=True, exist_ok=False)
+        if executor_start is not None:
+            _write_executor_start_receipt(
+                receipt_dir,
+                artifact=artifact,
+                workflow_phase=workflow_phase,
+                planning_session_id=planning_session_id,
+                started_unix_ns=executor_start[0],
+                started_monotonic_ns=executor_start[1],
+            )
         pregrasp_path = stage_executor.validate_stage_context(artifact, "pregrasp", None)
         started = time.time_ns()
         final, gripper = stage_executor.execute_stage(
@@ -419,6 +477,15 @@ def execute_workflow_phase(
             planning_session_id=planning_session_id,
         )
         receipt_dir.mkdir(parents=True, exist_ok=False)
+        if executor_start is not None:
+            _write_executor_start_receipt(
+                receipt_dir,
+                artifact=artifact,
+                workflow_phase=workflow_phase,
+                planning_session_id=planning_session_id,
+                started_unix_ns=executor_start[0],
+                started_monotonic_ns=executor_start[1],
+            )
         pregrasp_path = stage_executor.validate_stage_context(artifact, "pregrasp", None)
         approach_path = np.asarray(artifact.arrays["approach_raw"], dtype=float)
         timed_lift, lift_times_s = stage_executor.timed_stage_path(artifact, "lift")
@@ -594,6 +661,10 @@ def main() -> int:
         robot = None
         try:
             robot, effector = stage_executor.connect_real_arm(args.channel, args.firmware)
+            # Both clocks are sampled at the first trustworthy real-executor
+            # boundary: the CAN transport has opened, but no stage command has
+            # yet been emitted.
+            executor_start = (time.time_ns(), time.monotonic_ns())
             if args.workflow_phase == "full":
                 result = execute_full_grasp(
                     robot, effector, artifact, receipt_dir=args.receipt_dir,
@@ -601,6 +672,8 @@ def main() -> int:
                     segment_timeout_s=args.segment_timeout_s,
                     gripper_force_n=args.gripper_force_n,
                     lift_hold_s=args.lift_hold_s,
+                    executor_start=executor_start,
+                    planning_session_id=args.planning_session_id or "",
                 )
             else:
                 result = execute_workflow_phase(
@@ -611,6 +684,7 @@ def main() -> int:
                     speed_percent=args.speed_percent,
                     segment_timeout_s=args.segment_timeout_s,
                     gripper_force_n=args.gripper_force_n,
+                    executor_start=executor_start,
                 )
             print(json.dumps(result, indent=2))
             return 0

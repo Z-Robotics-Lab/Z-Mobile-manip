@@ -57,6 +57,23 @@ The current bag has five paired stop/perception/planning transactions but
 **0/5 complete evidence chains**. All recorded plans in those transactions
 were blocked and there is no grasp-start timestamp.
 
+## Evidence added for the next live capture
+
+The runtime now records `handoff_lifecycle` with host unix and monotonic stamps
+for base stop, fresh perception start/finish, and planning start/finish.  The
+NUC executor writes `executor-start-receipt.json` only after the real PiPER CAN
+transport opens and before the first motion command.  That receipt binds the
+planning artifact, identifies its separate NUC monotonic clock domain, and
+requires `commands_sent == 0` plus `motion_started == false`.
+
+Launching a PC worker, SSH process, or NUC Python process is not executor-start
+evidence.  Missing or malformed transport evidence blocks the transaction.  A
+later stage failure still copies the start receipt back to the PC so the next
+bag can distinguish dispatch latency, transport-open latency, and motion-stage
+failure without guessing from logs.  Monotonic stamps from the PC and NUC are
+never subtracted from one another; cross-machine elapsed time uses unix stamps
+and must account for host clock synchronization.
+
 ## Reproduce
 
 First create the bounded lifecycle report as documented in

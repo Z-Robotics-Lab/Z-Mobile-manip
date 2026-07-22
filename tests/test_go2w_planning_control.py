@@ -28,6 +28,42 @@ HTML = ROOT / "web" / "debug_dashboard" / "index.html"
 SERVICE = ROOT / "configs" / "z-manip-planning-workbench.service"
 
 
+def _executor_start_evidence() -> dict[str, object]:
+    return {
+        "schema": "z_manip.piper_executor_start_receipt.v1",
+        "event": "transport_opened",
+        "artifact_id": "a" * 64,
+        "executor_started_unix_ns": 1_800_000_001_000_000_000,
+        "executor_started_monotonic_ns": 123_456_789,
+        "monotonic_clock_domain": "nuc_piper_executor_process",
+        "transport": "piper_can",
+        "transport_opened": True,
+        "commands_sent": 0,
+        "motion_started": False,
+    }
+
+
+def test_executor_start_receipt_requires_real_zero_command_transport_evidence(tmp_path):
+    receipt = tmp_path / "executor-start-receipt.json"
+    receipt.write_text(json.dumps(_executor_start_evidence()), encoding="utf-8")
+
+    validated = CONTROL.PiperGraspRunner._validate_executor_start_receipt(receipt)
+
+    assert validated["transport_opened"] is True
+    assert validated["commands_sent"] == 0
+    assert validated["motion_started"] is False
+
+
+def test_executor_start_receipt_fails_closed_for_worker_only_claim(tmp_path):
+    document = _executor_start_evidence()
+    document["transport_opened"] = False
+    receipt = tmp_path / "executor-start-receipt.json"
+    receipt.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="identity/zero-command"):
+        CONTROL.PiperGraspRunner._validate_executor_start_receipt(receipt)
+
+
 def _depth_filter_report() -> dict[str, object]:
     return {
         "method": "motion_adaptive_temporal_median",
@@ -169,6 +205,7 @@ class _FakeGraspRunner:
         self.mobile_handoff_starts = 0
         self.superseded_perception_session_id = None
         self.base_stopped_unix_ns = None
+        self.base_stopped_monotonic_ns = None
 
     def status(self):
         return {
@@ -195,6 +232,7 @@ class _FakeGraspRunner:
         *,
         superseded_perception_session_id=None,
         base_stopped_unix_ns=None,
+        base_stopped_monotonic_ns=None,
     ):
         self.mobile_handoff_starts += 1
         self.starts += 1
@@ -202,6 +240,7 @@ class _FakeGraspRunner:
         self.speed_percent = speed_percent
         self.superseded_perception_session_id = superseded_perception_session_id
         self.base_stopped_unix_ns = base_stopped_unix_ns
+        self.base_stopped_monotonic_ns = base_stopped_monotonic_ns
         if self.running:
             return {"started": False, "grasp": self.status()}
         self.running = True
@@ -907,7 +946,8 @@ def test_depth_servo_server_hands_reached_target_to_grasp(tmp_path):
     assert grasp.target == "charger"
     assert grasp.speed_percent == 17
     assert isinstance(grasp.base_stopped_unix_ns, int)
-    assert runner.status()["workflow"]["phase"] == "grasp_started"
+    assert isinstance(grasp.base_stopped_monotonic_ns, int)
+    assert runner.status()["workflow"]["phase"] == "grasp_preparing"
 
 
 def test_depth_servo_stop_terminates_launcher_process_group(tmp_path):
@@ -966,7 +1006,8 @@ def test_depth_servo_handoff_phases_stop_base_before_fresh_grasp(tmp_path):
         assert isinstance(grasp.base_stopped_unix_ns, int)
         assert runner._process is not None
         assert runner._process.poll() is not None
-        assert runner.status()["workflow"]["phase"] == "grasp_started"
+        assert isinstance(grasp.base_stopped_monotonic_ns, int)
+        assert runner.status()["workflow"]["phase"] == "grasp_preparing"
 
 
 def test_depth_servo_supervisor_accepts_structured_handoff_evidence(tmp_path):
@@ -1537,6 +1578,7 @@ def test_mobile_handoff_invalidates_old_capture_and_plans_from_fresh_session(tmp
 
     def execute(**kwargs):
         events.append(("execute", kwargs["speed_percent"]))
+        return _executor_start_evidence()
 
     runner._run_full = execute
     # No home_runner/_wait_home is installed: a call to either would fail the
@@ -1682,7 +1724,7 @@ def test_mobile_handoff_overlaps_joint_wait_with_fresh_perception(tmp_path):
         tmp_path / "planning_report.json",
         tmp_path / "planned_grasp.npz",
     )
-    runner._run_full = lambda **_kwargs: None
+    runner._run_full = lambda **_kwargs: _executor_start_evidence()
 
     runner._run_mobile_handoff(
         "floor bottle",
