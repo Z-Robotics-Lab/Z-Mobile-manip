@@ -65,20 +65,48 @@ _ZH_COLORS: tuple[tuple[str, str], ...] = (
     ("紫", "purple"),
 )
 
+# YOLOE's open-vocabulary score is noticeably phrase-sensitive even when two
+# phrases name the same physical category.  Keep a deliberately small alias
+# set for categories used by the mobile manipulation stack.  All aliases are
+# semantic equivalents; this is not a broad "object" fallback, so a miss still
+# falls through to the VLM instead of silently changing target identity.
+_EQUIVALENT_PROMPTS: Mapping[str, tuple[str, ...]] = {
+    "charger": ("wall charger", "usb charger", "power adapter", "electrical plug"),
+    "power adapter": ("charger", "wall charger", "usb charger"),
+    "adapter": ("power adapter", "charger", "wall charger"),
+    "electrical plug": ("wall charger", "usb charger", "power adapter"),
+}
 
-def grounding_prompt(instruction: str) -> str | None:
-    """Return one concise English YOLOE class, or None for VLM fallback."""
+
+def grounding_prompts(instruction: str) -> tuple[str, ...]:
+    """Return a bounded set of identity-preserving YOLOE class phrases.
+
+    The first item is the legacy prompt returned by :func:`grounding_prompt`.
+    Extra items only cover strict category synonyms or, for an object described
+    on top of another support, the same category with a ``small`` modifier.
+    Ultralytics evaluates the whole tuple in one forward pass, avoiding a slow
+    provider fallback when a semantically equivalent phrase scores better.
+    """
 
     query = " ".join(str(instruction).strip().lower().split())
     if not query:
-        return None
+        return ()
     noun = next((english for chinese, english in _ZH_NOUNS if chinese in query), None)
     color = next((english for chinese, english in _ZH_COLORS if chinese in query), None)
     if noun is not None:
-        phrase = f"{color} {noun}" if color else noun
-        return phrase
+        primary = f"{color} {noun}" if color else noun
+        prompts = [primary]
+        # Repeating the same noun around a support relation means the requested
+        # target is the smaller item on the support, not the support itself.
+        if ("上" in query or "顶部" in query) and noun in {"box", "block"}:
+            prompts.append(f"small {primary}")
+        for alias in _EQUIVALENT_PROMPTS.get(noun, ()):
+            candidate = f"{color} {alias}" if color else alias
+            if candidate not in prompts:
+                prompts.append(candidate)
+        return tuple(prompts)
     if any("\u4e00" <= character <= "\u9fff" for character in query):
-        return None
+        return ()
     cleaned = re.sub(r"[^a-z0-9\s_-]+", " ", query)
     cleaned = " ".join(cleaned.split())
     cleaned = re.sub(
@@ -87,9 +115,14 @@ def grounding_prompt(instruction: str) -> str | None:
         cleaned,
     )
     cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned)
-    if not cleaned:
-        return None
-    return cleaned
+    return (cleaned,) if cleaned else ()
+
+
+def grounding_prompt(instruction: str) -> str | None:
+    """Return one concise English YOLOE class, or None for VLM fallback."""
+
+    prompts = grounding_prompts(instruction)
+    return prompts[0] if prompts else None
 
 
 def select_detection(
@@ -101,6 +134,7 @@ def select_detection(
     height: int,
     minimum_confidence: float,
     maximum_area_ratio: float,
+    maximum_area_ratio_by_label: Mapping[str, float] | None = None,
     minimum_border_margin_ratio: float = 0.002,
 ) -> dict[str, object] | None:
     """Select the strongest complete, finite, object-scale detection.
@@ -119,6 +153,9 @@ def select_detection(
         raise ValueError("maximum area ratio must be within (0, 1)")
     if not 0.0 <= minimum_border_margin_ratio < 0.5:
         raise ValueError("minimum border margin ratio must be within [0, 0.5)")
+    area_limits = dict(maximum_area_ratio_by_label or {})
+    if any(not 0.0 < limit < 1.0 for limit in area_limits.values()):
+        raise ValueError("per-label maximum area ratios must be within (0, 1)")
     candidates: list[tuple[float, float, dict[str, object]]] = []
     for index, raw_box in enumerate(boxes_xyxy):
         try:
@@ -146,9 +183,6 @@ def select_detection(
             or y2 >= height - border_y
         ):
             continue
-        area_ratio = ((x2 - x1) * (y2 - y1)) / float(width * height)
-        if area_ratio < 0.0002 or area_ratio > maximum_area_ratio:
-            continue
         label = "object"
         try:
             candidate_label = str(labels[index]).strip()
@@ -156,6 +190,10 @@ def select_detection(
                 label = candidate_label
         except (IndexError, TypeError):
             pass
+        area_ratio = ((x2 - x1) * (y2 - y1)) / float(width * height)
+        label_area_limit = min(maximum_area_ratio, area_limits.get(label, maximum_area_ratio))
+        if area_ratio < 0.0002 or area_ratio > label_area_limit:
+            continue
         result = {
             "label": label,
             "bbox_xyxy": [
@@ -246,9 +284,10 @@ class GroundingRuntime:
 
     def ground(self, image_bytes: bytes, instruction: str) -> dict[str, object]:
         request_started = time.perf_counter()
-        prompt = grounding_prompt(instruction)
-        if prompt is None:
+        prompts = grounding_prompts(instruction)
+        if not prompts:
             raise LookupError("instruction has no supported local noun phrase")
+        prompt = prompts[0]
         from PIL import Image
 
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -257,7 +296,7 @@ class GroundingRuntime:
         embedding_cache_hit = False
         with self._lock:
             self.load()
-            requested_classes = (prompt,)
+            requested_classes = prompts
             embedding_cache_hit = self._classes == requested_classes
             if self._classes != requested_classes:
                 embedding, embedding_cache_hit = self._embedding_for(requested_classes)
@@ -300,9 +339,18 @@ class GroundingRuntime:
             height=height,
             minimum_confidence=self.minimum_confidence,
             maximum_area_ratio=self.maximum_area_ratio,
+            maximum_area_ratio_by_label={
+                candidate: min(self.maximum_area_ratio, 0.12)
+                for candidate in prompts
+                if candidate.startswith("small ")
+            },
         )
         if selected is None:
             raise LookupError("local detector produced no qualified object box")
+        # Aliases only improve detector recall.  Preserve the canonical legacy
+        # target label so downstream identity and artifact semantics do not
+        # depend on which equivalent phrase happened to score highest.
+        selected["label"] = prompt
         finished = time.perf_counter()
         return {
             "schema": RESPONSE_SCHEMA,

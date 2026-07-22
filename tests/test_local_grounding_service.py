@@ -34,6 +34,21 @@ def test_grounding_prompt_defers_unknown_chinese_to_remote_vlm():
     assert SERVICE.grounding_prompt("拿起那个东西") is None
 
 
+def test_grounding_prompts_keep_aliases_semantically_bounded():
+    assert SERVICE.grounding_prompts("白色充电器") == (
+        "white charger",
+        "white wall charger",
+        "white usb charger",
+        "white power adapter",
+        "white electrical plug",
+    )
+    assert SERVICE.grounding_prompts("黑色箱子上的黑色盒子") == (
+        "black box",
+        "small black box",
+    )
+    assert SERVICE.grounding_prompts("红色瓶子") == ("red bottle",)
+
+
 def test_select_detection_rejects_broad_support_surface():
     selected = SERVICE.select_detection(
         ((10, 10, 630, 470), (356, 238, 415, 338)),
@@ -65,6 +80,22 @@ def test_select_detection_uses_confidence_before_area_tiebreak():
 
     assert selected is not None
     assert selected["label"] == "target"
+
+
+def test_select_detection_rejects_support_surface_for_small_alias():
+    selected = SERVICE.select_detection(
+        ((150, 80, 510, 280), (356, 238, 415, 338)),
+        (0.84, 0.58),
+        ("small black box", "black box"),
+        width=640,
+        height=480,
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+        maximum_area_ratio_by_label={"small black box": 0.12},
+    )
+
+    assert selected is not None
+    assert selected["label"] == "black box"
 
 
 def test_select_detection_rejects_partial_object_clipped_by_image_border():
@@ -139,6 +170,7 @@ def test_runtime_keeps_dynamic_prompt_inference_fp32():
 
     bottle = runtime.ground(encoded.getvalue(), "bottle")
     assert bottle["prompt"] == "bottle"
+    assert bottle["target"]["label"] == "bottle"
     assert bottle["embedding_cache_hit"] is False
     assert bottle["timings_s"]["total"] == pytest.approx(bottle["latency_s"])
     repeated_bottle = runtime.ground(encoded.getvalue(), "bottle")

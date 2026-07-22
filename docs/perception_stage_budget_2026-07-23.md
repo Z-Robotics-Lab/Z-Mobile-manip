@@ -68,3 +68,39 @@ container remains the compatibility fallback for isolated output paths.
 The resident context also keeps its subscription endpoints discovered between
 requests. It never spins callbacks, caches perception evidence, or publishes;
 each request still owns an isolated node and a fresh exact-bundle transaction.
+
+## Closed-bag grounding decomposition and bounded YOLOE aliases
+
+A second pass over 12 complete fresh request chains in the closed
+`mobile-handoff-tuning` MCAPs further decomposes the first-bundle latency:
+
+| Stage | p50 | p95 | Mean share |
+|---|---:|---:|---:|
+| Request to exact RGB-D seed offer | 0.489 s | 0.656 s | 12.3% |
+| Exact seed offer to tracker `init_bbox` | 3.035 s | 5.083 s | 76.1% |
+| `init_bbox` to first complete frame manifest | 0.422 s | 0.667 s | 11.6% |
+| Request to first complete frame manifest | 3.955 s | 6.159 s | — |
+
+This identifies grounding as the dominant stage rather than image capture,
+EdgeTAM publication, or geometric candidate generation. A network-disabled GPU
+replay of the corresponding 12 seed JPEGs showed warmed YOLOE inference itself
+takes about 8–15 ms, but the former single phrase only qualified 1/12 seeds.
+Misses therefore entered the multi-second provider fallback.
+
+The local grounder now evaluates a deliberately bounded set of strict semantic
+aliases in one YOLOE forward pass. On those same immutable seeds this qualified
+3/12 seeds at the unchanged 0.20 confidence threshold. The two additional
+qualified detections were a white wall charger and a small black box. A
+label-specific 12% image-area ceiling prevents the `small` alias from selecting
+the large support case; the recorded broad false positive is now rejected.
+Unknown Chinese targets and all remaining misses still fall through exactly as
+before. The exact identity and 0.5 s reuse gate, six-artifact bundle contract,
+and downstream outputs are unchanged.
+
+This is a safe reduction in fallback frequency, not evidence that the complete
+two-second target has been met. Eight of the 12 recorded seeds still contain no
+qualified local detection, often because the moving camera did not contain the
+requested object. Lowering confidence to 0.05 and increasing input size to
+960/1280 were tested offline and rejected: both admitted support/gripper/screw
+false positives without reliably recovering the charger. A post-change live
+artifact set is still required to certify end-to-end p50/p95.
