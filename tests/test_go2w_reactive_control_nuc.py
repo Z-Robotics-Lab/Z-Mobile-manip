@@ -201,13 +201,14 @@ def test_posture_commands_require_an_explicit_zero_ack():
     assert "code in (0, None)" not in source
 
 
-def test_euler_capability_starts_unknown_and_fail_closed():
+def test_euler_capability_starts_unknown_and_negotiates_once():
     source = SOURCE.read_text(encoding="utf-8")
 
     assert "self._euler_supported = False" in source
     assert 'self._euler_capability_state = "UNKNOWN"' in source
-    assert 'self._phase = "capability_unknown"' in source
-    assert "Euler capability is UNKNOWN" in source
+    assert 'self._euler_capability_state != "UNKNOWN"' in source
+    assert 'self._phase = "negotiating" if negotiating else "commanding"' in source
+    assert "establish same-epoch capability" in source
 
 
 def test_motion_mode_is_polled_and_mode_epoch_invalidates_pending_work():
@@ -387,3 +388,24 @@ def test_pc_relay_requires_explicit_same_epoch_euler_support():
         }
     )
     assert not bridge.euler_is_available({"capabilities": {"euler": False}})
+
+
+def test_pc_relay_allows_only_known_ai_w_epoch_to_negotiate_euler():
+    bridge = _load_pc_bridge()
+    status = {
+        "capabilities": {"euler": False, "euler_state": "UNKNOWN"},
+        "transport": {
+            "motion_mode": {
+                "robot_code": 0,
+                "name": "ai-w",
+                "api_family": "wheeled_sport",
+            }
+        },
+    }
+
+    assert bridge.euler_negotiation_is_allowed(status)
+    status["capabilities"]["euler_state"] = "UNSUPPORTED_FOR_EPOCH"
+    assert not bridge.euler_negotiation_is_allowed(status)
+    status["capabilities"]["euler_state"] = "UNKNOWN"
+    status["transport"]["motion_mode"]["robot_code"] = 3203
+    assert not bridge.euler_negotiation_is_allowed(status)

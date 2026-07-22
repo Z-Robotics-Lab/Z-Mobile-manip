@@ -124,8 +124,41 @@ def test_existing_intrusion_only_admits_a_step_that_increases_clearance():
     assert escape.selected_attempt is not None
     assert escape.selected_attempt.escaping
     assert escape.selected_attempt.target_margin_m > escape.selected_attempt.current_margin_m
-    assert not deeper.allowed
-    assert np.count_nonzero(deeper.arm_velocity_rps) == 0
+    # The task direction is unsafe, but the selector must not trap an arm that
+    # already starts inside a conservative envelope.  It synthesizes a short
+    # clearance-first recovery instead.
+    assert deeper.allowed
+    assert deeper.strategy.startswith("collision_escape_")
+    assert deeper.selected_attempt is not None
+    assert deeper.selected_attempt.escaping
+    assert deeper.selected_attempt.target_margin_m > deeper.selected_attempt.current_margin_m
+
+
+def test_recorded_submillimetre_mid360_boundary_synthesizes_escape():
+    guard = _guard()
+    current = np.asarray([
+        -0.08126252997285598,
+        0.36140532821046584,
+        -0.01005309649148734,
+        -0.04991641660703782,
+        0.3155206221755349,
+        0.0,
+    ])
+
+    selected = select_collision_safe_arm_step(
+        current_joints=current,
+        primary_arm_velocity=np.zeros(6),
+        horizon_dt_s=0.2,
+        tool_lateral_jacobian=np.zeros(6),
+        guard=guard,
+        candidate_improves_task=lambda _velocity: False,
+    )
+
+    assert selected.allowed
+    assert selected.strategy.startswith("collision_escape_")
+    assert selected.selected_attempt is not None
+    assert selected.selected_attempt.current_margin_m < 0.0
+    assert selected.selected_attempt.target_margin_m > 0.0
 
 
 def test_geometry_safe_candidate_is_rejected_when_task_replay_does_not_improve():

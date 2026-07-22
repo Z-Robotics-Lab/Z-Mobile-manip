@@ -34,11 +34,70 @@ class StepDecisionLike(Protocol):
 
 
 class ArmStepCollisionGuard(Protocol):
+    def check_state(self, joints: object) -> object: ...
+
     def check_step(
         self,
         current_joints: object,
         target_joints: object,
     ) -> StepDecisionLike: ...
+
+
+def _escape_candidates(
+    current: np.ndarray,
+    *,
+    horizon_dt_s: float,
+    guard: ArmStepCollisionGuard,
+    speed_rps: float = 0.10,
+    probe_rad: float = 0.002,
+) -> tuple[tuple[str, str, np.ndarray], ...]:
+    """Return bounded directions that increase fixed-fixture clearance.
+
+    Clearance is a non-smooth minimum over capsule pairs, so a gradient alone
+    can vanish at a pair switch.  Try the normalized finite-difference
+    gradient first, followed by the individual signed joint directions ordered
+    by their predicted clearance.  These candidates are used only when the
+    measured state already lies inside the conservative envelope.
+    """
+
+    check_state = getattr(guard, "check_state", None)
+    if not callable(check_state):
+        return ()
+    try:
+        current_margin = float(check_state(current).minimum_margin_m)
+    except (AttributeError, TypeError, ValueError):
+        return ()
+    if not math.isfinite(current_margin) or current_margin >= 0.0:
+        return ()
+
+    gradient = np.zeros(ARM_DOF)
+    axes: list[tuple[float, str, str, np.ndarray]] = []
+    for index in range(ARM_DOF):
+        plus = current.copy()
+        minus = current.copy()
+        plus[index] += probe_rad
+        minus[index] -= probe_rad
+        try:
+            plus_margin = float(check_state(plus).minimum_margin_m)
+            minus_margin = float(check_state(minus).minimum_margin_m)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(plus_margin) and math.isfinite(minus_margin)):
+            continue
+        gradient[index] = (plus_margin - minus_margin) / (2.0 * probe_rad)
+        for sign, margin in ((1.0, plus_margin), (-1.0, minus_margin)):
+            velocity = np.zeros(ARM_DOF)
+            velocity[index] = sign * speed_rps
+            axes.append((margin, f"collision_escape_joint_{index + 1}", _side(sign), velocity))
+
+    candidates: list[tuple[str, str, np.ndarray]] = []
+    maximum = float(np.max(np.abs(gradient)))
+    if maximum > 1e-12:
+        velocity = speed_rps * gradient / maximum
+        candidates.append(("collision_escape_gradient", "clearance", velocity))
+    for _margin, strategy, side, velocity in sorted(axes, key=lambda item: item[0], reverse=True):
+        candidates.append((strategy, side, velocity))
+    return tuple(candidates)
 
 
 @dataclass(frozen=True)
@@ -174,9 +233,10 @@ def select_collision_safe_arm_step(
     """Choose the first continuous collision-safe, task-improving arm step.
 
     Candidate order deliberately preserves the optimizer's current lateral
-    side first.  No zero-arm fallback is synthesized: if every real candidate
-    is unsafe or fails nonlinear task replay, the caller must return a fully
-    stationary, non-executable command.
+    side first.  If the measured state is already barely inside a conservative
+    fixed-fixture envelope, an explicit monotonic clearance escape is allowed
+    even when it temporarily worsens the visual task.  This prevents a model
+    boundary from trapping the arm while retaining the final collision guard.
     """
 
     current = _vector6(current_joints, label="current joints")
@@ -209,6 +269,42 @@ def select_collision_safe_arm_step(
         )
         attempts.append(attempt)
         if decision.allowed and task_improved:
+            return CollisionGateSelection(
+                allowed=True,
+                strategy=strategy,
+                current_side=current_side,
+                selected_side=side,
+                arm_velocity_rps=velocity.copy(),
+                attempts=tuple(attempts),
+            )
+
+    # A task optimizer cannot be expected to move *away* from its target to
+    # recover clearance.  Once ordinary task-improving candidates fail, try a
+    # short bounded escape and accept it solely on monotonic geometry proof.
+    for strategy, side, velocity in _escape_candidates(
+        current,
+        horizon_dt_s=dt,
+        guard=guard,
+    ):
+        target = current + dt * velocity
+        decision = guard.check_step(current, target)
+        try:
+            task_improved = bool(candidate_improves_task(velocity.copy()))
+        except (RuntimeError, ValueError):
+            task_improved = False
+        attempt = CollisionAttempt(
+            strategy=strategy,
+            side=side,
+            allowed_by_geometry=bool(decision.allowed),
+            task_improved=task_improved,
+            escaping=bool(decision.escaping),
+            reason=str(decision.reason),
+            pair=tuple(str(name) for name in decision.witness.pair),
+            current_margin_m=float(decision.current_margin_m),
+            target_margin_m=float(decision.target_margin_m),
+        )
+        attempts.append(attempt)
+        if decision.allowed and decision.escaping:
             return CollisionGateSelection(
                 allowed=True,
                 strategy=strategy,

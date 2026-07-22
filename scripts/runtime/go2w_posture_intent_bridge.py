@@ -81,6 +81,21 @@ def euler_is_available(document: dict[str, Any]) -> bool:
     )
 
 
+def euler_negotiation_is_allowed(document: dict[str, Any]) -> bool:
+    """Allow one bounded live intent to establish same-epoch Euler evidence."""
+    capabilities = document.get("capabilities")
+    transport = document.get("transport")
+    motion_mode = transport.get("motion_mode") if isinstance(transport, dict) else None
+    return bool(
+        isinstance(capabilities, dict)
+        and capabilities.get("euler_state") == "UNKNOWN"
+        and isinstance(motion_mode, dict)
+        and motion_mode.get("robot_code") == 0
+        and motion_mode.get("name") == "ai-w"
+        and motion_mode.get("api_family") == "wheeled_sport"
+    )
+
+
 def _parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("shadow", "live"), default="shadow")
@@ -167,7 +182,9 @@ def main(args: list[str] | None = None) -> None:
             ):
                 self._publish("blocked", "NUC posture feedback is missing/stale/latched", target=target)
                 return
-            if not euler_is_available(self.nuc_status):
+            available = euler_is_available(self.nuc_status)
+            negotiating = euler_negotiation_is_allowed(self.nuc_status)
+            if not available and not negotiating:
                 self._publish(
                     "degraded",
                     "Euler is not implemented by the active Go2W service; base + arm fallback",
@@ -182,7 +199,15 @@ def main(args: list[str] | None = None) -> None:
             command.twist.angular.y = target[2]
             command.twist.angular.z = target[3]
             self.command_pub.publish(command)
-            self._publish("commanding", "bounded posture target published to NUC owner", target=target)
+            self._publish(
+                "negotiating" if negotiating else "commanding",
+                (
+                    "bounded first Euler request published to establish robot ACK evidence"
+                    if negotiating
+                    else "bounded posture target published to NUC owner"
+                ),
+                target=target,
+            )
 
         def _full_stop(self, _message: Empty) -> None:
             # Full Stop is always forwarded in live mode and never waits for

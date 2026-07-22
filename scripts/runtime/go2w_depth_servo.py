@@ -1298,7 +1298,20 @@ def _run_ros(args: argparse.Namespace) -> int:
                     isinstance(transport, dict)
                     and transport.get("body_enabled") is False
                 ):
-                    return
+                    capabilities = (
+                        self.posture_status.get("capabilities")
+                        if isinstance(self.posture_status, dict)
+                        else None
+                    )
+                    # UNKNOWN is not a permanent denial: forward one bounded
+                    # (normally near-level) target so the NUC's sole WebRTC
+                    # owner can obtain the robot's same-epoch return code.
+                    # Confirmed unsupported/fault states remain blocked.
+                    if not (
+                        isinstance(capabilities, dict)
+                        and capabilities.get("euler_state") == "UNKNOWN"
+                    ):
+                        return
                 roll = self.whole_body_command.body_roll_target_rad
                 target = (roll, self.whole_body_command.body_pitch_target_rad)
             else:

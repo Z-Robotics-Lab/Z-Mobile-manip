@@ -312,6 +312,17 @@ class WholeBodyRuntimeController:
                 result = replayed[
                     tuple(float(item) for item in selection.arm_velocity_rps)
                 ]
+                if selection.selected_attempt is not None and selection.selected_attempt.escaping:
+                    result = replace(
+                        result,
+                        backend="fixed-fixture-collision-escape",
+                        success=True,
+                        reason=(
+                            "temporarily prioritizing a monotonic escape from "
+                            "the fixed-fixture envelope before resuming the view task"
+                        ),
+                        failure_code=None,
+                    )
             else:
                 zero = ReducedWholeBodyVelocity.from_vector(np.zeros(CONTROL_DOF))
                 result = replace(

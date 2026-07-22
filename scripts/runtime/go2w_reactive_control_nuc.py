@@ -785,7 +785,7 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             self._phase = "stopped"
             self._detail = "Full Stop is latched; publish /go2w/control_reset first"
             return
-        if not self._euler_supported:
+        if not self._euler_supported and self._euler_capability_state != "UNKNOWN":
             self._target = target
             self._target_generation = None
             if self._euler_capability_state == "UNSUPPORTED_FOR_EPOCH":
@@ -793,12 +793,6 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 self._detail = (
                     "Euler unavailable on the active Go2W motion service; "
                     "body posture is bypassed and base + arm remain available"
-                )
-            else:
-                self._phase = "capability_unknown"
-                self._detail = (
-                    "Euler capability is UNKNOWN and fail-closed; no posture "
-                    "request was transmitted"
                 )
             return
         fresh, detail = self._fresh_feedback()
@@ -826,8 +820,13 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             if self._posture_active:
                 return
             self._posture_active = True
-        self._phase = "commanding"
-        self._detail = "dispatching Euler; BodyHeight is not a control DOF"
+        negotiating = self._euler_capability_state == "UNKNOWN"
+        self._phase = "negotiating" if negotiating else "commanding"
+        self._detail = (
+            "dispatching one bounded Euler request to establish same-epoch capability"
+            if negotiating
+            else "dispatching Euler; BodyHeight is not a control DOF"
+        )
         asyncio.run_coroutine_threadsafe(self._drain_posture(), self.loop)
 
     async def _drain_posture(self) -> None:
