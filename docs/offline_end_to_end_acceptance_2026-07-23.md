@@ -53,5 +53,4 @@ for this recording.
   the linked perception report, and whose timestamp follows successful plan
   completion inside the bag window.
 - A process launch, log line, or planned trajectory is not executor-start
-  evidence. Missing evidence remains `UNMEASURED`.
-
+evidence. Missing evidence remains `UNMEASURED`.

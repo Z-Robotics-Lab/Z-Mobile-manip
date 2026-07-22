@@ -226,4 +226,3 @@ def test_counterfactual_tracking_never_satisfies_runtime_measurement() -> None:
 
     assert tracked["measurement_status"] == "counterfactual"
     assert tracked["passed"] is None
-
