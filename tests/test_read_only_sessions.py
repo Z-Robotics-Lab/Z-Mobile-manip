@@ -1068,6 +1068,168 @@ def test_planning_warm_runner_uses_read_only_inputs_and_atomic_scratch(
     assert list(scratch_root.iterdir()) == []
 
 
+def test_planning_warm_runner_exit_without_report_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    artifact_root = tmp_path / "artifacts"
+    perception = artifact_root / "sessions" / "capture" / "perception"
+    perception.mkdir(parents=True)
+    (perception / "selected_passive_joint_report.json").write_text(
+        json.dumps(_passive_report()),
+        encoding="utf-8",
+    )
+    output = artifact_root / "sessions" / "planning-attempt"
+    output.mkdir(parents=True)
+    calibration = artifact_root / "calibration.json"
+    calibration.write_text("{}", encoding="utf-8")
+    scratch_root = artifact_root / ".planning-runner-scratch"
+    stale_sibling = scratch_root / "planning-unrelated"
+    stale_sibling.mkdir(parents=True)
+    (stale_sibling / "planning_report.json").write_text(
+        '{"success": true, "old": true}',
+        encoding="utf-8",
+    )
+    log = tmp_path / "planning.log"
+    visualization_calls = []
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(module, "CALIBRATION", calibration)
+    monkeypatch.setattr(module, "PLANNING_RUNNER_SCRATCH_ROOT", scratch_root)
+    monkeypatch.setattr(backend, "_required_planning_files", lambda: ())
+    monkeypatch.setattr(backend, "_planning_runner_running", lambda: True)
+    monkeypatch.setattr(
+        backend,
+        "_build_visualization_bundle",
+        lambda **_kwargs: visualization_calls.append(True),
+    )
+
+    def fake_run(argv, _log_path, *, environment):
+        command = tuple(argv)
+        if str(module.SESSION_GATE) in command:
+            destination = Path(command[command.index("--output") + 1])
+            destination.write_text(json.dumps({
+                "planning_ready": True,
+                "measured_joints_rad": [0.0] * 6,
+                "planning_start_joints_rad": [0.0] * 6,
+            }))
+            return SimpleNamespace(returncode=0)
+        # Simulate inspect succeeding immediately before the runner exits.
+        return SimpleNamespace(returncode=125)
+
+    monkeypatch.setattr(module, "_run_logged", fake_run)
+
+    result = backend.run_planning(
+        perception_dir=perception,
+        output_dir=output,
+        log_path=log,
+    )
+
+    assert result.exit_code == 125
+    assert result.error_code == "PLANNING_RUNNER_OUTPUT_MISSING"
+    assert list((output / "planning").iterdir()) == []
+    assert stale_sibling.is_dir()
+    assert visualization_calls == []
+    assert not any(
+        path.name != stale_sibling.name for path in scratch_root.iterdir()
+    )
+
+
+def test_planning_warm_runner_atomic_promotion_failure_cleans_scratch(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    artifact_root = tmp_path / "artifacts"
+    perception = artifact_root / "sessions" / "capture" / "perception"
+    perception.mkdir(parents=True)
+    (perception / "selected_passive_joint_report.json").write_text(
+        json.dumps(_passive_report()),
+        encoding="utf-8",
+    )
+    output = artifact_root / "sessions" / "planning-attempt"
+    output.mkdir(parents=True)
+    calibration = artifact_root / "calibration.json"
+    calibration.write_text("{}", encoding="utf-8")
+    scratch_root = artifact_root / ".planning-runner-scratch"
+    log = tmp_path / "planning.log"
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(module, "CALIBRATION", calibration)
+    monkeypatch.setattr(module, "PLANNING_RUNNER_SCRATCH_ROOT", scratch_root)
+    monkeypatch.setattr(backend, "_required_planning_files", lambda: ())
+    monkeypatch.setattr(backend, "_planning_runner_running", lambda: True)
+
+    def fake_run(argv, _log_path, *, environment):
+        command = tuple(argv)
+        destination = Path(command[command.index("--output") + 1])
+        if str(module.SESSION_GATE) in command:
+            destination.write_text(json.dumps({
+                "planning_ready": True,
+                "measured_joints_rad": [0.0] * 6,
+                "planning_start_joints_rad": [0.0] * 6,
+            }))
+        else:
+            host_output = scratch_root / destination.name
+            (host_output / "planning_report.json").write_text(
+                '{"success": true}',
+                encoding="utf-8",
+            )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "_run_logged", fake_run)
+    monkeypatch.setattr(
+        module.os,
+        "replace",
+        lambda _source, _destination: (_ for _ in ()).throw(
+            OSError("synthetic cross-device failure"),
+        ),
+    )
+
+    result = backend.run_planning(
+        perception_dir=perception,
+        output_dir=output,
+        log_path=log,
+    )
+
+    assert result.error_code == "PLANNING_RUNNER_OUTPUT_INVALID"
+    assert (output / "planning").is_dir()
+    assert list((output / "planning").iterdir()) == []
+    assert list(scratch_root.iterdir()) == []
+
+
+def test_planning_runner_scratch_cleanup_is_old_prefix_only(tmp_path):
+    module = _integration_module()
+    scratch_root = tmp_path / "scratch"
+    old = scratch_root / "planning-old"
+    fresh = scratch_root / "planning-active"
+    unrelated = scratch_root / "operator-note"
+    old.mkdir(parents=True)
+    fresh.mkdir()
+    unrelated.mkdir()
+    symlink = scratch_root / "planning-link"
+    symlink.symlink_to(old, target_is_directory=True)
+    os.utime(old, (100.0, 100.0))
+    os.utime(fresh, (9_950.0, 9_950.0))
+    os.utime(unrelated, (100.0, 100.0))
+
+    module._cleanup_stale_planning_runner_scratch(
+        scratch_root,
+        now_s=10_000.0,
+        max_age_s=1_000.0,
+    )
+
+    assert not old.exists()
+    assert fresh.is_dir()
+    assert unrelated.is_dir()
+    assert symlink.is_symlink()
+
+
 def test_planning_runner_bringup_keeps_artifacts_read_only():
     source = (
         ROOT / "scripts" / "runtime" / "go2w_perception_lab.sh"

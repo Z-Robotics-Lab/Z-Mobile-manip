@@ -19,6 +19,7 @@ import os
 import pwd
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -80,6 +81,7 @@ PERCEPTION_ATTEMPTS = 2
 MAX_PASSIVE_REPORT_BYTES = 1024 * 1024
 MAX_SESSION_GATE_REPORT_BYTES = 256 * 1024
 MAX_PLANNING_REPORT_BYTES = 4 * 1024 * 1024
+PLANNING_RUNNER_SCRATCH_TTL_S = 24 * 60 * 60
 MAX_PLANNER_ERROR_CHARS = 600
 MAX_PERCEPTION_REPORT_BYTES = 256 * 1024
 MAX_PERCEPTION_ERROR_CHARS = 600
@@ -105,6 +107,87 @@ def _append_timing(log_path: Path, stage: str, elapsed_s: float, **fields: objec
     }
     with log_path.open("ab") as log:
         log.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def _cleanup_stale_planning_runner_scratch(
+    scratch_root: Path,
+    *,
+    now_s: float | None = None,
+    max_age_s: float = PLANNING_RUNNER_SCRATCH_TTL_S,
+) -> None:
+    """Remove only old, server-owned warm-planner scratch directories.
+
+    Every request uses ``mkdtemp`` and therefore never reuses these paths.
+    Cleanup is deliberately conservative so a concurrent planner cannot be
+    removed; symlinks and unrelated entries are never followed or deleted.
+    """
+
+    try:
+        root_metadata = scratch_root.lstat()
+    except OSError:
+        return
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        return
+    cutoff = (time.time() if now_s is None else float(now_s)) - float(max_age_s)
+    try:
+        entries = tuple(scratch_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.startswith("planning-"):
+            continue
+        try:
+            metadata = entry.lstat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_mtime >= cutoff
+        ):
+            continue
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            # Cleanup is maintenance only.  A new unique directory remains
+            # safe even when an old directory cannot be removed.
+            continue
+
+
+def _planning_runner_report_valid(report_path: Path) -> bool:
+    """Validate the minimum bounded output contract of the warm runner."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(report_path, flags)
+    except OSError:
+        return False
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_PLANNING_REPORT_BYTES
+        ):
+            return False
+        chunks: list[bytes] = []
+        remaining = MAX_PLANNING_REPORT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        if len(encoded) > MAX_PLANNING_REPORT_BYTES:
+            return False
+        document: Any = json.loads(encoded.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    finally:
+        os.close(descriptor)
+    return isinstance(document, dict)
 
 
 @dataclass(frozen=True)
@@ -1059,6 +1142,9 @@ class FixedReadOnlyBackend:
                     parents=True,
                     exist_ok=True,
                 )
+                _cleanup_stale_planning_runner_scratch(
+                    PLANNING_RUNNER_SCRATCH_ROOT,
+                )
                 runner_scratch = Path(tempfile.mkdtemp(
                     prefix="planning-",
                     dir=PLANNING_RUNNER_SCRATCH_ROOT,
@@ -1150,12 +1236,42 @@ class FixedReadOnlyBackend:
                 *planner_args,
             )
         planner_started = time.monotonic()
-        planner = _run_logged(
-            planner_command,
+        try:
+            planner = _run_logged(
+                planner_command,
+                log_path,
+                environment=_server_environment(),
+            )
+        except OSError:
+            _append_timing(
+                log_path,
+                "planning_search",
+                time.monotonic() - planner_started,
+                return_code=None,
+            )
+            if runner_scratch is not None:
+                shutil.rmtree(runner_scratch, ignore_errors=True)
+                return BackendResult(
+                    1,
+                    "PLANNING_RUNNER_UNAVAILABLE",
+                    "warm planner process could not be started",
+                )
+            raise
+        _append_timing(
             log_path,
-            environment=_server_environment(),
+            "planning_search",
+            time.monotonic() - planner_started,
+            return_code=planner.returncode,
         )
         if runner_scratch is not None:
+            runner_report = runner_scratch / "planning_report.json"
+            if not _planning_runner_report_valid(runner_report):
+                shutil.rmtree(runner_scratch, ignore_errors=True)
+                return BackendResult(
+                    planner.returncode or 1,
+                    "PLANNING_RUNNER_OUTPUT_MISSING",
+                    "warm planner exited without a valid bounded planning report",
+                )
             try:
                 # ``planning_dir`` is still empty: no consumer can observe a
                 # partially copied report, and inputs were never writable by
@@ -1163,6 +1279,7 @@ class FixedReadOnlyBackend:
                 planning_dir.rmdir()
                 os.replace(runner_scratch, planning_dir)
             except OSError as error:
+                shutil.rmtree(runner_scratch, ignore_errors=True)
                 if not planning_dir.exists():
                     planning_dir.mkdir(mode=0o700)
                 return BackendResult(
@@ -1170,12 +1287,6 @@ class FixedReadOnlyBackend:
                     "PLANNING_RUNNER_OUTPUT_INVALID",
                     f"warm planner output could not be promoted: {error}",
                 )
-        _append_timing(
-            log_path,
-            "planning_search",
-            time.monotonic() - planner_started,
-            return_code=planner.returncode,
-        )
         visualization_started = time.monotonic()
         visualization = self._build_visualization_bundle(
             perception_dir=perception_dir,
