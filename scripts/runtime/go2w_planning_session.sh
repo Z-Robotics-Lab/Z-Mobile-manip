@@ -9,6 +9,7 @@ STACK_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 WORKSPACE_ROOT="$(cd -- "$STACK_ROOT/.." && pwd)"
 IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:pinocchio}"
 IK_BACKEND="${Z_MANIP_IK_BACKEND:-pinocchio}"
+TASK_PACKAGE_CONTAINER="${Z_MANIP_TASK_PACKAGE_CONTAINER:-/opt/z_manip_ws/install/lib/python3.12/site-packages/z_manip_task}"
 PLANNING_ONLY_SEARCH_TIMEOUT_S="${Z_MANIP_PLANNING_ONLY_SEARCH_TIMEOUT_S:-6}"
 PLANNING_ONLY_SYMMETRY_SAMPLES="${Z_MANIP_PLANNING_ONLY_SYMMETRY_SAMPLES:-4}"
 PLANNING_ONLY_MAX_HYPOTHESES="${Z_MANIP_PLANNING_ONLY_MAX_HYPOTHESES:-64}"
@@ -114,7 +115,9 @@ if [[ "$perception_rc" -eq 0 && "$gate_rc" -eq 0 ]]; then
     -v "$CALIBRATION:/session/calibration.json:ro" \
     -v "$ROBOT_ASSETS:/robot_assets:ro" \
     -v "$STACK_ROOT/configs/go2w_piper.json:/opt/z_manip/configs/go2w_piper.json:ro" \
+    -v "$STACK_ROOT/configs/piper_collision_capsules.json:/opt/z_manip/configs/piper_collision_capsules.json:ro" \
     -v "$STACK_ROOT/z_manip:/opt/z_manip/python/z_manip:ro" \
+    -v "$STACK_ROOT/ros2/z_manip_task/z_manip_task:$TASK_PACKAGE_CONTAINER:ro" \
     -v "$SCRIPT_DIR/piper_planning_dry_run.py:/usr/local/bin/z-manip-piper-planning-dry-run:ro" \
     "$IMAGE" z-manip-piper-planning-dry-run \
       --artifacts /session/perception \

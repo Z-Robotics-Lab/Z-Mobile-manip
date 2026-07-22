@@ -140,6 +140,11 @@ def test_gate_and_launcher_have_no_actuator_transport():
     assert imports.isdisjoint(forbidden_imports)
     assert "--network none" in source
     assert "piper_planning_dry_run.py:/usr/local/bin/" in source
+    assert (
+        "configs/piper_collision_capsules.json:"
+        "/opt/z_manip/configs/piper_collision_capsules.json:ro"
+    ) in source
+    assert "ros2/z_manip_task/z_manip_task:$TASK_PACKAGE_CONTAINER:ro" in source
     assert '--joints="$joints_csv"' in source
     assert '--planning-joints="$planning_joints_csv"' in source
     assert '--search-timeout-s "$PLANNING_ONLY_SEARCH_TIMEOUT_S"' in source

@@ -774,6 +774,14 @@ def test_full_session_uses_fast_unprivileged_passive_snapshots():
     assert 'PLANNING_ONLY_SEARCH_TIMEOUT_S:-6' in source
     assert 'PLANNING_ONLY_SYMMETRY_SAMPLES:-4' in source
     assert '$STACK_ROOT/z_manip:/opt/z_manip/python/z_manip:ro' in source
+    assert (
+        '$STACK_ROOT/configs/piper_collision_capsules.json:'
+        '/opt/z_manip/configs/piper_collision_capsules.json:ro'
+    ) in source
+    assert (
+        '$STACK_ROOT/ros2/z_manip_task/z_manip_task:'
+        '$TASK_PACKAGE_CONTAINER:ro'
+    ) in source
     assert 'PLANNING_ONLY_MAX_HYPOTHESES:-64' in source
     assert 'Z_MANIP_PASSIVE_CAPTURE_SECONDS:-0.25' in source
     assert '/usr/local/libexec/z-manip/piper_passive_probe.py' in source
