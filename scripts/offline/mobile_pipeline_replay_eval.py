@@ -39,6 +39,23 @@ def _finite(value: object) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _record_timestamp_ns(record: dict[str, Any]) -> int | None:
+    """Return the wall-clock timestamp used to correlate JSON with a bag.
+
+    The API status recorder uses ``sample_unix_ns`` while the depth-servo
+    trace uses ``updated_unix_ns``.  A record without one of these positive
+    wall-clock timestamps is deliberately not eligible for a bounded replay.
+    """
+    raw = record.get("sample_unix_ns", record.get("updated_unix_ns"))
+    if isinstance(raw, bool):
+        return None
+    try:
+        stamp = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp > 0 else None
+
+
 def load_json_stream(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Decode concatenated or line-delimited JSON objects with diagnostics."""
     text = path.read_text(encoding="utf-8")
@@ -70,13 +87,7 @@ def load_json_stream(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             records.append(value)
         index = end
 
-    stamps: list[int] = []
-    for record in records:
-        raw = record.get("sample_unix_ns", record.get("updated_unix_ns"))
-        try:
-            stamps.append(int(raw))
-        except (TypeError, ValueError):
-            pass
+    stamps = [stamp for record in records if (stamp := _record_timestamp_ns(record)) is not None]
     violations = sum(b < a for a, b in zip(stamps, stamps[1:]))
     gaps_s = [(b - a) / 1e9 for a, b in zip(stamps, stamps[1:]) if b >= a]
     return records, {
@@ -96,6 +107,29 @@ def load_json_stream(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 def _yaml_scalar(text: str, name: str) -> str | None:
     match = re.search(rf"(?m)^\s*{re.escape(name)}:\s*([^\n]+?)\s*$", text)
     return match.group(1).strip('"\'') if match else None
+
+
+def _metadata_duration_ns(text: str) -> int | None:
+    match = re.search(
+        r"(?m)^\s{2}duration:\s*\n\s{4}nanoseconds:\s*([0-9]+)\s*$",
+        text,
+    )
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _metadata_start_unix_ns(text: str) -> int | None:
+    raw = _yaml_scalar(text, "nanoseconds_since_epoch")
+    try:
+        value = int(raw) if raw is not None else None
+    except ValueError:
+        return None
+    return value if value is not None and value > 0 else None
 
 
 def inspect_rosbag(path: Path) -> dict[str, Any]:
@@ -133,6 +167,13 @@ def inspect_rosbag(path: Path) -> dict[str, Any]:
             "footer_magic_valid": tail == MCAP_MAGIC,
         })
 
+    start_unix_ns = _metadata_start_unix_ns(text)
+    duration_ns = _metadata_duration_ns(text)
+    end_unix_ns_exclusive = (
+        start_unix_ns + duration_ns
+        if start_unix_ns is not None and duration_ns is not None
+        else None
+    )
     missing = [topic for topic in REQUIRED_TOPICS if topic not in topics]
     empty = [topic for topic in REQUIRED_TOPICS if topics.get(topic) == 0]
     return {
@@ -140,6 +181,14 @@ def inspect_rosbag(path: Path) -> dict[str, Any]:
         "metadata_present": metadata.is_file(),
         "storage_identifier": _yaml_scalar(text, "storage_identifier"),
         "declared_message_count": int(_yaml_scalar(text, "message_count") or 0),
+        "starting_time_unix_ns": start_unix_ns,
+        "duration_ns": duration_ns,
+        "ending_time_unix_ns_exclusive": end_unix_ns_exclusive,
+        "time_window_valid": (
+            start_unix_ns is not None
+            and end_unix_ns_exclusive is not None
+            and end_unix_ns_exclusive > start_unix_ns
+        ),
         "topic_count": len(topics),
         "topics": topics,
         "required_topics_missing": missing,
@@ -149,6 +198,101 @@ def inspect_rosbag(path: Path) -> dict[str, Any]:
             item["header_magic_valid"] and item["footer_magic_valid"]
             for item in framing
         ),
+    }
+
+
+def resolve_time_window(
+    *,
+    bag: dict[str, Any] | None,
+    explicit_start_unix_ns: int | None,
+    explicit_end_unix_ns: int | None,
+) -> dict[str, Any] | None:
+    """Resolve a strict half-open replay window.
+
+    Explicit bounds are accepted as a pair.  When a bag is also supplied,
+    they must be contained by its metadata window so an accidentally selected
+    bag cannot be paired with unrelated trace history.
+    """
+    if (explicit_start_unix_ns is None) != (explicit_end_unix_ns is None):
+        raise ValueError("explicit replay bounds require both start and end")
+
+    bag_start = bag.get("starting_time_unix_ns") if bag else None
+    bag_end = bag.get("ending_time_unix_ns_exclusive") if bag else None
+    bag_valid = bool(bag and bag.get("time_window_valid"))
+
+    if explicit_start_unix_ns is not None and explicit_end_unix_ns is not None:
+        if (
+            isinstance(explicit_start_unix_ns, bool)
+            or isinstance(explicit_end_unix_ns, bool)
+            or explicit_start_unix_ns <= 0
+            or explicit_end_unix_ns <= explicit_start_unix_ns
+        ):
+            raise ValueError("explicit replay bounds must be positive and end must exceed start")
+        if bag is not None:
+            if not bag_valid:
+                raise ValueError("rosbag metadata does not contain a valid time window")
+            if explicit_start_unix_ns < bag_start or explicit_end_unix_ns > bag_end:
+                raise ValueError("explicit replay bounds fall outside the rosbag time window")
+        return {
+            "source": "explicit",
+            "start_unix_ns": explicit_start_unix_ns,
+            "end_unix_ns_exclusive": explicit_end_unix_ns,
+            "duration_s": (explicit_end_unix_ns - explicit_start_unix_ns) / 1e9,
+        }
+
+    if bag is None:
+        # Backward compatibility for trace-only use.  A bag-backed evaluation
+        # below is always bounded and never silently falls back to this mode.
+        return None
+    if not bag_valid:
+        raise ValueError("rosbag metadata does not contain a valid time window")
+    return {
+        "source": "rosbag_metadata",
+        "start_unix_ns": bag_start,
+        "end_unix_ns_exclusive": bag_end,
+        "duration_s": (bag_end - bag_start) / 1e9,
+    }
+
+
+def select_records_in_time_window(
+    records: Iterable[dict[str, Any]],
+    window: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select only records in ``[start, end)`` and report all exclusions."""
+    materialized = list(records)
+    if window is None:
+        return materialized, {
+            "bounded": False,
+            "source": "unbounded_compatibility",
+            "input_records": len(materialized),
+            "selected_records": len(materialized),
+            "excluded_before": 0,
+            "excluded_after": 0,
+            "excluded_missing_timestamp": 0,
+        }
+
+    start = int(window["start_unix_ns"])
+    end = int(window["end_unix_ns_exclusive"])
+    selected: list[dict[str, Any]] = []
+    before = after = missing = 0
+    for record in materialized:
+        stamp = _record_timestamp_ns(record)
+        if stamp is None:
+            missing += 1
+        elif stamp < start:
+            before += 1
+        elif stamp >= end:
+            after += 1
+        else:
+            selected.append(record)
+    return selected, {
+        "bounded": True,
+        **window,
+        "input_records": len(materialized),
+        "selected_records": len(selected),
+        "excluded_before": before,
+        "excluded_after": after,
+        "excluded_missing_timestamp": missing,
     }
 
 
@@ -381,6 +525,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-jsonl", type=Path)
     parser.add_argument("--trace-jsonl", type=Path)
     parser.add_argument("--bag", type=Path)
+    parser.add_argument(
+        "--window-start-unix-ns",
+        type=int,
+        help="inclusive wall-clock replay bound; requires --window-end-unix-ns",
+    )
+    parser.add_argument(
+        "--window-end-unix-ns",
+        type=int,
+        help="exclusive wall-clock replay bound; requires --window-start-unix-ns",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--strict", action="store_true", help="fail when the report has integrity issues")
     args = parser.parse_args()
@@ -421,17 +575,45 @@ def main() -> int:
         }
     else:
         api, api_integrity = load_json_stream(args.api_jsonl)
-    trace, trace_integrity = load_json_stream(args.trace_jsonl)
     bag = inspect_rosbag(args.bag) if args.bag else None
+    try:
+        time_window = resolve_time_window(
+            bag=bag,
+            explicit_start_unix_ns=args.window_start_unix_ns,
+            explicit_end_unix_ns=args.window_end_unix_ns,
+        )
+    except ValueError as error:
+        raise SystemExit(f"invalid replay time window: {error}") from error
+    trace, trace_integrity = load_json_stream(args.trace_jsonl)
+    api, api_selection = select_records_in_time_window(api, time_window)
+    trace, trace_selection = select_records_in_time_window(trace, time_window)
     report = evaluate(api_records=api, trace_records=trace, bag=bag)
     report["integrity"] = {
         "api_status": api_integrity,
         "depth_servo_trace": trace_integrity,
         "rosbag": bag,
+        "time_window": time_window,
+        "api_status_selection": api_selection,
+        "depth_servo_trace_selection": trace_selection,
     }
     decode_failed = bool(api_integrity["decode_errors"] or trace_integrity["decode_errors"])
     if decode_failed:
         report["issues"].append("one or more JSON streams are truncated or malformed")
+        report["complete"] = False
+    if time_window is not None and trace_selection["excluded_missing_timestamp"]:
+        report["issues"].append(
+            "one or more depth-servo trace records lack a usable wall-clock timestamp"
+        )
+        report["complete"] = False
+    if time_window is not None and api_selection["excluded_missing_timestamp"]:
+        report["issues"].append(
+            "one or more API status records lack a usable wall-clock timestamp"
+        )
+        report["complete"] = False
+    if time_window is not None and trace_selection["selected_records"] == 0:
+        report["issues"].append(
+            "no depth-servo trace records fall within the replay time window"
+        )
         report["complete"] = False
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output:
