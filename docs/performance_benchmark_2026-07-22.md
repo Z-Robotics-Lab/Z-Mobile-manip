@@ -9,6 +9,9 @@ No replay in this report opened ROS, CAN, WebRTC, or a PiPER transport.
 - Duration: 956.0 s
 - Size: 17.5 GiB, four valid Zstd MCAP splits
 - Planning captures in the bag time window: 11
+- Depth-servo replay: **68/270** trace records are inside the strict rosbag
+  `[start, end)` window; **202** older records are excluded. The bounded report
+  is complete with no integrity issues.
 
 ## Planning result
 
