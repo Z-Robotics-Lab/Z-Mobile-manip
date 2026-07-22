@@ -48,6 +48,29 @@ def test_report_is_windowed_and_links_perception_to_planning(tmp_path):
     planning_dir = planning / "artifacts" / "planning"
     planning_dir.mkdir(parents=True)
     (planning_dir / "planning_report.json").write_text(json.dumps({"timings_s": {"setup": 0.2, "search": 0.7, "total": 0.9}, "rejections": [], "rejection_count": 0}), encoding="utf-8")
+    (planning / "planning.log").write_text("\n".join((
+        "planner human output",
+        json.dumps({
+            "schema": "z_manip.interactive_timing.v1",
+            "stage": "planning_session_gate",
+            "elapsed_s": 0.12,
+        }),
+        json.dumps({
+            "schema": "z_manip.interactive_timing.v1",
+            "stage": "planning_ready_pre_visualization",
+            "elapsed_s": 1.01,
+        }),
+        json.dumps({
+            "schema": "z_manip.interactive_timing.v1",
+            "stage": "planning_visualization_and_audit",
+            "elapsed_s": 0.2,
+        }),
+        json.dumps({
+            "schema": "z_manip.interactive_timing.v1",
+            "stage": "planning_total",
+            "elapsed_s": 1.21,
+        }),
+    )) + "\n", encoding="utf-8")
     _write_attempt(sessions, "perception", "stale", "1970-01-01T00:00:01Z", "1970-01-01T00:00:02Z", "succeeded")
 
     report = BENCH.build_report(bag=bag, sessions_root=sessions)
@@ -61,6 +84,30 @@ def test_report_is_windowed_and_links_perception_to_planning(tmp_path):
     assert report["transactions"]["duration_s"]["p50"] == 3.0
     assert report["transactions"]["orchestration_gap_s"]["p50"] == 0.1
     assert report["perception"]["wrapper_overhead_s"]["p50"] == 0.5
+    assert report["planning"]["wrapper_stages_s"][
+        "planning_ready_pre_visualization"
+    ] == {"samples": 1, "p50": 1.01, "p95": 1.01}
+    assert report["critical_path_audit"]["plan_ready_marker_status"] == "observed"
+    assert report["critical_path_audit"]["visualization_deferral_applied"] is False
+
+
+def test_timing_parser_does_not_infer_missing_or_invalid_markers(tmp_path):
+    log = tmp_path / "planning.log"
+    log.write_text("\n".join((
+        "not json",
+        json.dumps({
+            "schema": "other.schema",
+            "stage": "planning_ready_pre_visualization",
+            "elapsed_s": 0.3,
+        }),
+        json.dumps({
+            "schema": "z_manip.interactive_timing.v1",
+            "stage": "planning_ready_pre_visualization",
+            "elapsed_s": -1.0,
+        }),
+    )), encoding="utf-8")
+
+    assert BENCH._timing_stages(log) == {}
 
 
 def test_report_classifies_ik_dominated_planning_failure(tmp_path):

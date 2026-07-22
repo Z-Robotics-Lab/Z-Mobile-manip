@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -82,6 +83,8 @@ PERCEPTION_ATTEMPTS = 2
 MAX_PASSIVE_REPORT_BYTES = 1024 * 1024
 MAX_SESSION_GATE_REPORT_BYTES = 256 * 1024
 MAX_PLANNING_REPORT_BYTES = 4 * 1024 * 1024
+MAX_PLANNED_GRASP_BYTES = 8 * 1024 * 1024
+MAX_MODEL_EVIDENCE_BYTES = 8 * 1024 * 1024
 PLANNING_RUNNER_SCRATCH_TTL_S = 24 * 60 * 60
 MAX_PLANNER_ERROR_CHARS = 600
 MAX_PERCEPTION_REPORT_BYTES = 256 * 1024
@@ -189,6 +192,106 @@ def _planning_runner_report_valid(report_path: Path) -> bool:
     finally:
         os.close(descriptor)
     return isinstance(document, dict)
+
+
+def _bounded_evidence(path: Path, maximum: int) -> bytes | None:
+    """Read one bounded regular evidence file without following symlinks."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or not 1 <= metadata.st_size <= maximum
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        return payload if 1 <= len(payload) <= maximum else None
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _planning_ready_evidence(
+    *,
+    perception_dir: Path,
+    output_dir: Path,
+    joint_report: Path,
+) -> dict[str, object] | None:
+    """Bind a pre-visualization plan-ready marker to immutable inputs.
+
+    This marker is timing evidence only, never an executor receipt.  It is
+    emitted only after the same fail-closed planning fields required by the
+    immutable session controller are present and the execution archive exists.
+    """
+
+    paths = {
+        "perception_report": (
+            perception_dir / "report.json",
+            MAX_PERCEPTION_REPORT_BYTES,
+        ),
+        "passive_joint_report": (joint_report, MAX_PASSIVE_REPORT_BYTES),
+        "session_gate": (
+            output_dir / "session_gate.json",
+            MAX_SESSION_GATE_REPORT_BYTES,
+        ),
+        "planning_report": (
+            output_dir / "planning" / "planning_report.json",
+            MAX_PLANNING_REPORT_BYTES,
+        ),
+        "planned_grasp": (
+            output_dir / "planning" / "planned_grasp.npz",
+            MAX_PLANNED_GRASP_BYTES,
+        ),
+        "calibration": (CALIBRATION, MAX_MODEL_EVIDENCE_BYTES),
+        "urdf": (URDF, MAX_MODEL_EVIDENCE_BYTES),
+    }
+    payloads: dict[str, bytes] = {}
+    for name, (path, maximum) in paths.items():
+        payload = _bounded_evidence(path, maximum)
+        if payload is None:
+            return None
+        payloads[name] = payload
+    try:
+        gate: Any = json.loads(payloads["session_gate"].decode("utf-8"))
+        report: Any = json.loads(payloads["planning_report"].decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(gate, dict) or not isinstance(report, dict):
+        return None
+    if not (
+        gate.get("planning_ready") is True
+        and gate.get("read_only") is True
+        and gate.get("planning_only") is True
+        and gate.get("motion_commands_published") == 0
+        and gate.get("transport_opened") is False
+        and report.get("read_only") is True
+        and report.get("planning_only") is True
+        and report.get("motion_commands_published") == 0
+        and report.get("plan_valid") is True
+    ):
+        return None
+    return {
+        "evidence_sha256": {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in sorted(payloads.items())
+        },
+        "executor_receipt": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -1390,6 +1493,22 @@ class FixedReadOnlyBackend:
                     "PLANNING_RUNNER_OUTPUT_INVALID",
                     f"warm planner output could not be promoted: {error}",
                 )
+        ready_evidence = (
+            _planning_ready_evidence(
+                perception_dir=perception_dir,
+                output_dir=output_dir,
+                joint_report=joint_report,
+            )
+            if planner.returncode == 0
+            else None
+        )
+        if ready_evidence is not None:
+            _append_timing(
+                log_path,
+                "planning_ready_pre_visualization",
+                time.monotonic() - total_started,
+                **ready_evidence,
+            )
         visualization_started = time.monotonic()
         visualization = self._build_visualization_bundle(
             perception_dir=perception_dir,

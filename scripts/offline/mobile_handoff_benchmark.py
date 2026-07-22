@@ -19,6 +19,8 @@ from typing import Any, Iterable
 
 
 SCHEMA = "z_mobile_manip.mobile_handoff_benchmark.v1"
+TIMING_SCHEMA = "z_manip.interactive_timing.v1"
+MAX_TIMING_LOG_BYTES = 4 * 1024 * 1024
 PERCEPTION_GOAL_S = 2.0
 HANDOFF_GOAL_S = 3.0
 
@@ -152,12 +154,57 @@ def _nested_number(document: dict[str, Any] | None, *keys: str) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _timing_stages(path: Path) -> dict[str, float]:
+    """Read bounded, machine-readable timing markers from one action log.
+
+    Human log text is deliberately ignored.  A repeated stage keeps the last
+    valid marker because it represents the completed retry/attempt that the
+    backend returned.  This is measurement only: missing markers are never
+    inferred from attempt wall time.
+    """
+
+    try:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or not 1 <= metadata.st_size <= MAX_TIMING_LOG_BYTES
+        ):
+            return {}
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return {}
+    stages: dict[str, float] = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("schema") != TIMING_SCHEMA:
+            continue
+        stage = record.get("stage")
+        elapsed = record.get("elapsed_s")
+        if (
+            not isinstance(stage, str)
+            or not stage
+            or isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+        ):
+            continue
+        number = float(elapsed)
+        if math.isfinite(number) and number >= 0.0:
+            stages[stage] = number
+    return stages
+
+
 def enrich_attempts(attempts: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     enriched = []
     for attempt in attempts:
         root = Path(attempt["attempt_path"]).parent
         action = str(attempt.get("action", ""))
         item = dict(attempt)
+        timing_stages = _timing_stages(root / f"{action}.log")
+        item["timing_stages_s"] = timing_stages
         if action == "perception":
             report = _load_json(root / "perception" / "report.json")
             item["kernel_elapsed_s"] = _nested_number(report, "elapsed_s")
@@ -178,6 +225,9 @@ def enrich_attempts(attempts: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 for entry in rejections or []
                 if isinstance(entry, dict)
             ).items()))
+            item["plan_ready_pre_visualization_s"] = timing_stages.get(
+                "planning_ready_pre_visualization",
+            )
         internal = item.get("kernel_elapsed_s", item.get("planner_total_s"))
         duration = item.get("duration_s")
         item["wrapper_overhead_s"] = (
@@ -237,6 +287,36 @@ def summarize(attempts: list[dict[str, Any]], action: str) -> dict[str, Any]:
         for item in attempts:
             rejection_stages.update(item.get("rejection_stages") or {})
         result["rejection_stages"] = dict(sorted(rejection_stages.items()))
+        stage_names = (
+            "planning_session_gate",
+            "planning_search",
+            "planning_ready_pre_visualization",
+            "planning_visualization_and_audit",
+            "planning_total",
+        )
+        result["wrapper_stages_s"] = {
+            stage: {
+                "samples": sum(
+                    stage in (item.get("timing_stages_s") or {})
+                    for item in attempts
+                ),
+                "p50": _percentile(
+                    (
+                        (item.get("timing_stages_s") or {}).get(stage)
+                        for item in attempts
+                    ),
+                    0.50,
+                ),
+                "p95": _percentile(
+                    (
+                        (item.get("timing_stages_s") or {}).get(stage)
+                        for item in attempts
+                    ),
+                    0.95,
+                ),
+            }
+            for stage in stage_names
+        }
     return result
 
 
@@ -280,6 +360,9 @@ def pair_transactions(
                 "planning_status": plan.get("status"),
                 "perception_s": capture.get("duration_s"),
                 "planning_s": plan.get("duration_s"),
+                "plan_ready_pre_visualization_s": plan.get(
+                    "plan_ready_pre_visualization_s",
+                ),
                 "perception_to_planning_gap_s": orchestration_gap,
                 "perception_to_plan_finish_s": total,
                 "failure_code": plan.get("failure_code"),
@@ -551,6 +634,32 @@ def build_report(
         "bottlenecks": bottlenecks,
         "attempts": {"perception": perception, "planning": planning},
     }
+    wrapper_stages = planning_summary.get("wrapper_stages_s", {})
+    plan_ready_stage = wrapper_stages.get(
+        "planning_ready_pre_visualization",
+        {},
+    )
+    visualization_stage = wrapper_stages.get(
+        "planning_visualization_and_audit",
+        {},
+    )
+    report["critical_path_audit"] = {
+        "plan_ready_marker_status": (
+            "observed"
+            if plan_ready_stage.get("samples", 0) > 0
+            else "not_observed"
+        ),
+        "plan_ready_pre_visualization_s": plan_ready_stage,
+        "visualization_and_audit_s": visualization_stage,
+        "visualization_deferral_applied": False,
+        "reason": (
+            "the current immutable planning contract builds and audits the "
+            "debug bundle before the backend returns, then manifests and "
+            "freezes the complete action tree; no executor receipt is "
+            "observed in this bag, so subtracting UI work would be an "
+            "unverified counterfactual"
+        ),
+    }
     if trace_jsonl is not None:
         trace_records = window_trace_records(
             _load_json_stream(trace_jsonl),
@@ -582,6 +691,15 @@ def render_markdown(report: dict[str, Any]) -> str:
         "", "## Bottlenecks", "",
     ]
     lines.extend(f"- {item}" for item in report["bottlenecks"])
+    critical = report.get("critical_path_audit")
+    if isinstance(critical, dict):
+        visualization = critical.get("visualization_and_audit_s", {})
+        lines.extend((
+            "", "## Critical-path audit", "",
+            f"- Plan-ready marker: {critical['plan_ready_marker_status']}",
+            f"- Visualization + safety audit: p50 {visualization.get('p50')} s, p95 {visualization.get('p95')} s",
+            "- Visualization deferral: not applied; immutable manifest/freeze and executor receipt evidence remain fail-closed",
+        ))
     lifecycle = report.get("handoff_lifecycle")
     if isinstance(lifecycle, dict):
         stages = lifecycle["stages"]
