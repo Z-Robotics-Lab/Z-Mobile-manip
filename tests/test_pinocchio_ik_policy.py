@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,3 +35,51 @@ def test_weighted_cost_uses_configured_task_metric():
     weights = np.asarray([50.0, 50.0, 50.0, 2.0, 2.0, 2.0])
 
     assert PinocchioIKSolver._weighted_cost(error, weights) == np.hypot(0.5, 0.7)
+
+
+def test_maximum_chain_radius_is_a_conservative_urdf_bound():
+    joints = (
+        SimpleNamespace(
+            joint_type="revolute",
+            origin=np.array(
+                [[1.0, 0.0, 0.0, 0.3], [0.0, 1.0, 0.0, 0.0],
+                 [0.0, 0.0, 1.0, 0.4], [0.0, 0.0, 0.0, 1.0]],
+            ),
+            lower=-1.0,
+            upper=1.0,
+        ),
+        SimpleNamespace(
+            joint_type="prismatic",
+            origin=np.array(
+                [[1.0, 0.0, 0.0, 0.1], [0.0, 1.0, 0.0, 0.0],
+                 [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            ),
+            lower=-0.05,
+            upper=0.2,
+        ),
+    )
+
+    assert np.isclose(
+        PinocchioIKSolver._maximum_chain_radius(SimpleNamespace(joints=joints)),
+        0.8,
+    )
+
+
+def test_nearby_failed_pose_is_reused_before_global_seeds():
+    solver = _solver_policy()
+    solver._warm_starts = deque(maxlen=solver._WARM_START_CAPACITY)
+    warm = np.full(6, 0.25)
+    solver._warm_starts.append((np.array([0.40, 0.0, 0.0]), warm))
+    goal = np.eye(4)
+    goal[:3, 3] = (0.45, 0.0, 0.0)
+    global_seed = np.zeros(6)
+
+    seeds = solver._prepend_warm_starts(
+        goal,
+        [global_seed],
+        np.full(6, -1.0),
+        np.full(6, 1.0),
+    )
+
+    assert np.array_equal(seeds[0], warm)
+    assert np.array_equal(seeds[1], global_seed)
