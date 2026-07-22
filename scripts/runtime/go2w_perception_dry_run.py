@@ -11,6 +11,7 @@ import math
 from pathlib import Path
 import time
 import uuid
+from typing import Sequence
 
 import cv2
 from cv_bridge import CvBridge
@@ -47,6 +48,64 @@ from z_manip.perception.tracked_reuse import (
 from z_manip.verification.passive_capture import validate_passive_capture
 
 
+def start_resident_context() -> Node:
+    """Warm one read-only DDS participant for the resident request worker.
+
+    The node never publishes.  Its endpoints only pre-discover the same
+    perception topics used by each isolated request node, removing repeated
+    participant discovery without caching request evidence.
+    """
+
+    if rclpy.ok():
+        raise RuntimeError("resident ROS context is already initialized")
+    rclpy.init()
+    node = Node("go2w_perception_read_only_resident_context")
+    latched_qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    sink = lambda _message: None
+    node.create_subscription(Bool, "/z_manip/perception/valid", sink, latched_qos)
+    node.create_subscription(
+        Image, "/z_manip/perception/overlay", sink, qos_profile_sensor_data,
+    )
+    node.create_subscription(
+        Image, "/z_manip/perception/target_mask", sink, qos_profile_sensor_data,
+    )
+    node.create_subscription(
+        PointCloud2,
+        "/z_manip/perception/target_pointcloud",
+        sink,
+        qos_profile_sensor_data,
+    )
+    node.create_subscription(
+        PointCloud2,
+        "/z_manip/perception/scene_pointcloud",
+        sink,
+        qos_profile_sensor_data,
+    )
+    node.create_subscription(
+        String, "/track_3d/frame_manifest", sink, qos_profile_sensor_data,
+    )
+    node.create_subscription(
+        CameraInfo, "/camera/color/camera_info", sink, qos_profile_sensor_data,
+    )
+    node.create_subscription(
+        DiagnosticArray, "/z_manip/perception/status", sink, latched_qos,
+    )
+    # Endpoint discovery is performed by the middleware while the resident
+    # context remains alive. Request nodes still own their publishers and all
+    # request-specific callbacks/state.
+    return node
+
+
+def stop_resident_context(node: Node) -> None:
+    node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
 def _stamp_ns(message: object) -> int:
     header = getattr(message, "header")
     return header.stamp.sec * 1_000_000_000 + header.stamp.nanosec
@@ -78,7 +137,7 @@ def _freshness_summary(samples_s: list[float]) -> dict[str, float | int | None]:
     }
 
 
-def main() -> int:
+def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--instruction", required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -171,7 +230,7 @@ def main() -> int:
             "geometric grasp proposal; the report still records the failure"
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     instruction = args.instruction.strip()
     if (
         not instruction
@@ -199,10 +258,23 @@ def main() -> int:
         )
     if (args.passive_window is None) != (args.selected_passive_window is None):
         parser.error("passive-window and selected-passive-window must be provided together")
+    return args
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    manage_rclpy_context: bool = True,
+) -> int:
+    args = _arguments(argv)
+    instruction = args.instruction.strip()
     request_id = args.request_id.strip() or f"dry-run-{uuid.uuid4().hex[:16]}"
     args.output.mkdir(parents=True, exist_ok=True)
 
-    rclpy.init()
+    if manage_rclpy_context:
+        rclpy.init()
+    elif not rclpy.ok():
+        raise RuntimeError("resident ROS context is not initialized")
     node = Node("go2w_perception_grasp_read_only_dry_run")
     bridge = CvBridge()
     overlays: OrderedDict[int, Image] = OrderedDict()
@@ -551,7 +623,8 @@ def main() -> int:
         (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2))
         node.destroy_node()
-        rclpy.shutdown()
+        if manage_rclpy_context:
+            rclpy.shutdown()
         return 5 if perception_failure else 2
     passive_capture_summary: dict[str, object] | None = None
     if selected_passive_report is not None:
@@ -965,7 +1038,8 @@ def main() -> int:
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
     node.destroy_node()
-    rclpy.shutdown()
+    if manage_rclpy_context:
+        rclpy.shutdown()
     if args.soak_duration > 0.0 and not report["soak"]["stable"]:
         return 3
     if candidates is None and not args.allow_no_grasp_candidates:

@@ -812,6 +812,9 @@ class FixedReadOnlyBackend:
                 "/usr/bin/docker",
                 "exec",
                 PERCEPTION_RUNNER_CONTAINER,
+                "z-manip-go2w-perception-worker",
+                "client",
+                "--",
             )
             artifact_output = str(runner_output)
         else:
@@ -849,8 +852,10 @@ class FixedReadOnlyBackend:
                 self.runtime.runtime_image,
             )
             artifact_output = "/artifacts"
-        command = command_prefix + (
+        dry_run_program = () if runner_output is not None else (
             "z-manip-go2w-perception-dry-run",
+        )
+        command = command_prefix + dry_run_program + (
             "--instruction",
             target,
             "--output",
@@ -870,6 +875,10 @@ class FixedReadOnlyBackend:
             # This removes a redundant YOLOE forward and tracker re-seed without
             # allowing stale or semantically different geometry through.
             "--reuse-valid-tracking",
+            # Keep the identity/age quality gate explicit at the UI boundary;
+            # the resident worker must not turn into a long-lived result cache.
+            "--tracking-reuse-max-age",
+            "0.5",
         )
         return_code = 1
         passive_capture_s_total = 0.0

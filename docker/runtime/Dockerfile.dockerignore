@@ -13,6 +13,7 @@
 !scripts/runtime/real_rgbd_bridge.sh
 !scripts/runtime/go2w_perception_probe.py
 !scripts/runtime/go2w_perception_dry_run.py
+!scripts/runtime/go2w_perception_worker.py
 
 !ros2/
 !ros2/z_manip_ros/

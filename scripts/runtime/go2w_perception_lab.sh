@@ -236,9 +236,9 @@ start_perception() {
 }
 
 start_perception_runner() {
-  # Keep the runtime image and container filesystem warm between UI clicks.
-  # Each click still starts the fixed Python entrypoint via docker exec.  This
-  # container has no CAN/device mount and no actuator environment.
+  # Keep the Python/ROS perception process imports warm between UI clicks.
+  # Requests still execute the fixed fail-closed dry-run; this container has
+  # no CAN/device mount and no actuator environment.
   mkdir -p "$PERCEPTION_RUNNER_ARTIFACT_ROOT"
   docker rm -f "$PERCEPTION_RUNNER" >/dev/null 2>&1 || true
   docker run -d --name "$PERCEPTION_RUNNER" --restart unless-stopped \
@@ -248,9 +248,10 @@ start_perception_runner() {
     -e PYTHONPATH=/opt/z_manip_ws/install/lib/python3.12/site-packages:/opt/ros/jazzy/lib/python3.12/site-packages:/opt/z_manip/python \
     -e LD_LIBRARY_PATH=/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib \
     -v "$ROOT_DIR/scripts/runtime/go2w_perception_dry_run.py:/usr/local/bin/z-manip-go2w-perception-dry-run:ro" \
+    -v "$ROOT_DIR/scripts/runtime/go2w_perception_worker.py:/usr/local/bin/z-manip-go2w-perception-worker:ro" \
     -v "$ROOT_DIR/z_manip:/opt/z_manip/python/z_manip:ro" \
     -v "$PERCEPTION_RUNNER_ARTIFACT_ROOT:/workspace-artifacts" \
-    "$IMAGE" sleep infinity >/dev/null
+    "$IMAGE" z-manip-go2w-perception-worker serve >/dev/null
 }
 
 start_planning_runner() {

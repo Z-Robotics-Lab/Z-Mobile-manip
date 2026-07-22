@@ -58,3 +58,13 @@ quality pass, while fresh core, wrapper overhead, and total latency fail. A new
 post-change live artifact set must pass this command before perception is
 reported as meeting the two-second target.
 
+## Resident wrapper lifecycle
+
+The deployed perception runner now keeps one Python worker resident and imports
+ROS, OpenCV, and the grasp stack only once. Every UI request still executes the
+same dry-run validation, exact target-identity/0.5 s age gate, six-artifact
+bundle checks, passive joint capture, and candidate generation. The one-shot
+container remains the compatibility fallback for isolated output paths.
+The resident context also keeps its subscription endpoints discovered between
+requests. It never spins callbacks, caches perception evidence, or publishes;
+each request still owns an isolated node and a fresh exact-bundle transaction.

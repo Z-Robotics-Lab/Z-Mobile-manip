@@ -94,6 +94,8 @@ COPY scripts/runtime/go2w_perception_probe.py \
     /usr/local/bin/z-manip-go2w-perception-probe
 COPY scripts/runtime/go2w_perception_dry_run.py \
     /usr/local/bin/z-manip-go2w-perception-dry-run
+COPY scripts/runtime/go2w_perception_worker.py \
+    /usr/local/bin/z-manip-go2w-perception-worker
 COPY scripts/runtime/piper_planning_dry_run.py \
     /usr/local/bin/z-manip-piper-planning-dry-run
 COPY scripts/runtime/piper_hand_eye_calibrate.py \
@@ -112,6 +114,7 @@ RUN chmod 0755 \
         /usr/local/bin/z-manip-real-rgbd-bridge \
         /usr/local/bin/z-manip-go2w-perception-probe \
         /usr/local/bin/z-manip-go2w-perception-dry-run \
+        /usr/local/bin/z-manip-go2w-perception-worker \
         /usr/local/bin/z-manip-piper-planning-dry-run \
         /usr/local/bin/z-manip-piper-hand-eye-calibrate \
         /usr/local/bin/z-manip-piper-hand-eye-sample \

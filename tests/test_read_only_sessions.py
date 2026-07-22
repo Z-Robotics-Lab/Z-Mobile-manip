@@ -641,7 +641,13 @@ def test_perception_uses_warm_runner_for_workspace_artifacts(tmp_path, monkeypat
         "exec",
         module.PERCEPTION_RUNNER_CONTAINER,
     )
+    assert argv[3:6] == (
+        "z-manip-go2w-perception-worker",
+        "client",
+        "--",
+    )
     assert "run" not in argv[:4]
+    assert argv[argv.index("--tracking-reuse-max-age") + 1] == "0.5"
     assert argv[argv.index("--output") + 1] == (
         "/workspace-artifacts/go2w_real/interactive_sessions/sample"
     )
