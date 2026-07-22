@@ -146,6 +146,10 @@ python3 scripts/offline/planning_replay_benchmark.py \
 Pass a previous report with `--baseline` to reject success-rate or latency
 regressions after changing IK or planning code.
 
+The latest measured rosbag result and the exact interpretation of far approach
+versus near-field IK are recorded in
+[`docs/performance_benchmark_2026-07-22.md`](docs/performance_benchmark_2026-07-22.md).
+
 报告分别量化 detect、track、base、posture、arm intent/ACK 和 handoff，并检查 JSON
 完整性、时间戳单调性、必要 topic 以及 MCAP 首尾 framing。需要把缺失 ACK、损坏记录或
 姿态命令故障作为 CI 失败时追加 `--strict`。
