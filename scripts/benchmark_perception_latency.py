@@ -111,9 +111,22 @@ def collect(root: Path) -> dict[str, object]:
     wrapper_overhead: list[float] = []
     reused_wrapper_overhead: list[float] = []
     fresh_wrapper_overhead: list[float] = []
+    wrapper_stage_values: dict[str, list[float]] = {}
     for log_path in root.rglob("perception.log"):
         session_total: float | None = None
         for event in _json_lines(log_path):
+            event_stage = event.get("stage")
+            if isinstance(event_stage, str):
+                for name, value in event.items():
+                    if (
+                        name != "elapsed_s"
+                        and name.endswith("_s")
+                        and isinstance(value, (int, float))
+                    ):
+                        wrapper_stage_values.setdefault(
+                            f"{event_stage}.{name}",
+                            [],
+                        ).append(float(value))
             elapsed = event.get("elapsed_s")
             if not isinstance(elapsed, (int, float)):
                 continue
@@ -159,6 +172,10 @@ def collect(root: Path) -> dict[str, object]:
         "stages": {
             name: _summary(values)
             for name, values in sorted(stage_values.items())
+        },
+        "wrapper_stages": {
+            name: _summary(values)
+            for name, values in sorted(wrapper_stage_values.items())
         },
         "targets": {
             "perception_ui_total_s": 2.0,

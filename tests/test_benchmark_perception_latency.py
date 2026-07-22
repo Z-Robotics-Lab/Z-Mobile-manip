@@ -35,6 +35,8 @@ def test_collect_separates_reused_tracking_and_wrapper_latency(tmp_path):
             "schema": "z_manip.interactive_timing.v1",
             "stage": "perception_total",
             "elapsed_s": 1.75,
+            "runner_probe_s": 0.05,
+            "passive_capture_s": 0.25,
         }) + "\n",
     )
     (second / "perception.log").write_text(
@@ -42,6 +44,8 @@ def test_collect_separates_reused_tracking_and_wrapper_latency(tmp_path):
             "schema": "z_manip.interactive_timing.v1",
             "stage": "perception_total",
             "elapsed_s": 4.0,
+            "runner_probe_s": 0.15,
+            "passive_capture_s": 0.5,
         }) + "\n",
     )
 
@@ -56,6 +60,12 @@ def test_collect_separates_reused_tracking_and_wrapper_latency(tmp_path):
     assert result["reused_tracking_wrapper_overhead"]["p50_s"] == 0.5
     assert result["fresh_grounding_wrapper_overhead"]["p50_s"] == 1.0
     assert result["stages"]["bundle_wait_s"]["p50_s"] == 1.125
+    assert result["wrapper_stages"][
+        "perception_total.runner_probe_s"
+    ]["p50_s"] == 0.1
+    assert result["wrapper_stages"][
+        "perception_total.passive_capture_s"
+    ]["p50_s"] == 0.375
     assert result["instrumentation"] == {
         "instrumented_reports": 2,
         "legacy_reports": 0,

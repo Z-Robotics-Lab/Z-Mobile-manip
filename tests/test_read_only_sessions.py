@@ -47,6 +47,20 @@ def _passive_report():
     }
 
 
+def _write_perception_success(output: Path, target: str) -> None:
+    (output / "report.json").write_text(json.dumps({
+        "read_only": True,
+        "instruction": target,
+        "elapsed_s": 0.25,
+    }), encoding="utf-8")
+    for name in (
+        "edgetam_mask.png",
+        "edgetam_overlay.png",
+        "grasp_candidates_overlay.png",
+    ):
+        (output / name).write_bytes(b"fixed")
+
+
 class FakeBackend:
     def __init__(self) -> None:
         self.perception_result = BackendResult(0)
@@ -467,13 +481,7 @@ def test_perception_passes_immutable_output_and_captures_synchronized_joints(
     output = tmp_path / "immutable-output"
     output.mkdir()
     log = tmp_path / "perception.log"
-    for name in (
-        "report.json",
-        "edgetam_mask.png",
-        "edgetam_overlay.png",
-        "grasp_candidates_overlay.png",
-    ):
-        (output / name).write_bytes(b"fixed")
+    _write_perception_success(output, "white adapter")
 
     captured = {}
 
@@ -543,6 +551,40 @@ def test_perception_passes_immutable_output_and_captures_synchronized_joints(
         "z-manip-runtime:pinocchio"
     )
     assert (output / "selected_passive_joint_report.json").is_file()
+    timing_events = [
+        json.loads(line)
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("{")
+    ]
+    attempt_timing = next(
+        event for event in timing_events
+        if event.get("stage") == "perception_attempt"
+    )
+    total_timing = next(
+        event for event in timing_events
+        if event.get("stage") == "perception_total"
+    )
+    assert attempt_timing["passive_capture_count"] == 1
+    assert attempt_timing["process_launch_s"] >= 0.0
+    assert total_timing["target_identity_valid"] is True
+    assert total_timing["internal_elapsed_s"] == 0.25
+
+
+def test_perception_output_validation_rejects_different_target_identity(tmp_path):
+    module = _integration_module()
+    output = tmp_path / "mismatched-target"
+    output.mkdir()
+    _write_perception_success(output, "black box")
+    passive = json.dumps(_passive_report())
+    (output / "selected_passive_joint_report.json").write_text(
+        passive,
+        encoding="utf-8",
+    )
+
+    assert module.FixedReadOnlyBackend._perception_outputs_valid(
+        output,
+        "white adapter",
+    ) is False
 
 
 def test_perception_uses_warm_runner_for_workspace_artifacts(tmp_path, monkeypatch):
@@ -553,13 +595,7 @@ def test_perception_uses_warm_runner_for_workspace_artifacts(tmp_path, monkeypat
     output = artifact_root / "go2w_real" / "interactive_sessions" / "sample"
     output.mkdir(parents=True)
     log = tmp_path / "perception.log"
-    for name in (
-        "report.json",
-        "edgetam_mask.png",
-        "edgetam_overlay.png",
-        "grasp_candidates_overlay.png",
-    ):
-        (output / name).write_bytes(b"fixed")
+    _write_perception_success(output, "white adapter")
     captured = {}
 
     class FakeProcess:
@@ -636,13 +672,7 @@ def test_perception_retries_one_geometric_mask_failure(tmp_path, monkeypatch):
         attempt = len(attempts) + 1
         attempts.append(attempt)
         if attempt == 2:
-            for name in (
-                "report.json",
-                "edgetam_mask.png",
-                "edgetam_overlay.png",
-                "grasp_candidates_overlay.png",
-            ):
-                (output / name).write_bytes(f"attempt-{attempt}".encode())
+            _write_perception_success(output, "white adapter")
         return FakeProcess(4 if attempt == 1 else 0)
 
     backend = module.FixedReadOnlyBackend(
@@ -666,7 +696,9 @@ def test_perception_retries_one_geometric_mask_failure(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert attempts == [1, 2]
-    assert (output / "report.json").read_bytes() == b"attempt-2"
+    assert json.loads((output / "report.json").read_text())["instruction"] == (
+        "white adapter"
+    )
     assert "Retrying perception" in log.read_text(encoding="utf-8")
 
 
@@ -698,13 +730,7 @@ def test_perception_retries_one_explicit_tracker_failure(tmp_path, monkeypatch):
                 "perception_failure": "tracker_reported_loss: transient seed loss",
             }))
         if len(attempts) == 2:
-            for name in (
-                "report.json",
-                "edgetam_mask.png",
-                "edgetam_overlay.png",
-                "grasp_candidates_overlay.png",
-            ):
-                (output / name).write_bytes(b"recovered")
+            _write_perception_success(output, "white adapter")
         return FakeProcess(5 if len(attempts) == 1 else 0)
 
     backend = module.FixedReadOnlyBackend()

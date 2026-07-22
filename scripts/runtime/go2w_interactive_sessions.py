@@ -558,7 +558,7 @@ class FixedReadOnlyBackend:
             process.wait(timeout=5)
 
     @staticmethod
-    def _perception_outputs_valid(output_dir: Path) -> bool:
+    def _perception_outputs_valid(output_dir: Path, target: str) -> bool:
         required = (
             output_dir / "report.json",
             output_dir / "edgetam_mask.png",
@@ -566,10 +566,14 @@ class FixedReadOnlyBackend:
             output_dir / "grasp_candidates_overlay.png",
             output_dir / "selected_passive_joint_report.json",
         )
+        report = FixedReadOnlyBackend._perception_report(output_dir)
         return bool(
             all(path.is_file() and not path.is_symlink() for path in required)
             and required[-1].stat().st_size <= MAX_PASSIVE_REPORT_BYTES
             and FixedReadOnlyBackend._passive_report_valid(required[-1])
+            and report is not None
+            and report.get("read_only") is True
+            and report.get("instruction") == target
         )
 
     @staticmethod
@@ -738,6 +742,7 @@ class FixedReadOnlyBackend:
     ) -> BackendResult:
         """Run perception while repeatedly capturing synchronized passive joints."""
 
+        total_started = time.monotonic()
         for path in (NUC_KEY, DDS_CONFIG, PERCEPTION):
             if not path.is_file():
                 return BackendResult(
@@ -755,6 +760,7 @@ class FixedReadOnlyBackend:
         })
         log_path.parent.mkdir(parents=True, exist_ok=True)
         runner_output: Path | None = None
+        runner_probe_started = time.monotonic()
         try:
             relative_output = output_dir.resolve().relative_to(
                 ARTIFACT_ROOT.resolve(),
@@ -767,6 +773,7 @@ class FixedReadOnlyBackend:
             # outside the shared immutable artifact tree. Keep the former
             # one-shot container as a safe compatibility fallback.
             pass
+        runner_probe_s = time.monotonic() - runner_probe_started
         if runner_output is not None:
             command_prefix = (
                 "/usr/bin/docker",
@@ -831,8 +838,9 @@ class FixedReadOnlyBackend:
             # allowing stale or semantically different geometry through.
             "--reuse-valid-tracking",
         )
-        total_started = time.monotonic()
         return_code = 1
+        passive_capture_s_total = 0.0
+        passive_capture_count_total = 0
         for attempt in range(PERCEPTION_ATTEMPTS):
             if attempt:
                 for name in (
@@ -852,6 +860,7 @@ class FixedReadOnlyBackend:
                     )
             with log_path.open("ab") as log:
                 attempt_started = time.monotonic()
+                process_launch_started = time.monotonic()
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
@@ -860,13 +869,22 @@ class FixedReadOnlyBackend:
                     env=environment,
                     shell=False,
                 )
+                process_launch_s = time.monotonic() - process_launch_started
+            passive_capture_s = 0.0
+            passive_capture_count = 0
             try:
                 while process.poll() is None:
+                    passive_capture_started = time.monotonic()
                     passive = self._capture_passive_window(
                         output_dir,
                         log_path,
                         environment,
                     )
+                    capture_elapsed = time.monotonic() - passive_capture_started
+                    passive_capture_s += capture_elapsed
+                    passive_capture_s_total += capture_elapsed
+                    passive_capture_count += 1
+                    passive_capture_count_total += 1
                     if passive.exit_code != 0:
                         return passive
                 return_code = process.wait()
@@ -878,23 +896,60 @@ class FixedReadOnlyBackend:
                 time.monotonic() - attempt_started,
                 attempt=attempt + 1,
                 return_code=return_code,
+                runner_warm=runner_output is not None,
+                process_launch_s=round(process_launch_s, 6),
+                passive_capture_s=round(passive_capture_s, 6),
+                passive_capture_count=passive_capture_count,
             )
             if not self._perception_retryable(output_dir, return_code):
                 break
-        outputs_valid = self._perception_outputs_valid(output_dir)
+        output_validation_started = time.monotonic()
+        outputs_valid = self._perception_outputs_valid(output_dir, target)
+        output_validation_s = time.monotonic() - output_validation_started
+        report = self._perception_report(output_dir)
+        internal_elapsed = (
+            float(report["elapsed_s"])
+            if report is not None
+            and isinstance(report.get("elapsed_s"), (int, float))
+            else None
+        )
+        total_elapsed = time.monotonic() - total_started
+        timing_fields: dict[str, object] = {
+            "attempts": attempt + 1,
+            "return_code": return_code,
+            "runner_warm": runner_output is not None,
+            "runner_probe_s": round(runner_probe_s, 6),
+            "passive_capture_s": round(passive_capture_s_total, 6),
+            "passive_capture_count": passive_capture_count_total,
+            "output_validation_s": round(output_validation_s, 6),
+            "target_identity_valid": bool(
+                report is not None and report.get("instruction") == target
+            ),
+        }
+        if internal_elapsed is not None:
+            timing_fields["internal_elapsed_s"] = round(internal_elapsed, 6)
+            timing_fields["wrapper_overhead_s"] = round(
+                max(0.0, total_elapsed - internal_elapsed),
+                6,
+            )
+        if report is not None:
+            timing_fields["grounding_mode"] = (
+                "reused_tracking"
+                if report.get("grounding_reused") is True
+                else "fresh_grounding"
+            )
+        _append_timing(
+            log_path,
+            "perception_total",
+            total_elapsed,
+            **timing_fields,
+        )
         if return_code == 0 and not outputs_valid:
             return BackendResult(
                 1,
                 "PERCEPTION_OUTPUT_INVALID",
                 "perception omitted synchronized joints or fixed UI overlays",
             )
-        _append_timing(
-            log_path,
-            "perception_total",
-            time.monotonic() - total_started,
-            attempts=attempt + 1,
-            return_code=return_code,
-        )
         if return_code == 0:
             return BackendResult(0)
         return self._perception_failure_result(output_dir, return_code)
