@@ -35,7 +35,7 @@ def _fixtures(tmp_path: Path):
         frame=np.asarray("camera_color_optical_frame"),
         grasps=np.eye(4)[None, :, :],
     )
-    np.save(perception / "target_points.npy", np.asarray([[0.0, 0.0, 0.5]]))
+    np.save(perception / "target_points.npy", np.asarray([[0.0, 0.0, 0.1]]))
     joints = tmp_path / "joints.json"
     joints.write_text(json.dumps({
         "schema": "z_manip.piper_passive_joint_report.v1",
@@ -85,6 +85,57 @@ def test_synchronized_read_only_session_passes(tmp_path):
     assert report["joint_observation_overlaps"] is True
     assert report["candidate_count"] == 1
     assert report["target_centroid_base"] is not None
+
+
+def test_handoff_workspace_routes_only_far_targets_back_to_base_approach():
+    near = GATE.classify_handoff_workspace([[0.599, 0.0, 0.0]])
+    gray_low = GATE.classify_handoff_workspace([[0.600, 0.0, 0.0]])
+    gray_high = GATE.classify_handoff_workspace([[0.700, 0.0, 0.0]])
+    far = GATE.classify_handoff_workspace([[0.700001, 0.0, 0.0]])
+
+    assert near["state"] == "NEAR_FIELD_IK"
+    assert near["planning_allowed"] is True
+    assert gray_low["state"] == "PRECISION_IK"
+    assert gray_low["planning_allowed"] is True
+    assert gray_high["state"] == "PRECISION_IK"
+    assert gray_high["planning_allowed"] is True
+    assert far["state"] == "NEED_BASE_APPROACH"
+    assert far["planning_allowed"] is False
+
+
+def test_handoff_workspace_uses_robust_center_for_depth_outliers():
+    report = GATE.classify_handoff_workspace([
+        [0.49, 0.00, 0.00],
+        [0.50, 0.01, 0.00],
+        [0.51, -0.01, 0.00],
+        [50.0, 50.0, 50.0],
+    ])
+
+    assert report["state"] == "NEAR_FIELD_IK"
+    assert report["planning_allowed"] is True
+    assert report["target_range_m"] < 0.60
+
+
+def test_far_target_fails_before_ik_with_typed_base_approach_state(tmp_path):
+    perception, joints, calibration = _fixtures(tmp_path)
+    initial = GATE.evaluate_session(perception, joints, calibration, URDF)
+    base_from_camera = np.asarray(initial["base_from_camera"], dtype=float)
+    camera_from_base = np.linalg.inv(base_from_camera)
+    desired_base = np.asarray([0.71, 0.0, 0.0, 1.0])
+    desired_camera = (camera_from_base @ desired_base)[:3]
+    np.save(
+        perception / "target_points.npy",
+        np.repeat(desired_camera[None, :], repeats=5, axis=0),
+    )
+
+    report = GATE.evaluate_session(perception, joints, calibration, URDF)
+
+    assert report["planning_ready"] is False
+    assert report["planning_disposition"] == "NEED_BASE_APPROACH"
+    assert np.isclose(report["handoff_workspace"]["target_range_m"], 0.71)
+    assert {error["code"] for error in report["errors"]} == {
+        "NEED_BASE_APPROACH"
+    }
 
 
 def test_stale_or_out_of_limit_joint_state_fails_closed(tmp_path):
@@ -138,6 +189,9 @@ def test_gate_and_launcher_have_no_actuator_transport():
     source = LAUNCHER.read_text(encoding="utf-8")
 
     assert imports.isdisjoint(forbidden_imports)
+    assert source.index("piper_planning_session_gate.py") < source.index(
+        "docker run --rm --network none"
+    )
     assert "--network none" in source
     assert "piper_planning_dry_run.py:/usr/local/bin/" in source
     assert (

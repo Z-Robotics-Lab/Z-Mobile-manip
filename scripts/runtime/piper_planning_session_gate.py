@@ -25,6 +25,8 @@ MAX_CLOCK_SKEW_S = 0.250
 MAX_JOINT_RANGE_RAD = 0.002
 MAX_SNAPSHOT_SPAN_S = 0.050
 MAX_START_LIMIT_PROJECTION_RAD = 0.010
+DIRECT_HANDOFF_RANGE_M = 0.60
+MAX_HANDOFF_RANGE_M = 0.70
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -72,6 +74,48 @@ def _calibration_quality_passes(document: dict[str, Any]) -> bool:
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
+
+
+def classify_handoff_workspace(target_points_base: object) -> dict[str, object]:
+    """Classify target range before the expensive handoff IK search.
+
+    The median point is deliberately used instead of the cloud mean so a small
+    number of depth outliers cannot turn a near target into a far target (or the
+    reverse).  The 0.60--0.70 m gray zone remains available to the exact IK
+    solver; only targets strictly beyond 0.70 m are routed back to base
+    approach.
+    """
+
+    points = np.asarray(target_points_base, dtype=float)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 3
+        or points.shape[0] < 1
+        or not np.all(np.isfinite(points))
+    ):
+        raise ValueError("target point cloud in piper_base_link must have shape (N, 3)")
+
+    robust_center = np.median(points, axis=0)
+    target_range_m = float(np.linalg.norm(robust_center))
+    if target_range_m > MAX_HANDOFF_RANGE_M:
+        state = "NEED_BASE_APPROACH"
+        planning_allowed = False
+    elif target_range_m >= DIRECT_HANDOFF_RANGE_M:
+        state = "PRECISION_IK"
+        planning_allowed = True
+    else:
+        state = "NEAR_FIELD_IK"
+        planning_allowed = True
+
+    return {
+        "state": state,
+        "planning_allowed": planning_allowed,
+        "frame": "piper_base_link",
+        "target_range_m": target_range_m,
+        "target_robust_center_base": robust_center.tolist(),
+        "direct_handoff_range_m": DIRECT_HANDOFF_RANGE_M,
+        "maximum_handoff_range_m": MAX_HANDOFF_RANGE_M,
+    }
 
 
 def evaluate_session(
@@ -230,6 +274,8 @@ def evaluate_session(
 
     base_from_camera: np.ndarray | None = None
     target_centroid_base: list[float] | None = None
+    handoff_workspace: dict[str, object] | None = None
+    planning_disposition = "INVALID_SESSION"
     try:
         tip_from_camera = _rigid(calibration.get("tip_from_camera"), "tip_from_camera")
         base_from_camera = chain.forward(current_joints) @ tip_from_camera
@@ -239,6 +285,17 @@ def evaluate_session(
             raise ValueError("target point cloud must have shape (N, 3)")
         target_base = target @ base_from_camera[:3, :3].T + base_from_camera[:3, 3]
         target_centroid_base = np.mean(target_base, axis=0).tolist()
+        handoff_workspace = classify_handoff_workspace(target_base)
+        planning_disposition = str(handoff_workspace["state"])
+        if not bool(handoff_workspace["planning_allowed"]):
+            reject(
+                "NEED_BASE_APPROACH",
+                "target is outside the near-field handoff workspace; continue "
+                "base approach before running IK",
+                target_range_m=handoff_workspace["target_range_m"],
+                maximum_handoff_range_m=MAX_HANDOFF_RANGE_M,
+                frame="piper_base_link",
+            )
     except (OSError, ValueError) as error:
         reject("INVALID_FRAME_TRANSFORM_INPUT", str(error))
 
@@ -270,6 +327,8 @@ def evaluate_session(
         ),
         "base_from_camera": None if base_from_camera is None else base_from_camera.tolist(),
         "target_centroid_base": target_centroid_base,
+        "handoff_workspace": handoff_workspace,
+        "planning_disposition": planning_disposition,
         "errors": errors,
         "warnings": warnings,
     }
