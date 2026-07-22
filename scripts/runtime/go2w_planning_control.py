@@ -11,6 +11,7 @@ joint target, path, environment, or command from the browser.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 import hashlib
 import json
@@ -55,6 +56,8 @@ MAX_CAMERA_JPEG_BYTES = 512 * 1024
 CAMERA_STALE_AFTER_S = 2.0
 HOME_FAST_VERIFY_TOLERANCE_RAD = math.radians(1.0)
 MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 2.0
+MOBILE_HANDOFF_CAPTURE_MAX_SKEW_S = 1.0
+MAX_HANDOFF_EVIDENCE_BYTES = 512 * 1024
 MAX_CAMERA_FUTURE_S = 0.25
 MAX_INTERACTIVE_REQUEST_BYTES = 512
 MAX_INTERACTIVE_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -987,7 +990,7 @@ class MeasuredHomeVerifier:
         if (
             isinstance(source_timestamp_ns, bool)
             or not isinstance(source_timestamp_ns, int)
-            or source_timestamp_ns < not_before_unix_ns
+            or source_timestamp_ns <= not_before_unix_ns
         ):
             return False, "runtime joint feedback predates the stopped-base handoff", evidence
         joints = snapshot.get("joint_positions_rad")
@@ -3006,6 +3009,143 @@ class PiperGraspRunner:
         if completed.returncode != 0 or not (receipt_dir / "lift-receipt.json").is_file():
             raise RuntimeError(f"full grasp stopped safely; inspect {self.log_path}")
 
+    @staticmethod
+    def _read_handoff_json(path: Path) -> dict[str, Any]:
+        """Read one bounded, regular immutable handoff evidence document."""
+
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"handoff evidence is not a regular file: {path.name}")
+        size = path.stat().st_size
+        if size <= 0 or size > MAX_HANDOFF_EVIDENCE_BYTES:
+            raise RuntimeError(f"handoff evidence has an invalid size: {path.name}")
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise RuntimeError(f"handoff evidence is not an object: {path.name}")
+        return document
+
+    def _validate_mobile_handoff_capture_evidence(
+        self,
+        *,
+        perception_session_id: str,
+        target: str,
+        base_stopped_unix_ns: int,
+        joint_evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Gate planning on one coherent post-stop perception/joint snapshot.
+
+        The runtime observer and perception backend are separate receive-only
+        readers.  Parallel execution is safe only when both timestamp domains
+        prove they observed the same short post-stop epoch.  All inequalities
+        are intentionally strict at the base-stop boundary.
+        """
+
+        session_id = validate_session_id(perception_session_id)
+        expected_root = (
+            self.session_run_root / "perception" / session_id / "perception"
+        ).resolve()
+        if expected_root.is_symlink() or not expected_root.is_dir():
+            raise RuntimeError("fresh handoff perception artifacts are unavailable")
+        report_path = expected_root / "report.json"
+        passive_path = expected_root / "selected_passive_joint_report.json"
+        for path in (report_path, passive_path):
+            if path.resolve().parent != expected_root:
+                raise RuntimeError("handoff evidence escaped its immutable session")
+        report = self._read_handoff_json(report_path)
+        passive = self._read_handoff_json(passive_path)
+
+        source_timestamp_ns = joint_evidence.get("source_timestamp_ns")
+        if (
+            isinstance(source_timestamp_ns, bool)
+            or not isinstance(source_timestamp_ns, int)
+            or source_timestamp_ns <= base_stopped_unix_ns
+            or joint_evidence.get("read_only") is not True
+            or joint_evidence.get("motion_commands_published") != 0
+        ):
+            raise RuntimeError("observer joint evidence is not strictly post-stop/read-only")
+        joints = joint_evidence.get("joint_positions_rad")
+        if not isinstance(joints, list) or len(joints) != 6:
+            raise RuntimeError("observer joint evidence omitted the six-joint vector")
+        if not all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            for value in joints
+        ):
+            raise RuntimeError("observer joint evidence contains a non-finite joint")
+
+        if not go2w_interactive_sessions.FixedReadOnlyBackend._passive_report_valid(
+            passive_path,
+        ):
+            raise RuntimeError("selected passive handoff evidence is invalid")
+
+        timestamp_names = (
+            "observation_start_unix_ns",
+            "first_feedback_unix_ns",
+            "last_feedback_unix_ns",
+            "observation_end_unix_ns",
+        )
+        timestamps: dict[str, int] = {}
+        for name in timestamp_names:
+            value = passive.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise RuntimeError(f"passive handoff evidence omitted {name}")
+            timestamps[name] = value
+        observation_start = timestamps["observation_start_unix_ns"]
+        first_feedback = timestamps["first_feedback_unix_ns"]
+        last_feedback = timestamps["last_feedback_unix_ns"]
+        observation_end = timestamps["observation_end_unix_ns"]
+        if not (
+            base_stopped_unix_ns < observation_start
+            <= first_feedback
+            <= last_feedback
+            <= observation_end
+        ):
+            raise RuntimeError("passive handoff feedback is not strictly post-stop and ordered")
+
+        report_stamp_ns = report.get("stamp_ns")
+        if (
+            report.get("instruction") != target
+            or report.get("read_only") is not True
+            or report.get("grasp_generation_valid") is not True
+            or isinstance(report_stamp_ns, bool)
+            or not isinstance(report_stamp_ns, int)
+            or report_stamp_ns <= base_stopped_unix_ns
+        ):
+            raise RuntimeError("fresh handoff report failed target/read-only/post-stop identity")
+        passive_capture = report.get("passive_capture")
+        if not isinstance(passive_capture, dict) or passive_capture.get("synchronized") is not True:
+            raise RuntimeError("fresh handoff report lacks synchronized passive evidence")
+        if (
+            passive_capture.get("observation_start_unix_ns") != observation_start
+            or passive_capture.get("observation_end_unix_ns") != observation_end
+            or passive_capture.get("selected_stamp_ns") != report_stamp_ns
+        ):
+            raise RuntimeError("handoff report and selected passive window disagree")
+
+        if source_timestamp_ns < observation_start:
+            skew_ns = observation_start - source_timestamp_ns
+        elif source_timestamp_ns > observation_end:
+            skew_ns = source_timestamp_ns - observation_end
+        else:
+            skew_ns = 0
+        if skew_ns > int(MOBILE_HANDOFF_CAPTURE_MAX_SKEW_S * 1_000_000_000):
+            raise RuntimeError("observer and perception joint evidence are from different epochs")
+
+        return {
+            "validated": True,
+            "target": target,
+            "perception_session_id": session_id,
+            "base_stopped_unix_ns": base_stopped_unix_ns,
+            "observer_source_timestamp_ns": source_timestamp_ns,
+            "passive_observation_start_unix_ns": observation_start,
+            "passive_first_feedback_unix_ns": first_feedback,
+            "passive_last_feedback_unix_ns": last_feedback,
+            "passive_observation_end_unix_ns": observation_end,
+            "report_stamp_ns": report_stamp_ns,
+            "observer_passive_skew_ms": round(skew_ns / 1_000_000.0, 3),
+            "zero_transmit_verified": True,
+        }
+
     def _run_mobile_handoff(
         self,
         target: str,
@@ -3024,39 +3164,48 @@ class PiperGraspRunner:
                 "pre-servo perception is invalidated.\n",
                 encoding="utf-8",
             )
-            self._update(
-                phase="handoff_joint_ready",
-                message=(
-                    "Waiting for a fresh passive joint sample after base and "
-                    "reactive-view ownership stopped."
-                ),
-            )
-            joint_evidence = self._wait_mobile_handoff_joints(
-                not_before_unix_ns=base_stopped_unix_ns,
-            )
-            timings["handoff_joint_ready"] = round(
-                time.monotonic() - action_started,
-                6,
-            )
-            self._update(
-                handoff_joint_evidence=joint_evidence,
-                timings_s=dict(timings),
-            )
             # clear_current_context invalidates the detector/tracker seed and
-            # all old candidate/plan selections before the new capture starts.
+            # all old candidate/plan selections before either post-stop reader
+            # starts.  Passive joint readiness and fresh perception are
+            # independent receive-only operations, so overlap them and join
+            # both before any transform or planning is allowed.
             self.session_service.clear_current_context()
             self._update(
-                phase="handoff_perception",
+                phase="handoff_capture_parallel",
                 message=(
-                    "Capturing fresh close-range RGB-D, EdgeTAM mask, candidates, "
-                    "and synchronized passive joints at the current arm pose."
+                    "In parallel: waiting for post-stop passive joints and "
+                    "capturing fresh close-range RGB-D/EdgeTAM evidence."
                 ),
             )
+            parallel_started = time.monotonic()
 
-            phase_started = time.monotonic()
-            perception = self.session_service.start_perception(target)
-            timings["handoff_perception"] = round(
-                time.monotonic() - phase_started,
+            def wait_for_joints() -> tuple[dict[str, Any], float]:
+                started = time.monotonic()
+                evidence = self._wait_mobile_handoff_joints(
+                    not_before_unix_ns=base_stopped_unix_ns,
+                )
+                return evidence, round(time.monotonic() - started, 6)
+
+            def capture_perception() -> tuple[dict[str, Any], float]:
+                started = time.monotonic()
+                attempt = self.session_service.start_perception(target)
+                return attempt, round(time.monotonic() - started, 6)
+
+            with ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="z-manip-handoff-capture",
+            ) as executor:
+                joint_future = executor.submit(wait_for_joints)
+                perception_future = executor.submit(capture_perception)
+                # Always join both receive-only workers.  This prevents an
+                # orphan perception process from publishing artifacts after a
+                # joint-readiness failure has already blocked the handoff.
+                joint_evidence, joint_elapsed = joint_future.result()
+                perception, perception_elapsed = perception_future.result()
+            timings["handoff_joint_ready"] = joint_elapsed
+            timings["handoff_perception"] = perception_elapsed
+            timings["handoff_capture_parallel"] = round(
+                time.monotonic() - parallel_started,
                 6,
             )
             if perception.get("status") != "succeeded":
@@ -3071,9 +3220,18 @@ class PiperGraspRunner:
                     "close-range capture reused the pre-servo perception session",
                 )
 
+            capture_evidence = self._validate_mobile_handoff_capture_evidence(
+                perception_session_id=fresh_perception_session_id,
+                target=target,
+                base_stopped_unix_ns=base_stopped_unix_ns,
+                joint_evidence=joint_evidence,
+            )
+
             self._update(
                 phase="handoff_planning",
                 fresh_perception_session_id=fresh_perception_session_id,
+                handoff_joint_evidence=joint_evidence,
+                handoff_capture_evidence=capture_evidence,
                 timings_s=dict(timings),
                 message=(
                     "Generating new close-range grasp poses and planning from "

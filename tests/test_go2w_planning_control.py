@@ -1531,6 +1531,9 @@ def test_mobile_handoff_invalidates_old_capture_and_plans_from_fresh_session(tmp
             }
 
     runner.home_verifier = FreshJoints()
+    runner._validate_mobile_handoff_capture_evidence = lambda **_kwargs: {
+        "validated": True,
+    }
 
     def execute(**kwargs):
         events.append(("execute", kwargs["speed_percent"]))
@@ -1545,14 +1548,9 @@ def test_mobile_handoff_invalidates_old_capture_and_plans_from_fresh_session(tmp
         1_800_000_000_000_000_000,
     )
 
-    assert events == [
-        "joint_ready",
-        "clear",
-        ("perception", "floor bottle"),
-        "planning",
-        ("execute", 9),
-        "clear",
-    ]
+    assert events[0] == "clear"
+    assert set(events[1:3]) == {"joint_ready", ("perception", "floor bottle")}
+    assert events[3:] == ["planning", ("execute", 9), "clear"]
     status = runner.status()
     assert status["outcome"] == "passed"
     assert status["phase"] == "returned_home"
@@ -1607,6 +1605,9 @@ def test_mobile_handoff_surfaces_need_base_approach_without_execution(tmp_path):
             },
         ),
     })()
+    runner._validate_mobile_handoff_capture_evidence = lambda **_kwargs: {
+        "validated": True,
+    }
     runner._planning_artifacts = lambda _attempt: (_ for _ in ()).throw(
         AssertionError("typed base-approach disposition must bypass artifacts"),
     )
@@ -1630,6 +1631,234 @@ def test_mobile_handoff_surfaces_need_base_approach_without_execution(tmp_path):
     assert status["recovery_action"] == "approach_only"
     assert status["retryable"] is True
     assert "no execution was started" in status["message"]
+
+
+def test_mobile_handoff_overlaps_joint_wait_with_fresh_perception(tmp_path):
+    joint_started = threading.Event()
+    perception_started = threading.Event()
+
+    class Sessions:
+        def clear_current_context(self):
+            return None
+
+        def start_perception(self, _target):
+            perception_started.set()
+            assert joint_started.wait(timeout=0.25)
+            time.sleep(0.04)
+            return {"status": "succeeded", "session_id": "20260722-120030"}
+
+        def start_planning(self):
+            return {"status": "succeeded", "session_id": "20260722-120031"}
+
+    class Joints:
+        def current_joint_snapshot(self, *, not_before_unix_ns):
+            joint_started.set()
+            assert perception_started.wait(timeout=0.25)
+            time.sleep(0.04)
+            return True, "fresh", {
+                "sequence": 45,
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            }
+
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir()
+    runner.session_service = Sessions()
+    runner.home_verifier = Joints()
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+    runner._validate_mobile_handoff_capture_evidence = lambda **_kwargs: {
+        "validated": True,
+    }
+    runner._planning_artifacts = lambda _attempt: (
+        tmp_path / "planning_report.json",
+        tmp_path / "planned_grasp.npz",
+    )
+    runner._run_full = lambda **_kwargs: None
+
+    runner._run_mobile_handoff(
+        "floor bottle",
+        5,
+        "20260722-120029",
+        1_800_000_000_000_000_000,
+    )
+
+    status = runner.status()
+    assert status["outcome"] == "passed"
+    assert status["timings_s"]["handoff_capture_parallel"] < 0.2
+    assert status["timings_s"]["handoff_joint_ready"] >= 0.04
+    assert status["timings_s"]["handoff_perception"] >= 0.04
+
+
+def test_mobile_handoff_capture_gate_accepts_one_coherent_post_stop_epoch(tmp_path):
+    boundary = 1_800_000_000_000_000_000
+    session_id = "20260722-120040"
+    session_root = tmp_path / "sessions"
+    perception_root = session_root / "perception" / session_id / "perception"
+    perception_root.mkdir(parents=True)
+    observation_start = boundary + 100_000_000
+    first_feedback = boundary + 110_000_000
+    last_feedback = boundary + 190_000_000
+    observation_end = boundary + 200_000_000
+    report_stamp = boundary + 210_000_000
+    (perception_root / "selected_passive_joint_report.json").write_text(
+        json.dumps({
+            "schema": "z_manip.piper_passive_joint_report.v1",
+            "read_only": True,
+            "complete_joint_feedback": True,
+            "zero_transmit_verified": True,
+            "interface_tx_packet_delta": 0,
+            "observation_start_unix_ns": observation_start,
+            "first_feedback_unix_ns": first_feedback,
+            "last_feedback_unix_ns": last_feedback,
+            "observation_end_unix_ns": observation_end,
+        }),
+        encoding="utf-8",
+    )
+    (perception_root / "report.json").write_text(
+        json.dumps({
+            "instruction": "floor bottle",
+            "read_only": True,
+            "grasp_generation_valid": True,
+            "stamp_ns": report_stamp,
+            "passive_capture": {
+                "synchronized": True,
+                "observation_start_unix_ns": observation_start,
+                "observation_end_unix_ns": observation_end,
+                "selected_stamp_ns": report_stamp,
+            },
+        }),
+        encoding="utf-8",
+    )
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.session_run_root = session_root
+
+    evidence = runner._validate_mobile_handoff_capture_evidence(
+        perception_session_id=session_id,
+        target="floor bottle",
+        base_stopped_unix_ns=boundary,
+        joint_evidence={
+            "source_timestamp_ns": boundary + 150_000_000,
+            "joint_positions_rad": [0.0] * 6,
+            "read_only": True,
+            "motion_commands_published": 0,
+        },
+    )
+
+    assert evidence["validated"] is True
+    assert evidence["observer_passive_skew_ms"] == 0.0
+    assert evidence["zero_transmit_verified"] is True
+
+
+def test_mobile_handoff_capture_gate_rejects_pre_stop_passive_evidence(tmp_path):
+    boundary = 1_800_000_000_000_000_000
+    session_id = "20260722-120050"
+    session_root = tmp_path / "sessions"
+    perception_root = session_root / "perception" / session_id / "perception"
+    perception_root.mkdir(parents=True)
+    (perception_root / "selected_passive_joint_report.json").write_text(
+        json.dumps({
+            "schema": "z_manip.piper_passive_joint_report.v1",
+            "read_only": True,
+            "complete_joint_feedback": True,
+            "zero_transmit_verified": True,
+            "interface_tx_packet_delta": 0,
+            "observation_start_unix_ns": boundary,
+            "first_feedback_unix_ns": boundary + 1,
+            "last_feedback_unix_ns": boundary + 2,
+            "observation_end_unix_ns": boundary + 3,
+        }),
+        encoding="utf-8",
+    )
+    (perception_root / "report.json").write_text(
+        json.dumps({
+            "instruction": "floor bottle",
+            "read_only": True,
+            "grasp_generation_valid": True,
+            "stamp_ns": boundary + 4,
+            "passive_capture": {
+                "synchronized": True,
+                "observation_start_unix_ns": boundary,
+                "observation_end_unix_ns": boundary + 3,
+                "selected_stamp_ns": boundary + 4,
+            },
+        }),
+        encoding="utf-8",
+    )
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.session_run_root = session_root
+
+    with pytest.raises(RuntimeError, match="strictly post-stop"):
+        runner._validate_mobile_handoff_capture_evidence(
+            perception_session_id=session_id,
+            target="floor bottle",
+            base_stopped_unix_ns=boundary,
+            joint_evidence={
+                "source_timestamp_ns": boundary + 2,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+                "motion_commands_published": 0,
+            },
+        )
+
+
+def test_mobile_handoff_never_plans_when_parallel_evidence_gate_fails(tmp_path):
+    class Sessions:
+        def clear_current_context(self):
+            return None
+
+        def start_perception(self, _target):
+            return {"status": "succeeded", "session_id": "20260722-120059"}
+
+        def start_planning(self):
+            raise AssertionError("invalid parallel evidence must block planning")
+
+    boundary = 1_800_000_000_000_000_000
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir()
+    runner.session_service = Sessions()
+    runner.home_verifier = type("FreshJoints", (), {
+        "current_joint_snapshot": lambda self, *, not_before_unix_ns: (
+            True,
+            "fresh",
+            {
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            },
+        ),
+    })()
+    runner._validate_mobile_handoff_capture_evidence = lambda **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("evidence epochs disagree"))
+    )
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+
+    runner._run_mobile_handoff(
+        "floor bottle",
+        5,
+        "20260722-120058",
+        boundary,
+    )
+
+    status = runner.status()
+    assert status["outcome"] == "blocked"
+    assert "evidence epochs disagree" in status["message"]
 
 
 def test_depth_servo_mirrors_recoverable_handoff_disposition(tmp_path):
