@@ -328,6 +328,7 @@ def validate_runtime_state(document: object) -> dict[str, Any]:
             "fresh_topic_count",
             "configured_topic_count",
             "depth_filter",
+            "tracker",
         }
         _strict_keys(telemetry, allowed_telemetry, "telemetry")
         boolean_keys = {
@@ -467,6 +468,89 @@ def validate_runtime_state(document: object) -> dict[str, Any]:
                     raise RuntimeStateError("depth-filter reset_reason is unsupported")
                 normalized_filter["report"] = normalized_report
             normalized_telemetry["depth_filter"] = normalized_filter
+        tracker = telemetry.get("tracker")
+        if tracker is not None:
+            if not isinstance(tracker, dict):
+                raise RuntimeStateError("telemetry tracker must be an object")
+            _strict_keys(
+                tracker,
+                {
+                    "phase",
+                    "tracking",
+                    "target_fresh",
+                    "target_source_stamp_ns",
+                    "failure",
+                },
+                "telemetry tracker",
+            )
+            phase = tracker.get("phase")
+            if phase not in {
+                "tracking",
+                "target_stale",
+                "idle_or_lost",
+                "unobserved",
+                "failed",
+            }:
+                raise RuntimeStateError("telemetry tracker phase is unsupported")
+            tracking = tracker.get("tracking")
+            if tracking is not None and not isinstance(tracking, bool):
+                raise RuntimeStateError("telemetry tracker tracking must be boolean or null")
+            target_fresh = tracker.get("target_fresh")
+            if not isinstance(target_fresh, bool):
+                raise RuntimeStateError("telemetry tracker target_fresh must be a boolean")
+            target_stamp = tracker.get("target_source_stamp_ns")
+            if (
+                target_stamp is not None
+                and (
+                    isinstance(target_stamp, bool)
+                    or not isinstance(target_stamp, int)
+                    or target_stamp <= 0
+                )
+            ):
+                raise RuntimeStateError(
+                    "telemetry tracker target_source_stamp_ns must be positive or null",
+                )
+            failure = tracker.get("failure")
+            normalized_failure: dict[str, object] | None = None
+            if failure is not None:
+                if not isinstance(failure, dict):
+                    raise RuntimeStateError("telemetry tracker failure must be an object or null")
+                _strict_keys(
+                    failure,
+                    {"seed_id", "seed_stamp_ns", "reason_code", "reason"},
+                    "telemetry tracker failure",
+                )
+                normalized_failure = {}
+                for key in ("seed_id", "seed_stamp_ns"):
+                    value = failure.get(key)
+                    if (
+                        value is not None
+                        and (
+                            isinstance(value, bool)
+                            or not isinstance(value, int)
+                            or value < 0
+                        )
+                    ):
+                        raise RuntimeStateError(
+                            f"telemetry tracker failure {key} must be non-negative or null",
+                        )
+                    normalized_failure[key] = value
+                for key in ("reason_code", "reason"):
+                    value = failure.get(key)
+                    if value is not None and (
+                        not isinstance(value, str) or len(value) > 512
+                    ):
+                        raise RuntimeStateError(
+                            f"telemetry tracker failure {key} must be bounded text or null",
+                        )
+                    normalized_failure[key] = value
+            normalized_telemetry["tracker"] = {
+                "phase": phase,
+                "tracking": tracking,
+                "target_fresh": target_fresh,
+                "target_source_stamp_ns": target_stamp,
+                "failure": normalized_failure,
+            }
         normalized["telemetry"] = normalized_telemetry
 
     links = document.get("robot_links")

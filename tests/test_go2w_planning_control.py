@@ -452,6 +452,48 @@ def test_runtime_validator_rejects_inconsistent_or_malformed_filter_telemetry():
         raise AssertionError("out-of-bounds filter telemetry was accepted")
 
 
+def test_runtime_validator_accepts_observer_tracker_with_live_joint_feedback():
+    state = _runtime_state(1_800_000_000_000_000_000)
+    state["joint_state_available"] = True
+    state["telemetry"] = {
+        "read_only": True,
+        "motion_commands_published": 0,
+        "joint_state_available": True,
+        "tracker": {
+            "phase": "tracking",
+            "tracking": True,
+            "target_fresh": True,
+            "target_source_stamp_ns": 1_800_000_000_000_000_000,
+            "failure": None,
+        },
+    }
+
+    normalized = CONTROL.validate_runtime_state(state)
+
+    assert normalized["joint_state_available"] is True
+    assert normalized["telemetry"]["tracker"] == state["telemetry"]["tracker"]
+
+
+def test_runtime_validator_rejects_malformed_observer_tracker():
+    state = _runtime_state(1_800_000_000_000_000_000)
+    state["telemetry"] = {
+        "tracker": {
+            "phase": "tracking",
+            "tracking": "yes",
+            "target_fresh": True,
+            "target_source_stamp_ns": None,
+            "failure": None,
+        },
+    }
+
+    try:
+        CONTROL.validate_runtime_state(state)
+    except CONTROL.RuntimeStateError as error:
+        assert "tracking must be boolean or null" in str(error)
+    else:
+        raise AssertionError("malformed tracker telemetry was accepted")
+
+
 def test_runtime_reader_missing_invalid_and_oversized_files_are_offline(tmp_path, monkeypatch):
     missing = CONTROL.RuntimeStateReader(tmp_path / "missing.json").snapshot()[0]
     assert missing["status"] == "offline"
