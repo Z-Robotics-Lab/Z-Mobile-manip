@@ -1088,6 +1088,7 @@ def _acquire_runner(tmp_path, sessions, search):
         tmp_path / "servo.log",
         session_service=sessions,
         wrist_search=search,
+        acquisition_grace_s=0.0,
     )
 
 
@@ -1438,6 +1439,7 @@ def test_depth_servo_view_recovery_stops_base_before_wrist_search(tmp_path):
             phase_dir / "servo.log",
             session_service=interactive,
             wrist_search=search,
+            acquisition_grace_s=0.0,
         )
 
         result = runner.start(
@@ -3479,3 +3481,56 @@ def test_mobile_handoff_does_not_recapture_for_other_evidence_failures(tmp_path)
     assert events.count(("perception", 1)) == 1
     assert ("perception", 2) not in events
     assert runner.status()["outcome"] != "passed"
+
+
+def test_monitor_holds_search_through_the_acquisition_grace_window(tmp_path):
+    """The servo's first empty ticks are acquisition, not loss: a freshly
+    seeded track needs seed-to-first-bundle latency, so search_required
+    within the grace window must not spend a reacquisition attempt."""
+
+    class Search:
+        def __init__(self):
+            self.calls = 0
+            self.first_call_s = None
+
+        def run(self, target, *, mode, speed_percent, cancel, operator_present=False):
+            self.calls += 1
+            if self.first_call_s is None:
+                self.first_call_s = time.monotonic()
+            return True
+
+        def status(self):
+            return {"phase": "found", "failure": None}
+
+        def stop(self):
+            return None
+
+    interactive = _FakeInteractiveService()
+    search = Search()
+    runner = CONTROL.DepthServoRunner(
+        _servo_phase_sequence_script(
+            tmp_path / "servo.py",
+            ["search_required", "search_required", "base_approach"],
+        ),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=interactive,
+        wrist_search=search,
+        acquisition_grace_s=1.0,
+    )
+    started_s = time.monotonic()
+    result = runner.start(
+        "shadow",
+        target="charger",
+        operator_present=True,
+        speed_percent=9,
+    )
+    assert result["started"] is True
+    deadline = time.monotonic() + 4.0
+    while search.calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    runner.stop()
+
+    assert search.calls >= 1
+    # The sweep must not have started inside the grace window.
+    assert search.first_call_s - started_s >= 0.9

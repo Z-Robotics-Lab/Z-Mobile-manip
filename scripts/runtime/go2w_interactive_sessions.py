@@ -907,6 +907,18 @@ class FixedReadOnlyBackend:
         if report is None:
             return return_code == 4
         if return_code == 4:
+            filtered_points = report.get("filtered_target_points")
+            if (
+                not isinstance(filtered_points, bool)
+                and isinstance(filtered_points, int)
+                and filtered_points > 0
+            ):
+                # A real identity-valid bundle exists; grasp geometry at this
+                # range is deterministic for the frozen scene and the mobile
+                # flow advances on a seeded rc4, so a fresh seed would only
+                # add seconds and replace the live track that downstream
+                # target streaming depends on.
+                return False
             grasp_error = report.get("grasp_generation_error")
             return not (
                 isinstance(grasp_error, str)

@@ -1853,3 +1853,67 @@ def test_integration_module_is_importable_without_running_hardware():
 
     assert module.FixedReadOnlyBackend is not None
     assert module.RUN_ROOT.name == "interactive_sessions"
+
+
+def test_perception_does_not_retry_grasp_geometry_failure_with_valid_seed(
+    tmp_path,
+    monkeypatch,
+):
+    """A seeded rc4 must return immediately: the mobile flow advances on it,
+    and a fresh-grounding retry only adds seconds and churns the live track."""
+
+    module = _integration_module()
+    key = tmp_path / "server-key"
+    key.write_text("test", encoding="utf-8")
+    monkeypatch.setattr(module, "NUC_KEY", key)
+    output = tmp_path / "seeded-rc4"
+    output.mkdir()
+    log = tmp_path / "perception.log"
+    attempts = []
+
+    class FakeProcess:
+        def __init__(self, return_code):
+            self.return_code = return_code
+            self.polls = iter((None, return_code))
+
+        def poll(self):
+            return next(self.polls, self.return_code)
+
+        def wait(self, timeout=None):
+            return self.return_code
+
+    def fake_popen(_argv, **_kwargs):
+        attempts.append(len(attempts) + 1)
+        (output / "report.json").write_text(json.dumps({
+            "instruction": "white adapter",
+            "filtered_target_points": 1777,
+            "grasp_generation_valid": False,
+            "grasp_generation_error": (
+                "no antipodal or aperture-bounded OBB grasp; observed "
+                "extent=[0.118, 0.116, 0.069]"
+            ),
+        }))
+        return FakeProcess(4)
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+
+    def fake_capture(output_dir, _log_path, _environment):
+        payload = json.dumps(_passive_report())
+        (output_dir / "live_passive_joint_report.json").write_text(payload)
+        (output_dir / "selected_passive_joint_report.json").write_text(payload)
+        return module.BackendResult(0)
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(backend, "_capture_passive_window", fake_capture)
+
+    result = backend.run_perception(
+        target="white adapter",
+        output_dir=output,
+        log_path=log,
+    )
+
+    assert attempts == [1]
+    assert result.exit_code == 4
+    assert "Retrying perception" not in log.read_text(encoding="utf-8")

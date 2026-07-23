@@ -81,6 +81,7 @@ CLOUD_SOURCE_NAMES = {0: "d435_raw", 1: "ffs"}
 # Default advertised poll interval for lower-rate JSON/perception endpoints.
 DEFAULT_POLL_INTERVAL_MS = 200
 HOME_FAST_VERIFY_TOLERANCE_RAD = math.radians(1.0)
+SERVO_ACQUISITION_GRACE_S = 5.0
 MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 2.0
 # The passive observer publishes at 20 Hz, while recorded delivery can lag its
 # source stamp by about 0.2 s.  Poll frequently enough to avoid adding another
@@ -1667,6 +1668,7 @@ class DepthServoRunner:
         max_reacquisitions: int = 3,
         posture_wait_timeout_s: float = 12.0,
         state_heartbeat_timeout_s: float = 1.5,
+        acquisition_grace_s: float = SERVO_ACQUISITION_GRACE_S,
     ) -> None:
         self.script = script.expanduser().resolve()
         if not self.script.is_file():
@@ -1693,6 +1695,7 @@ class DepthServoRunner:
         )
         self._joint_feedback_timeout_s = float(joint_feedback_timeout_s)
         self._max_reacquisitions = max(0, int(max_reacquisitions))
+        self._acquisition_grace_s = max(0.0, float(acquisition_grace_s))
         self._reactive_watchdog = go2w_reactive_supervision.ReactivePhaseWatchdog(
             go2w_reactive_supervision.ReactiveWatchdogConfig(
                 posture_wait_timeout_s=posture_wait_timeout_s,
@@ -2397,6 +2400,7 @@ class DepthServoRunner:
                 self._message = "Target acquired; visual approach is running."
 
         last_reacquisition_s = 0.0
+        servo_started_s = time.monotonic()
         while not cancel.wait(0.20):
             with self._lock:
                 process = self._process
@@ -2437,6 +2441,15 @@ class DepthServoRunner:
                 return
             if phase in {"view_recovery", "search_required"}:
                 now = time.monotonic()
+                if now - servo_started_s < self._acquisition_grace_s:
+                    # A freshly seeded track needs grounding + EdgeTAM seeding
+                    # + the first depth-joined bundle (~2-3s measured live)
+                    # before the servo can see any 3-D target.  Reacting to
+                    # the servo's first empty ticks made detect-then-search a
+                    # startup coin flip; acquisition is not loss, so hold the
+                    # base and let the stream arrive before spending a
+                    # reacquisition attempt on a wrist sweep.
+                    continue
                 with self._lock:
                     attempts = int(self._workflow["reacquisition_attempts"])
                 if attempts >= self._max_reacquisitions:
