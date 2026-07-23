@@ -19,7 +19,13 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(SCRIPT_DIR.parents[1]))
+# On the NUC this file runs from ~/z-manip-runtime/wrist-search, where
+# parents[1] is $HOME: prepending it would shadow the installed pyAgxArm
+# package with the ~/pyAgxArm checkout as an import-breaking namespace
+# package. Only prepend the repo root in the local development layout.
+_REPO_ROOT = SCRIPT_DIR.parents[1]
+if (_REPO_ROOT / "z_manip").is_dir():
+    sys.path.insert(0, str(_REPO_ROOT))
 import piper_staged_grasp_executor as executor
 
 try:  # The remote wrapper copies the pure policy beside this executable.

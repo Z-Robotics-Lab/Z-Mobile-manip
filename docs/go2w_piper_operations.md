@@ -320,7 +320,7 @@ Even with one-shot authorization, the browser can request only a fixed view
 index and a bounded 1–12% search
 speed; it cannot submit joint angles. The finite grid is anchored to the
 measured software Home, changes only J4/J5, requires the other joints to remain
-at Home, and has a hard 75 s deadline. While no operator is present, keep the
+at Home, and has a hard 360 s deadline (measured: one remote fixed-view command costs about 12 s end to end, so the finite grid needs minutes, not the original 75 s in-process estimate). While no operator is present, keep the
 environment variable unset and use only **Shadow check**.
 
 ## 7. Troubleshooting

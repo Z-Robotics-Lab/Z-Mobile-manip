@@ -110,5 +110,5 @@ def test_stop_is_terminal_and_configuration_is_fail_closed():
 
 def test_default_confirmation_threshold_matches_grounding_service_contract():
     config = WristSearchConfig()
-    assert config.confidence_threshold == pytest.approx(0.20)
+    assert config.confidence_threshold == pytest.approx(0.15)
     assert config.confirmations_required == 2

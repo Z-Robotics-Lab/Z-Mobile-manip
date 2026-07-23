@@ -127,3 +127,76 @@ def test_stop_forwards_to_interruptible_motion():
     )
     coordinator.stop()
     assert motion.stopped
+
+
+def _grid_motion(config, motion_calls):
+    grid = MODULE.BoundedWristSearch(config)
+
+    def motion(view_index, speed_percent):
+        motion_calls.append(view_index)
+        view = grid.views[view_index]
+        joints = np.zeros(6)
+        joints[config.yaw_joint_index] = view.yaw_offset_rad
+        joints[config.pitch_joint_index] = view.pitch_offset_rad
+        return joints
+
+    return motion
+
+
+def _small_grid(**overrides):
+    parameters = dict(
+        settle_s=0.01,
+        detector_hz=20.0,
+        observations_per_view=1,
+        confirmations_required=1,
+        yaw_step_rad=0.1,
+        max_yaw_offset_rad=0.1,
+        pitch_step_rad=0.1,
+        max_pitch_offset_rad=0.1,
+    )
+    parameters.update(overrides)
+    return MODULE.WristSearchConfig(**parameters)
+
+
+def test_exhausted_live_search_restores_home_anchor(monkeypatch):
+    monkeypatch.setenv("Z_MANIP_ENABLE_WRIST_SEARCH", "1")
+    clock = Clock()
+    motion_calls = []
+    config = _small_grid()
+    coordinator = MODULE.WristSearchCoordinator(
+        np.zeros(6),
+        lambda _target: (False, None, "missing"),
+        motion=_grid_motion(config, motion_calls),
+        config=config,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+    assert not coordinator.run("charger", mode="live", speed_percent=5)
+    assert any(view != 0 for view in motion_calls[:-1])
+    assert motion_calls[-1] == 0
+    assert "returned" in coordinator.status()["message"]
+
+
+def test_found_live_search_stays_on_target_view(monkeypatch):
+    monkeypatch.setenv("Z_MANIP_ENABLE_WRIST_SEARCH", "1")
+    clock = Clock()
+    motion_calls = []
+    seen = {"count": 0}
+
+    def detector(_target):
+        seen["count"] += 1
+        if seen["count"] <= 2:
+            return (False, None, "missing")
+        return (True, 0.8, "charger")
+
+    config = _small_grid(observations_per_view=2, confirmations_required=2)
+    coordinator = MODULE.WristSearchCoordinator(
+        np.zeros(6),
+        detector,
+        motion=_grid_motion(config, motion_calls),
+        config=config,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+    assert coordinator.run("charger", mode="live", speed_percent=5)
+    assert motion_calls and motion_calls[-1] != 0

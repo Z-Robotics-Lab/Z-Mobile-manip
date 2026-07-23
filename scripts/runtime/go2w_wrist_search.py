@@ -280,65 +280,99 @@ class WristSearchCoordinator:
             failure=None,
             message="Searching the current camera view first.",
         )
-        while decision.phase not in {
-            WristSearchPhase.FOUND,
-            WristSearchPhase.EXHAUSTED,
-            WristSearchPhase.STOPPED,
-        }:
-            if self._cancel.is_set() or (external_cancel is not None and external_cancel.is_set()):
-                search.stop()
-                self._update(active=False, phase="stopped", message="Wrist search cancelled.")
-                return False
-            if decision.phase is WristSearchPhase.MOVE:
-                view = decision.view
-                assert view is not None
-                self._update(
-                    phase="move" if mode == "live" else "shadow_view",
-                    view_index=view.index,
-                    message=(
-                        f"Moving to bounded wrist view {view.index + 1}/{len(search.views)}."
-                        if mode == "live"
-                        else f"Shadowing wrist view {view.index + 1}/{len(search.views)}."
-                    ),
-                )
-                measured = (
-                    self.motion(view.index, min(int(speed_percent), 12))
-                    if mode == "live" and self.motion is not None
-                    else np.asarray(decision.target_joints_rad, dtype=float)
-                )
-                decision = search.update_motion(measured, now_s=self.clock())
-                if decision.phase is WristSearchPhase.SETTLE:
-                    self.sleep(self.config.settle_s)
+        confirmed = False
+        cancelled = False
+        last_live_view = 0
+        try:
+            while decision.phase not in {
+                WristSearchPhase.FOUND,
+                WristSearchPhase.EXHAUSTED,
+                WristSearchPhase.STOPPED,
+            }:
+                if self._cancel.is_set() or (external_cancel is not None and external_cancel.is_set()):
+                    cancelled = True
+                    search.stop()
+                    self._update(active=False, phase="stopped", message="Wrist search cancelled.")
+                    return False
+                if decision.phase is WristSearchPhase.MOVE:
+                    view = decision.view
+                    assert view is not None
+                    self._update(
+                        phase="move" if mode == "live" else "shadow_view",
+                        view_index=view.index,
+                        message=(
+                            f"Moving to bounded wrist view {view.index + 1}/{len(search.views)}."
+                            if mode == "live"
+                            else f"Shadowing wrist view {view.index + 1}/{len(search.views)}."
+                        ),
+                    )
+                    measured = (
+                        self.motion(view.index, min(int(speed_percent), 12))
+                        if mode == "live" and self.motion is not None
+                        else np.asarray(decision.target_joints_rad, dtype=float)
+                    )
+                    if mode == "live" and self.motion is not None:
+                        last_live_view = view.index
                     decision = search.update_motion(measured, now_s=self.clock())
-                continue
-            if decision.phase is WristSearchPhase.OBSERVE:
-                visible, confidence, detail = self.detector(target)
-                decision = search.observe(
-                    visible=visible,
-                    confidence=confidence,
-                    now_s=self.clock(),
-                )
-                self._update(
-                    phase=decision.phase.value,
-                    confidence=confidence,
-                    confirmations=decision.confirmations,
-                    message=detail if not visible else f"Detector confidence {confidence:.3f}.",
-                )
+                    if decision.phase is WristSearchPhase.SETTLE:
+                        self.sleep(self.config.settle_s)
+                        decision = search.update_motion(measured, now_s=self.clock())
+                    continue
                 if decision.phase is WristSearchPhase.OBSERVE:
-                    self.sleep(self.config.observation_period_s)
-                continue
-            raise RuntimeError(f"unexpected wrist search phase: {decision.phase}")
-        found = decision.phase is WristSearchPhase.FOUND
-        self._update(
-            active=False,
-            phase=decision.phase.value,
-            confidence=decision.confidence,
-            confirmations=decision.confirmations,
-            message=(
-                "Target confirmed; handing the stable view to EdgeTAM and depth servo."
-                if found
-                else "Finite wrist search exhausted without a confirmed target."
-            ),
-            failure=None if found else "target not found in bounded wrist search",
-        )
-        return found
+                    visible, confidence, detail = self.detector(target)
+                    decision = search.observe(
+                        visible=visible,
+                        confidence=confidence,
+                        now_s=self.clock(),
+                    )
+                    self._update(
+                        phase=decision.phase.value,
+                        confidence=confidence,
+                        confirmations=decision.confirmations,
+                        message=detail if not visible else f"Detector confidence {confidence:.3f}.",
+                    )
+                    if decision.phase is WristSearchPhase.OBSERVE:
+                        self.sleep(self.config.observation_period_s)
+                    continue
+                raise RuntimeError(f"unexpected wrist search phase: {decision.phase}")
+            found = decision.phase is WristSearchPhase.FOUND
+            confirmed = found
+            self._update(
+                active=False,
+                phase=decision.phase.value,
+                confidence=decision.confidence,
+                confirmations=decision.confirmations,
+                message=(
+                    "Target confirmed; handing the stable view to EdgeTAM and depth servo."
+                    if found
+                    else "Finite wrist search exhausted without a confirmed target."
+                ),
+                failure=None if found else "target not found in bounded wrist search",
+            )
+            return found
+        finally:
+            if (
+                not confirmed
+                and not cancelled
+                and last_live_view != 0
+                and mode == "live"
+                and self.motion is not None
+            ):
+                # A failed search must not strand the wrist off-anchor: the
+                # next Find would probe the current view from an arbitrary
+                # pose and miss a target that is plainly visible from Home.
+                try:
+                    self.motion(0, min(int(speed_percent), 12))
+                    self._update(
+                        message=(
+                            "Search ended without a target; wrist returned "
+                            "to the Home anchor view."
+                        ),
+                    )
+                except Exception as error:
+                    self._update(
+                        message=(
+                            "Wrist anchor restore failed; run Reset + Home "
+                            f"before the next Find: {error}"
+                        ),
+                    )

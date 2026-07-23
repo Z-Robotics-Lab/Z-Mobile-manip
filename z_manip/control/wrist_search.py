@@ -39,16 +39,21 @@ class WristSearchConfig:
     settle_s: float = 0.35
     detector_hz: float = 5.0
     observations_per_view: int = 3
-    # The resident grounding service already rejects candidates below 0.20
+    # The resident grounding service already rejects candidates below 0.15
     # and applies finite/border/area gates. Search adds temporal confirmation,
-    # not a contradictory second confidence gate.
-    confidence_threshold: float = 0.20
+    # not a contradictory second confidence gate. 0.15 keeps the measured
+    # white-charger operating point (0.19 on a plainly visible target) inside
+    # the gate while staying far above the 0.05 that the offline seed
+    # benchmark rejected for false positives.
+    confidence_threshold: float = 0.15
     confirmations_required: int = 2
     joint_tolerance_rad: float = math.radians(1.0)
-    # At 5% each smooth 18 degree wrist edge takes about 1.9 seconds.  The
-    # deadline therefore covers the finite grid once without permitting an
-    # unbounded scan.
-    max_search_s: float = 75.0
+    # Measured on hardware 2026-07-23: one remote fixed-view command costs
+    # about 12 seconds end to end (ssh + file staging + passive-feedback
+    # service stop/start around the bounded 5% move), so the 25-view grid
+    # needs several minutes, not the 75 seconds the original in-process
+    # motion estimate assumed.  The deadline still forbids an unbounded scan.
+    max_search_s: float = 360.0
 
     def __post_init__(self) -> None:
         if self.yaw_joint_index == self.pitch_joint_index:
