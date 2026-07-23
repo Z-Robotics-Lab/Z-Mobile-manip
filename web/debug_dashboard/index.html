@@ -1775,6 +1775,24 @@
         && Array.isArray(kt?.arm_base_from_camera);
     }
 
+    // The arm skeleton is pure forward kinematics (no hand-eye), so it is honest
+    // base-frame geometry whenever the observer publishes link frames — which it
+    // only does when the passive joint feedback is fresh.
+    function liveSkeletonAvailable(runtime) {
+      return runtime?.status === "live" && Array.isArray(runtime?.robot_links) && runtime.robot_links.length >= 2;
+    }
+
+    // The live view always works in the arm base frame; derive its label from the
+    // transform artifact when present, else the first link frame, else the known
+    // PiPER base link so the frame gate still has a stable string to check.
+    function liveBaseFrame(runtime) {
+      const kt = runtime?.kinematic_transforms;
+      if (typeof kt?.arm_base_frame === "string") return kt.arm_base_frame;
+      const links = runtime?.robot_links;
+      if (Array.isArray(links) && links.length && typeof links[0]?.name === "string") return links[0].name;
+      return "piper_base_link";
+    }
+
     function liveRobotOverlay(runtime, frame) {
       const links = runtime?.robot_links;
       if (!Array.isArray(links) || links.length < 2 || !frame) return null;
@@ -1812,9 +1830,14 @@
       const runtime = state.runtime;
       const verified = liveCalibrationVerified(runtime);
       const kt = runtime?.kinematic_transforms;
-      const frame = verified ? kt.arm_base_frame : (kt?.camera_frame || "camera_color_optical_frame");
-      scene.enterLiveMode({ frame, overlayAllowed: verified });
-      return { scene, verified, kt, runtime, frame };
+      const skeleton = liveSkeletonAvailable(runtime);
+      // Always render in the base frame.  The skeleton (forward kinematics) is
+      // allowed whenever link frames are fresh; the colored cloud and wrist
+      // frustum stay locked until the hand-eye transform verifies, so a camera
+      // frame cloud is never placed on the base grid.
+      const frame = liveBaseFrame(runtime);
+      scene.enterLiveMode({ frame, overlayAllowed: skeleton, cloudExpected: verified });
+      return { scene, verified, kt, runtime, frame, skeleton };
     }
 
     function applyLiveColoredCloud(parsed) {
@@ -1823,26 +1846,27 @@
       const context = ensureLiveMode();
       if (!context) return;
       const cloud = state.liveColoredCloud;
-      if (!cloud || !cloud.count) { context.scene.setLiveColoredCloud(null, null, 0); return; }
-      if (context.verified) {
-        const base = transformCloudToBase(cloud.xyz, cloud.count, context.kt.arm_base_from_camera);
-        context.scene.setLiveColoredCloud(base, cloud.rgb, cloud.count);
-      } else {
-        context.scene.setLiveColoredCloud(cloud.xyz, cloud.rgb, cloud.count);
+      // Only a verified, base-transformed cloud is fed to the shared scene.  When
+      // the hand-eye transform is not verified the cloud is withheld here (and the
+      // module drops it too), and stays visible only in the left color-cloud tile.
+      if (!context.verified || !cloud || !cloud.count) {
+        context.scene.setLiveColoredCloud(null, null, 0);
+        return;
       }
+      const base = transformCloudToBase(cloud.xyz, cloud.count, context.kt.arm_base_from_camera);
+      context.scene.setLiveColoredCloud(base, cloud.rgb, cloud.count);
     }
 
     function applyLiveGeometry() {
       const context = ensureLiveMode();
       if (!context) return;
-      const { scene, verified, kt, runtime } = context;
-      if (verified) {
-        scene.setLiveCameraPose(kt.arm_base_from_camera);
-        scene.setLiveRobot(liveRobotOverlay(runtime, kt.arm_base_frame));
-      } else {
-        scene.setLiveCameraPose(null);
-        scene.setLiveRobot(null);
-      }
+      const { scene, verified, kt, runtime, frame, skeleton } = context;
+      // Arm skeleton: live forward kinematics in the base frame whenever the
+      // observer publishes fresh link frames, independent of the hand-eye gate.
+      scene.setLiveRobot(skeleton ? liveRobotOverlay(runtime, frame) : null);
+      // Wrist-camera frustum + colored cloud fusion: gated on the measured
+      // hand-eye transform.
+      scene.setLiveCameraPose(verified ? kt.arm_base_from_camera : null);
       applyLiveColoredCloud(null);
     }
 
@@ -1883,9 +1907,14 @@
       if (state.geometryMode === "live") {
         const verified = liveCalibrationVerified(state.runtime);
         lock.hidden = verified;
-        lock.textContent = state.runtime?.status === "live"
-          ? "CALIBRATION INVALID — BASE-FRAME ROBOT AND ARM OVERLAYS ARE LOCKED · camera frame · uncalibrated cloud only"
-          : "LIVE OBSERVER OFFLINE — BASE-FRAME OVERLAYS ARE LOCKED";
+        if (state.runtime?.status !== "live") {
+          lock.textContent = "LIVE OBSERVER OFFLINE — base geometry locked · waiting for the subscribe-only runtime observer";
+        } else if (liveSkeletonAvailable(state.runtime)) {
+          // Skeleton is honest base FK; only the camera-derived fusion is locked.
+          lock.textContent = "HAND-EYE UNVERIFIED — colored cloud fusion locked (cloud stays camera-frame in the left tile) · arm skeleton is live forward kinematics";
+        } else {
+          lock.textContent = "JOINT FEEDBACK STALE — arm skeleton and cloud fusion locked · waiting for fresh /piper/state";
+        }
       } else {
         lock.hidden = state.calibrationValid;
         lock.textContent = "CALIBRATION INVALID — BASE-FRAME ROBOT AND TRAJECTORY OVERLAYS ARE LOCKED";

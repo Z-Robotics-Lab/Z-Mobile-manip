@@ -45,6 +45,19 @@
     Object.freeze([0, 0, 1, 0]),
     Object.freeze([0, 0, 0, 1]),
   ]);
+  // Default virtual-camera framing.  The live view stands the operator behind
+  // the robot and slightly elevated (base frame is Z-up; the projection remap in
+  // _worldToView keeps the arm's up axis upright).  The session/bundle view keeps
+  // the original angle so recorded evidence renders exactly as before.
+  const LIVE_ORBIT = Object.freeze({ yaw: -0.8, pitch: -0.38, zoom: 1, panX: 0, panY: 0 });
+  const SESSION_ORBIT = Object.freeze({ yaw: -0.72, pitch: -0.46, zoom: 1, panX: 0, panY: 0 });
+  // Live auto-fit tuning.  The colored cloud can span a whole room, so the fit
+  // ignores cloud points past LIVE_WORK_RADIUS_M of the base, clamps the span so
+  // the arm never shrinks below LIVE_ARM_MIN_FRAC of the view, and biases the
+  // centre forward so the arm reads left-of-centre with the scene in front.
+  const LIVE_WORK_RADIUS_M = 1.3;
+  const LIVE_ARM_MIN_FRAC = 0.28;
+  const LIVE_FWD_BIAS = 0.22;
 
   function finite(value) {
     return typeof value === "number" && Number.isFinite(value);
@@ -140,7 +153,7 @@
       this._renderCount = 0;
       this._selection = { candidateId: null, rejection: null };
       this._framing = null;
-      this.orbit = { yaw: -0.72, pitch: -0.46, zoom: 1, panX: 0, panY: 0 };
+      this.orbit = Object.assign({}, SESSION_ORBIT);
       this._drag = null;
       this._listeners = [];
       this._observer = null;
@@ -151,6 +164,7 @@
       // under the vector overlays so 15-20k points never stall the page.
       this.live = false;
       this._liveFramingLocked = false;
+      this._liveCloudExpected = false;
       this._cloudCanvas = null;
       this._cloudCtx = null;
       this._cloudImage = null;
@@ -431,6 +445,12 @@
 
     setBundle(bundle) {
       if (this._destroyed) return { accepted: false, diagnostics: this.getDiagnostics() };
+      // A recorded bundle is authored in the session frame and rendered with the
+      // plain (non-remapped) projection.  Leaving live mode here guarantees the
+      // Z-up remap and live framing never leak into the session/plan view.
+      this.live = false;
+      this._liveFramingLocked = false;
+      this._liveCloudExpected = false;
       this.diagnostics = [];
       this._diagnosticKeys.clear();
       this.bundle = bundle && typeof bundle === "object" ? bundle : null;
@@ -588,10 +608,23 @@
         this._diagnose("MISSING_DISPLAY_FRAME", "live view requires an explicit display frame", "live.frame");
         return { accepted: false, frame: null, live: false };
       }
+      // overlayAllowed gates the arm skeleton, which is pure forward kinematics
+      // and therefore honest base geometry whenever the joints are fresh.
+      // cloudExpected gates the colored cloud and wrist-camera frustum, which are
+      // the only inputs that need the measured hand-eye transform; when it is
+      // false the base grid + skeleton still render but no camera-frame geometry
+      // is ever placed on the base grid.
       const overlayAllowed = opts.overlayAllowed === true;
-      if (this.live && this.displayFrame === frame && this.model.overlayAllowed === overlayAllowed) {
-        return { accepted: true, frame, overlayAllowed, live: true };
+      const cloudExpected = opts.cloudExpected === true;
+      if (
+        this.live
+        && this.displayFrame === frame
+        && this.model.overlayAllowed === overlayAllowed
+        && this._liveCloudExpected === cloudExpected
+      ) {
+        return { accepted: true, frame, overlayAllowed, cloudExpected, live: true };
       }
+      const wasLive = this.live;
       this.live = true;
       this.bundle = null;
       this.diagnostics = [];
@@ -599,15 +632,19 @@
       this.displayFrame = frame;
       this.model = this._emptyModel();
       this.model.overlayAllowed = overlayAllowed;
+      this._liveCloudExpected = cloudExpected;
       this._filterStats = this._emptyFilterStats();
       this._selection = { candidateId: null, rejection: null };
       // The display frame is the base frame origin, so the floor grid and base
-      // axes anchor at identity.
+      // axes anchor at identity; the Z-up projection remap renders them upright.
       this.model.basePose = IDENTITY.map(row => row.slice());
       this._framing = null;
       this._liveFramingLocked = false;
+      // Snap to the standing-behind default only when first entering live mode so
+      // operator orbit/zoom persists across data refreshes and gate toggles.
+      if (!wasLive) this.orbit = Object.assign({}, LIVE_ORBIT);
       this._scheduleRender();
-      return { accepted: true, frame, overlayAllowed, live: true };
+      return { accepted: true, frame, overlayAllowed, cloudExpected, live: true };
     }
 
     setLiveRobot(value) {
@@ -642,12 +679,25 @@
     setLiveColoredCloud(xyz, rgb, count) {
       if (this._destroyed || !this.live) return 0;
       const total = Number.isInteger(count) && count > 0 ? count : 0;
+      // Hard gate: a colored cloud only enters the shared base scene when the
+      // hand-eye transform is verified (cloudExpected).  Camera-frame points must
+      // never be co-drawn on the base grid — that is the mis-scaled, disconnected
+      // picture operators reported — so an unverified cloud is dropped at the
+      // module boundary regardless of what the caller passes.
       const usable = total > 0
+        && this._liveCloudExpected
         && xyz && typeof xyz.length === "number" && xyz.length >= total * 3
         && rgb && typeof rgb.length === "number" && rgb.length >= total * 3;
       if (!usable) {
         const changed = this.model.coloredCloud !== null;
         this.model.coloredCloud = null;
+        if (total > 0 && !this._liveCloudExpected) {
+          this._diagnose(
+            "CLOUD_FUSION_LOCKED",
+            "colored cloud withheld from the base scene until hand-eye verifies",
+            "live.coloredCloud",
+          );
+        }
         if (changed) this._scheduleRender();
         return 0;
       }
@@ -662,43 +712,84 @@
       const framing = this._fitLiveFraming();
       if (!framing) return;
       this._framing = framing;
-      // Lock the virtual camera once the full live geometry is present so later
-      // joint motion and cloud refreshes cannot shake a stationary view.
-      if (this.model.actualRobot && this.model.cameraPose && this.model.coloredCloud) {
+      // Lock the virtual camera once the anchor geometry for the current gate is
+      // present so later joint motion and cloud refreshes cannot shake a settled
+      // view.  Verified fusion anchors on the arm + camera + cloud; the locked
+      // (cloud withheld) state anchors on the arm skeleton alone.
+      const cloud = this.model.coloredCloud;
+      const cloudReady = Boolean(cloud && cloud.count) && Boolean(this.model.cameraPose);
+      if (this.model.actualRobot && (this._liveCloudExpected ? cloudReady : true)) {
         this._liveFramingLocked = true;
       }
     }
 
-    _fitLiveFraming() {
-      const focus = [];
-      if (this.model.actualRobot) {
-        for (const link of this.model.actualRobot.links) focus.push(link[0], link[1]);
-      }
-      if (this.model.basePose) focus.push(origin(this.model.basePose));
-      if (this.model.cameraPose) focus.push(origin(this.model.cameraPose));
-      const cloud = this.model.coloredCloud;
-      if (cloud && cloud.count) {
-        const step = Math.max(1, Math.floor(cloud.count / 1500));
-        const sample = [];
-        for (let index = 0; index < cloud.count; index += step) {
-          const base = index * 3;
-          const value = [cloud.xyz[base], cloud.xyz[base + 1], cloud.xyz[base + 2]];
-          if (value.every(finite)) sample.push(value);
-        }
-        for (const value of this._robustCloudPoints(sample)) focus.push(value);
-      }
-      const values = focus.filter(Boolean);
-      if (values.length < 2) return null;
+    _bounds(values) {
+      const points = (values || []).filter(Boolean);
+      if (points.length < 2) return null;
       const low = [Infinity, Infinity, Infinity];
       const high = [-Infinity, -Infinity, -Infinity];
-      for (const value of values) {
+      for (const value of points) {
         for (let axis = 0; axis < 3; axis += 1) {
           low[axis] = Math.min(low[axis], value[axis]);
           high[axis] = Math.max(high[axis], value[axis]);
         }
       }
       const center = low.map((value, axis) => (value + high[axis]) * 0.5);
-      const span = Math.max(...low.map((value, axis) => high[axis] - value), 0.28);
+      const extent = Math.max(...low.map((value, axis) => high[axis] - value));
+      return { low, high, center, extent };
+    }
+
+    _skeletonPoints() {
+      const points = [];
+      if (this.model.actualRobot) {
+        for (const link of this.model.actualRobot.links) points.push(link[0], link[1]);
+      }
+      if (this.model.basePose) points.push(origin(this.model.basePose));
+      return points.filter(Boolean);
+    }
+
+    _fitSkeletonFraming(skeleton) {
+      // Locked / skeleton-only fit: the colored cloud is withheld until hand-eye
+      // verifies, so frame the arm + grid tightly enough that the arm is clearly
+      // readable rather than a speck beside a room-scale cloud.
+      const box = this._bounds(skeleton);
+      if (!box) return null;
+      return { center: box.center, span: Math.max(box.extent * 1.7, 0.5), source: "live" };
+    }
+
+    _fitLiveFraming() {
+      const skeleton = this._skeletonPoints();
+      const cloud = this.model.coloredCloud;
+      // Only a verified, base-frame cloud participates in the fit.
+      if (!this._liveCloudExpected || !cloud || !cloud.count) {
+        return this._fitSkeletonFraming(skeleton);
+      }
+      const armBox = this._bounds(skeleton);
+      const anchors = skeleton.slice();
+      if (this.model.cameraPose) anchors.push(origin(this.model.cameraPose));
+      const step = Math.max(1, Math.floor(cloud.count / 1500));
+      const near = [];
+      for (let index = 0; index < cloud.count; index += step) {
+        const base = index * 3;
+        const value = [cloud.xyz[base], cloud.xyz[base + 1], cloud.xyz[base + 2]];
+        if (!value.every(finite)) continue;
+        if (Math.hypot(value[0], value[1], value[2]) <= LIVE_WORK_RADIUS_M) near.push(value);
+      }
+      for (const value of this._robustCloudPoints(near)) anchors.push(value);
+      const box = this._bounds(anchors);
+      if (!box) return this._fitSkeletonFraming(skeleton);
+      let center = box.center;
+      let span = Math.max(box.extent, 0.4);
+      if (armBox) {
+        // Clamp so a wide cloud cannot shrink the arm below LIVE_ARM_MIN_FRAC of
+        // the view; when clamped, re-centre forward of the arm so it reads
+        // left-of-centre with the scene in front.
+        const cap = armBox.extent / LIVE_ARM_MIN_FRAC;
+        if (span > cap) {
+          span = cap;
+          center = [armBox.center[0] + LIVE_FWD_BIAS * span, armBox.center[1], armBox.center[2]];
+        }
+      }
       return { center, span, source: "live" };
     }
 
@@ -760,12 +851,21 @@
       const xyz = cloud.xyz;
       const rgb = cloud.rgb;
       const count = cloud.count;
+      const liveUp = this.live;
       const size = Math.max(1, Math.round(ratio * 1.5));
       for (let index = 0; index < count; index += 1) {
         const base = index * 3;
-        const wx = xyz[base] - cx;
-        const wy = xyz[base + 1] - cy;
-        const wz = xyz[base + 2] - cz;
+        let wx = xyz[base] - cx;
+        let wy = xyz[base + 1] - cy;
+        let wz = xyz[base + 2] - cz;
+        if (liveUp) {
+          // Match the Z-up remap applied to the vector overlays in _worldToView
+          // so the cloud shares one frame with the arm skeleton and floor grid.
+          const ry = wz;
+          const rz = -wy;
+          wy = ry;
+          wz = rz;
+        }
         const x1 = cyaw * wx - syaw * wz;
         const z1 = syaw * wx + cyaw * wz;
         const y2 = cpit * wy - spit * z1;
@@ -906,7 +1006,7 @@
     }
 
     resetView() {
-      this.orbit = { yaw: -0.72, pitch: -0.46, zoom: 1, panX: 0, panY: 0 };
+      this.orbit = Object.assign({}, this.live ? LIVE_ORBIT : SESSION_ORBIT);
       if (this.live) {
         this._liveFramingLocked = false;
         this._framing = null;
@@ -919,9 +1019,18 @@
     _worldToView(value, center, scale) {
       const width = this._viewport.width;
       const height = this._viewport.height;
-      const x = value[0] - center[0];
-      const y = value[1] - center[1];
-      const z = value[2] - center[2];
+      let x = value[0] - center[0];
+      let y = value[1] - center[1];
+      let z = value[2] - center[2];
+      if (this.live) {
+        // The turntable projection is Y-up, but the live base frame is Z-up.
+        // Remap robot(x, y, z) -> render(x, z, -y) so the robot's up axis renders
+        // straight up and the floor (base z=0 plane) reads as horizontal ground.
+        const ry = z;
+        const rz = -y;
+        y = ry;
+        z = rz;
+      }
       const cy = Math.cos(this.orbit.yaw);
       const sy = Math.sin(this.orbit.yaw);
       const cp = Math.cos(this.orbit.pitch);

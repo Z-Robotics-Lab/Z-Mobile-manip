@@ -416,7 +416,7 @@ def test_live_mode_renders_base_frame_skeleton_camera_and_colored_cloud():
     result = _node(_live_harness(r"""
 const canvas = new Canvas();
 const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
-const entered = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true}});
+const entered = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
 const cam = scene.setLiveCameraPose(cameraPose);
 const robot = scene.setLiveRobot({{
   frame:'piper_base_link', links_xyz_m: links, joint_positions_rad:[.01,.02,.03,.04,.05,0]
@@ -428,6 +428,7 @@ const labels = operations.filter(op => op[0] === 'fillText').map(op => op[1]);
 const drewCloud = operations.some(op => op[0] === 'drawImage');
 console.log(JSON.stringify({{
   entered, cam, robot, cloud, state, labels, drewCloud,
+  orbit: state.orbit,
   diagnostics: scene.getDiagnostics().map(item => item.code)
 }}));
 """))
@@ -435,6 +436,7 @@ console.log(JSON.stringify({{
     assert result["entered"]["accepted"] is True
     assert result["entered"]["frame"] == "piper_base_link"
     assert result["entered"]["live"] is True
+    assert result["entered"]["cloudExpected"] is True
     assert result["cam"] is True
     assert result["robot"] is True
     assert result["cloud"] == 4
@@ -448,14 +450,22 @@ console.log(JSON.stringify({{
     assert "camera pose" in result["labels"]
     assert "base" in result["labels"]
     assert result["diagnostics"] == []
+    # Live view snaps to the standing-behind default orbit, distinct from the
+    # session default so recorded evidence still renders at its original angle.
+    assert result["orbit"]["yaw"] == -0.8
+    assert result["orbit"]["pitch"] == -0.38
 
 
-def test_live_uncalibrated_locks_base_overlays_but_shows_camera_frame_cloud():
+def test_live_locked_shows_base_skeleton_but_withholds_the_colored_cloud():
+    # Hand-eye unverified: the arm skeleton is honest base-frame forward
+    # kinematics and still renders, but the colored cloud (which needs the
+    # measured transform) is withheld from the shared base scene so a camera-frame
+    # cloud can never be co-drawn on the base grid.  The cloud stays in the tile.
     result = _node(_live_harness(r"""
 const canvas = new Canvas();
 const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
-scene.enterLiveMode({{frame:'camera_color_optical_frame', overlayAllowed:false}});
-const robot = scene.setLiveRobot({{frame:'camera_color_optical_frame', links_xyz_m: links}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:false}});
+const robot = scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
 const cam = scene.setLiveCameraPose(null);
 const cloud = scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
 scene.flush();
@@ -467,25 +477,50 @@ console.log(JSON.stringify({{
 }}));
 """))
 
-    assert result["robot"] is False
+    assert result["robot"] is True
     assert result["cam"] is False
-    assert result["cloud"] == 4
+    assert result["cloud"] == 0
+    assert result["state"]["overlayAllowed"] is True
+    assert result["state"]["counts"]["actualLinks"] == 3
+    assert result["state"]["counts"]["coloredCloudPoints"] == 0
+    assert result["state"]["framing"]["source"] == "live"
+    assert result["drewCloud"] is False
+    assert "CLOUD_FUSION_LOCKED" in result["diagnostics"]
+    assert "OVERLAY_LOCKED" not in result["diagnostics"]
+
+
+def test_live_observer_offline_locks_everything_without_a_skeleton():
+    # No fresh link frames: skeleton unavailable and cloud withheld, so only the
+    # grid remains and the model reports no overlays.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:false, cloudExpected:false}});
+const robot = scene.setLiveRobot(null);
+const cloud = scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.flush();
+const state = scene.getState();
+const drewCloud = operations.some(op => op[0] === 'drawImage');
+console.log(JSON.stringify({{robot, cloud, state, drewCloud}}));
+"""))
+
+    assert result["robot"] is False
+    assert result["cloud"] == 0
     assert result["state"]["overlayAllowed"] is False
     assert result["state"]["counts"]["actualLinks"] == 0
-    assert result["state"]["counts"]["coloredCloudPoints"] == 4
-    assert result["drewCloud"] is True
-    assert "OVERLAY_LOCKED" in result["diagnostics"]
+    assert result["state"]["counts"]["coloredCloudPoints"] == 0
+    assert result["drewCloud"] is False
 
 
 def test_live_mode_is_idempotent_and_preserves_cloud_across_repeated_entry():
     result = _node(_live_harness(r"""
 const canvas = new Canvas();
 const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
-scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
 scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
-const again = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true}});
+const again = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
 const kept = scene.getState().counts.coloredCloudPoints;
-const reset = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:false}});
+const reset = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:false, cloudExpected:false}});
 const cleared = scene.getState().counts.coloredCloudPoints;
 console.log(JSON.stringify({{again, kept, reset, cleared}}));
 """))
@@ -502,7 +537,7 @@ def test_live_colored_cloud_is_fail_soft_without_a_document():
     result = _node(_live_harness(r"""
 const canvas = new Canvas();
 const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
-scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
 const cloud = scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
 const rendered = scene.render();
 const drewCloud = operations.some(op => op[0] === 'drawImage');
@@ -518,6 +553,62 @@ console.log(JSON.stringify({{
     assert result["points"] == 4
     assert result["drewCloud"] is False
     assert result["diagnostics"] == []
+
+
+def test_live_view_is_z_up_so_the_robot_up_axis_renders_straight_up():
+    # The turntable projection is Y-up, but the live base frame is Z-up.  A point
+    # directly above the base (+z) must render straight up on screen: same x, lower
+    # y than the base.  We read the drawn axis labels ("base" ~ base origin,
+    # "camera pose" ~ camera origin) which fillText places at each origin.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+// Camera origin exactly 0.4 m straight up (+z) from the base, identity rotation.
+scene.setLiveCameraPose([[1,0,0,0],[0,1,0,0],[0,0,1,.4],[0,0,0,1]]);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.flush();
+const texts = operations.filter(op => op[0] === 'fillText');
+const base = texts.find(op => op[1] === 'base');
+const camera = texts.find(op => op[1] === 'camera pose');
+console.log(JSON.stringify({{base, camera}}));
+"""))
+
+    assert result["base"] is not None
+    assert result["camera"] is not None
+    # fillText payload is [text, x, y]; the camera (+z above base) is higher on
+    # screen (smaller y) and horizontally aligned with the base.
+    base_x, base_y = result["base"][2], result["base"][3]
+    cam_x, cam_y = result["camera"][2], result["camera"][3]
+    assert cam_y < base_y - 20
+    assert abs(cam_x - base_x) < 6
+
+
+def test_verified_framing_clamps_span_so_the_arm_stays_readable():
+    # A room-scale colored cloud must not shrink the arm into a corner: cloud
+    # points past the work radius are excluded and the span is clamped so the arm
+    # keeps a readable fraction of the view.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+scene.setLiveCameraPose(cameraPose);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+// Wide near cloud (~2 m across, inside the work radius) plus a 3 m outlier that
+// must be excluded from the fit entirely.
+const wideXyz = new Float32Array([.4,1.0,0, .4,-1.0,0, .5,0,.3, 3.0,0,0]);
+const wideRgb = new Uint8Array([255,0,0, 0,255,0, 0,0,255, 90,90,90]);
+scene.setLiveColoredCloud(wideXyz, wideRgb, 4);
+scene.flush();
+const framing = scene.getState().framing;
+console.log(JSON.stringify({{framing}}));
+"""))
+
+    framing = result["framing"]
+    assert framing["source"] == "live"
+    # Neither the 2 m-wide near cloud nor the 3 m outlier blew up the fit.
+    assert 0.4 <= framing["span"] < 1.5
 
 
 def test_javascript_syntax_is_valid():

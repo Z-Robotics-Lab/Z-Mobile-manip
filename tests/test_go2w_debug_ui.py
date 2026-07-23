@@ -484,10 +484,21 @@ def test_geometry_view_defaults_to_live_fusion_with_session_toggle():
     assert "arm_base_from_camera" in lowered
     assert "function transformcloudtobase" in lowered
 
-    # When calibration is not verified the base overlays stay locked and only a
-    # camera-frame cloud is shown.
-    assert "uncalibrated cloud only" in lowered
-    assert "base-frame overlays are locked" in lowered
+    # The arm skeleton is pure forward kinematics, so it renders in the base frame
+    # whenever link frames are fresh; only the colored cloud + wrist frustum are
+    # gated on the measured hand-eye transform (cloudExpected).  A camera-frame
+    # cloud is never co-drawn on the base grid.
+    assert "function liveskeletonavailable" in lowered
+    assert "function livebaseframe" in lowered
+    assert "cloudexpected: verified" in lowered
+    assert "overlayallowed: skeleton" in lowered
+    assert "scene.setliverobot(skeleton ? liverobotoverlay(runtime, frame) : null)" in lowered
+    # When hand-eye is not verified the cloud is withheld from the shared scene
+    # (it stays in the left tile) and the banner says so honestly.
+    assert "!context.verified || !cloud || !cloud.count" in lowered
+    assert "hand-eye unverified" in lowered
+    assert "colored cloud fusion locked" in lowered
+    assert "arm skeleton is live forward kinematics" in lowered
     assert "function updatecalibrationlock" in lowered
 
     # Per-layer freshness badge consistent with the other live tiles.
