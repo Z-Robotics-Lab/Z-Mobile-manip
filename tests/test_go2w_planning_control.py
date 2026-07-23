@@ -1081,7 +1081,38 @@ def test_depth_servo_server_reacquires_after_bounded_tracking_loss(tmp_path):
     runner.stop()
 
 
-def test_depth_servo_uses_local_search_before_one_complete_perception(tmp_path):
+def _acquire_runner(tmp_path, sessions, search):
+    return CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=sessions,
+        wrist_search=search,
+    )
+
+
+class _RecordingSearch:
+    def __init__(self, found, events, status):
+        self.found = found
+        self.events = events
+        self._status = status
+        self.calls = []
+
+    def run(self, target, *, mode, speed_percent, cancel, operator_present=False):
+        self.events.append("search")
+        self.calls.append((
+            target, mode, speed_percent, cancel.is_set(), operator_present,
+        ))
+        return self.found
+
+    def status(self):
+        return dict(self._status)
+
+    def stop(self):
+        return None
+
+
+def test_depth_servo_confirms_current_view_perception_without_wrist_motion(tmp_path):
     events = []
 
     class Sessions:
@@ -1091,37 +1122,11 @@ def test_depth_servo_uses_local_search_before_one_complete_perception(tmp_path):
         def start_perception(self, target):
             self.calls += 1
             events.append("perception")
-            return {
-                "status": "succeeded",
-                "target": target,
-            }
-
-    class Search:
-        def __init__(self):
-            self.calls = []
-
-        def run(self, target, *, mode, speed_percent, cancel, operator_present=False):
-            events.append("search")
-            self.calls.append((
-                target, mode, speed_percent, cancel.is_set(), operator_present,
-            ))
-            return True
-
-        def status(self):
-            return {"phase": "found", "failure": None}
-
-        def stop(self):
-            return None
+            return {"status": "succeeded", "target": target}
 
     sessions = Sessions()
-    search = Search()
-    runner = CONTROL.DepthServoRunner(
-        _servo_status_script(tmp_path / "servo.py", "approach"),
-        tmp_path / "status.json",
-        tmp_path / "servo.log",
-        session_service=sessions,
-        wrist_search=search,
-    )
+    search = _RecordingSearch(True, events, {"phase": "idle", "failure": None})
+    runner = _acquire_runner(tmp_path, sessions, search)
 
     result = runner.start(
         "shadow",
@@ -1135,65 +1140,82 @@ def test_depth_servo_uses_local_search_before_one_complete_perception(tmp_path):
 
     assert result["started"] is True
     assert sessions.calls == 1
-    assert events[:2] == ["search", "perception"]
-    assert search.calls == [("charger", "shadow", 8, False, False)]
-    assert runner.status()["wrist_search"]["phase"] == "found"
+    assert events == ["perception"]
+    assert search.calls == []
     runner.stop()
 
 
-def test_depth_servo_local_search_miss_never_enters_remote_backed_perception(tmp_path):
+def test_depth_servo_current_view_miss_falls_back_to_bounded_wrist_search(tmp_path):
+    events = []
+
     class Sessions:
         def __init__(self):
             self.calls = 0
 
         def start_perception(self, target):
             self.calls += 1
-            raise AssertionError("complete perception must not run after local search miss")
-
-    class Search:
-        def __init__(self):
-            self.calls = 0
-
-        def run(self, target, *, mode, speed_percent, cancel, operator_present=False):
-            self.calls += 1
-            return False
-
-        def status(self):
-            return {"phase": "exhausted", "failure": "bounded local search exhausted"}
-
-        def stop(self):
-            return None
+            events.append("perception")
+            return {"status": "failed", "target": target}
 
     sessions = Sessions()
-    search = Search()
-    runner = CONTROL.DepthServoRunner(
-        _servo_status_script(tmp_path / "servo.py", "approach"),
-        tmp_path / "status.json",
-        tmp_path / "servo.log",
-        session_service=sessions,
-        wrist_search=search,
+    search = _RecordingSearch(
+        False,
+        events,
+        {"phase": "exhausted", "failure": "bounded local search exhausted"},
     )
+    runner = _acquire_runner(tmp_path, sessions, search)
 
-    started = time.monotonic()
     result = runner.start(
         "shadow",
         target="charger",
         acquire_target=True,
         speed_percent=8,
     )
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + 3.0
     while runner.status()["workflow"]["active"] and time.monotonic() < deadline:
         time.sleep(0.01)
-    elapsed = time.monotonic() - started
 
     status = runner.status()
     assert result["started"] is True
-    assert search.calls == 1
-    assert sessions.calls == 0
+    assert events == ["perception", "search"]
+    assert sessions.calls == 1
     assert status["workflow"]["phase"] == "blocked"
     assert status["workflow"]["failure"] == "bounded local search exhausted"
     assert runner._process is None
-    assert elapsed < 0.5
+
+
+def test_depth_servo_wrist_search_find_seeds_second_perception(tmp_path):
+    events = []
+
+    class Sessions:
+        def __init__(self):
+            self.calls = 0
+
+        def start_perception(self, target):
+            self.calls += 1
+            events.append("perception")
+            status = "failed" if self.calls == 1 else "succeeded"
+            return {"status": status, "target": target}
+
+    sessions = Sessions()
+    search = _RecordingSearch(True, events, {"phase": "found", "failure": None})
+    runner = _acquire_runner(tmp_path, sessions, search)
+
+    result = runner.start(
+        "shadow",
+        target="charger",
+        acquire_target=True,
+        speed_percent=8,
+    )
+    deadline = time.monotonic() + 3.0
+    while sessions.calls < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert result["started"] is True
+    assert events == ["perception", "search", "perception"]
+    assert search.calls == [("charger", "shadow", 8, False, False)]
+    assert runner.status()["wrist_search"]["phase"] == "found"
+    runner.stop()
 
 
 def test_depth_servo_view_recovery_stops_base_before_wrist_search(tmp_path):
@@ -2891,3 +2913,179 @@ def test_runtime_reader_has_no_process_ros_can_or_transport_surface():
         "sendto",
     }
     assert calls.isdisjoint(forbidden)
+
+
+def test_depth_servo_blocks_when_joint_feedback_is_stale(tmp_path):
+    class Sessions:
+        def start_perception(self, target):
+            return {"status": "succeeded", "target": target}
+
+    stale = tmp_path / "runtime.json"
+    stale.write_text(json.dumps({
+        "joint_state_available": True,
+        "source_timestamp_ns": 1,
+    }), encoding="utf-8")
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=Sessions(),
+        runtime_state=stale,
+        joint_feedback_timeout_s=0.2,
+    )
+
+    result = runner.start(
+        "shadow",
+        target="charger",
+        acquire_target=True,
+        speed_percent=8,
+    )
+    deadline = time.monotonic() + 3.0
+    while runner.status()["workflow"]["active"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    status = runner.status()
+    assert result["started"] is True
+    assert status["workflow"]["phase"] == "blocked"
+    assert "passive joint feedback" in status["workflow"]["failure"]
+    assert runner._process is None
+
+
+def test_depth_servo_starts_when_joint_feedback_is_fresh(tmp_path):
+    class Sessions:
+        def start_perception(self, target):
+            return {"status": "succeeded", "target": target}
+
+    fresh = tmp_path / "runtime.json"
+    fresh.write_text(json.dumps({
+        "joint_state_available": True,
+        "source_timestamp_ns": time.time_ns(),
+    }), encoding="utf-8")
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=Sessions(),
+        runtime_state=fresh,
+        joint_feedback_timeout_s=0.2,
+    )
+
+    result = runner.start(
+        "shadow",
+        target="charger",
+        acquire_target=True,
+        speed_percent=8,
+    )
+    deadline = time.monotonic() + 3.0
+    while runner.status()["workflow"]["phase"] not in {"approaching", "blocked"} and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert result["started"] is True
+    assert runner.status()["workflow"]["phase"] == "approaching"
+    runner.stop()
+
+
+def _handoff_retry_runner(tmp_path, events, validate):
+    class FakeSessions:
+        def __init__(self):
+            self.perception_calls = 0
+
+        def clear_current_context(self):
+            events.append("clear")
+
+        def start_perception(self, target):
+            self.perception_calls += 1
+            events.append(("perception", self.perception_calls))
+            return {
+                "status": "succeeded",
+                "session_id": f"20260723-12000{self.perception_calls}",
+            }
+
+        def start_planning(self):
+            events.append("planning")
+            return {"status": "succeeded", "session_id": "20260723-120009"}
+
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir()
+    runner.session_service = FakeSessions()
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+    runner._planning_artifacts = lambda attempt: (
+        tmp_path / "planning_report.json",
+        tmp_path / "planned_grasp.npz",
+    )
+
+    class FreshJoints:
+        def current_joint_snapshot(self, *, not_before_unix_ns):
+            events.append("joint_ready")
+            return True, "fresh", {
+                "sequence": 42,
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            }
+
+    runner.home_verifier = FreshJoints()
+    runner._validate_mobile_handoff_capture_evidence = validate
+
+    def execute(**kwargs):
+        events.append("execute")
+        return _executor_start_evidence()
+
+    runner._run_full = execute
+    return runner
+
+
+def test_mobile_handoff_recaptures_once_when_passive_window_straddles_stop(tmp_path):
+    events = []
+    attempts = {"n": 0}
+
+    def flaky_validate(**_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError(
+                "passive handoff feedback is not strictly post-stop and ordered"
+            )
+        return {"validated": True}
+
+    runner = _handoff_retry_runner(tmp_path, events, flaky_validate)
+    runner._run_mobile_handoff(
+        "white charger",
+        9,
+        "20260723-115900",
+        1_800_000_000_000_000_000,
+    )
+
+    assert events.count(("perception", 1)) == 1
+    assert events.count(("perception", 2)) == 1
+    assert attempts["n"] == 2
+    assert runner.status()["outcome"] == "passed"
+
+
+def test_mobile_handoff_does_not_recapture_for_other_evidence_failures(tmp_path):
+    events = []
+    attempts = {"n": 0}
+
+    def hard_validate(**_kwargs):
+        attempts["n"] += 1
+        raise RuntimeError("observer joint evidence is not strictly post-stop/read-only")
+
+    runner = _handoff_retry_runner(tmp_path, events, hard_validate)
+    runner._run_mobile_handoff(
+        "white charger",
+        9,
+        "20260723-115900",
+        1_800_000_000_000_000_000,
+    )
+
+    assert attempts["n"] == 1
+    assert events.count(("perception", 1)) == 1
+    assert ("perception", 2) not in events
+    assert runner.status()["outcome"] != "passed"

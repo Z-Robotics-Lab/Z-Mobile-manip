@@ -1543,6 +1543,8 @@ class DepthServoRunner:
         session_service: Any | None = None,
         grasp_runner: Any | None = None,
         wrist_search: Any | None = None,
+        runtime_state: Path | None = None,
+        joint_feedback_timeout_s: float = 12.0,
         max_reacquisitions: int = 3,
         posture_wait_timeout_s: float = 12.0,
         state_heartbeat_timeout_s: float = 1.5,
@@ -1567,6 +1569,10 @@ class DepthServoRunner:
         self._session_service = session_service
         self._grasp_runner = grasp_runner
         self._wrist_search = wrist_search
+        self._runtime_state = (
+            runtime_state.expanduser().resolve() if runtime_state is not None else None
+        )
+        self._joint_feedback_timeout_s = float(joint_feedback_timeout_s)
         self._max_reacquisitions = max(0, int(max_reacquisitions))
         self._reactive_watchdog = go2w_reactive_supervision.ReactivePhaseWatchdog(
             go2w_reactive_supervision.ReactiveWatchdogConfig(
@@ -1862,9 +1868,15 @@ class DepthServoRunner:
     ) -> None:
         """Latch zero base motion before starting the fresh grasp transaction."""
 
-        self._terminate_process(process, keep_status=True)
+        # The depth servo latched zero base velocity when it declared the
+        # handoff; the stop boundary is the supervisor's confirmation of that
+        # latch, not the completion of process teardown hundreds of
+        # milliseconds later.  A late anchor put the parallel capture's
+        # rolling passive window start "pre-stop" and fail-closed a
+        # physically valid capture (2026-07-23).
         base_stopped_monotonic_ns = time.monotonic_ns()
         base_stopped_unix_ns = time.time_ns()
+        self._terminate_process(process, keep_status=True)
         with self._lock:
             auto_handoff = self._workflow.get("auto_handoff") is True
             speed = int(self._workflow.get("speed_percent", 5))
@@ -2095,23 +2107,74 @@ class DepthServoRunner:
             self._message = "Target recovered with the base stationary; visual approach restarted."
         return True
 
+    def _wait_for_joint_feedback(self, cancel: threading.Event) -> str | None:
+        """Return None once passive joint feedback is fresh, else the reason.
+
+        The depth servo cannot transform camera-frame targets without live
+        passive joints: starting it anyway burns a good acquisition into an
+        immediate search spiral (observed 2026-07-23 while the NUC passive
+        bridge crash-looped through a can0 outage).
+        """
+        if self._runtime_state is None:
+            return None
+        deadline = time.monotonic() + self._joint_feedback_timeout_s
+        while not cancel.is_set():
+            try:
+                document = json.loads(self._runtime_state.read_text(encoding="utf-8"))
+                age_ns = time.time_ns() - int(document.get("source_timestamp_ns") or 0)
+                fresh = (
+                    document.get("joint_state_available") is True
+                    # Match the authoritative reader's 1s freshness bound and
+                    # reject future-stamped documents outright.
+                    and 0 <= age_ns <= 1_000_000_000
+                )
+            except (OSError, ValueError, TypeError):
+                fresh = False
+            if fresh:
+                return None
+            if time.monotonic() >= deadline:
+                return (
+                    "passive joint feedback is unavailable; check the NUC "
+                    "z-manip-piper-passive-feedback service and retry"
+                )
+            with self._lock:
+                self._message = (
+                    "Waiting for passive joint feedback before starting the "
+                    "visual approach."
+                )
+            time.sleep(0.5)
+        return "cancelled while waiting for passive joint feedback"
+
     def _supervise(self, mode: str, acquire_target: bool) -> None:
         with self._lock:
             target = self._workflow.get("target")
             cancel = self._cancel
         assert isinstance(target, str)
         if acquire_target:
-            # Mobile Find has a local, bounded detector in the wrist-search
-            # coordinator.  Probe/search with it before starting the complete
-            # perception transaction: a local YOLOE miss must transition to
-            # active acquisition instead of blocking for the remote VLM
-            # fallback and then repeating perception after search.
-            if self._wrist_search is not None:
+            # Run one complete perception transaction on the current view
+            # first: the local detector answers in well under a second and a
+            # local miss falls back to the same remote VLM the stationary
+            # Run Perception path trusts.  Small targets that the local
+            # detector scores below threshold (measured 0.06 on a plainly
+            # visible wrist-camera charger) must not fail Find while a
+            # stationary perception of the very same frame succeeds.  Only
+            # when the current view genuinely cannot confirm the target does
+            # the slow bounded wrist sweep start (measured ~12 s per view).
+            self._set_workflow(phase="current_view_perception", failure=None)
+            with self._lock:
+                self._message = (
+                    "Running complete perception on the current D435 view "
+                    "(local detector first, then VLM fallback)."
+                )
+            acquired = self._run_perception(target, reacquisition=False)
+            if not acquired and cancel.is_set():
+                return
+            if not acquired and self._wrist_search is not None:
                 self._set_workflow(phase="wrist_search", failure=None)
                 with self._lock:
                     self._message = (
-                        "Checking the current D435 view with local YOLOE; "
-                        "a miss starts bounded wrist search."
+                        "Current view did not confirm the target; starting "
+                        "bounded wrist search."
                     )
                 try:
                     found = self._wrist_search.run(
@@ -2145,14 +2208,25 @@ class DepthServoRunner:
                     with self._lock:
                         self._message = "Detector found the target, but stable 3-D tracking did not initialize."
                     return
-            elif not self._run_perception(target, reacquisition=False):
-                # Preserve the ordinary complete-perception behavior for
-                # deployments that do not configure the bounded local search.
+            elif not acquired:
                 self._set_workflow(active=False, phase="blocked", failure="initial perception failed")
                 with self._lock:
                     self._message = "Initial target detection failed; base was never started."
                 return
             if cancel.is_set():
+                return
+            feedback_failure = self._wait_for_joint_feedback(cancel)
+            if feedback_failure is not None:
+                if cancel.is_set():
+                    # Full Stop already latched phase="stopped"; a blocked
+                    # overwrite here would mislabel an operator stop.
+                    return
+                self._set_workflow(active=False, phase="blocked", failure=feedback_failure)
+                with self._lock:
+                    self._message = (
+                        "Passive joint feedback is unavailable; the approach "
+                        "was not started."
+                    )
                 return
             with self._lock:
                 try:
@@ -2892,7 +2966,7 @@ class PiperGraspRunner:
                 stderr=subprocess.STDOUT,
                 check=False,
                 shell=False,
-                timeout=430.0,
+                timeout=480.0,
             )
         if completed.returncode != 0 or not (receipt_dir / "workflow-state.json").is_file():
             raise RuntimeError(f"{workflow_phase} stopped safely; inspect {self.log_path}")
@@ -3046,7 +3120,7 @@ class PiperGraspRunner:
                 stderr=subprocess.STDOUT,
                 check=False,
                 shell=False,
-                timeout=430.0,
+                timeout=480.0,
             )
         start_receipt_path = receipt_dir / "executor-start-receipt.json"
         start_receipt = self._validate_executor_start_receipt(
@@ -3342,12 +3416,60 @@ class PiperGraspRunner:
                     "close-range capture reused the pre-servo perception session",
                 )
 
-            capture_evidence = self._validate_mobile_handoff_capture_evidence(
-                perception_session_id=fresh_perception_session_id,
-                target=target,
-                base_stopped_unix_ns=base_stopped_unix_ns,
-                joint_evidence=joint_evidence,
-            )
+            capture_evidence = None
+            for recapture in range(2):
+                try:
+                    capture_evidence = self._validate_mobile_handoff_capture_evidence(
+                        perception_session_id=fresh_perception_session_id,
+                        target=target,
+                        base_stopped_unix_ns=base_stopped_unix_ns,
+                        joint_evidence=joint_evidence,
+                    )
+                    break
+                except RuntimeError as error:
+                    if (
+                        recapture > 0
+                        or "not strictly post-stop and ordered" not in str(error)
+                    ):
+                        raise
+                    # The passive evidence window brackets the selected camera
+                    # frame by a fixed rolling span, so a frame taken within
+                    # that span of the stop boundary straddles it and is
+                    # correctly rejected.  A later frame satisfies the same
+                    # strict gate; retry the capture once instead of failing
+                    # the whole grasp.
+                    self._update(
+                        phase="handoff_capture_retry",
+                        message=(
+                            "Passive window straddled the stop boundary; "
+                            "capturing a later close-range frame."
+                        ),
+                    )
+                    retry_started = time.monotonic()
+                    perception = self.session_service.start_perception(target)
+                    timings["handoff_perception_retry"] = round(
+                        time.monotonic() - retry_started,
+                        6,
+                    )
+                    if perception.get("status") != "succeeded":
+                        retry_error = perception.get("error")
+                        detail = (
+                            retry_error.get("message")
+                            if isinstance(retry_error, dict)
+                            else None
+                        )
+                        raise RuntimeError(
+                            detail or "fresh close-range perception failed",
+                        )
+                    fresh_perception_session_id = validate_session_id(
+                        perception.get("session_id"),
+                    )
+                    if fresh_perception_session_id == superseded_perception_session_id:
+                        raise RuntimeError(
+                            "close-range capture reused the pre-servo perception session",
+                        )
+            if capture_evidence is None:
+                raise RuntimeError("handoff capture evidence unavailable after retry")
 
             self._update(
                 phase="handoff_planning",
@@ -5187,6 +5309,7 @@ def main() -> int:
             session_service=interactive_service,
             grasp_runner=grasp_runner,
             wrist_search=wrist_search,
+            runtime_state=args.runtime_state,
         )
     component_script = (
         args.component_manager
