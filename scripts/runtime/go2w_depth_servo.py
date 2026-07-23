@@ -58,6 +58,12 @@ IK_PROBE_SCHEMA = "z_manip.reactive_ik_probe.v1"
 IK_PROBE_TIMEOUT_S = 1.0
 
 
+# Measured PC-to-NUC NTP midpoint offset is ~0.31s (see the reactive-view
+# executor's MAX_FUTURE_SKEW rationale); this allowance keeps normally-fresh
+# cross-host stamps from reading as stale.
+CLOCK_SKEW_ALLOWANCE_S = 0.50
+
+
 @dataclass(frozen=True)
 class DepthServoSettings:
     mode: str = "shadow"
@@ -91,6 +97,14 @@ class DepthServoSettings:
     yaw_deadband_rad: float = math.radians(10.0)
     max_yaw_step_rps: float = 0.015
     target_timeout_s: float = 0.40
+    # Receipt time is not data time: with network queuing a bundle can arrive
+    # "fresh" while its capture stamp is a second old, and the servo then
+    # steers on an old world (live 2026-07-23 evening: 1.2s LAN RTT tilted the
+    # camera off a tracked target).  Observations whose capture-stamp age
+    # exceeds this limit are rejected outright; the existing receipt-based
+    # timeout then holds/stops the base safely.  The allowance absorbs the
+    # measured PC/NUC NTP skew (~0.3s) plus the normal FFS+relay latency.
+    max_target_capture_age_s: float = 0.70
     tracking_hold_s: float = 0.55
     tracking_loss_grace_s: float = 1.25
     handoff_settle_s: float = 0.30
@@ -111,6 +125,11 @@ class DepthServoSettings:
             raise ValueError("mode must be shadow or live")
         if not math.isfinite(self.target_timeout_s) or self.target_timeout_s <= 0.0:
             raise ValueError("target timeout must be finite and positive")
+        if (
+            not math.isfinite(self.max_target_capture_age_s)
+            or self.max_target_capture_age_s <= 0.0
+        ):
+            raise ValueError("maximum target capture age must be positive")
         if not math.isfinite(self.tracking_loss_grace_s) or self.tracking_loss_grace_s < self.target_timeout_s:
             raise ValueError("tracking-loss grace must be at least the target timeout")
         if (
@@ -581,6 +600,7 @@ class DepthServoCore:
         )
         self._accepted_observations = 0
         self._rejected_observations = 0
+        self._stale_data_rejections = 0
         self._rebases = 0
         self._geometry: TargetGeometry | None = None
         self._transforms_received_s: float | None = None
@@ -694,12 +714,24 @@ class DepthServoCore:
         T_base_camera: np.ndarray | None = None,
         T_arm_camera: np.ndarray | None = None,
         transform_error: str | None = None,
+        capture_age_s: float | None = None,
     ) -> bool:
         """Observe a complete optical-frame target centroid.
 
         ``y_m`` defaults to zero only for backward-compatible callers.  The
         ROS adapter always supplies the measured optical y coordinate.
+        ``capture_age_s`` is the skew-adjusted age of the CAPTURE stamp; data
+        older than ``max_target_capture_age_s`` is rejected so a congested
+        network cannot make the servo steer on an old world.
         """
+        if (
+            capture_age_s is not None
+            and math.isfinite(capture_age_s)
+            and capture_age_s > self.settings.max_target_capture_age_s
+        ):
+            self._rejected_observations += 1
+            self._stale_data_rejections += 1
+            return False
 
         values = (float(x_m), float(y_m), float(z_m), float(stamp_s))
         if not all(math.isfinite(value) for value in values) or z_m <= 0.0:
@@ -784,6 +816,7 @@ class DepthServoCore:
         self._outlier_samples.clear()
         self._accepted_observations = 0
         self._rejected_observations = 0
+        self._stale_data_rejections = 0
         self._rebases = 0
         self._geometry = None
         self._transforms_received_s = None
@@ -1332,6 +1365,18 @@ def _run_ros(args: argparse.Namespace) -> int:
                     f"({settings.base_frame}, {settings.arm_base_frame}) unavailable: {error}"
                 )
                 self.last_transform_error = transform_error
+            # Receipt freshness alone cannot see network queuing: judge the
+            # data by its capture stamp, minus the measured PC/NUC NTP skew
+            # allowance, so a congested link degrades to hold/stop instead of
+            # steering on an old world.
+            capture_stamp_s = (
+                float(message.header.stamp.sec)
+                + float(message.header.stamp.nanosec) * 1e-9
+            )
+            capture_age_s = max(
+                0.0,
+                time.time() - capture_stamp_s - CLOCK_SKEW_ALLOWANCE_S,
+            )
             accepted = self.core.observe_target(
                 x_m=statistics.median(xs),
                 y_m=statistics.median(ys),
@@ -1340,6 +1385,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 T_base_camera=T_base_camera,
                 T_arm_camera=T_arm_camera,
                 transform_error=transform_error,
+                capture_age_s=capture_age_s,
             )
             if accepted:
                 self.last_source_frame = source_frame or None

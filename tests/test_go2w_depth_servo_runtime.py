@@ -894,3 +894,29 @@ def test_launcher_uses_fixed_cyclonedds_runtime_for_pc_to_nuc_commands():
     assert "configs/piper_collision_capsules.json" in launcher
     assert ":/robot/piper_collision_capsules.json:ro" in launcher
     assert "--whole-body-collision-model /robot/piper_collision_capsules.json" in launcher
+
+
+def test_stale_capture_data_is_rejected_even_when_received_fresh():
+    """Receipt freshness must not launder queued data: a bundle that arrives
+    now but was CAPTURED a second ago (network bufferbloat, live incident
+    2026-07-23: 1.2s LAN RTT) would make the servo steer the camera on an old
+    world.  Such observations are rejected; the receipt-based timeout then
+    holds the base safely."""
+
+    core = _reactive_core(target_timeout_s=0.40)
+    fresh = core.observe_target(
+        x_m=0.0, y_m=0.0, z_m=1.5,
+        stamp_s=1.0,
+        capture_age_s=0.20,
+    )
+    assert fresh is True
+
+    stale = core.observe_target(
+        x_m=0.0, y_m=0.0, z_m=1.5,
+        stamp_s=1.1,
+        capture_age_s=1.2,
+    )
+    assert stale is False
+    status = core.status() if hasattr(core, "status") else None
+    # The rejection is visible for diagnosis.
+    assert core._stale_data_rejections == 1
