@@ -4,6 +4,7 @@ from pathlib import Path
 import threading
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -318,3 +319,76 @@ def test_search_records_persist_per_observation(tmp_path):
     # The coordinator skips the redundant anchor view 0; the first observed view
     # is the first genuinely new viewpoint.
     assert lines[0]["view_index"] == 1
+
+
+def test_one_shot_authorization_reaches_the_fixed_script_env_gate(
+    tmp_path,
+    monkeypatch,
+):
+    """The remote view script has its own Z_MANIP_ENABLE_WRIST_SEARCH gate.
+
+    A browser-confirmed one-shot authorization must be injected into exactly
+    the authorized run's subprocess environment: without it every per-view
+    move exits "locked" even though the coordinator accepted the operator
+    confirmation (live incident 2026-07-23: FIND aborted at view recovery
+    with "View recovery failed" while the search never moved a view).
+    """
+
+    monkeypatch.delenv("Z_MANIP_ENABLE_WRIST_SEARCH", raising=False)
+    script = tmp_path / "fake_remote.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        '[[ "${Z_MANIP_ENABLE_WRIST_SEARCH:-0}" == 1 ]] || exit 3\n'
+        'printf \'{"phase": "complete", "view_index": %s, '
+        '"final_joints_rad": [0, 0, 0, 0, 0, 0]}\\n\' "$1"\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    motion = MODULE.FixedWristMotion(script, tmp_path / "motion.log")
+
+    with pytest.raises(RuntimeError, match="code 3"):
+        motion(0, 5)
+
+    motion.set_session_authorized(True)
+    joints = motion(0, 5)
+    assert joints.shape == (6,)
+
+    motion.set_session_authorized(False)
+    with pytest.raises(RuntimeError, match="code 3"):
+        motion(0, 5)
+
+
+def test_coordinator_authorizes_motion_for_exactly_one_live_run(monkeypatch):
+    monkeypatch.delenv("Z_MANIP_ENABLE_WRIST_SEARCH", raising=False)
+    clock = Clock()
+    motion_calls = []
+    config = _small_grid(observations_per_view=1, confirmations_required=1)
+    grid = _grid_motion(config, motion_calls)
+    authorized_states = []
+
+    class AuthorizedGrid:
+        def __call__(self, view_index, speed_percent):
+            authorized_states.append(self.session_authorized)
+            return grid(view_index, speed_percent)
+
+        def set_session_authorized(self, value):
+            self.session_authorized = bool(value)
+
+    motion = AuthorizedGrid()
+    motion.session_authorized = False
+    coordinator = MODULE.WristSearchCoordinator(
+        np.zeros(6),
+        lambda _target: (True, 0.9, "target"),
+        motion=motion,
+        config=config,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+    assert coordinator.run(
+        "charger",
+        mode="live",
+        speed_percent=5,
+        operator_present=True,
+    )
+    assert authorized_states and all(authorized_states)
+    assert motion.session_authorized is False

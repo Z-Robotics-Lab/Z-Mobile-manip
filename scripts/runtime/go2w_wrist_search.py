@@ -121,6 +121,20 @@ class FixedWristMotion:
             raise FileNotFoundError(f"fixed wrist-search script is unavailable: {self.script}")
         self._lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
+        self._session_authorized = False
+
+    def set_session_authorized(self, authorized: bool) -> None:
+        """Extend one confirmed authorization to the fixed script's env gate.
+
+        The remote script keeps its own session-level gate
+        (``Z_MANIP_ENABLE_WRIST_SEARCH``) so a bare subprocess can never move
+        the wrist.  A browser-confirmed one-shot authorization must reach that
+        gate for exactly the authorized run -- without it, every per-view move
+        exits 3 ("locked") even though the coordinator accepted the operator's
+        confirmation, which aborted a live FIND at view recovery.
+        """
+        with self._lock:
+            self._session_authorized = bool(authorized)
 
     def stop(self) -> None:
         """Interrupt a currently running fixed-view command, if any."""
@@ -142,6 +156,11 @@ class FixedWristMotion:
             process.wait(timeout=2.0)
 
     def __call__(self, view_index: int, speed_percent: int) -> np.ndarray:
+        with self._lock:
+            authorized = self._session_authorized
+        environment = dict(os.environ)
+        if authorized:
+            environment["Z_MANIP_ENABLE_WRIST_SEARCH"] = "1"
         process = subprocess.Popen(
             [str(self.script), str(int(view_index)), str(int(speed_percent))],
             cwd=self.script.parents[2],
@@ -149,6 +168,7 @@ class FixedWristMotion:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=environment,
         )
         with self._lock:
             self._process = process
@@ -310,6 +330,9 @@ class WristSearchCoordinator:
             )
             return False
         self._update(operator_authorized=one_shot_authorized)
+        authorize = getattr(self.motion, "set_session_authorized", None)
+        if callable(authorize) and mode == "live":
+            authorize(self.live_enabled or one_shot_authorized)
         try:
             return self._run_authorized(
                 target,
@@ -321,6 +344,8 @@ class WristSearchCoordinator:
             # Browser confirmation authorizes only this one finite scan.  A
             # later task must be confirmed again unless the operator explicitly
             # enabled the service environment for a supervised session.
+            if callable(authorize):
+                authorize(False)
             self._update(operator_authorized=False)
 
     def _run_authorized(
