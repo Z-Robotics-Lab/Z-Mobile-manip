@@ -1067,7 +1067,7 @@ class FixedReadOnlyBackend:
         dry_run_program = () if runner_output is not None else (
             "z-manip-go2w-perception-dry-run",
         )
-        perception_args = (
+        base_perception_args = (
             "--instruction",
             target,
             "--output",
@@ -1080,6 +1080,8 @@ class FixedReadOnlyBackend:
             "15",
             "--min-bundle-target-points",
             "400",
+        )
+        perception_args = base_perception_args + (
             # A close-range handoff commonly asks for the exact same target
             # that EdgeTAM is already tracking.  The dry-run accepts reuse only
             # when the bridge reports a valid track with the exact instruction
@@ -1097,7 +1099,19 @@ class FixedReadOnlyBackend:
         passive_capture_s_total = 0.0
         passive_capture_count_total = 0
         for attempt in range(PERCEPTION_ATTEMPTS):
+            attempt_args = perception_args
+            attempt_command = command
             if attempt:
+                # _perception_retryable only admits failures a fresh
+                # segmentation seed can recover.  Tracking reuse would replay
+                # the exact mask that just failed — a drifted persistent
+                # EdgeTAM track stays within the reuse age forever at
+                # streaming rate — so the retry must force a new grounding
+                # transaction instead of reusing the live track.
+                attempt_args = base_perception_args
+                attempt_command = (
+                    command_prefix + dry_run_program + attempt_args
+                )
                 for name in (
                     "report.json",
                     "edgetam_mask.png",
@@ -1111,7 +1125,8 @@ class FixedReadOnlyBackend:
                     (output_dir / name).unlink(missing_ok=True)
                 with log_path.open("ab") as log:
                     log.write(
-                        b"Retrying perception after an invalid geometric mask.\n",
+                        b"Retrying perception with a fresh grounding seed"
+                        b" after an invalid geometric mask.\n",
                     )
             attempt_started = time.monotonic()
             process_launch_started = time.monotonic()
@@ -1125,7 +1140,7 @@ class FixedReadOnlyBackend:
                     try:
                         worker_result.append(_run_fixed_worker_request(
                             runner_socket,
-                            {"argv": list(perception_args)},
+                            {"argv": list(attempt_args)},
                             log_path,
                             # Recompute from the current checkout for every
                             # action.  A long-lived UI must reject a worker
@@ -1145,7 +1160,7 @@ class FixedReadOnlyBackend:
             else:
                 with log_path.open("ab") as log:
                     process = subprocess.Popen(
-                        command,
+                        attempt_command,
                         stdin=subprocess.DEVNULL,
                         stdout=log,
                         stderr=subprocess.STDOUT,

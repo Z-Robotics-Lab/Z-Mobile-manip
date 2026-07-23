@@ -127,8 +127,11 @@ class MotionAdaptiveDepthFilter:
     spatially smooth depth this filter targets the MAD-class stability metrics
     are expected to be virtually unchanged.  Per-pixel validity counts and the
     stability gate remain full resolution, so invalid pixels are never revived
-    by an upsampled neighbour.  Set ``half_resolution=False`` to force the exact
-    full-resolution median.
+    by an upsampled neighbour.  Camera-motion detection also compares on the
+    decimated grid so the tiled output is only ever tested against the exact
+    pixels it stabilizes; a full-resolution comparison would misread the
+    intra-block spatial gradient as scene motion.  Set
+    ``half_resolution=False`` to force the exact full-resolution median.
     """
 
     def __init__(
@@ -254,23 +257,54 @@ class MotionAdaptiveDepthFilter:
             self.reset()
         self._last_stamp_ns = stamp_ns
 
+        height, width = depth.shape
+        use_half = self._half_resolution and height >= 4 and width >= 4
         current_valid = np.isfinite(depth) & (depth > 0.0)
         current = np.where(current_valid, depth, np.nan).astype(np.float32)
         changed = np.zeros(depth.shape, dtype=bool)
         overlap_count = 0
+        changed_fraction = 0.0
         if self._previous_output is not None:
-            previous_valid = np.isfinite(self._previous_output) & (self._previous_output > 0.0)
-            overlap = current_valid & previous_valid
+            # With half_resolution the stabilized output tiles each decimated
+            # value over its 2x2 block, so a full-resolution comparison would
+            # read the intra-block spatial gradient (one pixel of surface
+            # slope, easily beyond motion_threshold_m on oblique floors) as
+            # persistent motion on every frame.  Comparing on the decimated
+            # grid keeps the test pixel-aligned: element [2i, 2j] of the tiled
+            # output is exactly the stabilized value of input pixel [2i, 2j].
+            if use_half:
+                depth_cmp = depth[::2, ::2]
+                previous_cmp = self._previous_output[::2, ::2]
+                valid_cmp = current_valid[::2, ::2]
+            else:
+                depth_cmp = depth
+                previous_cmp = self._previous_output
+                valid_cmp = current_valid
+            previous_valid = np.isfinite(previous_cmp) & (previous_cmp > 0.0)
+            overlap = valid_cmp & previous_valid
             overlap_count = int(np.count_nonzero(overlap))
-            changed[overlap] = (
-                np.abs(depth[overlap] - self._previous_output[overlap])
+            changed_cmp = np.zeros(depth_cmp.shape, dtype=bool)
+            changed_cmp[overlap] = (
+                np.abs(depth_cmp[overlap] - previous_cmp[overlap])
                 > self.motion_threshold_m
             )
-        changed_fraction = (
-            0.0
-            if overlap_count == 0
-            else float(np.count_nonzero(changed)) / float(overlap_count)
-        )
+            if overlap_count:
+                changed_fraction = (
+                    float(np.count_nonzero(changed_cmp)) / float(overlap_count)
+                )
+            if use_half:
+                # Scale the sampled overlap back to a full-resolution pixel
+                # count so min_motion_pixels keeps its calibrated meaning, and
+                # tile the changed mask so motion-hold bookkeeping stays at
+                # full resolution.
+                overlap_count *= 4
+                changed = np.repeat(
+                    np.repeat(changed_cmp, 2, axis=0),
+                    2,
+                    axis=1,
+                )[:height, :width]
+            else:
+                changed = changed_cmp
         global_motion = bool(
             overlap_count >= self.min_motion_pixels
             and changed_fraction >= self.global_motion_fraction
