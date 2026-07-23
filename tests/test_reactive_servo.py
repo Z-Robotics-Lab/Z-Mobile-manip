@@ -10,6 +10,7 @@ from z_manip.control.reactive_servo import (
     ReactiveServoConfig,
     ReactiveTargetController,
     TargetGeometry,
+    ViewMeasurementDampingConfig,
     transform_point,
 )
 
@@ -537,3 +538,227 @@ def test_configuration_rejects_overlapping_or_inverted_corridors():
             camera_handoff_depth_m=0.38,
             camera_hard_min_depth_m=0.40,
         )
+
+
+# ---------------------------------------------------------------------------
+# Measurement-aware arm-view damping.
+#
+# The Fast-FoundationStereo depth switch dropped the tracked-target bundle rate
+# to a measured ~7.5-8 Hz and grew capture-to-use latency to ~200-250 ms.  The
+# wrist arm-view inner loop (the whole-body QP nulling the image error over its
+# fixed 0.20 s horizon) keeps integrating a frozen perception error between
+# bundles.  With the loop delay roughly tripled, the *unchanged* gain crosses
+# the discrete stability boundary and the camera over-pitches past a high
+# target.  These tests validate the damping law offline against a replayed
+# plant model before any live motion.
+# ---------------------------------------------------------------------------
+
+# QP small-signal view gain: the optimizer nulls the image error over its fixed
+# 0.20 s horizon, so the inner proportional gain is 1 / 0.20 = 5 /s regardless
+# of the perception rate.  MAX_QDOT mirrors the NUC executor's 12 deg/s cap.
+_QP_HORIZON_S = 0.20
+_QP_VIEW_GAIN_PER_S = 1.0 / _QP_HORIZON_S
+_MAX_QDOT_RPS = math.radians(12.0)
+
+
+def _view_loop_spectral_radius(*, effective_gain_per_s, update_period_s, latency_s):
+    """Dominant closed-loop pole of the delayed sampled arm-view loop.
+
+    Small-signal model near centre: the camera pitch integrates the commanded
+    rate; every ``update_period`` the controller resamples an error that is
+    ``latency`` seconds stale and holds (ZOH) the command between updates::
+
+        e[n+1] = e[n] - gain * update_period * e[n - m],  m = round(latency / P)
+
+    ``|z|_max > 1`` means the frozen-error loop diverges.
+    """
+
+    delay_samples = max(0, round(latency_s / update_period_s))
+    loop_gain = effective_gain_per_s * update_period_s
+    coefficients = [0.0] * (delay_samples + 2)
+    coefficients[0] = 1.0
+    coefficients[1] = -1.0
+    coefficients[-1] = loop_gain
+    return float(np.max(np.abs(np.roots(coefficients))))
+
+
+def _simulate_view_loop(
+    *,
+    initial_error_rad,
+    update_period_s,
+    latency_s,
+    damping=None,
+    dt_s=0.002,
+    horizon_s=10.0,
+):
+    """Replay the wrist-view loop against a delayed ZOH plant with MAX_QDOT.
+
+    ``damping`` None reproduces the pre-fix aggressive QP (rate saturates at
+    MAX_QDOT).  A ``ViewMeasurementDampingConfig`` scales the commanded view
+    rate exactly as the wired whole-body adapter does.  Returns the error
+    trajectory (rad), the peak overshoot fraction past centre, the residual
+    oscillation amplitude over the final 3 s, and whether it converged and
+    stayed within 5 % of the initial error.
+    """
+
+    steps = int(horizon_s / dt_s)
+    error = float(initial_error_rad)
+    history = [(-1.0, error)]
+    command_rate = 0.0
+    next_sample_s = 0.0
+    trajectory = [error]
+
+    def observed(now_s):
+        stale_s = now_s - latency_s
+        for stamp_s, value in reversed(history):
+            if stamp_s <= stale_s:
+                return value
+        return float(initial_error_rad)
+
+    for index in range(steps):
+        now_s = index * dt_s
+        if now_s >= next_sample_s:
+            error_obs = observed(now_s)
+            raw_rate = max(
+                -_MAX_QDOT_RPS,
+                min(_MAX_QDOT_RPS, _QP_VIEW_GAIN_PER_S * error_obs),
+            )
+            if damping is not None:
+                raw_rate *= damping.rate_scale(
+                    view_error_rad=error_obs,
+                    commanded_rate_rps=raw_rate,
+                    update_period_s=update_period_s,
+                )
+            command_rate = raw_rate
+            next_sample_s += update_period_s
+        error -= command_rate * dt_s
+        history.append((now_s, error))
+        trajectory.append(error)
+
+    peak_reverse = min(0.0, min(trajectory))
+    overshoot_fraction = abs(peak_reverse) / abs(initial_error_rad)
+    tail = trajectory[int((horizon_s - 3.0) / dt_s):]
+    oscillation = (max(tail) - min(tail)) / 2.0
+    tolerance = 0.05 * abs(initial_error_rad)
+    converged = all(abs(value) <= tolerance for value in tail)
+    return trajectory, overshoot_fraction, oscillation, converged
+
+
+def test_view_damping_config_validation():
+    ViewMeasurementDampingConfig()  # defaults are valid
+    with pytest.raises(ValueError):
+        ViewMeasurementDampingConfig(stability_alpha=0.0)
+    with pytest.raises(ValueError):
+        ViewMeasurementDampingConfig(stability_alpha=1.0)
+    with pytest.raises(ValueError):
+        ViewMeasurementDampingConfig(nominal_latency_s=0.0)
+    with pytest.raises(ValueError):
+        ViewMeasurementDampingConfig(min_rate_scale=1.5)
+
+
+def test_view_damping_passes_through_low_latency_and_bounds_high_latency():
+    config = ViewMeasurementDampingConfig(stability_alpha=0.5, nominal_latency_s=0.25)
+    error = math.radians(26.0)
+
+    # A brisk pre-FFS loop leaves an already-small command untouched.
+    fast = config.rate_scale(
+        view_error_rad=error,
+        commanded_rate_rps=config.rate_cap_rps(error, update_period_s=0.033) * 0.5,
+        update_period_s=0.033,
+    )
+    assert fast == pytest.approx(1.0)
+
+    # At the measured FFS regime a saturated command is scaled below unity, and
+    # the resulting rate never exceeds the measurement-aware cap.
+    saturated = _MAX_QDOT_RPS
+    scale = config.rate_scale(
+        view_error_rad=math.radians(3.0),
+        commanded_rate_rps=saturated,
+        update_period_s=0.133,
+    )
+    assert 0.0 < scale < 1.0
+    capped = saturated * scale
+    assert capped <= config.rate_cap_rps(
+        math.radians(3.0), update_period_s=0.133
+    ) + 1e-9
+
+    # Far from centre the cap is large, so full authority is retained to keep a
+    # climbing target in frame during approach.
+    far = config.rate_scale(
+        view_error_rad=math.radians(26.0),
+        commanded_rate_rps=saturated,
+        update_period_s=0.133,
+    )
+    assert far == pytest.approx(1.0)
+
+
+def test_old_gain_diverges_but_new_law_is_stable_across_the_ffs_regime():
+    # Same QP gain, only the loop delay changes: pre-FFS is well damped, the
+    # measured FFS rate/latency pushes the identical gain past the unit circle.
+    pre_ffs = _view_loop_spectral_radius(
+        effective_gain_per_s=_QP_VIEW_GAIN_PER_S,
+        update_period_s=0.033,
+        latency_s=0.03,
+    )
+    ffs = _view_loop_spectral_radius(
+        effective_gain_per_s=_QP_VIEW_GAIN_PER_S,
+        update_period_s=0.133,
+        latency_s=0.25,
+    )
+    assert pre_ffs < 1.0
+    assert ffs > 1.0  # the recorded regression: frozen-error loop diverges
+
+    # The damping law reduces the effective small-signal gain to
+    # alpha / (update_period + latency); check it stays comfortably inside the
+    # unit circle across the whole 5-10 Hz / 200-350 ms envelope.
+    config = ViewMeasurementDampingConfig(stability_alpha=0.5)
+    for update_period_s, latency_s in [
+        (0.200, 0.35),
+        (0.133, 0.25),
+        (0.125, 0.20),
+        (0.100, 0.20),
+        (0.133, 0.35),
+    ]:
+        effective_gain = config.stability_alpha / (update_period_s + latency_s)
+        spectral_radius = _view_loop_spectral_radius(
+            effective_gain_per_s=effective_gain,
+            update_period_s=update_period_s,
+            latency_s=latency_s,
+        )
+        assert spectral_radius < 0.9
+
+
+def test_view_loop_simulation_old_oscillates_and_new_converges_on_a_step():
+    step = math.radians(26.0)
+
+    # Pre-fix aggressive QP at the measured FFS regime: sustained oscillation
+    # that never settles within tolerance (the target leaves frame).
+    _traj, old_overshoot, old_oscillation, old_converged = _simulate_view_loop(
+        initial_error_rad=step,
+        update_period_s=0.133,
+        latency_s=0.25,
+        damping=None,
+    )
+    assert not old_converged
+    assert old_oscillation > math.radians(1.0)
+
+    # Measurement-aware damping: monotonic convergence with bounded overshoot.
+    config = ViewMeasurementDampingConfig(stability_alpha=0.5)
+    _traj, new_overshoot, new_oscillation, new_converged = _simulate_view_loop(
+        initial_error_rad=step,
+        update_period_s=0.133,
+        latency_s=0.25,
+        damping=config,
+    )
+    assert new_converged
+    assert new_overshoot < 0.20  # well under the 20 % overshoot budget
+    assert new_oscillation < math.radians(0.5)
+
+
+def test_view_damping_can_be_disabled_for_a_transparent_passthrough():
+    disabled = ViewMeasurementDampingConfig(enabled=False)
+    assert disabled.rate_scale(
+        view_error_rad=math.radians(3.0),
+        commanded_rate_rps=_MAX_QDOT_RPS,
+        update_period_s=0.133,
+    ) == pytest.approx(1.0)

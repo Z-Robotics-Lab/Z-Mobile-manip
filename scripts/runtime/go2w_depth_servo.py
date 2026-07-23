@@ -1164,6 +1164,13 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.tracking: bool | None = None
             self.last_source_stamp_ns: int | None = None
             self.last_source_frame: str | None = None
+            # Live measurement of the tracked-target bundle period, used by the
+            # whole-body view damper to keep the arm-view loop discrete-stable at
+            # the measured FFS rate (~7.5-8 Hz) without raising any sensor rate.
+            # Only genuine new bundles (advancing source stamp) count, and the
+            # arrival is timed on the skew-free local monotonic clock.
+            self.last_bundle_monotonic_s: float | None = None
+            self.view_update_period_s: float | None = None
             self.last_transform_error: str | None = "no target transforms received"
             self.last_transform_success_s: float | None = None
             self.last_transform_source: str | None = None
@@ -1389,10 +1396,28 @@ def _run_ros(args: argparse.Namespace) -> int:
             )
             if accepted:
                 self.last_source_frame = source_frame or None
-                self.last_source_stamp_ns = (
+                new_source_stamp_ns = (
                     int(message.header.stamp.sec) * 1_000_000_000
                     + int(message.header.stamp.nanosec)
                 )
+                if new_source_stamp_ns != self.last_source_stamp_ns:
+                    arrival_s = time.monotonic()
+                    if self.last_bundle_monotonic_s is not None:
+                        interval_s = arrival_s - self.last_bundle_monotonic_s
+                        # Ignore non-positive or absurd gaps (process pauses,
+                        # reacquisition); a fresh EMA otherwise tracks the live
+                        # rate with a light 0.3 weight so a single jittered
+                        # frame cannot swing the damping cap.
+                        if 0.0 < interval_s <= 2.0:
+                            if self.view_update_period_s is None:
+                                self.view_update_period_s = interval_s
+                            else:
+                                self.view_update_period_s = (
+                                    0.7 * self.view_update_period_s
+                                    + 0.3 * interval_s
+                                )
+                    self.last_bundle_monotonic_s = arrival_s
+                self.last_source_stamp_ns = new_source_stamp_ns
 
         def _tracking(self, message: Bool) -> None:
             self.tracking = bool(message.data)
@@ -1815,6 +1840,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     desired_target_lateral_in_body_m=(
                         self.core.desired_target_lateral_m
                     ),
+                    view_update_period_s=self.view_update_period_s,
                 )
             except Exception as error:
                 self.whole_body_error = f"whole-body solve failed: {error}"

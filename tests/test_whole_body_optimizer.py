@@ -524,3 +524,120 @@ def test_real_urdf_pinocchio_reduces_to_virtual_body_plus_piper_six():
     assert camera_jacobian.shape == (6, 10)
     assert np.isfinite(camera_jacobian).all()
     assert np.count_nonzero(np.linalg.norm(camera_jacobian[:, 4:], axis=0) > 1e-8) >= 4
+
+
+# ---------------------------------------------------------------------------
+# Measurement-aware arm-view damping wired into the runtime adapter.
+# ---------------------------------------------------------------------------
+
+from z_manip.control.reactive_servo import ViewMeasurementDampingConfig
+from z_manip.control.whole_body_runtime import WholeBodyRuntimeController
+from z_manip.control.whole_body_optimizer import WholeBodyOptimizationResult
+
+
+class _AngularCameraModel:
+    """Minimal model whose arm joints induce a known camera angular rate."""
+
+    camera_frame = "camera_optical"
+
+    def frame_jacobian(self, state, frame):
+        jacobian = np.zeros((6, CONTROL_DOF))
+        # Arm joint 0 pitches the camera 1:1; the rest do not rotate it.
+        jacobian[3, 4] = 1.0
+        return jacobian
+
+
+def _view_result(arm_velocity, *, backend="casadi-qrqp", success=True):
+    velocity = ReducedWholeBodyVelocity.from_vector(
+        (0.0, 0.0, 0.0, 0.0, *arm_velocity),
+    )
+    return WholeBodyOptimizationResult(
+        velocity=velocity,
+        predicted_state=_state(),
+        backend=backend,
+        objective_before=1.0,
+        objective_after=0.5,
+        residual_before=(0.1,),
+        residual_after=(0.05,),
+        residual_names=("image_v",),
+        near_weight=1.0,
+        reach_weight=0.0,
+        planar_distance_m=0.9,
+        camera_depth_m=0.9,
+        manipulability=0.2,
+        success=success,
+        reason="test",
+        failure_code=None,
+        minimum_camera_depth_m=0.38,
+    )
+
+
+def _runtime_with(model, damping):
+    controller = WholeBodyRuntimeController.__new__(WholeBodyRuntimeController)
+    controller.model = model
+    controller.view_damping = damping
+    return controller
+
+
+def test_runtime_view_damping_bounds_arm_rate_near_centre():
+    controller = _runtime_with(
+        _AngularCameraModel(),
+        ViewMeasurementDampingConfig(stability_alpha=0.5, nominal_latency_s=0.25),
+    )
+    # High target (~18 deg) but the QP asks for 0.5 rad/s of camera pitch, above
+    # the measurement-aware cap alpha*|e|/(P+L) = 0.5*0.32/0.383 ~= 0.42 rad/s.
+    camera_target = np.asarray((0.0, -0.30, 0.90))
+    result, document = controller._damp_view_velocity(
+        _view_result((0.5, 0.0, 0.0, 0.0, 0.0, 0.0)),
+        state=_state(),
+        camera_target_optical=camera_target,
+        view_update_period_s=0.133,
+    )
+
+    assert document["applied"] is True
+    assert 0.0 < document["scale"] < 1.0
+    damped_rate = document["commanded_view_rate_rps"] * document["scale"]
+    assert damped_rate <= document["rate_cap_rps"] + 1e-9
+    # Direction preserved, only joint 0 is nonzero and it was scaled down.
+    arm = np.asarray(result.velocity.arm_joint_velocity_rps)
+    assert arm[0] == pytest.approx(0.5 * document["scale"])
+    assert np.allclose(arm[1:], 0.0)
+
+
+def test_runtime_view_damping_keeps_full_authority_far_from_centre():
+    controller = _runtime_with(
+        _AngularCameraModel(),
+        ViewMeasurementDampingConfig(stability_alpha=0.5, nominal_latency_s=0.25),
+    )
+    # A large 30 deg error yields a large cap, so a modest command passes through.
+    camera_target = np.asarray((0.0, -0.58, 1.00))
+    result, document = controller._damp_view_velocity(
+        _view_result((0.15, 0.0, 0.0, 0.0, 0.0, 0.0)),
+        state=_state(),
+        camera_target_optical=camera_target,
+        view_update_period_s=0.133,
+    )
+
+    assert document["applied"] is False
+    assert document["scale"] == pytest.approx(1.0)
+    assert result.velocity.arm_joint_velocity_rps[0] == pytest.approx(0.15)
+
+
+def test_runtime_view_damping_never_throttles_a_collision_escape():
+    controller = _runtime_with(
+        _AngularCameraModel(),
+        ViewMeasurementDampingConfig(stability_alpha=0.5),
+    )
+    camera_target = np.asarray((0.0, -0.30, 0.90))
+    result, document = controller._damp_view_velocity(
+        _view_result(
+            (0.5, 0.0, 0.0, 0.0, 0.0, 0.0),
+            backend="fixed-fixture-collision-escape",
+        ),
+        state=_state(),
+        camera_target_optical=camera_target,
+        view_update_period_s=0.133,
+    )
+
+    assert document["applied"] is False
+    assert result.velocity.arm_joint_velocity_rps[0] == pytest.approx(0.5)

@@ -164,6 +164,106 @@ class ArmViewIntent:
 
 
 @dataclass(frozen=True)
+class ViewMeasurementDampingConfig:
+    """Measurement-aware damping for the wrist arm-view loop.
+
+    The Fast-FoundationStereo depth switch dropped the tracked-target bundle
+    update rate from the ~30 Hz era to a measured 7.5-8 Hz and grew the
+    capture-to-use latency to ~200-250 ms.  The arm-view inner loop -- the
+    whole-body QP nulling the wrist-camera image error over its 0.20 s horizon
+    -- keeps integrating a FROZEN perception error between bundles.  With the
+    loop delay roughly tripled, the *unchanged* gain crosses the discrete
+    stability boundary: the wrist camera over-pitches past a high target until
+    it leaves frame, view recovery climbs further, and the run aborts.
+
+    The fix bounds the per-update view rotation so the arm can never rotate
+    past the last measured error before a fresh measurement lands::
+
+        omega_cap = stability_alpha * |view_error| / (update_period + latency)
+
+    The rotation applied before the next fresh error is then at most
+    ``stability_alpha * |view_error| < |view_error|`` for ``stability_alpha < 1``
+    -- discrete-stable at any measurement rate.  Because the cap scales with the
+    error, full authority (up to the executor's own MAX_QDOT) is retained far
+    from centre, so the arm still keeps a climbing target in frame during
+    approach; damping only engages near centre where the delayed loop would
+    otherwise oscillate.  ``update_period`` is measured live; ``latency`` is a
+    tuned constant for the FFS regime because the capture stamp is deliberately
+    skew-adjusted upstream and cannot carry the sub-second latency directly.
+    """
+
+    enabled: bool = True
+    stability_alpha: float = 0.5
+    nominal_update_period_s: float = 0.133
+    nominal_latency_s: float = 0.25
+    min_rate_scale: float = 0.05
+
+    def __post_init__(self) -> None:
+        positive = (
+            self.stability_alpha,
+            self.nominal_update_period_s,
+            self.nominal_latency_s,
+        )
+        if any(not math.isfinite(value) or value <= 0.0 for value in positive):
+            raise ValueError("view damping timing and alpha must be finite and positive")
+        if not 0.0 < self.stability_alpha < 1.0:
+            raise ValueError("view damping stability_alpha must be within (0, 1)")
+        if not math.isfinite(self.min_rate_scale) or not 0.0 <= self.min_rate_scale <= 1.0:
+            raise ValueError("view damping min_rate_scale must be within [0, 1]")
+
+    def effective_delay_s(self, update_period_s: float | None) -> float:
+        """Loop delay = live-measured update period (fallback nominal) + latency."""
+
+        period = self.nominal_update_period_s
+        if (
+            update_period_s is not None
+            and math.isfinite(update_period_s)
+            and update_period_s > 0.0
+        ):
+            period = float(update_period_s)
+        return period + self.nominal_latency_s
+
+    def rate_cap_rps(
+        self,
+        view_error_rad: float,
+        *,
+        update_period_s: float | None = None,
+    ) -> float:
+        """Maximum discrete-stable view rate for the current measured error."""
+
+        return (
+            self.stability_alpha
+            * abs(float(view_error_rad))
+            / self.effective_delay_s(update_period_s)
+        )
+
+    def rate_scale(
+        self,
+        *,
+        view_error_rad: float,
+        commanded_rate_rps: float,
+        update_period_s: float | None = None,
+    ) -> float:
+        """Multiplier in [min_rate_scale, 1] bounding a commanded view rate.
+
+        ``commanded_rate_rps`` is the view (camera) angular rate the inner
+        controller wants to apply for this cycle.  When it already sits below
+        the measurement-aware cap the command passes through untouched (scale
+        1.0), so the proven low-latency behaviour is preserved exactly.
+        """
+
+        if not self.enabled:
+            return 1.0
+        omega = abs(float(commanded_rate_rps))
+        if not math.isfinite(omega) or omega <= 1e-9:
+            return 1.0
+        cap = self.rate_cap_rps(view_error_rad, update_period_s=update_period_s)
+        if not math.isfinite(cap) or omega <= cap:
+            return 1.0
+        return max(self.min_rate_scale, cap / omega)
+
+
+@dataclass(frozen=True)
 class ReactiveServoDecision:
     phase: ReactivePhase
     base: BaseMotionIntent

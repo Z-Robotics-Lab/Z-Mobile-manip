@@ -23,6 +23,7 @@ from .whole_body_model import (
     ReducedWholeBodyState,
     ReducedWholeBodyVelocity,
 )
+from .reactive_servo import ViewMeasurementDampingConfig
 from .whole_body_collision import select_collision_safe_arm_step
 from .whole_body_optimizer import (
     CasadiBoxQP,
@@ -111,6 +112,7 @@ class WholeBodyRuntimeController:
         calibration_path: Path,
         collision_model_path: Path,
         desired_standoff_m: float = 0.52,
+        view_damping: ViewMeasurementDampingConfig | None = None,
     ) -> None:
         from z_manip.fixed_self_collision import FixedSelfCollisionGuard
 
@@ -168,6 +170,7 @@ class WholeBodyRuntimeController:
             model_path=collision_model_path,
         )
         self.desired_standoff_m = float(desired_standoff_m)
+        self.view_damping = view_damping or ViewMeasurementDampingConfig()
         self.previous_velocity: ReducedWholeBodyVelocity | None = None
 
     @staticmethod
@@ -243,6 +246,7 @@ class WholeBodyRuntimeController:
         mode: str,
         freeze_base: bool = False,
         desired_target_lateral_in_body_m: float = 0.0,
+        view_update_period_s: float | None = None,
     ) -> WholeBodyRuntimeCommand:
         camera_target = np.asarray(camera_target_xyz_m, dtype=float)
         if camera_target.shape != (3,) or not np.isfinite(camera_target).all() or camera_target[2] <= 0.0:
@@ -359,6 +363,12 @@ class WholeBodyRuntimeController:
                 "reason": "optimizer rejected target before arm-step prediction",
                 "attempts": [],
             }
+        result, view_damping_document = self._damp_view_velocity(
+            result,
+            state=state,
+            camera_target_optical=camera_target,
+            view_update_period_s=view_update_period_s,
+        )
         self.previous_velocity = result.velocity if result.success else None
         velocity = result.velocity
         dt = self.optimizer.config.horizon_dt_s
@@ -384,6 +394,7 @@ class WholeBodyRuntimeController:
             "mode": mode,
             "executable": executable,
             "fixed_fixture_collision": collision_document,
+            "view_damping": view_damping_document,
             "measured_state": {
                 "posture_fresh": posture_fresh,
                 "posture_detail": posture_detail,
@@ -457,6 +468,94 @@ class WholeBodyRuntimeController:
             arm_joint_velocity_rps=velocity.arm_joint_velocity_rps,
             executable=executable,
             document=document,
+        )
+
+    def _damp_view_velocity(
+        self,
+        result: Any,
+        *,
+        state: ReducedWholeBodyState,
+        camera_target_optical: np.ndarray,
+        view_update_period_s: float | None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Bound the arm-induced wrist-camera view rate to a measurement-safe cap.
+
+        The whole-body QP nulls the frozen image error over its fixed 0.20 s
+        horizon; between 7.5-8 Hz perception bundles the same command keeps
+        integrating a stale error, which -- at the FFS-era loop delay -- drives
+        the wrist camera past a high target.  Here the final (collision-checked)
+        arm velocity is scaled down, preserving its direction and coupled joint
+        coordination, until the camera angular rate it induces respects::
+
+            omega_cap = alpha * |elevation_error| / (update_period + latency)
+
+        Scaling a collision-checked step *down* only shortens it along the same
+        safe direction, so the fixed-fixture guarantee is preserved.  Collision
+        escapes and non-executable/visibility-gated results keep full authority.
+        """
+
+        config = self.view_damping
+        arm_velocity = np.asarray(result.velocity.arm_joint_velocity_rps, dtype=float)
+        elevation_error_rad = float(
+            math.atan2(-float(camera_target_optical[1]), float(camera_target_optical[2]))
+        )
+        effective_delay_s = config.effective_delay_s(view_update_period_s)
+        document: dict[str, Any] = {
+            "enabled": bool(config.enabled),
+            "applied": False,
+            "stability_alpha": config.stability_alpha,
+            "elevation_error_rad": elevation_error_rad,
+            "update_period_s": view_update_period_s,
+            "effective_delay_s": effective_delay_s,
+            "commanded_view_rate_rps": 0.0,
+            "rate_cap_rps": config.rate_cap_rps(
+                elevation_error_rad, update_period_s=view_update_period_s
+            ),
+            "scale": 1.0,
+        }
+        escape_backend = (
+            "collision-escape" in result.backend
+            or "collision-gate" in result.backend
+            or "visibility-gate" in result.backend
+        )
+        if not config.enabled or not result.success or escape_backend:
+            document["reason"] = (
+                "view damping disabled"
+                if not config.enabled
+                else "escape/gate result keeps full authority"
+                if escape_backend
+                else "non-executable result left unscaled"
+            )
+            return result, document
+
+        camera_jacobian = np.asarray(
+            self.model.frame_jacobian(state, self.model.camera_frame),
+            dtype=float,
+        )
+        angular_arm = camera_jacobian[3:, 4:]
+        commanded_view_rate_rps = float(np.linalg.norm(angular_arm @ arm_velocity))
+        document["commanded_view_rate_rps"] = commanded_view_rate_rps
+        scale = config.rate_scale(
+            view_error_rad=elevation_error_rad,
+            commanded_rate_rps=commanded_view_rate_rps,
+            update_period_s=view_update_period_s,
+        )
+        document["scale"] = scale
+        if scale >= 1.0 - 1e-9:
+            document["reason"] = "commanded view rate already within the measurement cap"
+            return result, document
+        damped_velocity = result.velocity.as_vector()
+        damped_velocity[4:] = arm_velocity * scale
+        document["applied"] = True
+        document["reason"] = (
+            "arm view rate bounded to the measurement-synchronized cap"
+        )
+        return (
+            replace(
+                result,
+                velocity=ReducedWholeBodyVelocity.from_vector(damped_velocity),
+            ),
+            document,
         )
 
     def reset(self) -> None:
