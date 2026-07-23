@@ -1,0 +1,11 @@
+# Fast-FoundationStereo PyTorch inference deps.
+# torch / CUDA come from the z-manip-edgetam base image (torch 2.8.0+cu128).
+# Fast-FFS core imports NO flash-attn and NO xformers; triton ships with torch
+# and is only used on the optional TRT path (guarded import).
+timm
+einops
+omegaconf
+scipy
+scikit-image
+imageio
+pyyaml

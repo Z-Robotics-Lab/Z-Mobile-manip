@@ -18,7 +18,17 @@ Type=simple
 # lag, thermal), ROLL BACK by changing both profiles below to 640x480x15 and
 # `sudo systemctl restart d435i` (color+depth must stay at the same rate so the
 # node's exact-time RGB-D synchronizer keeps joining stamps).
-ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh && exec ros2 launch realsense2_camera rs_launch.py camera_namespace:=/nuc camera_name:=camera enable_sync:=true align_depth.enable:=true rgb_camera.color_profile:=640x480x30 depth_module.depth_profile:=640x480x30 spatial_filter.enable:=true spatial_filter.filter_magnitude:=2 spatial_filter.filter_smooth_alpha:=0.5 spatial_filter.filter_smooth_delta:=20 spatial_filter.holes_fill:=0 temporal_filter.enable:=true temporal_filter.filter_smooth_alpha:=0.4 temporal_filter.filter_smooth_delta:=20 temporal_filter.holes_fill:=3'
+#
+# infra1(left)+infra2(right) Y8 640x480x30 are enabled as the RAW, rectified,
+# unfiltered stereo pair consumed by the optional Fast-FoundationStereo depth
+# node (docker/ffs_service) on the 4090 PC.  They share the hardware-synced frame
+# timestamps of color+depth (enable_sync:=true), so an FFS depth stamped with the
+# IR-pair stamp still exact-joins the color frame downstream.  DDS only ships
+# these streams when a reader subscribes, so enabling them adds no Wi-Fi load
+# unless the FFS node runs.  The spatial/temporal filters below apply to the
+# DEPTH stream only; the IR pair stays raw (what the learned matcher wants).
+# ROLL BACK by removing the enable_infra1/2 + depth_module.infra_profile args.
+ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh && exec ros2 launch realsense2_camera rs_launch.py camera_namespace:=/nuc camera_name:=camera enable_sync:=true align_depth.enable:=true rgb_camera.color_profile:=640x480x30 depth_module.depth_profile:=640x480x30 enable_infra1:=true enable_infra2:=true depth_module.infra_profile:=640x480x30 spatial_filter.enable:=true spatial_filter.filter_magnitude:=2 spatial_filter.filter_smooth_alpha:=0.5 spatial_filter.filter_smooth_delta:=20 spatial_filter.holes_fill:=0 temporal_filter.enable:=true temporal_filter.filter_smooth_alpha:=0.4 temporal_filter.filter_smooth_delta:=20 temporal_filter.holes_fill:=3'
 # ros2 launch can exit successfully even when its child node failed during an
 # early-boot network race, so retry regardless of the launcher's exit status.
 Restart=always

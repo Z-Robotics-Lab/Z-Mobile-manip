@@ -1,0 +1,22 @@
+[Unit]
+Description=FFS IR pair throttle (bounded Wi-Fi shipping of D435 stereo IR)
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Joins infra1+infra2 compressed by exact frameset stamp on the NUC and
+# republishes the paired messages at <=10 Hz on /nuc/camera/ffs_ir_pair/*.
+# Rationale: unthrottled 30 fps IR jpeg over Wi-Fi collapsed the color stream
+# from ~30 Hz to ~6 Hz on the PC (measured 2026-07-23).  The PC-side
+# Fast-FoundationStereo relay subscribes ONLY the throttled topics.
+# Deployed from repo source scripts/runtime/ffs_ir_pair_throttle.py (scp to
+# ~/ffs_ir_pair_throttle.py); unit source configs/ffs-ir-throttle.service.
+Environment=FFS_IR_PAIR_HZ=10
+ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh && exec python3 %h/ffs_ir_pair_throttle.py'
+Restart=always
+RestartSec=5
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

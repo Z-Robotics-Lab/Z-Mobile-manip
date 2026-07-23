@@ -1,7 +1,21 @@
 z_manip_edgetam:
   ros__parameters:
     color_topic: /camera/color/image_raw
-    depth_topic: /camera/aligned_depth_to_color/image_raw
+    # DEPTH SOURCE SWITCH (2026-07-23) ---------------------------------------
+    # Default: Fast-FoundationStereo learned stereo depth computed on the PC
+    # from the D435 IR pair and registered into the color frame by
+    # scripts/runtime/ffs_depth_stack.sh (service: docker/ffs_service).  Same
+    # exact frameset stamps and frame_id as the raw stream; measured ~18 fps.
+    # Shootout vs raw D435 (2026-07-23, static scene): floor plane-fit RMS
+    # 1.07 mm vs 2.23 mm, temporal std p95 42 mm vs 105 mm, holes 12% vs 28%
+    # (IR frame).  Registration validated against librealsense rs.align to
+    # 1.09 mm median.
+    # FALLBACK (raw D435): set depth_topic back to
+    #     /camera/aligned_depth_to_color/image_raw
+    # then `go2w_perception_lab.sh build` + component-manager restart
+    # perception (this yaml is baked into z-manip-runtime:pinocchio).  The raw
+    # aligned-depth stream keeps publishing either way; no NUC change needed.
+    depth_topic: /camera/ffs_depth_aligned/image_raw
     camera_info_topic: /camera/color/camera_info
     init_bbox_topic: /track_3d/init_bbox
     reset_topic: /track_3d/reset

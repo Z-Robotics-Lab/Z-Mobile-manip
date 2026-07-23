@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Factory calibration of the wrist D435i (serial below), captured live via",
+    "pyrealsense2 on the NUC on 2026-07-23 for the Fast-FoundationStereo depth",
+    "integration.  Used by docker/ffs_service/ffs_depth_service.py to convert",
+    "left-IR disparity to metric depth and register it into the COLOR optical",
+    "frame.  Regenerate with the rs_stereo_capture probe if the camera module is",
+    "ever replaced or recalibrated (the relay cross-checks live camera_info and",
+    "fails closed on mismatch).  rotation is column-major (rs.extrinsics layout)."
+  ],
+  "device": "RealSense D435I",
+  "serial": "347622076369",
+  "firmware": "5.15.1.55",
+  "width": 640,
+  "height": 480,
+  "depth_scale": 0.0010000000474974513,
+  "baseline_m": 0.05001901090145111,
+  "K_ir1": {
+    "fx": 387.3583679199219,
+    "fy": 387.3583679199219,
+    "ppx": 325.837646484375,
+    "ppy": 235.5001220703125
+  },
+  "K_color": {
+    "fx": 605.8689575195312,
+    "fy": 605.2122192382812,
+    "ppx": 331.7785339355469,
+    "ppy": 240.23947143554688
+  },
+  "ir1_to_color": {
+    "rotation_colmajor": [
+      0.999995768070221,
+      0.00240536080673337,
+      -0.001620717579498887,
+      -0.00240014074370265,
+      0.9999919533729553,
+      0.0032151099294424057,
+      0.0016284380108118057,
+      -0.003211206290870905,
+      0.9999935030937195
+    ],
+    "translation_m": [
+      0.014840344898402691,
+      8.228952356148511e-05,
+      9.706902346806601e-05
+    ]
+  },
+  "color_frame_id": "camera_color_optical_frame",
+  "ir1_frame_id": "camera_infra1_optical_frame"
+}
