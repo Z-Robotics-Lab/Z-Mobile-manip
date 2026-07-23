@@ -20,8 +20,8 @@ def test_d435_service_persistently_filters_the_aligned_source_depth():
     assert "temporal_filter.enable:=true" in source
     assert "temporal_filter.filter_smooth_alpha:=0.4" in source
     assert "temporal_filter.filter_smooth_delta:=20" in source
-    assert "rgb_camera.color_profile:=640x480x15" in source
-    assert "depth_module.depth_profile:=640x480x15" in source
+    assert "rgb_camera.color_profile:=640x480x30" in source
+    assert "depth_module.depth_profile:=640x480x30" in source
 
 
 def test_d435_service_has_no_robot_or_can_command_surface():

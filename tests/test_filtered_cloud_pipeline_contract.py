@@ -13,9 +13,12 @@ def test_target_and_scene_clouds_project_the_same_filtered_rgbd_frame():
     core = CORE.read_text(encoding="utf-8")
     node = NODE.read_text(encoding="utf-8")
 
-    assert "depth_m, depth_filter = self._depth_filter.update(" in node
+    # The stabilized depth is produced by the dedicated depth worker and
+    # joined back by exact source stamp before any projection consumes it.
+    assert "depth_m, report = self._depth_filter.update(" in node
     assert "depth_m=depth_m," in node
-    assert "depth_filter=depth_filter," in node
+    assert "depth_filter=report," in node
+    assert "_join_filtered_depth(" in node
     scene_projection = (
         "project_scene_depth(\n            observation.mask,\n            frame.depth_m,"
     )

@@ -13,8 +13,10 @@ import pytest
 from z_manip_edgetam.core import (
     AcquisitionGate,
     CameraIntrinsics,
+    MotionAdaptiveDepthFilter,
     ReseedRegistrationConfig,
     RgbdFrame,
+    TrackerFailure,
 )
 
 
@@ -45,6 +47,7 @@ node_module = importlib.import_module('z_manip_edgetam.node')
 EdgeTamAdapter = node_module.EdgeTamAdapter
 Command = node_module._Command
 CachedRgb = node_module._CachedRgb
+PendingFrame = node_module._PendingFrame
 SeedOffer = node_module._SeedOffer
 SeedRequest = node_module._SeedRequest
 parse_seed_request = node_module._parse_seed_request
@@ -788,6 +791,11 @@ def test_recreate_rgbd_subscriptions_replaces_stale_readers() -> None:
         _rgbd_messages=deque(((object(), object(), object()),)),
         _state_lock=threading.RLock(),
         _last_sync_ros_s=5.0,
+        _depth_condition=threading.Condition(),
+        _depth_filter_lock=threading.Lock(),
+        _depth_pending=deque((object(),)),
+        _depth_results=OrderedDict({1: object()}),
+        _depth_last_stamp_ns=7,
         _depth_filter=SimpleNamespace(reset=lambda: None),
         destroy_subscription=lambda subscription: destroyed.append(subscription),
         _create_rgbd_subscriptions=lambda: created.append(True),
@@ -801,6 +809,9 @@ def test_recreate_rgbd_subscriptions_replaces_stale_readers() -> None:
     assert adapter._sync_subscribers == ()
     assert adapter._synchronizer is None
     assert not adapter._rgbd_messages
+    assert not adapter._depth_pending
+    assert not adapter._depth_results
+    assert adapter._depth_last_stamp_ns is None
     assert adapter._last_sync_ros_s is None
     assert warnings == [
         'recreated RGB-D DDS readers after synchronization timeout',
@@ -1688,3 +1699,142 @@ def test_fail_closed_false_cannot_land_after_new_generation_true() -> None:
     assert not adapter._seed_offer_armed
     assert adapter._seed_request_started_steady_s is None
     assert adapter._seed_request_deadline_steady_s is None
+
+
+def _pending(stamp_ns: int, *, fill: float = 1.0) -> object:
+    return PendingFrame(
+        stamp_ns=stamp_ns,
+        frame_id='camera_color_optical_frame',
+        image_jpeg=b'\xff\xd8depth\xff\xd9',
+        width=8,
+        height=8,
+        raw_depth_m=np.full((8, 8), fill, dtype=np.float32),
+        intrinsics=CameraIntrinsics(4.0, 4.0, 4.0, 4.0),
+    )
+
+
+def _depth_adapter(**overrides: object) -> SimpleNamespace:
+    adapter = SimpleNamespace(
+        _depth_condition=threading.Condition(),
+        _depth_filter_lock=threading.Lock(),
+        _depth_pending=deque(),
+        _depth_results=OrderedDict(),
+        _depth_last_stamp_ns=None,
+        _stop_depth_worker=False,
+        _finalize_frame=EdgeTamAdapter._finalize_frame,
+        get_parameter=_parameter_reader({
+            'depth_result_cache_size': 8,
+            'depth_join_timeout_s': 2.0,
+        }),
+    )
+    for name, value in overrides.items():
+        setattr(adapter, name, value)
+    return adapter
+
+
+def test_join_returns_exact_stamp_frame_regardless_of_completion_order() -> None:
+    adapter = _depth_adapter()
+    frame_100 = _frame(100)
+    frame_200 = _frame(200)
+    # The fresher stamp was resolved first (out-of-order completion); the join
+    # must still hand each mask its own same-stamp depth frame, never the other.
+    adapter._depth_results[200] = frame_200
+    adapter._depth_results[100] = frame_100
+    adapter._depth_last_stamp_ns = 200
+
+    joined_100 = EdgeTamAdapter._join_filtered_depth(adapter, 100)
+    joined_200 = EdgeTamAdapter._join_filtered_depth(adapter, 200)
+
+    assert joined_100 is frame_100
+    assert joined_100.stamp_ns == 100
+    assert joined_200 is frame_200
+    assert joined_200.stamp_ns == 200
+    # Each result is consumed exactly once.
+    assert not adapter._depth_results
+
+
+def test_join_skips_a_frame_superseded_by_a_fresher_stamp() -> None:
+    adapter = _depth_adapter(_depth_last_stamp_ns=200)
+    # Stamp 100 never landed in the results map and the depth timeline already
+    # advanced past it: treat it as a dropped latest-only frame, not a failure.
+    assert EdgeTamAdapter._join_filtered_depth(adapter, 100) is None
+
+
+def test_join_reraises_a_deferred_depth_filter_error() -> None:
+    failure = TrackerFailure('bad depth', reason_code='depth_broken')
+    adapter = _depth_adapter(
+        _depth_results=OrderedDict({100: failure}),
+        _depth_last_stamp_ns=100,
+    )
+    with pytest.raises(TrackerFailure, match='bad depth'):
+        EdgeTamAdapter._join_filtered_depth(adapter, 100)
+
+
+def test_join_blocks_until_its_exact_stamp_resolves_out_of_order() -> None:
+    adapter = _depth_adapter()
+    joined: list[object] = []
+
+    def wait_for_100() -> None:
+        joined.append(EdgeTamAdapter._join_filtered_depth(adapter, 100))
+
+    waiter = threading.Thread(target=wait_for_100)
+    waiter.start()
+    # A different, later stamp resolves first; it must not satisfy the wait for
+    # stamp 100 nor advance the timeline past it.
+    with adapter._depth_condition:
+        adapter._depth_results[50] = _frame(50)
+        adapter._depth_condition.notify_all()
+    frame_100 = _frame(100)
+    with adapter._depth_condition:
+        adapter._depth_results[100] = frame_100
+        adapter._depth_last_stamp_ns = 100
+        adapter._depth_condition.notify_all()
+    waiter.join(timeout=2.0)
+
+    assert not waiter.is_alive()
+    assert joined == [frame_100]
+
+
+def test_join_times_out_and_fails_closed_when_depth_never_resolves() -> None:
+    adapter = _depth_adapter(get_parameter=_parameter_reader({
+        'depth_result_cache_size': 8,
+        'depth_join_timeout_s': 0.05,
+    }))
+    with pytest.raises(TrackerFailure) as excinfo:
+        EdgeTamAdapter._join_filtered_depth(adapter, 100)
+    assert excinfo.value.reason_code == 'depth_join_timeout'
+
+
+def test_depth_worker_pairs_stabilized_depth_with_its_exact_source_stamp() -> None:
+    depth_filter = MotionAdaptiveDepthFilter(window_size=3, min_motion_pixels=8)
+    adapter = _depth_adapter(_depth_filter=depth_filter)
+    worker = threading.Thread(
+        target=EdgeTamAdapter._depth_worker_loop,
+        args=(adapter,),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        for index in range(1, 4):
+            stamp_ns = index * 100_000_000
+            pending = _pending(stamp_ns, fill=1.0 + 0.001 * index)
+            EdgeTamAdapter._submit_depth_frame(adapter, pending)
+            joined = EdgeTamAdapter._join_filtered_depth(adapter, stamp_ns)
+            assert joined is not None
+            assert joined.stamp_ns == stamp_ns
+            assert joined.frame_id == 'camera_color_optical_frame'
+            assert joined.depth_m.shape == (8, 8)
+            assert joined.depth_m.flags.writeable is False
+            assert joined.depth_filter['frame_count'] == min(index, 3)
+    finally:
+        with adapter._depth_condition:
+            adapter._stop_depth_worker = True
+            adapter._depth_condition.notify_all()
+        worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+
+def test_submit_depth_frame_is_a_noop_after_worker_stop() -> None:
+    adapter = _depth_adapter(_stop_depth_worker=True)
+    EdgeTamAdapter._submit_depth_frame(adapter, _pending(100))
+    assert not adapter._depth_pending

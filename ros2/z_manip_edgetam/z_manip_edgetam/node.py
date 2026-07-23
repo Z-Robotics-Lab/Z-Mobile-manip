@@ -206,6 +206,28 @@ class _CachedRgb:
     height: int
 
 
+@dataclass(frozen=True, eq=False)
+class _PendingFrame:
+    """
+    One decoded RGB frame whose depth median is still being computed.
+
+    The RGB payload (JPEG, dimensions, intrinsics) is ready immediately so the
+    frame can enter the seed cache and the EdgeTAM HTTP queue without waiting on
+    the temporal depth filter.  ``raw_depth_m`` is the unfiltered metric depth;
+    the depth worker stabilizes it and publishes the resulting ``RgbdFrame`` on
+    ``_depth_results`` keyed by this exact ``stamp_ns`` (see ``_run_update`` /
+    ``_join_filtered_depth``), preserving the mask<->depth same-stamp pairing.
+    """
+
+    stamp_ns: int
+    frame_id: str
+    image_jpeg: bytes
+    width: int
+    height: int
+    raw_depth_m: np.ndarray
+    intrinsics: CameraIntrinsics
+
+
 @dataclass(frozen=True)
 class _SeedRequest:
     action: str
@@ -240,7 +262,7 @@ class _SeedOffer:
 class _Command:
     kind: str
     generation: int
-    frame: RgbdFrame | _CachedRgb | None = None
+    frame: RgbdFrame | _CachedRgb | _PendingFrame | None = None
     bbox_xyxy: tuple[int, int, int, int] | None = None
     label: str = ''
     seed_id: str = ''
@@ -288,7 +310,21 @@ class EdgeTamAdapter(Node):
                 self.get_parameter('depth_filter_min_motion_pixels').value,
             ),
             max_gap_s=float(self.get_parameter('depth_filter_max_gap_s').value),
+            half_resolution=bool(
+                self.get_parameter('depth_filter_half_resolution').value,
+            ),
         )
+        # The depth median runs off the mask critical path on its own worker.
+        # ``_depth_filter_lock`` guards the temporal filter object itself (its
+        # ~15ms update and any reset); ``_depth_condition`` guards the handoff
+        # queues.  Results are published keyed by the exact source stamp so the
+        # HTTP worker joins the depth frame that pairs with its mask.
+        self._depth_filter_lock = threading.Lock()
+        self._depth_condition = threading.Condition()
+        self._depth_pending: deque[_PendingFrame] = deque()
+        self._depth_results: OrderedDict[int, RgbdFrame | Exception] = OrderedDict()
+        self._depth_last_stamp_ns: int | None = None
+        self._stop_depth_worker = False
         self._state_lock = threading.RLock()
         self._worker_condition = threading.Condition(self._state_lock)
         self._commands: deque[_Command] = deque()
@@ -510,6 +546,13 @@ class EdgeTamAdapter(Node):
         )
         self._rgbd_worker.start()
 
+        self._depth_worker = threading.Thread(
+            target=self._depth_worker_loop,
+            name='z-manip-depth-filter',
+            daemon=True,
+        )
+        self._depth_worker.start()
+
         self._worker = threading.Thread(
             target=self._worker_loop,
             name='z-manip-edgetam-http',
@@ -631,6 +674,14 @@ class EdgeTamAdapter(Node):
             'depth_filter_global_motion_fraction': 0.15,
             'depth_filter_min_motion_pixels': 24,
             'depth_filter_max_gap_s': 0.5,
+            # Half-resolution temporal median (~4-5x faster, ~15ms at
+            # 640x480x5).  Kept off the mask critical path on a depth worker;
+            # see MotionAdaptiveDepthFilter.  Set False for the exact median.
+            'depth_filter_half_resolution': True,
+            # Bounded stamp-keyed store of filtered depth frames awaiting their
+            # matching mask, plus the ceiling the HTTP worker will wait for one.
+            'depth_result_cache_size': 8,
+            'depth_join_timeout_s': 2.0,
             'min_depth_m': 0.28,
             'max_depth_m': 2.5,
             'min_cloud_points': 24,
@@ -658,6 +709,7 @@ class EdgeTamAdapter(Node):
             'depth_filter_global_motion_fraction',
             'depth_filter_max_gap_s',
             'short_span_seed_fallback_max_s',
+            'depth_join_timeout_s',
         )
         if any(
             not math.isfinite(float(self.get_parameter(name).value))
@@ -686,6 +738,7 @@ class EdgeTamAdapter(Node):
             'depth_filter_window_size',
             'depth_filter_min_motion_pixels',
             'short_span_seed_fallback_max_frames',
+            'depth_result_cache_size',
         )
         if any(int(self.get_parameter(name).value) < 1 for name in integers):
             raise ValueError('EdgeTAM queue and point limits must be positive')
@@ -874,7 +927,15 @@ class EdgeTamAdapter(Node):
             self.destroy_subscription(subscriber.sub)
         with self._rgbd_condition:
             self._rgbd_messages.clear()
-        self._depth_filter.reset()
+        # Drop the stale depth backlog and the temporal window together: the
+        # proven input gap invalidates the median history, and any abandoned
+        # pending frames must not resolve against the fresh timeline.
+        with self._depth_condition:
+            self._depth_pending.clear()
+            self._depth_results.clear()
+            self._depth_last_stamp_ns = None
+        with self._depth_filter_lock:
+            self._depth_filter.reset()
         with self._state_lock:
             self._last_sync_ros_s = None
         self._create_rgbd_subscriptions()
@@ -1065,6 +1126,107 @@ class EdgeTamAdapter(Node):
                 self._rgbd_messages.clear()
             self._synchronized_cb_guarded(*messages)
 
+    def _submit_depth_frame(self, pending: _PendingFrame) -> None:
+        """Hand one pending frame to the parallel depth-stabilization worker."""
+        with self._depth_condition:
+            if self._stop_depth_worker:
+                return
+            self._depth_pending.append(pending)
+            self._depth_condition.notify_all()
+
+    def _depth_worker_loop(self) -> None:
+        """Stabilize depth off the mask path, publishing results keyed by stamp."""
+        while True:
+            with self._depth_condition:
+                while not self._depth_pending and not self._stop_depth_worker:
+                    self._depth_condition.wait()
+                if self._stop_depth_worker:
+                    return
+                # Collapse any backlog to the freshest frame.  Older frames are
+                # abandoned; their exact stamps fall below the advancing depth
+                # timeline, so a waiting HTTP worker treats them as superseded
+                # (never as a lost pairing) - see ``_join_filtered_depth``.
+                pending = self._depth_pending.pop()
+                self._depth_pending.clear()
+            result: RgbdFrame | Exception
+            try:
+                with self._depth_filter_lock:
+                    depth_m, report = self._depth_filter.update(
+                        pending.raw_depth_m,
+                        stamp_ns=pending.stamp_ns,
+                    )
+                result = self._finalize_frame(pending, depth_m, report)
+            except Exception as error:  # noqa: BLE001 - deferred to the HTTP join
+                result = error
+            with self._depth_condition:
+                if self._stop_depth_worker:
+                    return
+                self._depth_results[pending.stamp_ns] = result
+                self._depth_last_stamp_ns = (
+                    pending.stamp_ns
+                    if self._depth_last_stamp_ns is None
+                    else max(self._depth_last_stamp_ns, pending.stamp_ns)
+                )
+                limit = int(self.get_parameter('depth_result_cache_size').value)
+                while len(self._depth_results) > limit:
+                    self._depth_results.popitem(last=False)
+                self._depth_condition.notify_all()
+
+    @staticmethod
+    def _finalize_frame(
+        pending: _PendingFrame,
+        depth_m: np.ndarray,
+        report: dict[str, object],
+    ) -> RgbdFrame:
+        """Assemble the mask-pairable RGB-D frame from its stabilized depth."""
+        depth_m = np.asarray(depth_m)
+        depth_m.setflags(write=False)
+        return RgbdFrame(
+            stamp_ns=pending.stamp_ns,
+            frame_id=pending.frame_id,
+            image_jpeg=pending.image_jpeg,
+            width=pending.width,
+            height=pending.height,
+            depth_m=depth_m,
+            intrinsics=pending.intrinsics,
+            depth_filter=report,
+        )
+
+    def _join_filtered_depth(self, stamp_ns: int) -> RgbdFrame | None:
+        """
+        Return the stabilized frame for ``stamp_ns`` once the worker resolves it.
+
+        Blocks until the exact-stamp depth frame is ready, returns ``None`` if a
+        fresher frame superseded it, and re-raises a deferred filter error so the
+        HTTP worker fails closed.  The bounded wait guards against a wedged depth
+        worker rather than normal latency.
+        """
+        deadline = time.monotonic() + float(
+            self.get_parameter('depth_join_timeout_s').value,
+        )
+        with self._depth_condition:
+            while True:
+                result = self._depth_results.pop(stamp_ns, None)
+                if result is not None:
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+                if self._stop_depth_worker:
+                    return None
+                if (
+                    self._depth_last_stamp_ns is not None
+                    and self._depth_last_stamp_ns >= stamp_ns
+                ):
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TrackerFailure(
+                        'depth stabilization did not resolve the mask-paired '
+                        f'frame within {self.get_parameter("depth_join_timeout_s").value}s',
+                        reason_code='depth_join_timeout',
+                    )
+                self._depth_condition.wait(timeout=remaining)
+
     def _synchronized_cb(
         self,
         color_msg: Image,
@@ -1081,6 +1243,7 @@ class EdgeTamAdapter(Node):
         failure: str | None = None
         failure_code = 'tracker_failure'
         offer_to_publish: _SeedOffer | None = None
+        frame_to_filter: _PendingFrame | None = None
         with self._state_lock:
             if (
                 self._last_sync_stamp_ns is not None
@@ -1128,9 +1291,16 @@ class EdgeTamAdapter(Node):
                 if self._seed_stamp_ns is not None and frame.stamp_ns > self._seed_stamp_ns:
                     failure = self._enqueue_frame_locked(frame)
                     if failure is None:
+                        frame_to_filter = frame
                         self._worker_condition.notify()
                     else:
                         failure_code = 'update_queue_overflow'
+        if frame_to_filter is not None:
+            # Start the depth median now, in parallel with the HTTP worker still
+            # processing the previous frame.  The HTTP worker joins this exact
+            # stamp only when it reaches the depth-dependent step, so the median
+            # latency hides behind EdgeTAM inference instead of preceding it.
+            self._submit_depth_frame(frame_to_filter)
         if offer_to_publish is not None:
             self._publish_seed_offer(offer_to_publish)
             self._publish_seed_status(
@@ -1141,7 +1311,7 @@ class EdgeTamAdapter(Node):
         if failure is not None:
             self._fail_closed(failure, reason_code=failure_code)
 
-    def _enqueue_frame_locked(self, frame: RgbdFrame) -> str | None:
+    def _enqueue_frame_locked(self, frame: _PendingFrame) -> str | None:
         """Queue a live frame while retaining only the freshest bounded window."""
         generation = self._generation
         limit = int(
@@ -1180,7 +1350,7 @@ class EdgeTamAdapter(Node):
         color_msg: Image,
         depth_msg: Image,
         info_msg: CameraInfo,
-    ) -> RgbdFrame:
+    ) -> _PendingFrame:
         stamps = (
             self._stamp_ns(color_msg.header),
             self._stamp_ns(depth_msg.header),
@@ -1234,23 +1404,22 @@ class EdgeTamAdapter(Node):
         else:
             raise ValueError(f'unsupported aligned depth encoding {depth_msg.encoding!r}')
         raw_depth_m = np.asarray(depth_raw, dtype=np.float32) * scale
-        depth_m, depth_filter = self._depth_filter.update(
-            raw_depth_m,
-            stamp_ns=stamps[0],
-        )
-        depth_m.setflags(write=False)
         k = tuple(float(value) for value in info_msg.k)
         if len(k) != 9 or not all(math.isfinite(value) for value in k):
             raise ValueError('camera K must contain nine finite values')
-        return RgbdFrame(
+        # The expensive temporal depth median is intentionally NOT run here: it
+        # only stabilizes 3-D geometry and is independent of the EdgeTAM mask
+        # identity.  The RGB payload leaves immediately for the seed cache and
+        # the HTTP queue; the depth worker filters ``raw_depth_m`` in parallel
+        # and the HTTP worker joins the same-stamp result before it needs depth.
+        return _PendingFrame(
             stamp_ns=stamps[0],
             frame_id=frame_ids[0],
             image_jpeg=encoded.tobytes(),
             width=width,
             height=height,
-            depth_m=depth_m,
+            raw_depth_m=raw_depth_m,
             intrinsics=CameraIntrinsics(fx=k[0], fy=k[4], cx=k[2], cy=k[5]),
-            depth_filter=depth_filter,
         )
 
     def _ignore_seed_bbox(
@@ -1818,9 +1987,19 @@ class EdgeTamAdapter(Node):
         )
 
     def _run_update(self, command: _Command) -> None:
-        if not isinstance(command.frame, RgbdFrame):
-            raise RuntimeError('invalid frame command')
-        observation = self._tracker.update(command.frame)
+        frame = command.frame
+        if not isinstance(frame, RgbdFrame):
+            if not isinstance(frame, _PendingFrame):
+                raise RuntimeError('invalid frame command')
+            # Join the same-stamp stabilized depth here, right before the
+            # depth-dependent tracker step.  Its median ran in parallel with the
+            # previous frame's EdgeTAM inference, so this rarely blocks.  A
+            # ``None`` means a fresher frame superseded this one - skip it just
+            # like a dropped latest-only queue entry, without failing closed.
+            frame = self._join_filtered_depth(frame.stamp_ns)
+            if frame is None:
+                return
+        observation = self._tracker.update(frame)
         lag_failure: str | None = None
         token: _PublicationToken | None = None
         with self._state_lock:
@@ -1828,7 +2007,7 @@ class EdgeTamAdapter(Node):
                 self._tracker.reset()
                 return
             result_stamp_ns = (
-                command.frame.stamp_ns
+                frame.stamp_ns
                 if observation is None
                 else observation.stamp_ns
             )
@@ -1861,7 +2040,7 @@ class EdgeTamAdapter(Node):
 
         messages = self._build_observation_messages(
             observation,
-            command.frame,
+            frame,
             token,
         )
         with self._state_lock:
@@ -2110,6 +2289,12 @@ class EdgeTamAdapter(Node):
             self._rgbd_condition.notify_all()
         if hasattr(self, '_rgbd_worker'):
             self._rgbd_worker.join(timeout=3.0)
+        with self._depth_condition:
+            self._stop_depth_worker = True
+            self._depth_pending.clear()
+            self._depth_condition.notify_all()
+        if hasattr(self, '_depth_worker'):
+            self._depth_worker.join(timeout=3.0)
         with self._worker_condition:
             self._stop_worker = True
             self._commands.clear()
