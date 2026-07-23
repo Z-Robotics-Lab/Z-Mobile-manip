@@ -454,6 +454,79 @@ def test_dashboard_explains_blocked_attempt_while_showing_last_good_bundle():
     assert 'status.title = control.message || control.log_tail || ""' in source
 
 
+def test_geometry_view_defaults_to_live_fusion_with_session_toggle():
+    source = HTML.read_text(encoding="utf-8")
+    lowered = source.lower()
+
+    # Live/Session indicator + toggle live in the geometry toolbar.
+    assert 'data-testid="geometry-view-mode"' in lowered
+    assert 'data-testid="geometry-live-state"' in lowered
+    assert 'data-testid="geometry-view-toggle"' in lowered
+    # The empty state defaults to the observer-fed LIVE view.
+    assert 'geometrymode: "live"' in lowered
+    assert "function syncgeometrymode" in lowered
+    assert "function setgeometrymode" in lowered
+
+    # Live overlays are driven by the runtime observer, not the bundle frame.
+    assert "function applylivegeometry" in lowered
+    assert "function ensurelivemode" in lowered
+    assert "function liverobotoverlay" in lowered
+    assert "scene.enterlivemode" in lowered
+    assert "setlivecamerapose" in lowered
+    assert "setliverobot" in lowered
+    assert "setlivecoloredcloud" in lowered
+
+    # Base-frame fusion is gated on the live measured hand-eye transform, never
+    # a synthetic calibration.
+    assert "function livecalibrationverified" in lowered
+    assert "kt?.verified === true" in lowered
+    assert "kt?.calibration_synthetic !== true" in lowered
+    assert "arm_base_from_camera" in lowered
+    assert "function transformcloudtobase" in lowered
+
+    # When calibration is not verified the base overlays stay locked and only a
+    # camera-frame cloud is shown.
+    assert "uncalibrated cloud only" in lowered
+    assert "base-frame overlays are locked" in lowered
+    assert "function updatecalibrationlock" in lowered
+
+    # Per-layer freshness badge consistent with the other live tiles.
+    assert "function rendergeometryfreshness" in lowered
+    assert "lagging" in lowered
+    assert "runtime_fresh_max_ms" in lowered
+
+    # The colored cloud CONSUMES the single existing endpoint (no second
+    # producer): fed from the same parsed frame the tile already fetches.
+    assert lowered.count('fetch("/api/cloud/latest.bin"') == 1
+    assert "applylivecoloredcloud(parsed)" in lowered
+
+    # Still offline/self-contained.
+    assert "http://" not in lowered
+    assert "https://" not in lowered
+
+
+def test_runtime_scene_exposes_live_view_api_and_composited_cloud():
+    source = (ROOT / "web/debug_dashboard/runtime_scene.js").read_text(encoding="utf-8")
+
+    for required in (
+        "enterLiveMode(options)",
+        "setLiveRobot(value)",
+        "setLiveCameraPose(value)",
+        "setLiveColoredCloud(xyz, rgb, count)",
+        "_drawColoredCloud(view)",
+        "_fitLiveFraming",
+        # High-throughput colored cloud: rasterized off-screen then composited
+        # under the vector overlays.
+        "putImageData",
+        "drawImage",
+        "coloredCloudPoints",
+    ):
+        assert required in source
+    # The live cloud path must stay dependency-free like the rest of the module.
+    for forbidden in ("fetch(", "XMLHttpRequest", "WebSocket", "innerHTML"):
+        assert forbidden not in source
+
+
 def test_launcher_contains_no_remote_or_actuator_commands():
     source = SHELL.read_text(encoding="utf-8").lower()
     forbidden = (

@@ -146,6 +146,16 @@
       this._observer = null;
       this._viewport = { width: 1, height: 1, ratio: 1 };
       this._filterStats = this._emptyFilterStats();
+      // Live view (subscribe-only observer feed, no recorded bundle).  The
+      // colored cloud is rasterized into an offscreen buffer and composited
+      // under the vector overlays so 15-20k points never stall the page.
+      this.live = false;
+      this._liveFramingLocked = false;
+      this._cloudCanvas = null;
+      this._cloudCtx = null;
+      this._cloudImage = null;
+      this._cloudU32 = null;
+      this._cloudZ = null;
       if (this.options.interactive) this._bindInteractions();
       if (this.options.autoResize) this._bindResize();
       this.resize(false);
@@ -165,6 +175,7 @@
         collision: null,
         basePose: null,
         cameraPose: null,
+        coloredCloud: null,
         overlayAllowed: false,
       };
     }
@@ -561,6 +572,228 @@
       return this.getState();
     }
 
+    // --- Live view -------------------------------------------------------
+    // The live view renders the same base-frame geometry language as a recorded
+    // session (floor, base axes, wrist-camera frustum, arm skeleton) but is fed
+    // by the subscribe-only runtime observer instead of an immutable bundle, and
+    // a colored point cloud replaces the sparse monochrome scene cloud.  Every
+    // input stays frame-gated: the caller supplies base-frame geometry only when
+    // the measured hand-eye transform is verified, otherwise it supplies a
+    // camera-frame cloud with the base overlays left locked.
+    enterLiveMode(options) {
+      if (this._destroyed) return { accepted: false, frame: null, live: false };
+      const opts = options && typeof options === "object" ? options : {};
+      const frame = normalizeFrame(opts.frame);
+      if (!frame) {
+        this._diagnose("MISSING_DISPLAY_FRAME", "live view requires an explicit display frame", "live.frame");
+        return { accepted: false, frame: null, live: false };
+      }
+      const overlayAllowed = opts.overlayAllowed === true;
+      if (this.live && this.displayFrame === frame && this.model.overlayAllowed === overlayAllowed) {
+        return { accepted: true, frame, overlayAllowed, live: true };
+      }
+      this.live = true;
+      this.bundle = null;
+      this.diagnostics = [];
+      this._diagnosticKeys.clear();
+      this.displayFrame = frame;
+      this.model = this._emptyModel();
+      this.model.overlayAllowed = overlayAllowed;
+      this._filterStats = this._emptyFilterStats();
+      this._selection = { candidateId: null, rejection: null };
+      // The display frame is the base frame origin, so the floor grid and base
+      // axes anchor at identity.
+      this.model.basePose = IDENTITY.map(row => row.slice());
+      this._framing = null;
+      this._liveFramingLocked = false;
+      this._scheduleRender();
+      return { accepted: true, frame, overlayAllowed, live: true };
+    }
+
+    setLiveRobot(value) {
+      if (this._destroyed || !this.live) return false;
+      if (value === null) {
+        const changed = this.model.actualRobot !== null;
+        this.model.actualRobot = null;
+        if (changed) this._scheduleRender();
+        return false;
+      }
+      const robot = this._robot(value, "live.robot", true);
+      if (!robot) return false;
+      this.model.actualRobot = robot;
+      this._ensureLiveFraming();
+      this._scheduleRender();
+      return true;
+    }
+
+    setLiveCameraPose(value) {
+      if (this._destroyed || !this.live) return false;
+      const matrix = value === null ? null : pose(value);
+      if (value !== null && !matrix) {
+        this._diagnose("INVALID_POSE", "live camera pose is not a finite transform", "live.cameraPose");
+        return false;
+      }
+      this.model.cameraPose = matrix;
+      this._ensureLiveFraming();
+      this._scheduleRender();
+      return Boolean(matrix);
+    }
+
+    setLiveColoredCloud(xyz, rgb, count) {
+      if (this._destroyed || !this.live) return 0;
+      const total = Number.isInteger(count) && count > 0 ? count : 0;
+      const usable = total > 0
+        && xyz && typeof xyz.length === "number" && xyz.length >= total * 3
+        && rgb && typeof rgb.length === "number" && rgb.length >= total * 3;
+      if (!usable) {
+        const changed = this.model.coloredCloud !== null;
+        this.model.coloredCloud = null;
+        if (changed) this._scheduleRender();
+        return 0;
+      }
+      this.model.coloredCloud = { xyz, rgb, count: total };
+      this._ensureLiveFraming();
+      this._scheduleRender();
+      return total;
+    }
+
+    _ensureLiveFraming() {
+      if (!this.live || this._liveFramingLocked) return;
+      const framing = this._fitLiveFraming();
+      if (!framing) return;
+      this._framing = framing;
+      // Lock the virtual camera once the full live geometry is present so later
+      // joint motion and cloud refreshes cannot shake a stationary view.
+      if (this.model.actualRobot && this.model.cameraPose && this.model.coloredCloud) {
+        this._liveFramingLocked = true;
+      }
+    }
+
+    _fitLiveFraming() {
+      const focus = [];
+      if (this.model.actualRobot) {
+        for (const link of this.model.actualRobot.links) focus.push(link[0], link[1]);
+      }
+      if (this.model.basePose) focus.push(origin(this.model.basePose));
+      if (this.model.cameraPose) focus.push(origin(this.model.cameraPose));
+      const cloud = this.model.coloredCloud;
+      if (cloud && cloud.count) {
+        const step = Math.max(1, Math.floor(cloud.count / 1500));
+        const sample = [];
+        for (let index = 0; index < cloud.count; index += step) {
+          const base = index * 3;
+          const value = [cloud.xyz[base], cloud.xyz[base + 1], cloud.xyz[base + 2]];
+          if (value.every(finite)) sample.push(value);
+        }
+        for (const value of this._robustCloudPoints(sample)) focus.push(value);
+      }
+      const values = focus.filter(Boolean);
+      if (values.length < 2) return null;
+      const low = [Infinity, Infinity, Infinity];
+      const high = [-Infinity, -Infinity, -Infinity];
+      for (const value of values) {
+        for (let axis = 0; axis < 3; axis += 1) {
+          low[axis] = Math.min(low[axis], value[axis]);
+          high[axis] = Math.max(high[axis], value[axis]);
+        }
+      }
+      const center = low.map((value, axis) => (value + high[axis]) * 0.5);
+      const span = Math.max(...low.map((value, axis) => high[axis] - value), 0.28);
+      return { center, span, source: "live" };
+    }
+
+    _ensureCloudBuffer() {
+      const doc = (typeof root.document !== "undefined" && root.document
+        && typeof root.document.createElement === "function") ? root.document : null;
+      if (!doc) return null;
+      if (!this._cloudCanvas) {
+        this._cloudCanvas = doc.createElement("canvas");
+        this._cloudCtx = this._cloudCanvas && typeof this._cloudCanvas.getContext === "function"
+          ? this._cloudCanvas.getContext("2d")
+          : null;
+      }
+      if (!this._cloudCtx || typeof this._cloudCtx.createImageData !== "function") return null;
+      const pixelWidth = this.canvas.width;
+      const pixelHeight = this.canvas.height;
+      if (!(pixelWidth >= 1) || !(pixelHeight >= 1)) return null;
+      if (
+        this._cloudCanvas.width !== pixelWidth
+        || this._cloudCanvas.height !== pixelHeight
+        || !this._cloudImage
+      ) {
+        this._cloudCanvas.width = pixelWidth;
+        this._cloudCanvas.height = pixelHeight;
+        this._cloudImage = this._cloudCtx.createImageData(pixelWidth, pixelHeight);
+        if (!this._cloudImage || !this._cloudImage.data || !this._cloudImage.data.buffer) {
+          this._cloudImage = null;
+          return null;
+        }
+        this._cloudU32 = new Uint32Array(this._cloudImage.data.buffer);
+        this._cloudZ = new Float32Array(pixelWidth * pixelHeight);
+      }
+      return this._cloudCanvas;
+    }
+
+    _drawColoredCloud(view) {
+      const cloud = this.model.coloredCloud;
+      if (!cloud || !cloud.count || !view) return;
+      const surface = this._ensureCloudBuffer();
+      if (!surface) return;
+      const pixelWidth = this._cloudCanvas.width;
+      const pixelHeight = this._cloudCanvas.height;
+      const u32 = this._cloudU32;
+      const zbuf = this._cloudZ;
+      u32.fill(0);
+      zbuf.fill(Infinity);
+      const ratio = this._viewport.ratio;
+      const center = view.center;
+      const scale = Math.min(this._viewport.width, this._viewport.height) * 0.80 / view.span * this.orbit.zoom;
+      const cyaw = Math.cos(this.orbit.yaw);
+      const syaw = Math.sin(this.orbit.yaw);
+      const cpit = Math.cos(this.orbit.pitch);
+      const spit = Math.sin(this.orbit.pitch);
+      const halfW = this._viewport.width * 0.5 + this.orbit.panX;
+      const halfH = this._viewport.height * 0.5 + this.orbit.panY;
+      const cx = center[0];
+      const cy = center[1];
+      const cz = center[2];
+      const xyz = cloud.xyz;
+      const rgb = cloud.rgb;
+      const count = cloud.count;
+      const size = Math.max(1, Math.round(ratio * 1.5));
+      for (let index = 0; index < count; index += 1) {
+        const base = index * 3;
+        const wx = xyz[base] - cx;
+        const wy = xyz[base + 1] - cy;
+        const wz = xyz[base + 2] - cz;
+        const x1 = cyaw * wx - syaw * wz;
+        const z1 = syaw * wx + cyaw * wz;
+        const y2 = cpit * wy - spit * z1;
+        const z2 = spit * wy + cpit * z1;
+        const sx = ((halfW + x1 * scale) * ratio) | 0;
+        const sy = ((halfH - y2 * scale) * ratio) | 0;
+        if (sx < 0 || sy < 0 || sx >= pixelWidth || sy >= pixelHeight) continue;
+        // Little-endian RGBA packed as one uint32 (A=255,B,G,R).
+        const pixel = (255 << 24) | (rgb[base + 2] << 16) | (rgb[base + 1] << 8) | rgb[base];
+        for (let dy = 0; dy < size; dy += 1) {
+          const py = sy + dy;
+          if (py >= pixelHeight) break;
+          const rowBase = py * pixelWidth;
+          for (let dx = 0; dx < size; dx += 1) {
+            const px = sx + dx;
+            if (px >= pixelWidth) break;
+            const idx = rowBase + px;
+            if (z2 < zbuf[idx]) {
+              zbuf[idx] = z2;
+              u32[idx] = pixel;
+            }
+          }
+        }
+      }
+      this._cloudCtx.putImageData(this._cloudImage, 0, 0);
+      this.context.drawImage(this._cloudCanvas, 0, 0, this._viewport.width, this._viewport.height);
+    }
+
     _scheduleRender() {
       if (this._destroyed) return;
       if (this.reducedMotion) {
@@ -674,6 +907,11 @@
 
     resetView() {
       this.orbit = { yaw: -0.72, pitch: -0.46, zoom: 1, panX: 0, panY: 0 };
+      if (this.live) {
+        this._liveFramingLocked = false;
+        this._framing = null;
+        this._ensureLiveFraming();
+      }
       this._scheduleRender();
       return this;
     }
@@ -1040,6 +1278,7 @@
           const project = view.project;
           const pixelScale = Math.min(width, height) * 0.68 / view.span;
           this._drawFloor(project);
+          this._drawColoredCloud(view);
           if (this.model.basePose) this._drawAxes(project, this.model.basePose, view.span * 0.075, "base", 2.2);
           this._drawCamera(project, this.model.cameraPose);
           this._drawClouds(project);
@@ -1069,6 +1308,7 @@
       return {
         version: VERSION,
         frame: this.displayFrame,
+        live: this.live,
         reducedMotion: this.reducedMotion,
         maxFps: this.maxFps,
         renderCount: this._renderCount,
@@ -1082,6 +1322,7 @@
           actualLinks: this.model.actualRobot ? this.model.actualRobot.links.length : 0,
           plannedLinks: this.model.plannedRobot ? this.model.plannedRobot.links.length : 0,
           collisionWitness: this.model.collision ? 1 : 0,
+          coloredCloudPoints: this.model.coloredCloud ? this.model.coloredCloud.count : 0,
           diagnostics: this.diagnostics.length,
         },
         framing: this._framing ? {
@@ -1112,6 +1353,11 @@
       this.bundle = null;
       this.model = this._emptyModel();
       this._framing = null;
+      this._cloudCanvas = null;
+      this._cloudCtx = null;
+      this._cloudImage = null;
+      this._cloudU32 = null;
+      this._cloudZ = null;
     }
   }
 

@@ -176,6 +176,7 @@ console.log(JSON.stringify(output));
         "actualLinks": 3,
         "plannedLinks": 3,
         "collisionWitness": 1,
+        "coloredCloudPoints": 0,
         "diagnostics": 0,
     }
     assert result["interactive"]["orbit"]["zoom"] > 1
@@ -353,6 +354,170 @@ console.log(JSON.stringify({{before,beforeLabels,after,afterLabels}}));
     assert result["after"]["counts"]["collisionWitness"] == 1
     assert "scene nearest" in result["afterLabels"]
     assert "capsule nearest" in result["afterLabels"]
+
+
+def _live_harness(assertions: str, *, with_document: bool = True) -> str:
+    assertions = assertions.replace("{{", "{").replace("}}", "}")
+    document = (
+        r"""
+global.document = {
+  createElement(tag) {
+    if (tag !== 'canvas') return {};
+    const canvas = { width: 0, height: 0 };
+    canvas.getContext = () => ({
+      createImageData(width, height) { return { data: new Uint8ClampedArray(width * height * 4) }; },
+      putImageData() {}
+    });
+    return canvas;
+  }
+};
+"""
+        if with_document
+        else ""
+    )
+    return rf"""
+const fs = require('fs');
+const vm = require('vm');
+global.window = global;
+global.devicePixelRatio = 1;
+global.HTMLCanvasElement = function() {{}};
+global.matchMedia = () => ({{ matches: true }});
+{document}
+const operations = [];
+const context = new Proxy({{ operations }}, {{
+  get(target, key) {{
+    if (key in target) return target[key];
+    return (...args) => operations.push([String(key), ...args]);
+  }},
+  set(target, key, value) {{ target[key] = value; return true; }}
+}});
+class Canvas {{
+  constructor() {{ this.width = 640; this.height = 480; this.rect = {{ width: 640, height: 480 }}; this.listeners = new Map(); }}
+  getContext(kind) {{ return kind === '2d' ? context : null; }}
+  getBoundingClientRect() {{ return this.rect; }}
+  addEventListener(name, callback) {{ this.listeners.set(name, callback); }}
+  removeEventListener(name) {{ this.listeners.delete(name); }}
+  setPointerCapture() {{}}
+}}
+vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'), {{ filename: process.argv[1] }});
+const cameraPose = [[0,0,1,.1],[-1,0,0,0],[0,-1,0,.31],[0,0,0,1]];
+const links = [
+  [[0,0,0],[0,0,.12]],
+  [[0,0,.12],[.18,0,.22]],
+  [[.18,0,.22],[.06,0,.23]]
+];
+const cloudXyz = new Float32Array([.1,0,.3, .12,.02,.31, .2,-.05,.28, .05,.05,.35]);
+const cloudRgb = new Uint8Array([255,0,0, 0,255,0, 0,0,255, 200,200,200]);
+{assertions}
+"""
+
+
+def test_live_mode_renders_base_frame_skeleton_camera_and_colored_cloud():
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+const entered = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true}});
+const cam = scene.setLiveCameraPose(cameraPose);
+const robot = scene.setLiveRobot({{
+  frame:'piper_base_link', links_xyz_m: links, joint_positions_rad:[.01,.02,.03,.04,.05,0]
+}});
+const cloud = scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.flush();
+const state = scene.getState();
+const labels = operations.filter(op => op[0] === 'fillText').map(op => op[1]);
+const drewCloud = operations.some(op => op[0] === 'drawImage');
+console.log(JSON.stringify({{
+  entered, cam, robot, cloud, state, labels, drewCloud,
+  diagnostics: scene.getDiagnostics().map(item => item.code)
+}}));
+"""))
+
+    assert result["entered"]["accepted"] is True
+    assert result["entered"]["frame"] == "piper_base_link"
+    assert result["entered"]["live"] is True
+    assert result["cam"] is True
+    assert result["robot"] is True
+    assert result["cloud"] == 4
+    assert result["state"]["live"] is True
+    assert result["state"]["frame"] == "piper_base_link"
+    assert result["state"]["overlayAllowed"] is True
+    assert result["state"]["counts"]["actualLinks"] == 3
+    assert result["state"]["counts"]["coloredCloudPoints"] == 4
+    assert result["state"]["framing"]["source"] == "live"
+    assert result["drewCloud"] is True
+    assert "camera pose" in result["labels"]
+    assert "base" in result["labels"]
+    assert result["diagnostics"] == []
+
+
+def test_live_uncalibrated_locks_base_overlays_but_shows_camera_frame_cloud():
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'camera_color_optical_frame', overlayAllowed:false}});
+const robot = scene.setLiveRobot({{frame:'camera_color_optical_frame', links_xyz_m: links}});
+const cam = scene.setLiveCameraPose(null);
+const cloud = scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.flush();
+const state = scene.getState();
+const drewCloud = operations.some(op => op[0] === 'drawImage');
+console.log(JSON.stringify({{
+  robot, cam, cloud, state, drewCloud,
+  diagnostics: scene.getDiagnostics().map(item => item.code)
+}}));
+"""))
+
+    assert result["robot"] is False
+    assert result["cam"] is False
+    assert result["cloud"] == 4
+    assert result["state"]["overlayAllowed"] is False
+    assert result["state"]["counts"]["actualLinks"] == 0
+    assert result["state"]["counts"]["coloredCloudPoints"] == 4
+    assert result["drewCloud"] is True
+    assert "OVERLAY_LOCKED" in result["diagnostics"]
+
+
+def test_live_mode_is_idempotent_and_preserves_cloud_across_repeated_entry():
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true}});
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+const again = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true}});
+const kept = scene.getState().counts.coloredCloudPoints;
+const reset = scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:false}});
+const cleared = scene.getState().counts.coloredCloudPoints;
+console.log(JSON.stringify({{again, kept, reset, cleared}}));
+"""))
+
+    assert result["again"]["live"] is True
+    assert result["kept"] == 4
+    assert result["reset"]["live"] is True
+    # Toggling the calibration gate rebuilds the model, so the cloud is dropped
+    # until the next observer frame arrives (never silently retained cross-gate).
+    assert result["cleared"] == 0
+
+
+def test_live_colored_cloud_is_fail_soft_without_a_document():
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true}});
+const cloud = scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+const rendered = scene.render();
+const drewCloud = operations.some(op => op[0] === 'drawImage');
+console.log(JSON.stringify({{
+  cloud, rendered, drewCloud,
+  points: scene.getState().counts.coloredCloudPoints,
+  diagnostics: scene.getDiagnostics().map(item => item.code)
+}}));
+""", with_document=False))
+
+    assert result["cloud"] == 4
+    assert result["rendered"] is True
+    assert result["points"] == 4
+    assert result["drewCloud"] is False
+    assert result["diagnostics"] == []
 
 
 def test_javascript_syntax_is_valid():
