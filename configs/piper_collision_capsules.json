@@ -47,6 +47,17 @@
       "supplemental_self_collision": true
     },
     {
+      "name": "nuc",
+      "start_frame": "piper_base_link",
+      "end_frame": "piper_base_link",
+      "radius": 0.06,
+      "start_offset": [-0.283526599, 0.0, 0.010205713],
+      "end_offset": [-0.173526599, 0.0, 0.010205713],
+      "check_scene": false,
+      "check_target": false,
+      "supplemental_self_collision": true
+    },
+    {
       "name": "mount",
       "start_frame": "piper_base_link",
       "end_frame": "piper_base_link",
@@ -146,6 +157,14 @@
       ["mid360", "gripper_camera_plate"],
       ["mid360", "finger_left_proximal"], ["mid360", "finger_left_mid"], ["mid360", "finger_left_pad"], ["mid360", "finger_left_tip"],
       ["mid360", "finger_right_proximal"], ["mid360", "finger_right_mid"], ["mid360", "finger_right_pad"], ["mid360", "finger_right_tip"],
+      ["nuc", "upper_arm"],
+      ["nuc", "forearm"],
+      ["nuc", "wrist"],
+      ["nuc", "palm"],
+      ["nuc", "d435_body"],
+      ["nuc", "gripper_camera_plate"],
+      ["nuc", "finger_left_proximal"], ["nuc", "finger_left_mid"], ["nuc", "finger_left_pad"], ["nuc", "finger_left_tip"],
+      ["nuc", "finger_right_proximal"], ["nuc", "finger_right_mid"], ["nuc", "finger_right_pad"], ["nuc", "finger_right_tip"],
       ["mount", "wrist"],
       ["mount", "palm"],
       ["mount", "finger_left_proximal"], ["mount", "finger_left_mid"], ["mount", "finger_left_pad"], ["mount", "finger_left_tip"],

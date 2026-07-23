@@ -371,6 +371,49 @@ def test_box_qp_respects_velocity_and_one_step_joint_position_bounds():
     assert np.all(value <= problem.upper + 1e-9)
 
 
+def test_rear_lean_floor_asymmetrically_bounds_shoulder_pitch_joint():
+    model = ReplayKinematics()
+    floor = 0.15
+    optimizer = WholeBodyShadowOptimizer(
+        model,
+        WholeBodyOptimizerConfig(
+            horizon_dt_s=0.2,
+            rear_lean_joint_index=1,
+            rear_lean_floor_rad=floor,
+        ),
+    )
+    task = WholeBodyTask(target_world_xyz_m=(0.60, 0.20, 0.0))
+    j2_control = 4 + 1  # arm joint index 1 (shoulder pitch)
+
+    # Forward of the floor: the rearward (decreasing) direction stays open.
+    ahead = optimizer.linearize(_state(arm_joints_rad=(0.0, 0.6, -1.0, 0, 0, 0)), task)
+    assert ahead.lower[j2_control] < 0.0
+
+    # At the floor: rearward velocity is blocked, but the up/forward range is
+    # untouched (generous positive bound).
+    at_floor = optimizer.linearize(
+        _state(arm_joints_rad=(0.0, floor, -1.0, 0, 0, 0)), task
+    )
+    assert at_floor.lower[j2_control] >= -1e-9
+    assert at_floor.upper[j2_control] > 0.0
+
+    # Already rearward of the floor: a bounded escape *toward* the floor and the
+    # problem stays feasible (no lower > upper infeasibility).
+    behind = optimizer.linearize(_state(arm_joints_rad=(0.0, 0.0, -1.0, 0, 0, 0)), task)
+    assert behind.lower[j2_control] > 0.0
+    assert behind.lower[j2_control] <= behind.upper[j2_control] + 1e-12
+
+    # Disabled by default: the full URDF rearward range is preserved.
+    default = WholeBodyShadowOptimizer(model)
+    base = default.linearize(_state(arm_joints_rad=(0.0, 0.0, -1.0, 0, 0, 0)), task)
+    assert base.lower[j2_control] < 0.0
+
+
+def test_rear_lean_joint_index_is_validated():
+    with pytest.raises(ValueError):
+        WholeBodyOptimizerConfig(rear_lean_joint_index=9)
+
+
 def test_fifty_tick_shadow_replay_converges_without_a_posture_blocking_phase():
     model = ReplayKinematics()
     optimizer = WholeBodyShadowOptimizer(model)

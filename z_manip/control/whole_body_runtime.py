@@ -144,6 +144,14 @@ class WholeBodyRuntimeController:
             body_roll_rate_max_rps=math.radians(3.0),
             body_pitch_rate_max_rps=math.radians(5.0),
             arm_velocity_scale=0.18,
+            # Keep the PiPER shoulder-pitch joint (J2, index 1) from rotating
+            # rearward past this floor, which would swing the upper arm behind
+            # the base toward the rear-mounted NUC.  Asymmetric: only the
+            # rearward/decreasing direction is bounded; the up/forward range is
+            # unchanged.  The shared collision capsule config remains the
+            # primary NUC protection; this is a defensive intent-layer stop.
+            rear_lean_joint_index=1,
+            rear_lean_floor_rad=math.radians(9.0),
         )
         self.optimizer = WholeBodyShadowOptimizer(
             self.model,

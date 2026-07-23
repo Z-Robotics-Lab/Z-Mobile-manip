@@ -208,6 +208,15 @@ class ReactiveServoConfig:
     max_forward_mps: float = 0.18
     max_yaw_rps: float = 0.12
     yaw_deadband_rad: float = math.radians(7.0)
+    # Couple base approach speed to camera-elevation view risk.  Once the
+    # elevation error exceeds the soft limit, the forward command is ramped
+    # down linearly, reaching this fraction of its nominal value at the hard
+    # limit (and held there beyond it).  A non-holonomic base cannot reduce a
+    # high target's elevation error by advancing -- getting closer makes it
+    # steeper -- so at full speed the target leaves the wrist-camera FOV before
+    # the arm view can compensate.  This gate is independent of body posture,
+    # which the Go2W SPORT service does not actuate.  1.0 disables the slowdown.
+    elevation_approach_speed_floor: float = 0.25
     posture_height_gain: float = 0.55
     posture_pitch_gain: float = 0.70
     max_height_step_m: float = 0.10
@@ -261,6 +270,8 @@ class ReactiveServoConfig:
             raise ValueError("camera soft elevation limit must precede hard limit")
         if not 0.0 <= self.max_arm_view_extension_fraction <= 1.0:
             raise ValueError("arm extension fraction must be within [0, 1]")
+        if not 0.0 <= self.elevation_approach_speed_floor <= 1.0:
+            raise ValueError("elevation approach speed floor must be within [0, 1]")
         if (
             not math.isfinite(self.tracking_hold_s)
             or self.tracking_hold_s < 0.0
@@ -621,6 +632,23 @@ class ReactiveTargetController:
             self.config.linear_gain * distance_error,
             self.config.max_forward_mps,
         )
+        # Ramp the forward command down when the camera elevation error is at
+        # risk.  ``elevation_error`` was computed above from the current
+        # geometry.  Advancing on a high target only steepens the elevation, so
+        # slowing here keeps the target inside the wrist-camera FOV long enough
+        # for the arm view to compensate before a VIEW_RECOVERY/SEARCH loss.
+        elevation_excess = (
+            abs(elevation_error) - self.config.camera_elevation_soft_limit_rad
+        )
+        if elevation_excess > 0.0:
+            span = (
+                self.config.camera_elevation_hard_limit_rad
+                - self.config.camera_elevation_soft_limit_rad
+            )
+            ramp = 1.0 - (elevation_excess / span) * (
+                1.0 - self.config.elevation_approach_speed_floor
+            )
+            linear *= _clamp(ramp, self.config.elevation_approach_speed_floor, 1.0)
         # Steer toward a side work pose, not the platform centreline.  The
         # lateral error is expressed in the base frame; a non-holonomic base
         # removes it by following this shifted line of sight while advancing.

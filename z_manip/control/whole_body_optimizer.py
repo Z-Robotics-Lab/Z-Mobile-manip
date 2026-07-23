@@ -123,6 +123,17 @@ class WholeBodyOptimizerConfig:
     body_roll_abs_max_rad: float = math.radians(8.0)
     body_pitch_abs_max_rad: float = math.radians(12.0)
     arm_velocity_scale: float = 0.35
+    # Asymmetric rear-lean guard.  ``rear_lean_joint_index`` selects the arm
+    # joint whose rearward rotation swings the upper arm behind the arm base
+    # toward the rear-mounted NUC enclosure.  On the PiPER this is J2 (shoulder
+    # pitch, index 1): decreasing it toward its 0 rad stop leans the upper arm
+    # back (FK confirms piper_link3 reaches x ~= -0.27 m in piper_base_link,
+    # inside the NUC keep-out region).  ``rear_lean_floor_rad`` raises only that
+    # joint's *lower* position bound; the forward/up range stays at the full
+    # URDF limit.  ``None`` disables the guard (the default keeps offline
+    # optimizer studies at the full joint range); the live runtime enables it.
+    rear_lean_joint_index: int | None = None
+    rear_lean_floor_rad: float = 0.0
 
     def __post_init__(self) -> None:
         positive = (
@@ -160,6 +171,15 @@ class WholeBodyOptimizerConfig:
             self.manipulability_weight,
         ):
             raise ValueError("manipulability weight must be finite and nonnegative")
+        if self.rear_lean_joint_index is not None:
+            if (
+                isinstance(self.rear_lean_joint_index, bool)
+                or not isinstance(self.rear_lean_joint_index, int)
+                or not 0 <= self.rear_lean_joint_index < ARM_DOF
+            ):
+                raise ValueError("rear-lean joint index must be a valid arm joint")
+            if not math.isfinite(self.rear_lean_floor_rad):
+                raise ValueError("rear-lean floor must be finite")
 
 
 @dataclass(frozen=True)
@@ -494,6 +514,20 @@ class WholeBodyShadowOptimizer:
             upper[4:],
             (np.asarray(self.model.arm_upper_limits, dtype=float) - joints) / dt,
         )
+        rear_index = self.config.rear_lean_joint_index
+        if rear_index is not None:
+            # Block only the rearward (decreasing) direction of the shoulder
+            # pitch joint so the upper arm cannot lean back into the rear NUC.
+            # Clamping to ``upper`` keeps the bound feasible: a pose already
+            # rearward of the floor retains a bounded escape velocity toward it
+            # rather than raising the ``lower > upper`` infeasibility below.
+            floor_velocity = (
+                self.config.rear_lean_floor_rad - joints[rear_index]
+            ) / dt
+            lower[4 + rear_index] = min(
+                max(lower[4 + rear_index], floor_velocity),
+                upper[4 + rear_index],
+            )
         if np.any(lower > upper):
             raise ValueError("measured arm state lies outside whole-body model limits")
         return lower, upper

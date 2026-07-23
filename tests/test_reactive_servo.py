@@ -84,6 +84,73 @@ def test_base_approach_uses_ground_plane_euclidean_distance_not_camera_depth():
     assert "ground-plane" in decision.reason
 
 
+def test_high_target_approach_slows_when_camera_elevation_is_at_risk():
+    controller = ReactiveTargetController()
+    # A high window-sill target with the base still far (planar 1.9 m) and body
+    # posture NOT actionable (the Go2W SPORT service rejects Euler), so the FSM
+    # stays in BASE_APPROACH -- the branch that drove the recorded loss.  The
+    # camera elevation error (~24 deg) exceeds the 16 deg soft limit.
+    high = _geometry(
+        camera_xyz=(0.0, -0.52, 1.80),
+        base_xyz=(1.90, 0.0, 0.25),
+        arm_xyz=(1.75, 0.0, 0.35),
+    )
+    slowed = controller.update(
+        high,
+        now_s=1.0,
+        tracking=True,
+        body_settled=True,
+        body_posture_actionable=False,
+    )
+    assert slowed.phase is ReactivePhase.BASE_APPROACH
+
+    # A level target at the same range is not at elevation risk and advances at
+    # the full commanded speed.
+    controller.reset()
+    level = _geometry(
+        camera_xyz=(0.0, 0.0, 1.80),
+        base_xyz=(1.90, 0.0, 0.25),
+        arm_xyz=(1.75, 0.0, 0.35),
+    )
+    full = controller.update(
+        level,
+        now_s=1.0,
+        tracking=True,
+        body_settled=True,
+        body_posture_actionable=False,
+    )
+    assert full.phase is ReactivePhase.BASE_APPROACH
+    assert 0.0 < slowed.base.linear_x_mps < full.base.linear_x_mps
+
+
+def test_elevation_speed_floor_of_zero_halts_approach_past_the_hard_limit():
+    controller = ReactiveTargetController(
+        ReactiveServoConfig(elevation_approach_speed_floor=0.0)
+    )
+    # Elevation error well beyond the 26 deg hard limit ramps the forward
+    # command all the way to zero: hold the base rather than drive the target
+    # out of the wrist-camera view.
+    too_high = _geometry(
+        camera_xyz=(0.0, -1.20, 1.80),
+        base_xyz=(1.90, 0.0, 0.25),
+        arm_xyz=(1.75, 0.0, 0.35),
+    )
+    decision = controller.update(
+        too_high,
+        now_s=1.0,
+        tracking=True,
+        body_settled=True,
+        body_posture_actionable=False,
+    )
+    assert decision.phase is ReactivePhase.BASE_APPROACH
+    assert decision.base.linear_x_mps == 0.0
+
+
+def test_elevation_speed_floor_is_validated():
+    with pytest.raises(ValueError):
+        ReactiveServoConfig(elevation_approach_speed_floor=1.5)
+
+
 def test_side_setpoint_steers_off_centre_and_gates_handoff():
     controller = ReactiveTargetController()
     centred = _geometry(
