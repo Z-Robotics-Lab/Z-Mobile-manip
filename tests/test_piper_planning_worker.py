@@ -46,7 +46,7 @@ def test_same_source_all_ik_failure_runs_exhaustive_search_only_once(tmp_path):
     module = _module()
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    for name in ("grasp_candidates.npz", "target_points.npy", "scene_points.npy"):
+    for name in ("grasp_candidates.npz", "target_points.npy", "scene_collision_points.npy"):
         (artifacts / name).write_bytes(name.encode())
     output1 = tmp_path / "output-1"
     output2 = tmp_path / "output-2"

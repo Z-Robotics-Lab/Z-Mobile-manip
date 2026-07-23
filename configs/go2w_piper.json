@@ -6,12 +6,30 @@
     "mount_parent_link": "base",
     "base_link": "piper_base_link",
     "tip_link": "piper_gripper_base",
-    "acceleration_limits": [1.5, 1.5, 1.5, 2.0, 2.0, 2.0]
+    "acceleration_limits": [
+      1.5,
+      1.5,
+      1.5,
+      2.0,
+      2.0,
+      2.0
+    ]
   },
   "tool_geometry": {
-    "tip_closing_axis": [0.0, 1.0, 0.0],
-    "tip_approach_axis": [0.0, 0.0, 1.0],
-    "finger_contact_z_interval_m": [0.0593, 0.1358],
+    "tip_closing_axis": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "tip_approach_axis": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "finger_contact_z_interval_m": [
+      0.0593,
+      0.1358
+    ],
     "contact_tcp_z_m": 0.116675,
     "collision_open_aperture_m": 0.07,
     "collision_grasp_margin_m": 0.004
@@ -53,7 +71,7 @@
     "max_pitch_rad": 0.2094395102
   },
   "ik": {
-    "position_tolerance_m": 0.010,
+    "position_tolerance_m": 0.01,
     "orientation_tolerance_rad": 0.3490658504,
     "max_iterations": 220,
     "random_seeds": 14,
@@ -61,7 +79,7 @@
     "orientation_scale_rad": 0.35,
     "current_distance_weight": 0.015,
     "joint_limit_weight": 0.003,
-    "solve_timeout_s": 0.60,
+    "solve_timeout_s": 0.6,
     "seed_timeout_s": 0.15,
     "max_feasible_solutions": 2,
     "solution_refinement_timeout_s": 0.05,
@@ -91,9 +109,23 @@
     "solution_refinement_timeout_s": 0.35
   },
   "work_pose": {
-    "radial_distances_m": [0.56, 0.50, 0.62],
-    "target_lateral_offsets_m": [-0.14, 0.14, 0.0],
-    "yaw_offsets_rad": [0.0, -0.1745329252, 0.1745329252, -0.3490658504, 0.3490658504],
+    "radial_distances_m": [
+      0.56,
+      0.5,
+      0.62
+    ],
+    "target_lateral_offsets_m": [
+      -0.14,
+      0.14,
+      0.0
+    ],
+    "yaw_offsets_rad": [
+      0.0,
+      -0.1745329252,
+      0.1745329252,
+      -0.3490658504,
+      0.3490658504
+    ],
     "corridor_min_x_m": 0.48,
     "corridor_max_x_m": 0.78,
     "corridor_min_y_m": -0.28,
@@ -120,11 +152,15 @@
     "max_diagnostic_failures": 12
   },
   "grasp_plan": {
-    "pregrasp_distance_m": 0.10,
+    "pregrasp_distance_m": 0.05,
     "approach_steps": 6,
     "lift_distance_m": 0.07,
     "lift_steps": 4,
-    "lift_direction_base": [0.0, 0.0, 1.0],
+    "lift_direction_base": [
+      0.0,
+      0.0,
+      1.0
+    ],
     "fallback_lift_vertical_m": 0.045,
     "fallback_lift_retreat_m": 0.025,
     "symmetry_samples": 4,
@@ -139,13 +175,33 @@
     "hypothesis_timeout_s": 2.5,
     "solution_refinement_timeout_s": 0.35,
     "joint_limit_penalty": 0.02,
-    "lateral_approach_prior_weight": 0.50,
-    "overhead_approach_penalty_weight": 0.40,
+    "lateral_approach_prior_weight": 0.5,
+    "overhead_approach_penalty_weight": 0.4,
     "tool_from_tip": [
-      [0.0, -1.0, 0.0, 0.0],
-      [1.0, 0.0, 0.0, 0.0],
-      [0.0, 0.0, 1.0, 0.116675],
-      [0.0, 0.0, 0.0, 1.0]
+      [
+        0.0,
+        -1.0,
+        0.0,
+        0.0
+      ],
+      [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0,
+        0.116675
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
     ]
   },
   "time_parameterization": {

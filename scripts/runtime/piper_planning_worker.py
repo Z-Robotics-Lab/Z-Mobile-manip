@@ -81,7 +81,7 @@ def _request_cache_key(module: object, argv: Sequence[str], backend: str) -> tup
     artifact_files = (
         args.artifacts / "grasp_candidates.npz",
         args.artifacts / "target_points.npy",
-        args.artifacts / "scene_points.npy",
+        args.artifacts / "scene_collision_points.npy",
     )
     identities: list[tuple[str, int, int]] = []
     for path in artifact_files:
