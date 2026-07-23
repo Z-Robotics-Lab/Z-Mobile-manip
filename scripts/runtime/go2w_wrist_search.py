@@ -10,6 +10,7 @@ provide a joint target or command.
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -40,16 +41,49 @@ class DetectorProbe:
         *,
         endpoint: str = "http://127.0.0.1:8771/ground",
         timeout_s: float = 2.0,
+        max_age_s: float = 1.0,
+        freshness_margin_s: float = 0.1,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.camera_image = camera_image.expanduser().resolve()
         self.endpoint = endpoint
         self.timeout_s = float(timeout_s)
+        self.max_age_s = float(max_age_s)
+        self.freshness_margin_s = float(freshness_margin_s)
+        self._wall_clock = wall_clock
+        # Frames captured before this wall-clock instant show a stale (pre-move)
+        # view. The coordinator sets it after each view move completes so a
+        # detector never scores a mid-move or leftover camera-latest.jpg.
+        self._min_capture_wall: float | None = None
+        # Age of the frame consumed by the most recent probe, for diagnostics.
+        self.last_frame_age_s: float | None = None
+
+    def require_fresh_after(self, wall_time: float) -> None:
+        """Reject frames captured before ``wall_time`` (the last move-complete)."""
+        self._min_capture_wall = float(wall_time)
 
     def __call__(self, target: str) -> tuple[bool, float | None, str]:
         try:
+            try:
+                mtime = self.camera_image.stat().st_mtime
+            except OSError as error:
+                self.last_frame_age_s = None
+                return False, None, f"camera frame unavailable: {type(error).__name__}"
+            now = self._wall_clock()
+            age = now - mtime
+            self.last_frame_age_s = age
+            if age > self.max_age_s:
+                return False, None, f"stale camera frame ({age:.2f}s old)"
+            if (
+                self._min_capture_wall is not None
+                and mtime < self._min_capture_wall - self.freshness_margin_s
+            ):
+                return False, None, "stale camera frame (captured before the view move)"
             image = self.camera_image.read_bytes()
             if not 1 <= len(image) <= 512 * 1024:
                 return False, None, "camera image is unavailable or oversized"
+            if len(image) < 3 or image[:2] != b"\xff\xd8":
+                return False, None, "camera frame is not a valid JPEG"
             payload = json.dumps({
                 "schema": "z_manip.local_grounding_request.v1",
                 "instruction": target,
@@ -161,6 +195,11 @@ class WristSearchCoordinator:
         config: WristSearchConfig | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        vlm_detector: Callable[[str], tuple[bool, float | None, str]] | None = None,
+        per_view_vlm_calls: int = 1,
+        search_records_path: Path | None = None,
+        wall_clock: Callable[[], float] = time.time,
+        skip_anchor_view: bool = True,
     ) -> None:
         home = np.asarray(home_joints_rad, dtype=float)
         if home.shape != (6,) or not np.isfinite(home).all():
@@ -168,9 +207,23 @@ class WristSearchCoordinator:
         self.home = home.copy()
         self.detector = detector
         self.motion = motion
-        self.config = config or WristSearchConfig()
+        # The coordinator is only ever entered after the stationary flow already
+        # checked the current (anchor) view with yoloe+VLM, so re-observing view
+        # 0 wastes a ~12 s remote command. Skip it by default; the anchor stays
+        # view 0 in the grid for the executor's post-search restore path.
+        self.config = replace(config or WristSearchConfig(), skip_anchor_view=skip_anchor_view)
         self.sleep = sleep
         self.clock = clock
+        # A bounded, per-view VLM fallback: the raster is entered only after the
+        # stationary yoloe+VLM both missed, so retrying yoloe alone on a new view
+        # is a strictly weaker detector. When a view's yoloe probe abstains, one
+        # VLM call rescues it, matching the stationary path's proven recall.
+        self.vlm_detector = vlm_detector
+        self.per_view_vlm_calls = max(0, int(per_view_vlm_calls))
+        self.search_records_path = (
+            Path(search_records_path) if search_records_path is not None else None
+        )
+        self._wall_clock = wall_clock
         self._lock = threading.RLock()
         self._cancel = threading.Event()
         self._revision = 0
@@ -219,6 +272,22 @@ class WristSearchCoordinator:
                 return
             self._status.update(values)
             self._revision += 1
+
+    def _write_search_record(self, record: dict[str, Any]) -> None:
+        """Append one per-observation JSONL record for offline diagnosis.
+
+        Per-view confidences were previously never persisted (null on disk),
+        making a failed search undiagnosable. Failures here never interrupt the
+        search itself.
+        """
+        if self.search_records_path is None:
+            return
+        try:
+            self.search_records_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.search_records_path.open("a", encoding="utf-8") as sink:
+                sink.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except OSError:
+            return
 
     def run(
         self,
@@ -283,6 +352,8 @@ class WristSearchCoordinator:
         confirmed = False
         cancelled = False
         last_live_view = 0
+        view_joints: np.ndarray = self.home.copy()
+        view_vlm_used = 0
         try:
             while decision.phase not in {
                 WristSearchPhase.FOUND,
@@ -313,13 +384,43 @@ class WristSearchCoordinator:
                     )
                     if mode == "live" and self.motion is not None:
                         last_live_view = view.index
+                    view_joints = np.asarray(measured, dtype=float)
                     decision = search.update_motion(measured, now_s=self.clock())
                     if decision.phase is WristSearchPhase.SETTLE:
                         self.sleep(self.config.settle_s)
                         decision = search.update_motion(measured, now_s=self.clock())
+                    if decision.phase is WristSearchPhase.OBSERVE:
+                        # A fresh viewpoint: reject any frame captured before the
+                        # move completed and reset the per-view VLM budget.
+                        view_vlm_used = 0
+                        require_fresh = getattr(self.detector, "require_fresh_after", None)
+                        if callable(require_fresh):
+                            require_fresh(self._wall_clock())
                     continue
                 if decision.phase is WristSearchPhase.OBSERVE:
+                    observing_view = (
+                        decision.view.index if decision.view is not None else 0
+                    )
                     visible, confidence, detail = self.detector(target)
+                    detector_source = "yoloe"
+                    vlm_latency_s: float | None = None
+                    threshold = self.config.confidence_threshold
+                    needs_fallback = (not visible) or (
+                        confidence is not None and confidence < threshold
+                    )
+                    if (
+                        needs_fallback
+                        and self.vlm_detector is not None
+                        and view_vlm_used < self.per_view_vlm_calls
+                    ):
+                        view_vlm_used += 1
+                        vlm_started = self._wall_clock()
+                        v_visible, v_confidence, v_detail = self.vlm_detector(target)
+                        vlm_latency_s = self._wall_clock() - vlm_started
+                        if v_visible and v_confidence is not None:
+                            visible, confidence, detail = v_visible, v_confidence, v_detail
+                            detector_source = "vlm"
+                    frame_age_s = getattr(self.detector, "last_frame_age_s", None)
                     decision = search.observe(
                         visible=visible,
                         confidence=confidence,
@@ -331,6 +432,18 @@ class WristSearchCoordinator:
                         confirmations=decision.confirmations,
                         message=detail if not visible else f"Detector confidence {confidence:.3f}.",
                     )
+                    self._write_search_record({
+                        "view_index": observing_view,
+                        "joints_rad": [float(value) for value in view_joints],
+                        "frame_age_s": frame_age_s,
+                        "detector": detector_source,
+                        "visible": bool(visible),
+                        "score": confidence,
+                        "confirmations": decision.confirmations,
+                        "decision": decision.phase.value,
+                        "vlm_latency_s": vlm_latency_s,
+                        "detail": detail,
+                    })
                     if decision.phase is WristSearchPhase.OBSERVE:
                         self.sleep(self.config.observation_period_s)
                     continue

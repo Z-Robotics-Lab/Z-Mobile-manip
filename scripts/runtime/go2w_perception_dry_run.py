@@ -45,7 +45,27 @@ from z_manip.perception.tracked_reuse import (
     TrackingReuseContract,
     parse_tracking_reuse_contract,
 )
+from z_manip.perception.seed_gate import BundleGateConfig, min_points_for_depth
 from z_manip.verification.passive_capture import validate_passive_capture
+
+
+def _cloud_median_z(cloud_message: object) -> float | None:
+    """Median metric z (metres) of a filtered target cloud, or None if empty."""
+    try:
+        zs = np.asarray(
+            point_cloud2.read_points_numpy(
+                cloud_message,
+                field_names=("z",),
+                skip_nans=True,
+            ),
+            dtype=np.float64,
+        ).reshape(-1)
+    except (KeyError, ValueError, TypeError):
+        return None
+    zs = zs[np.isfinite(zs) & (zs > 0.0)]
+    if zs.size == 0:
+        return None
+    return float(np.median(zs))
 
 
 def start_resident_context() -> Node:
@@ -157,9 +177,37 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=40,
         help=(
-            "wait for this many depth-supported target points before freezing "
-            "the first tracker bundle"
+            "near-field ceiling for depth-supported target points before "
+            "freezing the first tracker bundle; the distance-aware gate never "
+            "demands more than this"
         ),
+    )
+    parser.add_argument(
+        "--distance-aware-bundle-gate",
+        action="store_true",
+        help=(
+            "scale the minimum target point count by the seed's median depth so "
+            "a genuinely far, small object is not geometrically killed by a flat "
+            "near-field count; --min-bundle-target-points stays the near ceiling"
+        ),
+    )
+    parser.add_argument(
+        "--bundle-gate-reference-points",
+        type=int,
+        default=400,
+        help="target points a reference object yields at the reference depth",
+    )
+    parser.add_argument(
+        "--bundle-gate-reference-depth-m",
+        type=float,
+        default=1.3,
+        help="reference depth (m) at which the reference point count was measured",
+    )
+    parser.add_argument(
+        "--bundle-gate-floor-points",
+        type=int,
+        default=120,
+        help="hard floor below which any depth cluster is treated as noise",
     )
     parser.add_argument("--request-id", default="")
     parser.add_argument(
@@ -506,8 +554,17 @@ def main(
         accepted_source_request_id = request_id
         publish_grounding(request_id)
 
+    bundle_gate_cfg = BundleGateConfig(
+        enabled=bool(args.distance_aware_bundle_gate),
+        reference_points=int(args.bundle_gate_reference_points),
+        reference_depth_m=float(args.bundle_gate_reference_depth_m),
+        floor_points=int(args.bundle_gate_floor_points),
+    )
     bundle_wait_started = time.monotonic()
     selected_stamp: int | None = None
+    selected_stamp_median_z: float | None = None
+    selected_stamp_effective_min = args.min_bundle_target_points
+    smallest_effective_min = args.min_bundle_target_points
     selected_passive_report: dict[str, object] | None = None
     passive_window_error = "waiting for first passive capture window"
     while time.monotonic() < deadline:
@@ -546,17 +603,42 @@ def main(
                         largest_bundle_target_points,
                         point_count,
                     )
-                    if point_count >= args.min_bundle_target_points:
+                    stamp_median_z = (
+                        _cloud_median_z(clouds[stamp])
+                        if bundle_gate_cfg.enabled
+                        else None
+                    )
+                    effective_min = min_points_for_depth(
+                        stamp_median_z,
+                        args.min_bundle_target_points,
+                        bundle_gate_cfg,
+                    )
+                    smallest_effective_min = min(
+                        smallest_effective_min, effective_min
+                    )
+                    if point_count >= effective_min:
                         supported.append(stamp)
+                        if (
+                            selected_stamp_effective_min is None
+                            or effective_min <= selected_stamp_effective_min
+                        ):
+                            selected_stamp_effective_min = effective_min
+                            selected_stamp_median_z = stamp_median_z
                 if not supported:
                     passive_window_error = (
                         "waiting for depth-supported target bundle "
                         f"({largest_bundle_target_points}/"
-                        f"{args.min_bundle_target_points} points)"
+                        f"{smallest_effective_min} points)"
                     )
                     continue
                 if args.passive_window is None:
                     selected_stamp = max(supported)
+                    selected_stamp_median_z = _cloud_median_z(clouds[selected_stamp])
+                    selected_stamp_effective_min = min_points_for_depth(
+                        selected_stamp_median_z,
+                        args.min_bundle_target_points,
+                        bundle_gate_cfg,
+                    )
                     break
                 try:
                     candidate_report = json.loads(
@@ -574,6 +656,14 @@ def main(
                         selected_stamp = min(
                             eligible,
                             key=lambda stamp: abs(stamp - capture.midpoint_unix_ns),
+                        )
+                        selected_stamp_median_z = _cloud_median_z(
+                            clouds[selected_stamp]
+                        )
+                        selected_stamp_effective_min = min_points_for_depth(
+                            selected_stamp_median_z,
+                            args.min_bundle_target_points,
+                            bundle_gate_cfg,
                         )
                         selected_passive_report = candidate_report
                         break
@@ -618,6 +708,8 @@ def main(
             "perception_failure": perception_failure or None,
             "minimum_bundle_target_points": args.min_bundle_target_points,
             "largest_bundle_target_points": largest_bundle_target_points,
+            "distance_aware_bundle_gate": bundle_gate_cfg.enabled,
+            "smallest_effective_min_bundle_target_points": smallest_effective_min,
             "timings": stage_timings,
         }
         (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -890,6 +982,13 @@ def main(
         "input_points": len(points),
         "minimum_bundle_target_points": args.min_bundle_target_points,
         "largest_bundle_target_points": largest_bundle_target_points,
+        "distance_aware_bundle_gate": bundle_gate_cfg.enabled,
+        "selected_bundle_median_z_m": (
+            round(selected_stamp_median_z, 4)
+            if selected_stamp_median_z is not None
+            else None
+        ),
+        "effective_min_bundle_target_points": selected_stamp_effective_min,
         "filtered_target_points": len(filtered_points),
         "scene_points_total": len(scene_points),
         "scene_target_excluded_points": None,

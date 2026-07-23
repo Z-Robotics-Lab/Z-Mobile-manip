@@ -63,6 +63,30 @@ vlm_edgetam_bridge:
     vlm_min_confidence: 0.15
     vlm_max_target_area_ratio: 0.95
     vlm_max_semantic_conflict_coverage_ratio: 0.95
+    # Seed depth gate (P2-1). Before admitting a grounding seed, project its
+    # box into the aligned depth frame and reject a seed whose measured range
+    # contradicts the instruction: an explicitly distant target seeded nearer
+    # than vlm_seed_distant_min_z_m, or any seed outside the sanity band. The
+    # gate fails OPEN - a missing/unjoinable depth frame or a box with too
+    # little depth support ABSTAINS (admits), so it never causes a false
+    # rejection when depth is unavailable.
+    vlm_seed_depth_gate_enabled: true
+    vlm_seed_depth_topic: /camera/aligned_depth_to_color/image_raw
+    vlm_seed_depth_scale_m: 0.001
+    vlm_seed_distant_min_z_m: 1.2
+    vlm_seed_sanity_min_z_m: 0.25
+    vlm_seed_sanity_max_z_m: 4.0
+    vlm_seed_depth_min_valid_fraction: 0.10
+    vlm_seed_depth_max_join_age_s: 0.20
+    # Seed confidence hygiene (P2-2). Cap a remote VLM's self-reported
+    # confidence so downstream never treats a fallback seed as high certainty;
+    # local YOLOE detector scores are left untouched. Local corroboration is an
+    # optional stricter mode (default off).
+    vlm_seed_confidence_ceiling_enabled: true
+    vlm_seed_confidence_ceiling: 0.60
+    vlm_seed_local_corroboration_enabled: false
+    vlm_seed_local_corroboration_floor: 0.08
+    vlm_seed_local_corroboration_min_iou: 0.10
     jpeg_quality: 85
     # Keep a small margin around a tight detector box. Larger margins can make
     # box-prompted masks jump onto a touching support surface, especially near

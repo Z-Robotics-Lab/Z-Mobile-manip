@@ -262,3 +262,142 @@ def test_runtime_text_embedding_cache_is_bounded_and_exact():
         (("red bottle",), True),
     ]
     assert tuple(runtime._text_embeddings) == (("charger",), ("red bottle",))
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected_first"),
+    (
+        # 箱子 (box) is a support here; the charger must still win because it
+        # sorts before the box noun and is present in the phrase.
+        ("远处箱子上白色充电器", "white charger"),
+        ("箱子上的白色充电器", "white charger"),
+        # Newly added zero-hit nouns.
+        ("红色可乐", "red soda bottle"),
+        ("可乐瓶", "soda bottle"),
+        ("黑色airpods", "black wireless earbuds"),
+        ("黑色耳机", "black headphones"),
+        ("小电器", "small appliance"),
+        # 电器 must not degrade the charger (which contains the substring 电器).
+        ("白色充电器", "white charger"),
+        ("箱子", "box"),
+    ),
+)
+def test_added_nouns_are_identity_preserving_and_correctly_ordered(instruction, expected_first):
+    prompts = SERVICE.grounding_prompts(instruction)
+    assert prompts and prompts[0] == expected_first
+
+
+def test_box_support_relation_adds_small_variant():
+    assert SERVICE.grounding_prompts("远处箱子上的黑色盒子") == ("black box", "small black box")
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    (
+        ("远处箱子上白色充电器", True),
+        ("远处小白色方块", True),
+        ("small charger", True),
+        ("tiny block", True),
+        ("白色充电器", False),
+        ("the farm charger", False),
+        ("smaller shelf", False),
+    ),
+)
+def test_roi_zoom_qualifier_detection(instruction, expected):
+    assert SERVICE.roi_zoom_qualifier(instruction) is expected
+
+
+def test_center_crop_region_is_central_half():
+    assert SERVICE.center_crop_region(640, 480, 0.5) == (160, 120, 480, 360)
+    assert SERVICE.center_crop_region(640, 480, 1.0) == (0, 0, 640, 480)
+
+
+def test_merge_detection_lists_dedupes_by_iou_keeping_stronger():
+    boxes, scores, labels = SERVICE.merge_detection_lists(
+        [[0, 0, 10, 10]], [0.5], ["a"],
+        [[1, 1, 11, 11], [100, 100, 110, 110]], [0.9, 0.3], ["b", "c"],
+        iou_threshold=0.6,
+    )
+    # The overlapping crop box (0.9) replaces the weaker full-frame box; the
+    # disjoint one is appended.
+    assert boxes == [[1, 1, 11, 11], [100, 100, 110, 110]]
+    assert scores == [0.9, 0.3]
+    assert labels == ["b", "c"]
+
+
+class _RoiFakeBoxes:
+    def __init__(self, xyxy, conf, cls):
+        self.xyxy = _FakeTensor(xyxy)
+        self.conf = _FakeTensor(conf)
+        self.cls = _FakeTensor(cls)
+
+
+class _RoiFakeResult:
+    def __init__(self, xyxy, conf, cls):
+        self.boxes = _RoiFakeBoxes(xyxy, conf, cls)
+        self.names = {0: "target"}
+
+
+class _RoiFakeModel:
+    """Full-frame pass finds nothing; the centre-crop pass finds the target."""
+
+    def __init__(self):
+        self.model = self
+        self.predict_sizes = []
+
+    def get_text_pe(self, classes, *, cache_clip_model=False):
+        return ("embedding", *classes)
+
+    def set_classes(self, classes, embeddings=None):
+        pass
+
+    def predict(self, **kwargs):
+        source = kwargs["source"]
+        self.predict_sizes.append(source.size)
+        if source.size == (640, 480):
+            return [_RoiFakeResult([], [], [])]
+        return [_RoiFakeResult([[50, 50, 90, 90]], [0.9], [0])]
+
+
+def test_roi_zoom_second_pass_maps_crop_detection_to_full_frame():
+    runtime = SERVICE.GroundingRuntime(
+        model_id="fake.pt",
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+        roi_zoom_enabled=True,
+        roi_zoom_fraction=0.5,
+    )
+    runtime._model = _RoiFakeModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (640, 480), color=(90, 90, 90))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+
+    response = runtime.ground(encoded.getvalue(), "远处充电器")
+
+    # Two forwards: full frame then the 320x240 centre crop.
+    assert runtime._model.predict_sizes == [(640, 480), (320, 240)]
+    assert response["roi_zoom_used"] is True
+    # Crop box [50,50,90,90] + crop origin (160,120) => full-frame [210,170,250,210].
+    assert response["target"]["bbox_xyxy"] == pytest.approx(
+        (210 / 640, 170 / 480, 250 / 640, 210 / 480)
+    )
+
+
+def test_roi_zoom_skipped_without_qualifier():
+    runtime = SERVICE.GroundingRuntime(
+        model_id="fake.pt",
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+        roi_zoom_enabled=True,
+    )
+    runtime._model = _RoiFakeModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (640, 480), color=(90, 90, 90))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+    # A near, unqualified charger: no ROI pass, and the empty full frame yields
+    # no qualified box -> local miss -> LookupError (VLM fallback upstream).
+    with pytest.raises(LookupError):
+        runtime.ground(encoded.getvalue(), "充电器")
+    assert runtime._model.predict_sizes == [(640, 480)]

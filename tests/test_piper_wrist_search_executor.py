@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,19 @@ def test_fixed_views_change_only_j4_j5_and_stay_in_limits():
         assert changed.issubset({3, 4})
         assert np.all(target >= MODULE.executor.JOINT_LIMITS_RAD[:, 0])
         assert np.all(target <= MODULE.executor.JOINT_LIMITS_RAD[:, 1])
+
+
+def test_pitch_cone_view_targets_are_validated_against_joint_limits():
+    # Any extended pitch coverage for floor targets is auto-validated: a Home
+    # whose J5 sits at the joint limit makes the down/up-pitch views leave the
+    # envelope, and fixed_view_targets must fail closed rather than command it.
+    home = np.asarray(
+        json.loads((ROOT / "configs/piper_home.example.json").read_text())["joint_radians"]
+    )
+    at_limit = home.copy()
+    at_limit[4] = MODULE.executor.JOINT_LIMITS_RAD[4, 1]  # J5 pitch at its upper limit
+    with pytest.raises(MODULE.executor.SafetyError):
+        MODULE.fixed_view_targets(at_limit)
 
 
 def test_smooth_path_is_rest_to_rest_and_small_sampled():

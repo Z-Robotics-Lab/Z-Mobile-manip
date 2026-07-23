@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -19,7 +20,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import CompressedImage, PointCloud2
+from sensor_msgs.msg import CompressedImage, Image, PointCloud2
 from std_msgs.msg import Bool, Empty, String
 from vision_msgs.msg import (
     Detection2D,
@@ -33,6 +34,14 @@ from z_manip.perception.vlm_affordance import (
     AffordanceResult,
     OpenRouterVLM,
     VLMAttemptEvent,
+)
+from z_manip.perception.seed_gate import (
+    SeedConfidenceConfig,
+    SeedDepthGateConfig,
+    SeedDepthMeasurement,
+    evaluate_seed_depth,
+    hygiene_confidence,
+    median_depth_in_bbox,
 )
 
 from .contract import (
@@ -408,6 +417,40 @@ class VlmEdgeTamBridge(Node):
         )
         if not 0.0 <= self._seed_bbox_padding_fraction <= 1.0:
             raise ValueError('seed_bbox_padding_fraction must be within [0, 1]')
+        self._seed_depth_gate_cfg = SeedDepthGateConfig(
+            enabled=bool(self.get_parameter('vlm_seed_depth_gate_enabled').value),
+            distant_min_z_m=float(self.get_parameter('vlm_seed_distant_min_z_m').value),
+            sanity_min_z_m=float(self.get_parameter('vlm_seed_sanity_min_z_m').value),
+            sanity_max_z_m=float(self.get_parameter('vlm_seed_sanity_max_z_m').value),
+            min_valid_fraction=float(
+                self.get_parameter('vlm_seed_depth_min_valid_fraction').value,
+            ),
+        )
+        self._seed_confidence_cfg = SeedConfidenceConfig(
+            ceiling=float(self.get_parameter('vlm_seed_confidence_ceiling').value),
+            apply_ceiling=bool(
+                self.get_parameter('vlm_seed_confidence_ceiling_enabled').value,
+            ),
+            corroboration_enabled=bool(
+                self.get_parameter('vlm_seed_local_corroboration_enabled').value,
+            ),
+            corroboration_floor=float(
+                self.get_parameter('vlm_seed_local_corroboration_floor').value,
+            ),
+            corroboration_min_iou=float(
+                self.get_parameter('vlm_seed_local_corroboration_min_iou').value,
+            ),
+        )
+        self._seed_depth_scale_m = float(
+            self.get_parameter('vlm_seed_depth_scale_m').value,
+        )
+        self._seed_depth_max_join_age_s = float(
+            self.get_parameter('vlm_seed_depth_max_join_age_s').value,
+        )
+        # Aligned depth frames cached by stamp_ns for the seed depth gate. Only
+        # populated when the gate is enabled; the seed decision joins the frame
+        # whose stamp matches the admitted seed image.
+        self._seed_depth_frames: OrderedDict[int, np.ndarray] = OrderedDict()
         # OpenRouterVLM reads OPENROUTER_API_KEY from the process environment.
         self._vlm = OpenRouterVLM(
             models=models or None,
@@ -543,6 +586,16 @@ class VlmEdgeTamBridge(Node):
         self.create_subscription(
             PointCloud2, topic('edge_selected_cloud_topic'), self._selected_cloud_cb, reliable,
         )
+        if self._seed_depth_gate_cfg.enabled:
+            # Aligned depth is a best-effort sensor stream; the gate abstains if
+            # no frame joins the seed, so sensor-data QoS is appropriate here.
+            depth_qos = QoSProfile(depth=4, reliability=ReliabilityPolicy.BEST_EFFORT)
+            self.create_subscription(
+                Image,
+                topic('vlm_seed_depth_topic'),
+                self._seed_depth_cb,
+                depth_qos,
+            )
 
         self._current_seed_request: _SeedRequestIdentity | None = None
         self._seed_images: dict[str, CompressedImage] = {}
@@ -632,6 +685,27 @@ class VlmEdgeTamBridge(Node):
             'vlm_min_confidence': 0.15,
             'vlm_max_target_area_ratio': 0.95,
             'vlm_max_semantic_conflict_coverage_ratio': 0.95,
+            # --- seed depth gate (P2-1) -------------------------------------
+            # Project the admitted seed box into the aligned depth frame and
+            # reject a seed whose measured range contradicts the instruction.
+            # Fails open: a missing/unjoinable depth frame ABSTAINS (admits),
+            # so this can never regress the pipeline into false rejections.
+            'vlm_seed_depth_gate_enabled': True,
+            'vlm_seed_depth_topic': '/camera/aligned_depth_to_color/image_raw',
+            # Metres per raw unit for a 16UC1 depth image (mm -> m). Ignored for
+            # a 32FC1 float depth image already in metres.
+            'vlm_seed_depth_scale_m': 0.001,
+            'vlm_seed_distant_min_z_m': 1.2,
+            'vlm_seed_sanity_min_z_m': 0.25,
+            'vlm_seed_sanity_max_z_m': 4.0,
+            'vlm_seed_depth_min_valid_fraction': 0.10,
+            'vlm_seed_depth_max_join_age_s': 0.20,
+            # --- seed confidence hygiene (P2-2) -----------------------------
+            'vlm_seed_confidence_ceiling_enabled': True,
+            'vlm_seed_confidence_ceiling': 0.60,
+            'vlm_seed_local_corroboration_enabled': False,
+            'vlm_seed_local_corroboration_floor': 0.08,
+            'vlm_seed_local_corroboration_min_iou': 0.10,
             'jpeg_quality': 85,
             'seed_bbox_padding_fraction': 0.12,
             'max_camera_age_s': 0.5,
@@ -989,6 +1063,75 @@ class VlmEdgeTamBridge(Node):
             self.get_logger().error(f'grounding setup failed ({type(error).__name__})')
             self._handle_new_failure()
 
+    def _seed_depth_cb(self, msg: Image) -> None:
+        """Cache one aligned depth frame (metres) by stamp for the seed gate."""
+        try:
+            depth_m = self._decode_depth_frame(msg, self._seed_depth_scale_m)
+            stamp_ns = (
+                int(msg.header.stamp.sec) * 1_000_000_000
+                + int(msg.header.stamp.nanosec)
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError) as error:
+            self.get_logger().warn(
+                f'ignored undecodable seed depth frame: {type(error).__name__}',
+            )
+            return
+        with self._lock:
+            self._seed_depth_frames[stamp_ns] = depth_m
+            self._seed_depth_frames.move_to_end(stamp_ns)
+            while len(self._seed_depth_frames) > 12:
+                self._seed_depth_frames.popitem(last=False)
+
+    @staticmethod
+    def _decode_depth_frame(msg: Image, scale_m: float) -> np.ndarray:
+        """Decode a raw aligned depth image into a metric float32 H x W array."""
+        height, width = int(msg.height), int(msg.width)
+        if height <= 0 or width <= 0:
+            raise ValueError('depth frame has no extent')
+        encoding = str(msg.encoding)
+        buffer = bytes(msg.data)
+        if encoding in ('16UC1', 'mono16'):
+            frame = np.frombuffer(buffer, dtype=np.uint16)
+            if frame.size < height * width:
+                raise ValueError('depth buffer is shorter than its declared extent')
+            metric = frame[: height * width].reshape(height, width).astype(np.float32)
+            return metric * float(scale_m)
+        if encoding == '32FC1':
+            frame = np.frombuffer(buffer, dtype=np.float32)
+            if frame.size < height * width:
+                raise ValueError('depth buffer is shorter than its declared extent')
+            return frame[: height * width].reshape(height, width).astype(np.float32)
+        raise ValueError(f'unsupported depth encoding {encoding!r}')
+
+    def _measure_seed_depth(
+        self,
+        header: Any,
+        bbox_xyxy_normalized: tuple[float, float, float, float],
+    ) -> SeedDepthMeasurement:
+        """Median depth under the seed box from the joined aligned depth frame.
+
+        Returns an abstaining (median None) measurement when no depth frame is
+        close enough in time to the seed image, so the gate fails open.
+        """
+        stamp_ns = (
+            int(header.stamp.sec) * 1_000_000_000 + int(header.stamp.nanosec)
+        )
+        with self._lock:
+            frames = list(self._seed_depth_frames.items())
+        if not frames:
+            return SeedDepthMeasurement(None, 0.0, 0)
+        best_stamp, best_frame = min(
+            frames, key=lambda item: abs(item[0] - stamp_ns)
+        )
+        if abs(best_stamp - stamp_ns) > self._seed_depth_max_join_age_s * 1e9:
+            return SeedDepthMeasurement(None, 0.0, 0)
+        return median_depth_in_bbox(
+            best_frame,
+            bbox_xyxy_normalized,
+            sanity_min_z_m=self._seed_depth_gate_cfg.sanity_min_z_m,
+            sanity_max_z_m=self._seed_depth_gate_cfg.sanity_max_z_m,
+        )
+
     def _poll_grounding(self, now: float) -> None:
         future = self._future
         if future is None or not future.done():
@@ -1021,6 +1164,43 @@ class VlmEdgeTamBridge(Node):
             if grounding_scope is None:
                 raise RuntimeError('grounding image metadata or scope is unavailable')
             header = image_meta.header
+            # Confidence hygiene: a remote VLM's self-report must never be
+            # trusted as high certainty downstream (P2-2). Attributes are read
+            # via getattr so the harness-driven contract tests, which invoke
+            # this method on a lightweight stand-in, keep the legacy behaviour.
+            confidence_cfg = getattr(self, '_seed_confidence_cfg', None)
+            if (
+                confidence_cfg is not None
+                and confidence_cfg.apply_ceiling
+                and not result.model.startswith('local/')
+            ):
+                capped = hygiene_confidence(result.confidence, confidence_cfg)
+                if capped != result.confidence:
+                    result = replace(result, confidence=capped)
+            # Depth gate: reject a seed whose measured range contradicts the
+            # instruction (e.g. a near distractor narrated as the distant
+            # target). Fails open when depth is unavailable (P2-1).
+            depth_cfg = getattr(self, '_seed_depth_gate_cfg', None)
+            if depth_cfg is not None and depth_cfg.enabled:
+                measurement = self._measure_seed_depth(
+                    header,
+                    (
+                        result.target_bbox.x1,
+                        result.target_bbox.y1,
+                        result.target_bbox.x2,
+                        result.target_bbox.y2,
+                    ),
+                )
+                depth_decision = evaluate_seed_depth(
+                    measurement,
+                    self._contract.instruction,
+                    depth_cfg,
+                )
+                if not depth_decision.accepted:
+                    raise ValueError(
+                        f'seed depth gate rejected seed ({result.model}): '
+                        f'{depth_decision.reason}'
+                    )
             semantic_box = normalized_xyxy_to_pixel_box(
                 (
                     result.target_bbox.x1,

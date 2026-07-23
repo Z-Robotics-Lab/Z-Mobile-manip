@@ -28,7 +28,7 @@ def test_search_views_are_finite_bounded_and_near_center_first():
     assert max(steps) < math.radians(72)
 
 
-def test_search_requires_measured_settle_then_consecutive_confidence():
+def test_search_requires_measured_settle_then_two_of_n_confidence():
     config = WristSearchConfig(
         settle_s=0.2,
         detector_hz=5.0,
@@ -44,13 +44,78 @@ def test_search_requires_measured_settle_then_consecutive_confidence():
     assert observing.phase is WristSearchPhase.OBSERVE
     first = search.observe(visible=True, confidence=0.8, now_s=1.32)
     assert first.phase is WristSearchPhase.OBSERVE
-    # One bad observation resets a streak instead of accepting a flicker.
-    bad = search.observe(visible=False, confidence=None, now_s=1.53)
-    assert bad.confirmations == 0
-    search.observe(visible=True, confidence=0.7, now_s=1.74)
-    found = search.observe(visible=True, confidence=0.75, now_s=1.95)
+    assert first.confirmations == 1
+    # A 422 / blur frame ABSTAINS: it does not veto the running confirmation.
+    abstain = search.observe(visible=False, confidence=None, now_s=1.53)
+    assert abstain.confirmations == 1
+    found = search.observe(visible=True, confidence=0.7, now_s=1.74)
     assert found.phase is WristSearchPhase.FOUND
     assert found.confirmations == 2
+
+
+def _observe_at_view(search, anchor, now):
+    search.start(anchor, now_s=now)
+    search.update_motion(anchor, now_s=now + 0.01)
+    search.update_motion(anchor, now_s=now + 0.05)
+
+
+def test_confident_negative_resets_but_abstain_does_not():
+    config = WristSearchConfig(
+        settle_s=0.01,
+        detector_hz=100.0,
+        observations_per_view=6,
+        confirmations_required=2,
+    )
+    search = BoundedWristSearch(config)
+    anchor = np.zeros(6)
+    _observe_at_view(search, anchor, 0.0)
+    now = 0.06
+
+    def step(visible, conf):
+        nonlocal now
+        now += 0.02
+        return search.observe(visible=visible, confidence=conf, now_s=now)
+
+    assert step(True, 0.5).confirmations == 1
+    # A real detection scoring below the threshold is a confident negative.
+    assert step(True, 0.05).confirmations == 0
+    assert step(True, 0.5).confirmations == 1
+    # An abstain (no detection) never vetoes the rebuilt confirmation.
+    assert step(False, None).confirmations == 1
+
+
+def test_empty_view_never_confirms_under_abstain_only_frames():
+    config = WristSearchConfig(
+        settle_s=0.01,
+        detector_hz=100.0,
+        observations_per_view=3,
+        confirmations_required=2,
+    )
+    search = BoundedWristSearch(config)
+    anchor = np.zeros(6)
+    _observe_at_view(search, anchor, 0.0)
+    now = 0.06
+    decision = None
+    for _ in range(3):
+        now += 0.02
+        decision = search.observe(visible=False, confidence=None, now_s=now)
+    # Every frame abstained (a genuinely empty view): confirmation stays zero
+    # and the search moves on rather than false-confirming.
+    assert decision.confirmations == 0
+    assert decision.phase in (WristSearchPhase.MOVE, WristSearchPhase.EXHAUSTED)
+
+
+def test_skip_anchor_view_starts_raster_at_first_new_viewpoint():
+    search = BoundedWristSearch(WristSearchConfig(skip_anchor_view=True))
+    anchor = np.zeros(6)
+    decision = search.start(anchor, now_s=0.0)
+    assert decision.view is not None and decision.view.index == 1
+    # The anchor stays view 0 so the executor can restore it after a search.
+    assert search.views[0].yaw_offset_rad == 0.0
+    assert search.views[0].pitch_offset_rad == 0.0
+    # The default preserves the legacy behaviour (begin at the anchor view).
+    legacy = BoundedWristSearch().start(anchor, now_s=0.0)
+    assert legacy.view is not None and legacy.view.index == 0
 
 
 def test_low_confidence_advances_to_next_fixed_view():

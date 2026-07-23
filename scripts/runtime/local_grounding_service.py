@@ -33,6 +33,12 @@ DEFAULT_TEXT_EMBEDDING_CACHE_SIZE = 64
 # a larger size for distant small-object recall (see --imgsz / Dockerfile CMD).
 DEFAULT_IMAGE_SIZE = 640
 
+# NOTE ON ORDER: the first entry whose Chinese key is a substring of the
+# instruction wins, so more specific / higher-priority targets must precede the
+# broader ones. In particular "充电器" (charger) contains the substring "电器",
+# so the generic appliance noun MUST sort after every charger/adapter entry or
+# "白色充电器" would degrade to "appliance". Support nouns like "箱子"/"盒子" sort
+# after "充电器" too, so "箱子上白色充电器" grounds the charger, not the box.
 _ZH_NOUNS: tuple[tuple[str, str], ...] = (
     ("电源适配器", "power adapter"),
     ("充电适配器", "charger"),
@@ -42,14 +48,21 @@ _ZH_NOUNS: tuple[tuple[str, str], ...] = (
     ("遥控器", "remote control"),
     ("鼠标", "computer mouse"),
     ("手机", "mobile phone"),
+    ("airpods", "wireless earbuds"),
+    ("耳机", "headphones"),
     ("方块", "block"),
     ("积木", "block"),
+    ("箱子", "box"),
     ("盒子", "box"),
+    ("可乐瓶", "soda bottle"),
+    ("可乐", "soda bottle"),
     ("瓶子", "bottle"),
     ("杯子", "cup"),
     ("罐子", "can"),
     ("碗", "bowl"),
     ("球", "ball"),
+    # Generic appliance last: keep it below "充电器" (which contains "电器").
+    ("电器", "small appliance"),
 )
 _ZH_COLORS: tuple[tuple[str, str], ...] = (
     ("白色", "white"),
@@ -126,6 +139,113 @@ def grounding_prompt(instruction: str) -> str | None:
 
     prompts = grounding_prompts(instruction)
     return prompts[0] if prompts else None
+
+
+# A distant and/or small target occupies few pixels in the full frame, so YOLOE
+# at a fixed forward resolution frequently misses it. When the instruction says
+# so, a second forward pass on an upscaled centre crop recovers recall without
+# changing the reported geometry (crop detections are mapped back to full-frame
+# pixels and merged with the full-frame detections).
+_ROI_QUALIFIER_TOKENS: tuple[str, ...] = (
+    "远处", "远端", "远方", "较远", "远的", "distant", "far",
+    "小型", "小的", "小白", "小黑", "小", "tiny", "small",
+)
+
+
+def roi_zoom_qualifier(instruction: str) -> bool:
+    """True when the instruction marks the target as distant and/or small."""
+
+    text = str(instruction)
+    lowered = text.lower()
+    for token in _ROI_QUALIFIER_TOKENS:
+        if not token.isascii():
+            # CJK qualifiers have no word boundaries; a substring match is safe.
+            if token in text:
+                return True
+            continue
+        # Latin qualifiers must match a whole word so "far" never fires on
+        # "farm" and "small" never fires inside an unrelated token.
+        index = lowered.find(token)
+        while index != -1:
+            before = lowered[index - 1] if index > 0 else " "
+            after = (
+                lowered[index + len(token)]
+                if index + len(token) < len(lowered)
+                else " "
+            )
+            if not before.isalpha() and not after.isalpha():
+                return True
+            index = lowered.find(token, index + 1)
+    return False
+
+
+def center_crop_region(width: int, height: int, fraction: float) -> tuple[int, int, int, int]:
+    """Central ``fraction`` sub-window as an integer (x0, y0, x1, y1) box."""
+
+    if width <= 0 or height <= 0:
+        raise ValueError("image dimensions must be positive")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("crop fraction must be within (0, 1]")
+    crop_w = max(1, int(round(width * fraction)))
+    crop_h = max(1, int(round(height * fraction)))
+    x0 = (width - crop_w) // 2
+    y0 = (height - crop_h) // 2
+    return x0, y0, x0 + crop_w, y0 + crop_h
+
+
+def _iou_xyxy(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def merge_detection_lists(
+    boxes_a: list[list[float]],
+    scores_a: list[float],
+    labels_a: list[str],
+    boxes_b: list[list[float]],
+    scores_b: list[float],
+    labels_b: list[str],
+    *,
+    iou_threshold: float = 0.6,
+) -> tuple[list[list[float]], list[float], list[str]]:
+    """Union two detection lists, dropping the weaker of any overlapping pair.
+
+    Both lists must already be in the same (full-frame pixel) coordinate space.
+    Detections from ``a`` are kept preferentially on a tie so the full-frame
+    geometry wins when the crop merely rediscovers the same object.
+    """
+
+    merged_boxes = [list(box) for box in boxes_a]
+    merged_scores = [float(score) for score in scores_a]
+    merged_labels = [str(label) for label in labels_a]
+    for box, score, label in zip(boxes_b, scores_b, labels_b):
+        candidate = tuple(float(value) for value in box)
+        replaced = False
+        duplicate = False
+        for index, existing in enumerate(merged_boxes):
+            if _iou_xyxy(candidate, tuple(existing)) >= iou_threshold:
+                duplicate = True
+                if float(score) > merged_scores[index]:
+                    merged_boxes[index] = list(box)
+                    merged_scores[index] = float(score)
+                    merged_labels[index] = str(label)
+                    replaced = True
+                break
+        if not duplicate and not replaced:
+            merged_boxes.append(list(box))
+            merged_scores.append(float(score))
+            merged_labels.append(str(label))
+    return merged_boxes, merged_scores, merged_labels
 
 
 def select_detection(
@@ -217,6 +337,23 @@ def select_detection(
     return candidates[0][2]
 
 
+def _result_boxes(
+    result: Any,
+    prompt: str,
+    names: Mapping[int, str],
+) -> tuple[list[list[float]], list[float], list[str]]:
+    """Extract (xyxy, scores, labels) from one Ultralytics result."""
+
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        return [], [], []
+    xyxy = boxes.xyxy.detach().cpu().tolist()
+    scores = boxes.conf.detach().cpu().tolist()
+    class_ids = boxes.cls.detach().cpu().tolist()
+    labels = [str(names.get(int(class_id), prompt)) for class_id in class_ids]
+    return xyxy, scores, labels
+
+
 class GroundingRuntime:
     """One persistent CUDA YOLOE model guarded against concurrent forwards."""
 
@@ -228,16 +365,22 @@ class GroundingRuntime:
         maximum_area_ratio: float,
         text_embedding_cache_size: int = DEFAULT_TEXT_EMBEDDING_CACHE_SIZE,
         image_size: int = DEFAULT_IMAGE_SIZE,
+        roi_zoom_enabled: bool = True,
+        roi_zoom_fraction: float = 0.5,
     ) -> None:
         if text_embedding_cache_size < 1:
             raise ValueError("text_embedding_cache_size must be positive")
         if image_size < 32 or image_size % 32 != 0:
             raise ValueError("image_size must be a positive multiple of 32")
+        if not 0.0 < roi_zoom_fraction <= 1.0:
+            raise ValueError("roi_zoom_fraction must be within (0, 1]")
         self.model_id = model_id
         self.minimum_confidence = minimum_confidence
         self.maximum_area_ratio = maximum_area_ratio
         self.text_embedding_cache_size = text_embedding_cache_size
         self.image_size = image_size
+        self.roi_zoom_enabled = bool(roi_zoom_enabled)
+        self.roi_zoom_fraction = float(roi_zoom_fraction)
         self._lock = threading.Lock()
         self._model: Any = None
         self._device = "unloaded"
@@ -313,8 +456,7 @@ class GroundingRuntime:
                 )
                 self._classes = requested_classes
             embedding_finished = time.perf_counter()
-            result = self._model.predict(
-                source=image,
+            predict_kwargs = dict(
                 device=self._device,
                 imgsz=self.image_size,
                 conf=min(0.20, self.minimum_confidence),
@@ -330,14 +472,40 @@ class GroundingRuntime:
                 max_det=24,
                 retina_masks=False,
                 verbose=False,
-            )[0]
+            )
+            result = self._model.predict(source=image, **predict_kwargs)[0]
+            # ROI zoom: a distant/small target occupies too few pixels for the
+            # full-frame forward. Run one extra forward on an upscaled centre
+            # crop and merge the crop detections (mapped back to full-frame
+            # pixels) so recall improves without changing reported geometry.
+            roi_origin: tuple[int, int] | None = None
+            roi_result = None
+            roi_used = (
+                self.roi_zoom_enabled and roi_zoom_qualifier(instruction)
+            )
+            if roi_used:
+                x0, y0, x1, y1 = center_crop_region(
+                    width, height, self.roi_zoom_fraction
+                )
+                roi_origin = (x0, y0)
+                roi_result = self._model.predict(
+                    source=image.crop((x0, y0, x1, y1)), **predict_kwargs
+                )[0]
         inference_finished = time.perf_counter()
-        boxes = getattr(result, "boxes", None)
-        xyxy = [] if boxes is None else boxes.xyxy.detach().cpu().tolist()
-        scores = [] if boxes is None else boxes.conf.detach().cpu().tolist()
-        class_ids = [] if boxes is None else boxes.cls.detach().cpu().tolist()
         names = getattr(result, "names", {0: prompt})
-        labels = [str(names.get(int(class_id), prompt)) for class_id in class_ids]
+        xyxy, scores, labels = _result_boxes(result, prompt, names)
+        if roi_result is not None and roi_origin is not None:
+            roi_xyxy, roi_scores, roi_labels = _result_boxes(
+                roi_result, prompt, getattr(roi_result, "names", names)
+            )
+            offset_x, offset_y = roi_origin
+            roi_xyxy = [
+                [box[0] + offset_x, box[1] + offset_y, box[2] + offset_x, box[3] + offset_y]
+                for box in roi_xyxy
+            ]
+            xyxy, scores, labels = merge_detection_lists(
+                xyxy, scores, labels, roi_xyxy, roi_scores, roi_labels,
+            )
         selected = select_detection(
             xyxy,
             scores,
@@ -366,6 +534,7 @@ class GroundingRuntime:
             "target": selected,
             "latency_s": finished - request_started,
             "embedding_cache_hit": embedding_cache_hit,
+            "roi_zoom_used": roi_used,
             "timings_s": {
                 "decode": decode_finished - request_started,
                 "prompt_embedding": embedding_finished - decode_finished,
@@ -488,6 +657,20 @@ def _arguments() -> argparse.Namespace:
         default=DEFAULT_TEXT_EMBEDDING_CACHE_SIZE,
     )
     parser.add_argument("--imgsz", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument(
+        "--roi-zoom",
+        dest="roi_zoom",
+        action="store_true",
+        default=True,
+        help="run a second forward on an upscaled centre crop for distant/small targets",
+    )
+    parser.add_argument(
+        "--no-roi-zoom",
+        dest="roi_zoom",
+        action="store_false",
+        help="disable the ROI-zoom second forward pass",
+    )
+    parser.add_argument("--roi-zoom-fraction", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -501,6 +684,8 @@ def main() -> int:
         maximum_area_ratio=args.maximum_area_ratio,
         text_embedding_cache_size=args.text_embedding_cache_size,
         image_size=args.imgsz,
+        roi_zoom_enabled=args.roi_zoom,
+        roi_zoom_fraction=args.roi_zoom_fraction,
     )
     runtime.load()
     runtime.warmup()

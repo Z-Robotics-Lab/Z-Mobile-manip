@@ -47,6 +47,18 @@ class WristSearchConfig:
     # benchmark rejected for false positives.
     confidence_threshold: float = 0.15
     confirmations_required: int = 2
+    # Confirmation counts qualified frames within a view (2-of-N), not a
+    # consecutive streak: a frame the detector cannot score (a 422, a border or
+    # blur reject) ABSTAINS and leaves the count intact, so a single transient
+    # miss no longer vetoes a plainly visible target. Only a confident negative
+    # (a real detection scoring below the threshold) resets the count.
+    reset_on_confident_negative: bool = True
+    # The sweep is only entered after the stationary flow already checked the
+    # current (anchor) view with the full detector; re-observing view 0 wastes a
+    # ~12 s remote fixed-view command. The runtime enables this to begin the
+    # raster at the first genuinely new viewpoint. The anchor remains view 0 in
+    # the grid so the executor can still restore it after a failed search.
+    skip_anchor_view: bool = False
     joint_tolerance_rad: float = math.radians(1.0)
     # Measured on hardware 2026-07-23: one remote fixed-view command costs
     # about 12 seconds end to end (ssh + file staging + passive-feedback
@@ -181,6 +193,10 @@ class BoundedWristSearch:
         self.anchor_joints_rad = joints.copy()
         self.started_at_s = now
         self.view_started_at_s = now
+        if self.config.skip_anchor_view and len(self._views) > 1:
+            # The stationary flow already checked the anchor view; start the
+            # raster at the first genuinely new viewpoint.
+            self.view_index = 1
         self.phase = WristSearchPhase.MOVE
         return self._decision(message="move to the first bounded search view")
 
@@ -265,7 +281,16 @@ class BoundedWristSearch:
         self.last_confidence = value
         self.observation_count += 1
         qualified = visible and value is not None and value >= self.config.confidence_threshold
-        self.confirmation_count = self.confirmation_count + 1 if qualified else 0
+        # A confident negative is a real detection that scored below the
+        # threshold; a 422 / border / blur frame reports visible=False (or no
+        # confidence) and ABSTAINS so it neither confirms nor vetoes.
+        confident_negative = (
+            visible and value is not None and value < self.config.confidence_threshold
+        )
+        if qualified:
+            self.confirmation_count += 1
+        elif confident_negative and self.config.reset_on_confident_negative:
+            self.confirmation_count = 0
         if self.confirmation_count >= self.config.confirmations_required:
             self.phase = WristSearchPhase.FOUND
             return self._decision(confidence=value, message="target confirmed")

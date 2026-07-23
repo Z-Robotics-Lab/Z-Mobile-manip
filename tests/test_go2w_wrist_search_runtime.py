@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import threading
 
@@ -62,16 +63,13 @@ def test_live_search_is_locked_without_operator_environment(monkeypatch):
 def test_live_search_accepts_one_shot_operator_confirmation(monkeypatch):
     monkeypatch.delenv("Z_MANIP_ENABLE_WRIST_SEARCH", raising=False)
     clock = Clock()
+    motion_calls = []
+    config = _small_grid(observations_per_view=1, confirmations_required=1)
     coordinator = MODULE.WristSearchCoordinator(
         np.zeros(6),
         lambda _target: (True, 0.9, "target"),
-        motion=lambda *_args: np.zeros(6),
-        config=MODULE.WristSearchConfig(
-            settle_s=0.01,
-            detector_hz=20.0,
-            observations_per_view=1,
-            confirmations_required=1,
-        ),
+        motion=_grid_motion(config, motion_calls),
+        config=config,
         sleep=clock.sleep,
         clock=clock,
     )
@@ -200,3 +198,123 @@ def test_found_live_search_stays_on_target_view(monkeypatch):
     )
     assert coordinator.run("charger", mode="live", speed_percent=5)
     assert motion_calls and motion_calls[-1] != 0
+
+
+def test_detector_probe_rejects_stale_premove_and_invalid_frames(tmp_path):
+    valid = tmp_path / "camera-latest.jpg"
+    valid.write_bytes(b"\xff\xd8" + b"\x00" * 128 + b"\xff\xd9")
+    mtime = valid.stat().st_mtime
+
+    stale = MODULE.DetectorProbe(valid, max_age_s=1.0, wall_clock=lambda: mtime + 5.0)
+    visible, _conf, detail = stale("charger")
+    assert visible is False and "stale" in detail
+
+    premove = MODULE.DetectorProbe(valid, max_age_s=100.0, wall_clock=lambda: mtime + 0.1)
+    premove.require_fresh_after(mtime + 10.0)
+    visible, _conf, detail = premove("charger")
+    assert visible is False and "before the view move" in detail
+
+    bad = tmp_path / "bad.jpg"
+    bad.write_bytes(b"not a jpeg at all")
+    bmtime = bad.stat().st_mtime
+    invalid = MODULE.DetectorProbe(bad, max_age_s=100.0, wall_clock=lambda: bmtime + 0.1)
+    visible, _conf, detail = invalid("charger")
+    assert visible is False and "JPEG" in detail
+
+    missing = MODULE.DetectorProbe(tmp_path / "missing.jpg", wall_clock=lambda: 0.0)
+    visible, _conf, detail = missing("charger")
+    assert visible is False and "unavailable" in detail
+
+
+def test_per_view_vlm_fallback_confirms_a_blind_yoloe_view(tmp_path):
+    clock = Clock()
+    vlm_calls = {"n": 0}
+
+    def yoloe(_target):
+        return (False, None, "target not detected")
+
+    def vlm(_target):
+        vlm_calls["n"] += 1
+        return (True, 0.8, "vlm charger")
+
+    records = tmp_path / "records.jsonl"
+    config = MODULE.WristSearchConfig(
+        settle_s=0.01,
+        detector_hz=20.0,
+        observations_per_view=3,
+        confirmations_required=2,
+    )
+    coordinator = MODULE.WristSearchCoordinator(
+        np.zeros(6),
+        yoloe,
+        config=config,
+        sleep=clock.sleep,
+        clock=clock,
+        vlm_detector=vlm,
+        per_view_vlm_calls=2,
+        search_records_path=records,
+    )
+    assert coordinator.run("charger", mode="shadow", speed_percent=5)
+    assert coordinator.status()["phase"] == "found"
+    # Two per-view VLM rescues supply the two confirmations yoloe could not.
+    assert vlm_calls["n"] == 2
+    lines = [json.loads(line) for line in records.read_text().splitlines()]
+    assert lines[0]["detector"] == "vlm"
+    assert lines[-1]["decision"] == "found"
+
+
+def test_per_view_vlm_budget_is_bounded():
+    clock = Clock()
+    vlm_calls = {"n": 0}
+
+    def vlm(_target):
+        vlm_calls["n"] += 1
+        return (False, None, "vlm also missed")
+
+    config = _small_grid(observations_per_view=3, confirmations_required=2)
+    coordinator = MODULE.WristSearchCoordinator(
+        np.zeros(6),
+        lambda _target: (False, None, "target not detected"),
+        config=config,
+        sleep=clock.sleep,
+        clock=clock,
+        vlm_detector=vlm,
+        per_view_vlm_calls=1,
+    )
+    assert not coordinator.run("charger", mode="shadow", speed_percent=5)
+    # Exactly one VLM call per observed view (budget of 1, never repeated within
+    # a view); the redundant anchor view 0 is skipped by the coordinator.
+    observed_views = len(MODULE.BoundedWristSearch(config).views) - 1
+    assert vlm_calls["n"] == observed_views
+
+
+def test_search_records_persist_per_observation(tmp_path):
+    clock = Clock()
+    records = tmp_path / "search.jsonl"
+    observations = iter((
+        (False, None, "missing"),
+        (True, 0.8, "charger"),
+        (True, 0.82, "charger"),
+    ))
+    coordinator = MODULE.WristSearchCoordinator(
+        np.zeros(6),
+        lambda _target: next(observations),
+        config=MODULE.WristSearchConfig(
+            settle_s=0.01,
+            detector_hz=20.0,
+            observations_per_view=3,
+            confirmations_required=2,
+        ),
+        sleep=clock.sleep,
+        clock=clock,
+        search_records_path=records,
+    )
+    assert coordinator.run("charger", mode="shadow", speed_percent=5)
+    lines = [json.loads(line) for line in records.read_text().splitlines()]
+    required = {"view_index", "joints_rad", "frame_age_s", "detector", "score", "decision"}
+    assert lines and all(required <= set(line) for line in lines)
+    assert lines[-1]["decision"] == "found"
+    assert lines[0]["detector"] == "yoloe"
+    # The coordinator skips the redundant anchor view 0; the first observed view
+    # is the first genuinely new viewpoint.
+    assert lines[0]["view_index"] == 1
