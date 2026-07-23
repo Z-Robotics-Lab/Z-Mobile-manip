@@ -516,6 +516,30 @@ restart_one() {
   esac
 }
 
+bringup_rgbd_with_retry() {
+  # Truly-cold RGB-D bringup races DDS discovery / USB enumeration against the
+  # camera-artifact freshness gate, so the first restart+wait can time out even
+  # though the camera is fine (component-manager.log 2026-07-23: two morning
+  # episodes needed 2-3 operator re-runs of cold bringup). Absorb that with one
+  # bounded container restart + re-wait before declaring failure; a genuinely
+  # dead camera still fails closed after this single retry.
+  if restart_one rgbd; then
+    return 0
+  fi
+  # The retry only helps a discovery/enumeration race; a physically absent
+  # camera must keep its fast, legible failure instead of hiding behind a
+  # container restart.
+  if ! remote_camera_device_ready; then
+    printf '[%s] cold bringup: D435 USB device is absent; skipping the RGB-D restart retry\n' \
+      "$(date --iso-8601=seconds)" >&2
+    return 1
+  fi
+  printf '[%s] cold bringup self-heal: RGB-D not ready on first pass; trigger=rgbd_ready_timeout action=restart z-manip-rgbd container once and re-wait\n' \
+    "$(date --iso-8601=seconds)" >&2
+  "$LAB_SCRIPT" restart-rgbd || return 1
+  wait_until "RGB-D bridge" rgbd_ready
+}
+
 shutdown_stack() {
   printf '[%s] full-stack shutdown begin\n' "$(date --iso-8601=seconds)"
   # The UI owns workflows: stop it first so nothing new can start mid-way.
@@ -559,7 +583,7 @@ cold_bringup_steps() {
   # the observer must be running before the RGB-D wait can ever pass.
   $SYSTEMCTL --user enable --now "$OBSERVER_UNIT" || return 1
   wait_until "runtime observer" observer_ready || return 1
-  restart_one rgbd || return 1
+  bringup_rgbd_with_retry || return 1
   restart_one perception || return 1
   # ``enable --now`` leaves an already-running Python UI on its old imported
   # modules.  Cold bringup is also the supported post-update reload path, so
@@ -611,6 +635,14 @@ show_logs() {
       ;;
   esac
 }
+
+# Allow tests to source this script for function-level verification without
+# triggering the CLI dispatch below. When sourced, `return` succeeds at the top
+# level; when executed, it fails and the dispatch runs normally.
+(return 0 2>/dev/null) && __sourced=1 || __sourced=0
+if ((__sourced)); then
+  return 0
+fi
 
 mkdir -p "$LOG_ROOT" "$RUNTIME_DIR"
 action="${1:-status}"

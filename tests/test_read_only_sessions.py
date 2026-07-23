@@ -851,6 +851,187 @@ def test_perception_calls_resident_worker_socket_without_client_process(
     shutil.rmtree(artifact_root)
 
 
+def _serve_fingerprint_worker(socket_path, output, module, state, ready):
+    """Serve resident-worker requests, healing the fingerprint after a restart.
+
+    Each connection replies with a stale ``worker_fingerprint`` until
+    ``state['healed']`` flips (set by the faked component restart), after which
+    it returns the live fingerprint and writes a valid perception bundle.
+    """
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(socket_path))
+        os.chmod(socket_path, 0o600)
+        server.listen(1)
+        server.settimeout(5.0)
+        ready.set()
+        while state["connections"] < state["max_connections"]:
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            state["connections"] += 1
+            with connection:
+                payload = bytearray()
+                while True:
+                    block = connection.recv(4096)
+                    if not block:
+                        break
+                    payload.extend(block)
+                if state["healed"]:
+                    deadline = time.monotonic() + 1.0
+                    selected = output / "selected_passive_joint_report.json"
+                    while not selected.is_file() and time.monotonic() < deadline:
+                        time.sleep(0.001)
+                    _write_perception_success(output, "white adapter")
+                    fingerprint = module.runtime_fingerprint()
+                else:
+                    fingerprint = "stale-resident-fingerprint"
+                connection.sendall(json.dumps({
+                    "return_code": 0,
+                    "elapsed_s": 0.01,
+                    "output": "resident request\n",
+                    "worker_fingerprint": fingerprint,
+                }).encode("utf-8"))
+
+
+def test_perception_selfheals_once_on_resident_fingerprint_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    key = tmp_path / "server-key"
+    key.write_text("test", encoding="utf-8")
+    artifact_root = Path(tempfile.mkdtemp(prefix="zmi-", dir="/tmp"))
+    output = artifact_root / "go2w_real" / "interactive_sessions" / "sample"
+    output.mkdir(parents=True)
+    log = tmp_path / "perception.log"
+    socket_path = artifact_root / "go2w_real" / ".perception_runner.sock"
+    state = {"healed": False, "connections": 0, "max_connections": 2}
+    ready = threading.Event()
+
+    server_thread = threading.Thread(
+        target=_serve_fingerprint_worker,
+        args=(socket_path, output, module, state, ready),
+        daemon=True,
+    )
+    server_thread.start()
+    assert ready.wait(timeout=1.0)
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+
+    def fake_capture(output_dir, _log_path, _environment):
+        payload = json.dumps(_passive_report())
+        (output_dir / "live_passive_joint_report.json").write_text(payload)
+        (output_dir / "selected_passive_joint_report.json").write_text(payload)
+        return module.BackendResult(0)
+
+    restart_calls = []
+
+    def fake_run_logged(argv, _log_path, *, environment):
+        restart_calls.append(tuple(argv))
+        # The restarted read-only component recreates the worker with the live
+        # fingerprint; model that by healing the fake server.
+        state["healed"] = True
+        return module.subprocess.CompletedProcess(tuple(argv), 0)
+
+    monkeypatch.setattr(module, "NUC_KEY", key)
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(module, "_run_logged", fake_run_logged)
+    monkeypatch.setattr(backend, "_capture_passive_window", fake_capture)
+    monkeypatch.setattr(
+        backend,
+        "_perception_runner_running",
+        lambda: pytest.fail("docker inspect must not run when socket is ready"),
+    )
+
+    result = backend.run_perception(
+        target="white adapter",
+        output_dir=output,
+        log_path=log,
+    )
+    server_thread.join(timeout=2.0)
+
+    assert result.exit_code == 0
+    # Exactly one restart+retry: the stale worker is healed, not hammered.
+    assert len(restart_calls) == 1
+    assert restart_calls[0][-2:] == ("restart", "perception")
+    assert restart_calls[0][0] == str(module.COMPONENT_MANAGER)
+    assert state["connections"] == 2
+    log_text = log.read_text(encoding="utf-8")
+    heal = next(
+        json.loads(line)
+        for line in log_text.splitlines()
+        if line.startswith("{")
+        and json.loads(line).get("stage") == "perception_fingerprint_selfheal"
+    )
+    assert heal["trigger"] == "resident_worker_fingerprint_mismatch"
+    assert heal["action"] == "restart_perception"
+    shutil.rmtree(artifact_root)
+
+
+def test_perception_fingerprint_selfheal_is_capped_and_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    key = tmp_path / "server-key"
+    key.write_text("test", encoding="utf-8")
+    artifact_root = Path(tempfile.mkdtemp(prefix="zmi-", dir="/tmp"))
+    output = artifact_root / "go2w_real" / "interactive_sessions" / "sample"
+    output.mkdir(parents=True)
+    log = tmp_path / "perception.log"
+    socket_path = artifact_root / "go2w_real" / ".perception_runner.sock"
+    # Never heals: a genuine mid-edit checkout keeps mismatching.
+    state = {"healed": False, "connections": 0, "max_connections": 2}
+    ready = threading.Event()
+
+    server_thread = threading.Thread(
+        target=_serve_fingerprint_worker,
+        args=(socket_path, output, module, state, ready),
+        daemon=True,
+    )
+    server_thread.start()
+    assert ready.wait(timeout=1.0)
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+
+    def fake_capture(output_dir, _log_path, _environment):
+        payload = json.dumps(_passive_report())
+        (output_dir / "live_passive_joint_report.json").write_text(payload)
+        (output_dir / "selected_passive_joint_report.json").write_text(payload)
+        return module.BackendResult(0)
+
+    restart_calls = []
+
+    def fake_run_logged(argv, _log_path, *, environment):
+        # Restart runs but the checkout is still mid-edit, so no heal happens.
+        restart_calls.append(tuple(argv))
+        return module.subprocess.CompletedProcess(tuple(argv), 0)
+
+    monkeypatch.setattr(module, "NUC_KEY", key)
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifact_root)
+    monkeypatch.setattr(module, "_run_logged", fake_run_logged)
+    monkeypatch.setattr(backend, "_capture_passive_window", fake_capture)
+
+    result = backend.run_perception(
+        target="white adapter",
+        output_dir=output,
+        log_path=log,
+    )
+    server_thread.join(timeout=2.0)
+
+    # One restart only (no loop) and the legible rc=70 error still surfaces.
+    assert len(restart_calls) == 1
+    assert result.exit_code == 70
+    assert state["connections"] == 2
+    shutil.rmtree(artifact_root)
+
+
 def test_perception_retries_one_geometric_mask_failure(tmp_path, monkeypatch):
     module = _integration_module()
     key = tmp_path / "server-key"

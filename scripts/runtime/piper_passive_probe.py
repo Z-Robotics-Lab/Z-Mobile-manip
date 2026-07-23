@@ -81,6 +81,7 @@ def main() -> int:
     last_received_unix_ns = None
     last_by_id_unix_ns: dict[int, int] = {}
     total_frames = 0
+    bus_error: str | None = None
     deadline = time.monotonic() + args.duration
 
     # The only socket operation after bind is recv().  In particular this
@@ -92,40 +93,54 @@ def main() -> int:
         )
         channel.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_FILTER, filters)
         channel.settimeout(min(0.25, args.duration))
-        channel.bind((args.interface,))
-        while time.monotonic() < deadline:
-            try:
-                frame = channel.recv(CAN_FRAME.size)
-            except TimeoutError:
-                continue
-            if len(frame) != CAN_FRAME.size:
-                continue
-            can_id, dlc, data = CAN_FRAME.unpack(frame)
-            frame_id = can_id & CAN_SFF_MASK
-            if frame_id not in counts or dlc != 8:
-                continue
-            received = time.monotonic()
-            received_unix_ns = time.time_ns()
-            if first_received is None:
-                first_received = received
-                first_received_unix_ns = received_unix_ns
-            last_received = received
-            last_received_unix_ns = received_unix_ns
-            last_by_id_unix_ns[frame_id] = received_unix_ns
-            total_frames += 1
-            counts[frame_id] += 1
-            for index, value in decode_joint_pair(frame_id, data[:dlc]):
-                joints[index] = value
-                joint_minima[index] = (
-                    value
-                    if joint_minima[index] is None
-                    else min(joint_minima[index], value)
-                )
-                joint_maxima[index] = (
-                    value
-                    if joint_maxima[index] is None
-                    else max(joint_maxima[index], value)
-                )
+        try:
+            channel.bind((args.interface,))
+            while time.monotonic() < deadline:
+                try:
+                    frame = channel.recv(CAN_FRAME.size)
+                except TimeoutError:
+                    continue
+                except OSError as error:
+                    # can0 going bus-down mid-window (ENETDOWN [Errno 100] or
+                    # ECONNRESET [Errno 104] seen after aborted executor runs,
+                    # 2026-07-23) yields no further feedback.  Stop and fail
+                    # closed with a legible reason instead of terminating on an
+                    # unhandled traceback (SystemExit).
+                    bus_error = f"can0 down during passive window: {error}"
+                    break
+                if len(frame) != CAN_FRAME.size:
+                    continue
+                can_id, dlc, data = CAN_FRAME.unpack(frame)
+                frame_id = can_id & CAN_SFF_MASK
+                if frame_id not in counts or dlc != 8:
+                    continue
+                received = time.monotonic()
+                received_unix_ns = time.time_ns()
+                if first_received is None:
+                    first_received = received
+                    first_received_unix_ns = received_unix_ns
+                last_received = received
+                last_received_unix_ns = received_unix_ns
+                last_by_id_unix_ns[frame_id] = received_unix_ns
+                total_frames += 1
+                counts[frame_id] += 1
+                for index, value in decode_joint_pair(frame_id, data[:dlc]):
+                    joints[index] = value
+                    joint_minima[index] = (
+                        value
+                        if joint_minima[index] is None
+                        else min(joint_minima[index], value)
+                    )
+                    joint_maxima[index] = (
+                        value
+                        if joint_maxima[index] is None
+                        else max(joint_maxima[index], value)
+                    )
+        except OSError as error:
+            # bind() raises ENETDOWN when the interface is already down at the
+            # start of the window; treat it identically to a mid-window drop so
+            # the gate returns a legible fail-closed report rather than crashing.
+            bus_error = f"can0 down during passive window: {error}"
 
     tx_after = _counter(args.interface, "tx_packets")
     rx_after = _counter(args.interface, "rx_packets")
@@ -146,6 +161,7 @@ def main() -> int:
         "first_feedback_unix_ns": first_received_unix_ns,
         "last_feedback_unix_ns": last_received_unix_ns,
         "complete_joint_feedback": complete,
+        "passive_window_error": bus_error,
         "joint_positions_rad": joints,
         "joint_positions_deg": [
             None if value is None else value * 180.0 / math.pi
@@ -189,6 +205,9 @@ def main() -> int:
             flush=True,
         )
         return 2
+    if bus_error is not None:
+        print(f"ERROR: {bus_error}", flush=True)
+        return 1
     if not complete:
         print(
             "ERROR: no complete passive PiPER joint-feedback set was observed",

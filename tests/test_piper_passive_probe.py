@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import math
 from pathlib import Path
 import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -55,6 +57,69 @@ def test_probe_source_has_no_socket_transmit_call():
     ]
 
     assert calls == []
+
+
+class _FakeChannel:
+    """Minimal PF_CAN stand-in that fails closed like a bus-down interface."""
+
+    def __init__(self, *, fail_on):
+        self._fail_on = fail_on
+        self.recv_calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def setsockopt(self, *_args):
+        return None
+
+    def settimeout(self, *_args):
+        return None
+
+    def bind(self, *_args):
+        if self._fail_on == "bind":
+            raise OSError(100, "Network is down")
+
+    def recv(self, *_args):
+        self.recv_calls += 1
+        if self._fail_on == "recv":
+            raise OSError(100, "Network is down")
+        raise AssertionError("recv must not be reached in this scenario")
+
+
+@pytest.mark.parametrize("fail_on", ["bind", "recv"])
+def test_probe_reports_bus_down_fail_closed_without_traceback(
+    tmp_path,
+    monkeypatch,
+    fail_on,
+):
+    output = tmp_path / "passive.json"
+    channel = _FakeChannel(fail_on=fail_on)
+    monkeypatch.setattr(PROBE, "_counter", lambda _interface, _name: 0)
+    monkeypatch.setattr(PROBE.socket, "socket", lambda *_a, **_k: channel)
+    monkeypatch.setattr(
+        PROBE,
+        "_arguments",
+        lambda: SimpleNamespace(interface="can0", duration=0.25, output=output),
+    )
+
+    # A raw OSError would escape as SystemExit; the gate must instead return a
+    # legible fail-closed exit code and still emit its report.
+    return_code = PROBE.main()
+
+    assert return_code == 1
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["schema"] == "z_manip.piper_passive_joint_report.v1"
+    assert document["read_only"] is True
+    assert document["complete_joint_feedback"] is False
+    # Zero-TX evidence is preserved: a down bus never transmits.
+    assert document["zero_transmit_verified"] is True
+    assert document["interface_tx_packet_delta"] == 0
+    assert "can0 down during passive window" in document["passive_window_error"]
+    if fail_on == "recv":
+        assert channel.recv_calls == 1
 
 
 def test_root_can_gate_is_fail_closed_and_has_no_can_sender():

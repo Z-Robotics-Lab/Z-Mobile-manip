@@ -53,6 +53,7 @@ PLANNING_WORKER = SCRIPT_DIR / "piper_planning_worker.py"
 STACK_CONFIG = STACK_ROOT / "configs" / "go2w_piper.json"
 DEBUG_BUNDLE = SCRIPT_DIR / "go2w_debug_bundle.py"
 SAFETY_GATE = SCRIPT_DIR / "go2w_debug_safety_gate.py"
+COMPONENT_MANAGER = SCRIPT_DIR / "go2w_component_manager.sh"
 DDS_CONFIG = STACK_ROOT / "docker" / "runtime" / "cyclonedds-go2w-pc.xml"
 CALIBRATION = (
     WORKSPACE_ROOT
@@ -104,6 +105,16 @@ SUPPORT_APPROACH_PRIOR_WEIGHT = "0.05"
 SUPERVISED_SCENE_CLEARANCE_M = "0.001"
 SUPERVISED_SCENE_POINT_RADIUS_M = "0.001"
 SUPERVISED_GRIPPER_SCENE_RADIUS_SCALE = "0.60"
+
+
+class _ResidentWorkerFingerprintMismatch(RuntimeError):
+    """A resident worker reported a stale runtime fingerprint.
+
+    Subclasses ``RuntimeError`` so existing callers that catch RuntimeError
+    (e.g. the planning transport) keep their behaviour, while the perception
+    path can recognise this specific, self-healable condition and restart the
+    read-only perception component exactly once before retrying.
+    """
 
 
 @dataclass(frozen=True)
@@ -176,7 +187,7 @@ def _run_fixed_worker_request(
     if not isinstance(return_code, int) or not isinstance(output, str):
         raise RuntimeError("resident worker response violates its schema")
     if expected_fingerprint is not None and worker_fingerprint != expected_fingerprint:
-        raise RuntimeError(
+        raise _ResidentWorkerFingerprintMismatch(
             "resident worker fingerprint mismatch; restart the perception component "
             f"(expected {expected_fingerprint[:12]}, got "
             f"{str(worker_fingerprint)[:12]})",
@@ -983,6 +994,41 @@ class FixedReadOnlyBackend:
         )
         return completed.returncode == 0 and completed.stdout.strip() == b"true"
 
+    def _heal_stale_perception_worker(self, log_path: Path) -> bool:
+        """Restart the read-only perception component once to clear a stale worker.
+
+        This is the sole recovery for an rc=70 resident-worker fingerprint
+        mismatch.  It restarts perception (read-only; motion stays 0) through
+        the existing fixed component-manager target and logs the trigger.  It
+        does not loosen any evidence gate: the restarted worker recomputes
+        ``runtime_fingerprint()`` from the live checkout, so a genuine mid-edit
+        checkout still mismatches on the subsequent retry and fails closed with
+        the same legible error.
+        """
+
+        if not COMPONENT_MANAGER.is_file():
+            with log_path.open("ab") as log:
+                log.write(
+                    b"resident worker fingerprint mismatch: component manager "
+                    b"is unavailable; cannot self-heal perception\n",
+                )
+            return False
+        started = time.monotonic()
+        restart = _run_logged(
+            (str(COMPONENT_MANAGER), "restart", "perception"),
+            log_path,
+            environment=_server_environment(),
+        )
+        _append_timing(
+            log_path,
+            "perception_fingerprint_selfheal",
+            time.monotonic() - started,
+            trigger="resident_worker_fingerprint_mismatch",
+            action="restart_perception",
+            return_code=restart.returncode,
+        )
+        return restart.returncode == 0
+
     def run_perception(
         self,
         *,
@@ -990,8 +1036,46 @@ class FixedReadOnlyBackend:
         output_dir: Path,
         log_path: Path,
     ) -> BackendResult:
-        """Run perception while repeatedly capturing synchronized passive joints."""
+        """Run perception, self-healing one stale resident-worker episode.
 
+        A resident-worker fingerprint mismatch surfaces as rc=70.  Instead of
+        forcing the operator to hammer retry against a stale worker, restart the
+        read-only perception component exactly once and retry the request a
+        single time.  The cap guarantees no restart loop, and a persistent
+        mismatch still fails closed with its legible rc=70 error.
+        """
+
+        result, fingerprint_mismatch = self._run_perception_once(
+            target=target,
+            output_dir=output_dir,
+            log_path=log_path,
+        )
+        if not fingerprint_mismatch:
+            return result
+        if not self._heal_stale_perception_worker(log_path):
+            return result
+        healed, _mismatch_again = self._run_perception_once(
+            target=target,
+            output_dir=output_dir,
+            log_path=log_path,
+        )
+        return healed
+
+    def _run_perception_once(
+        self,
+        *,
+        target: str,
+        output_dir: Path,
+        log_path: Path,
+    ) -> tuple[BackendResult, bool]:
+        """Run perception once, capturing synchronized passive joints.
+
+        Returns the backend result together with a flag indicating whether the
+        attempt failed on a resident-worker fingerprint mismatch (rc=70), which
+        the public ``run_perception`` wrapper uses to self-heal exactly once.
+        """
+
+        fingerprint_mismatch = False
         total_started = time.monotonic()
         for path in (NUC_KEY, DDS_CONFIG, PERCEPTION):
             if not path.is_file():
@@ -999,7 +1083,7 @@ class FixedReadOnlyBackend:
                     1,
                     "SERVER_PREFLIGHT_FAILED",
                     f"required server-owned input is unavailable: {path.name}",
-                )
+                ), fingerprint_mismatch
 
         environment = _server_environment()
         environment.update({
@@ -1223,7 +1307,7 @@ class FixedReadOnlyBackend:
                     passive_capture_count += 1
                     passive_capture_count_total += 1
                     if passive.exit_code != 0:
-                        return passive
+                        return passive, fingerprint_mismatch
                 if worker_thread is not None:
                     worker_thread.join()
                     if worker_error or not worker_result:
@@ -1239,6 +1323,12 @@ class FixedReadOnlyBackend:
                                 ),
                             )
                         return_code = 70
+                        if worker_error and isinstance(
+                            worker_error[0], _ResidentWorkerFingerprintMismatch
+                        ):
+                            # Recoverable: the wrapper restarts the read-only
+                            # perception component once and retries.
+                            fingerprint_mismatch = True
                     else:
                         return_code = worker_result[0].returncode
                         worker_elapsed_s = worker_result[0].worker_elapsed_s
@@ -1310,10 +1400,13 @@ class FixedReadOnlyBackend:
                 1,
                 "PERCEPTION_OUTPUT_INVALID",
                 "perception omitted synchronized joints or fixed UI overlays",
-            )
+            ), fingerprint_mismatch
         if return_code == 0:
-            return BackendResult(0)
-        return self._perception_failure_result(output_dir, return_code)
+            return BackendResult(0), fingerprint_mismatch
+        return (
+            self._perception_failure_result(output_dir, return_code),
+            fingerprint_mismatch,
+        )
 
     @staticmethod
     def _required_planning_files() -> tuple[Path, ...]:

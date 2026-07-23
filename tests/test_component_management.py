@@ -138,6 +138,8 @@ def test_component_manager_is_syntax_checked_singleton_and_motion_free():
     assert 'reconnect its usb cable before restarting' in source
     assert 'container_running z-manip-rgbd && camera_artifact_fresh' in source
     assert "sudo -n /usr/local/sbin/z-manip-piper-passive-can-gate can0 8" in source
+    assert "bringup_rgbd_with_retry" in source
+    assert "bringup_rgbd_with_retry || return 1" in source
     assert "restart-edgetam)" in lab
     assert "restart-rgbd)" in lab
     assert "restart-perception)" in lab
@@ -147,6 +149,61 @@ def test_component_manager_is_syntax_checked_singleton_and_motion_free():
     assert 'rm -f -- "$planning_runner_socket"' in lab
     for forbidden in ("cansend", "ip link set", "--execute", "motionenable"):
         assert forbidden not in source
+
+
+def test_cold_bringup_rgbd_self_heals_with_single_container_restart(tmp_path):
+    # Source the manager (its CLI dispatch is skipped when sourced) and drive the
+    # RGB-D cold-bringup helper with faked restart/wait primitives so the retry
+    # logic is exercised without docker/ssh. Reproduces the morning cold-start
+    # race: the first restart+wait times out, one container restart heals it.
+    lab = tmp_path / "lab.sh"
+    lab.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$1" >> "$LAB_LOG"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    lab.chmod(0o755)
+    lab_log = tmp_path / "lab.log"
+
+    def _drive(body: str) -> subprocess.CompletedProcess:
+        lab_log.write_text("", encoding="utf-8")
+        script = (
+            "set -uo pipefail\n"
+            f'source "{MANAGER}"\n'
+            f'LAB_SCRIPT="{lab}"\n'
+            f'export LAB_LOG="{lab_log}"\n'
+            f"{body}\n"
+            "bringup_rgbd_with_retry && echo RESULT=healed || echo RESULT=failed\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+        )
+
+    # First pass races and fails; the single container restart + re-wait heals.
+    healed = _drive(
+        "restart_one() { return 1; }\n"
+        "wait_until() { rgbd_ready; }\n"
+        "rgbd_ready() { return 0; }"
+    )
+    assert "RESULT=healed" in healed.stdout, healed.stderr
+    assert lab_log.read_text(encoding="utf-8").split() == ["restart-rgbd"]
+
+    # A genuinely dead camera stays fail-closed after exactly one retry (no loop).
+    dead = _drive(
+        "restart_one() { return 1; }\n"
+        "wait_until() { return 1; }\n"
+        "rgbd_ready() { return 1; }"
+    )
+    assert "RESULT=failed" in dead.stdout, dead.stderr
+    assert lab_log.read_text(encoding="utf-8").split() == ["restart-rgbd"]
+
+    # When the first pass already succeeds, no extra container restart happens.
+    healthy = _drive("restart_one() { return 0; }")
+    assert "RESULT=healed" in healthy.stdout, healthy.stderr
+    assert lab_log.read_text(encoding="utf-8").split() == []
 
 
 def test_component_api_has_bounded_status_logs_restart_and_bringup(tmp_path):
