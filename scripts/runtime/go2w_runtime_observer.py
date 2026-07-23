@@ -30,6 +30,22 @@ MAX_CAMERA_WIDTH = 640
 MAX_CAMERA_HEIGHT = 480
 MAX_CAMERA_JPEG_BYTES = 512 * 1024
 CAMERA_JPEG_QUALITY = 82
+# Fixed colorization window for the live depth tile.  A fixed near/far range
+# keeps the turbo view stable frame-to-frame (per-frame min/max would flicker)
+# and covers the typical D435 indoor manipulation working distance.  Invalid
+# (zero / non-finite) depth pixels are rendered black.
+DEPTH_COLORMAP_NEAR_M = 0.20
+DEPTH_COLORMAP_FAR_M = 4.00
+# The depth tile targets ~10 Hz.  Colorization is heavier than the RGB path, so
+# the writer coalesces bursts to this minimum interval.  Because the depth topic
+# arrives at the camera rate (30 Hz), the achieved write rate is quantized to
+# writing every Nth frame: this interval selects "every 3rd frame" ~= 10 Hz.
+# It sits below 3x the nominal 33 ms frame spacing on purpose — the live D435
+# stream jitters (measured std dev ~11 ms), and a tighter threshold keeps a
+# late 3rd frame from slipping to every-4th (~8.6 Hz measured at 0.08).  The
+# browser polls slightly faster than this so it catches every distinct frame.
+# CPU stays well under one core alongside the 30 Hz RGB path.
+DEPTH_WRITE_MIN_INTERVAL_S = 0.075
 DEFAULT_TOPICS = {
     "joint_state": ("/piper/state", "sensor_msgs/msg/JointState", 0.50),
     "color": ("/camera/color/image_raw", "sensor_msgs/msg/Image", 1.00),
@@ -263,6 +279,115 @@ def encode_color_image_jpeg(message: object) -> tuple[bytes, dict[str, object]]:
         "source_encoding": encoding,
         "width": width,
         "height": height,
+        "jpeg_bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    return encoded, metadata
+
+
+def encode_depth_image_colormap(
+    message: object,
+    *,
+    near_m: float = DEPTH_COLORMAP_NEAR_M,
+    far_m: float = DEPTH_COLORMAP_FAR_M,
+) -> tuple[bytes, dict[str, object]]:
+    """Colorize one bounded raw ROS depth image into a turbo JPEG for the tile.
+
+    Depth is normalized over a fixed [near_m, far_m] window and mapped through
+    ``cv2.COLORMAP_TURBO``.  Zero and non-finite pixels (no return) are rendered
+    black so the operator can distinguish missing depth from near-range depth.
+    """
+
+    import cv2
+    import numpy as np
+
+    try:
+        source_width = int(message.width)
+        source_height = int(message.height)
+        step = int(message.step)
+        encoding = str(message.encoding).lower()
+        data = memoryview(message.data)
+    except (AttributeError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"invalid raw depth image: {error}") from error
+    dtype_by_encoding = {
+        "16uc1": (np.uint16, 2, "mm"),
+        "mono16": (np.uint16, 2, "mm"),
+        "32fc1": (np.float32, 4, "m"),
+    }
+    spec = dtype_by_encoding.get(encoding)
+    if spec is None:
+        raise ValueError(f"unsupported raw depth encoding: {encoding!r}")
+    dtype, bytes_per_pixel, units = spec
+    if (
+        source_width <= 0
+        or source_height <= 0
+        or source_width > 8192
+        or source_height > 8192
+        or step < source_width * bytes_per_pixel
+        or step > source_width * bytes_per_pixel + 65536
+        or len(data) < source_height * step
+    ):
+        raise ValueError("raw depth dimensions, step, or payload are invalid")
+    rows = np.frombuffer(
+        data, dtype=np.uint8, count=source_height * step
+    ).reshape(source_height, step)
+    pixels = rows[:, : source_width * bytes_per_pixel].reshape(
+        source_height, source_width, bytes_per_pixel
+    )
+    depth = (
+        np.ascontiguousarray(pixels)
+        .view(dtype)
+        .reshape(source_height, source_width)
+    )
+    if units == "mm":
+        metres = depth.astype(np.float32) / 1000.0
+    else:
+        metres = depth.astype(np.float32)
+    valid = np.isfinite(metres) & (metres > 0.0)
+    span = max(1e-6, float(far_m) - float(near_m))
+    normalized = np.clip((metres - float(near_m)) / span, 0.0, 1.0)
+    scaled = np.zeros((source_height, source_width), dtype=np.uint8)
+    scaled[valid] = (normalized[valid] * 255.0).astype(np.uint8)
+    colorized = cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
+    colorized[~valid] = (0, 0, 0)
+    scale = min(
+        1.0,
+        MAX_CAMERA_WIDTH / source_width,
+        MAX_CAMERA_HEIGHT / source_height,
+    )
+    width = max(1, min(MAX_CAMERA_WIDTH, round(source_width * scale)))
+    height = max(1, min(MAX_CAMERA_HEIGHT, round(source_height * scale)))
+    if (width, height) != (source_width, source_height):
+        # Nearest keeps invalid (black) regions crisp instead of bleeding colour.
+        colorized = cv2.resize(
+            colorized, (width, height), interpolation=cv2.INTER_NEAREST
+        )
+    encoded: bytes | None = None
+    for quality in (CAMERA_JPEG_QUALITY, 70, 55, 40):
+        ok, buffer = cv2.imencode(
+            ".jpg",
+            colorized,
+            [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+        )
+        if ok and len(buffer) <= MAX_CAMERA_JPEG_BYTES:
+            encoded = buffer.tobytes()
+            break
+    if encoded is None:
+        raise ValueError("encoded depth JPEG exceeds the 512 KiB limit")
+    metadata: dict[str, object] = {
+        "schema": "z_manip.depth_frame.v1",
+        "source_timestamp_ns": stamp_ns(message),
+        "source_frame": frame_id(message),
+        "received_unix_ns": time.time_ns(),
+        "source_width": source_width,
+        "source_height": source_height,
+        "source_encoding": encoding,
+        "width": width,
+        "height": height,
+        "colormap": "turbo",
+        "near_m": float(near_m),
+        "far_m": float(far_m),
+        "valid_fraction": round(float(valid.mean()), 4),
         "jpeg_bytes": len(encoded),
         "sha256": hashlib.sha256(encoded).hexdigest(),
     }
@@ -975,6 +1100,51 @@ class CameraFrameWriter:
         atomic_write_json(self.metadata_path, metadata)
 
 
+class DepthFrameWriter:
+    """Colorize and commit the live depth tile, coalescing bursts to ~10 Hz.
+
+    The depth topic runs at the camera rate (30 Hz today) but colorization is
+    heavier than the RGB path, so writes are rate-limited to
+    ``min_interval_s``.  Like ``CameraFrameWriter`` the JPEG is committed before
+    its metadata manifest.
+    """
+
+    def __init__(
+        self,
+        image_path: Path,
+        *,
+        min_interval_s: float = DEPTH_WRITE_MIN_INTERVAL_S,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.image_path = image_path.expanduser().resolve()
+        self.metadata_path = self.image_path.with_suffix(".json")
+        self.min_interval_s = max(0.0, float(min_interval_s))
+        self._monotonic = monotonic
+        self._last_write_monotonic: float | None = None
+
+    def _due(self, now: float) -> bool:
+        return (
+            self._last_write_monotonic is None
+            or now - self._last_write_monotonic >= self.min_interval_s
+        )
+
+    def write(self, message: object) -> bool:
+        """Colorize and persist one frame, or skip if the throttle is not due.
+
+        Returns ``True`` when a frame was written so callers can reflect it in
+        telemetry.
+        """
+
+        now = self._monotonic()
+        if not self._due(now):
+            return False
+        jpeg, metadata = encode_depth_image_colormap(message)
+        atomic_write_bytes(self.image_path, jpeg)
+        atomic_write_json(self.metadata_path, metadata)
+        self._last_write_monotonic = now
+        return True
+
+
 def _callback(
     state: RuntimeObserverState,
     key: str,
@@ -1013,6 +1183,26 @@ def _color_callback(
                 payload["camera_jpeg_available"] = False
                 payload["camera_jpeg_error"] = f"{type(error).__name__}: {error}"[:512]
         state.observe("color", payload, stamp_ns(message))
+
+    return observe
+
+
+def _depth_callback(
+    state: RuntimeObserverState,
+    writer: DepthFrameWriter | None,
+) -> Callable[[object], None]:
+    def observe(message: object) -> None:
+        payload = summarize_image(message)
+        if writer is not None and payload.get("valid") is True:
+            try:
+                wrote = writer.write(message)
+                if wrote:
+                    payload["depth_jpeg_available"] = True
+                    payload["depth_jpeg_error"] = None
+            except Exception as error:  # Preserve the last known-good depth JPEG.
+                payload["depth_jpeg_available"] = False
+                payload["depth_jpeg_error"] = f"{type(error).__name__}: {error}"[:512]
+        state.observe("depth", payload, stamp_ns(message))
 
     return observe
 
@@ -1109,6 +1299,14 @@ def run_ros_observer(args: argparse.Namespace) -> int:
     camera_writer = (
         None if args.camera_output is None else CameraFrameWriter(args.camera_output)
     )
+    depth_writer = (
+        None
+        if args.depth_output is None
+        else DepthFrameWriter(
+            args.depth_output,
+            min_interval_s=args.depth_write_min_interval_s,
+        )
+    )
     rclpy.init()
     node = rclpy.create_node(
         "z_manip_runtime_observer_read_only",
@@ -1143,7 +1341,7 @@ def run_ros_observer(args: argparse.Namespace) -> int:
         node.create_subscription(
             Image,
             args.depth_topic,
-            _callback(state, "depth", summarize_image),
+            _depth_callback(state, depth_writer),
             qos_profile_sensor_data,
         ),
         node.create_subscription(
@@ -1263,6 +1461,20 @@ def _arguments() -> argparse.Namespace:
         type=Path,
         help="fixed atomically replaced 640x480-or-smaller JPEG artifact path",
     )
+    parser.add_argument(
+        "--depth-output",
+        type=Path,
+        help=(
+            "fixed atomically replaced colorized (turbo) depth JPEG artifact "
+            "path, written at ~10 Hz next to --camera-output"
+        ),
+    )
+    parser.add_argument(
+        "--depth-write-min-interval-s",
+        type=float,
+        default=DEPTH_WRITE_MIN_INTERVAL_S,
+        help="minimum seconds between colorized depth-tile writes (~10 Hz)",
+    )
     parser.add_argument("--ros-domain-id", type=int, default=int(os.environ.get("ROS_DOMAIN_ID", "20")))
     parser.add_argument("--joint-topic", default=DEFAULT_TOPICS["joint_state"][0])
     parser.add_argument("--color-topic", default=DEFAULT_TOPICS["color"][0])
@@ -1337,6 +1549,19 @@ def _arguments() -> argparse.Namespace:
             parser.error("camera_output must use a .jpg or .jpeg suffix")
         if values.camera_output.expanduser().resolve() == values.output.expanduser().resolve():
             parser.error("camera_output must be different from output")
+    if not math.isfinite(values.depth_write_min_interval_s) or values.depth_write_min_interval_s < 0.0:
+        parser.error("depth_write_min_interval_s must be finite and non-negative")
+    if values.depth_output is not None:
+        if values.depth_output.suffix.lower() not in {".jpg", ".jpeg"}:
+            parser.error("depth_output must use a .jpg or .jpeg suffix")
+        resolved_depth = values.depth_output.expanduser().resolve()
+        if resolved_depth == values.output.expanduser().resolve():
+            parser.error("depth_output must be different from output")
+        if (
+            values.camera_output is not None
+            and resolved_depth == values.camera_output.expanduser().resolve()
+        ):
+            parser.error("depth_output must be different from camera_output")
     for name in (
         "joint_topic",
         "color_topic",

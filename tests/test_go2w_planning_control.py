@@ -2836,6 +2836,9 @@ def test_camera_endpoint_is_fixed_bounded_fresh_conditional_get_and_head(tmp_pat
         assert response.getheader("Content-Type") == "image/jpeg"
         assert response.getheader("Cache-Control") == "no-store"
         assert response.getheader("X-Z-Manip-Camera-State") == "live"
+        # Real-time RGB tile: the live response advertises the fast poll interval
+        # so the browser can refresh the tile at >=10 Hz instead of a flat 5 Hz.
+        assert response.getheader("X-Z-Manip-Poll-Interval-Ms") == "80"
         assert response.read() == jpeg
 
         connection.request("HEAD", "/api/camera/latest.jpg", headers={"If-None-Match": etag})
@@ -2883,10 +2886,106 @@ def test_camera_reader_rejects_oversized_or_non_jpeg_files(tmp_path):
     assert "JPEG" in message
 
 
+def test_depth_endpoint_is_fixed_bounded_fresh_conditional_get_and_head(tmp_path):
+    class FakeControl:
+        def status(self):
+            return {"available": True, "running": False, "state": "idle"}
+
+        def start(self):
+            raise AssertionError("depth reads must never start planning")
+
+    depth_path = tmp_path / "depth-latest.jpg"
+    jpeg = b"\xff\xd8bounded-depth-frame\xff\xd9"
+    depth_path.write_bytes(jpeg)
+    server = CONTROL.create_server(
+        _bundle(tmp_path / "debug_bundle.json"),
+        port=0,
+        index_path=HTML,
+        control_backend=FakeControl(),
+        runtime_state=None,
+        depth_image=depth_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        connection.request("GET", "/api/depth/latest.jpg")
+        response = connection.getresponse()
+        assert response.status == 200
+        etag = response.getheader("ETag")
+        assert response.getheader("Content-Type") == "image/jpeg"
+        assert response.getheader("Cache-Control") == "no-store"
+        assert response.getheader("X-Z-Manip-Camera-State") == "live"
+        assert response.getheader("X-Z-Manip-Poll-Interval-Ms") == "75"
+        assert response.read() == jpeg
+
+        connection.request("HEAD", "/api/depth/latest.jpg", headers={"If-None-Match": etag})
+        response = connection.getresponse()
+        assert response.status == 304
+        assert response.getheader("ETag") == etag
+        assert response.read() == b""
+
+        connection.request("GET", "/api/depth/latest.jpg?path=/etc/passwd")
+        response = connection.getresponse()
+        assert response.status == 400
+        assert b"no query" in response.read()
+
+        connection.request("GET", "/api/depth/other.jpg")
+        response = connection.getresponse()
+        assert response.status == 404
+        response.read()
+
+        stale_ns = time.time_ns() - 3_000_000_000
+        os.utime(depth_path, ns=(stale_ns, stale_ns))
+        connection.request("GET", "/api/depth/latest.jpg")
+        response = connection.getresponse()
+        assert response.status == 503
+        assert response.getheader("X-Z-Manip-Camera-State") == "stale"
+        response.read()
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_depth_endpoint_is_offline_without_configuration(tmp_path):
+    class FakeControl:
+        def status(self):
+            return {"available": True, "running": False, "state": "idle"}
+
+        def start(self):
+            raise AssertionError("depth reads must never start planning")
+
+    server = CONTROL.create_server(
+        _bundle(tmp_path / "debug_bundle.json"),
+        port=0,
+        index_path=HTML,
+        control_backend=FakeControl(),
+        runtime_state=None,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        connection.request("GET", "/api/depth/latest.jpg")
+        response = connection.getresponse()
+        assert response.status == 404
+        assert response.getheader("X-Z-Manip-Camera-State") == "offline"
+        response.read()
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
 def test_workbench_service_passes_only_the_fixed_camera_artifact_path():
     source = SERVICE.read_text(encoding="utf-8")
     assert "--camera-image %h/Z-Robotics-Lab/artifacts/go2w_real/latest/camera-latest.jpg" in source
+    assert "--depth-image %h/Z-Robotics-Lab/artifacts/go2w_real/latest/depth-latest.jpg" in source
     assert "/api/camera" not in source
+    assert "/api/depth" not in source
 
 
 def test_runtime_reader_has_no_process_ros_can_or_transport_surface():

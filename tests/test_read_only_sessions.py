@@ -872,9 +872,12 @@ def test_perception_retries_one_geometric_mask_failure(tmp_path, monkeypatch):
         def wait(self, timeout=None):
             return self.return_code
 
-    def fake_popen(_argv, **_kwargs):
+    attempt_argvs = []
+
+    def fake_popen(argv, **_kwargs):
         attempt = len(attempts) + 1
         attempts.append(attempt)
+        attempt_argvs.append(tuple(argv))
         if attempt == 2:
             _write_perception_success(output, "white adapter")
         return FakeProcess(4 if attempt == 1 else 0)
@@ -904,6 +907,12 @@ def test_perception_retries_one_geometric_mask_failure(tmp_path, monkeypatch):
         "white adapter"
     )
     assert "Retrying perception" in log.read_text(encoding="utf-8")
+    # The first attempt may reuse a live same-instruction track; the retry
+    # exists to recover with a fresh segmentation seed, so it must not offer
+    # reuse of the exact mask that just failed.
+    assert "--reuse-valid-tracking" in attempt_argvs[0]
+    assert "--reuse-valid-tracking" not in attempt_argvs[1]
+    assert "--tracking-reuse-max-age" not in attempt_argvs[1]
 
 
 def test_perception_retries_one_explicit_tracker_failure(tmp_path, monkeypatch):
@@ -927,8 +936,11 @@ def test_perception_retries_one_explicit_tracker_failure(tmp_path, monkeypatch):
         def wait(self, timeout=None):
             return self.return_code
 
-    def fake_popen(_argv, **_kwargs):
+    attempt_argvs = []
+
+    def fake_popen(argv, **_kwargs):
         attempts.append(len(attempts) + 1)
+        attempt_argvs.append(tuple(argv))
         if len(attempts) == 1:
             (output / "report.json").write_text(json.dumps({
                 "perception_failure": "tracker_reported_loss: transient seed loss",
@@ -956,6 +968,8 @@ def test_perception_retries_one_explicit_tracker_failure(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert attempts == [1, 2]
+    assert "--reuse-valid-tracking" in attempt_argvs[0]
+    assert "--reuse-valid-tracking" not in attempt_argvs[1]
 
 
 def test_perception_camera_timeout_fails_without_replaying_full_timeout(

@@ -205,6 +205,87 @@ def test_camera_encoder_rejects_ambiguous_or_short_raw_images():
         OBSERVER.encode_color_image_jpeg(message)
 
 
+def test_raw_depth_frame_is_colorized_bounded_and_atomically_manifested(tmp_path):
+    width, height = 800, 600
+    depth = np.full((height, width), 1000, dtype="<u2")  # 1.0 m valid return
+    depth[:300, :400] = 0  # top-left quadrant: no return (invalid)
+    message = SimpleNamespace(
+        header=_header(frame="camera_color_optical_frame"),
+        width=width,
+        height=height,
+        step=width * 2,
+        encoding="16UC1",
+        data=depth.tobytes(),
+    )
+    image_path = tmp_path / "depth-latest.jpg"
+
+    wrote = OBSERVER.DepthFrameWriter(image_path, min_interval_s=0.0).write(message)
+
+    assert wrote is True
+    jpeg = image_path.read_bytes()
+    metadata = json.loads(image_path.with_suffix(".json").read_text(encoding="utf-8"))
+    decoded = cv2.imdecode(np.frombuffer(jpeg, dtype="uint8"), cv2.IMREAD_COLOR)
+    assert decoded.shape == (480, 640, 3)
+    # Invalid (no-return) region renders black; valid mid-range renders colour.
+    assert int(decoded[120, 160].sum()) < 40
+    assert int(decoded[360, 480].sum()) > 60
+    assert len(jpeg) <= OBSERVER.MAX_CAMERA_JPEG_BYTES
+    assert metadata["schema"] == "z_manip.depth_frame.v1"
+    assert metadata["colormap"] == "turbo"
+    assert metadata["width"] == 640
+    assert metadata["height"] == 480
+    assert metadata["source_encoding"] == "16uc1"
+    assert metadata["near_m"] == OBSERVER.DEPTH_COLORMAP_NEAR_M
+    assert metadata["far_m"] == OBSERVER.DEPTH_COLORMAP_FAR_M
+    assert metadata["valid_fraction"] == pytest.approx(0.75, abs=0.01)
+    assert metadata["jpeg_bytes"] == len(jpeg)
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_depth_encoder_rejects_unsupported_or_short_images():
+    message = SimpleNamespace(
+        header=_header(frame="camera"),
+        width=4,
+        height=3,
+        step=12,
+        encoding="rgb8",
+        data=bytes(36),
+    )
+    with pytest.raises(ValueError, match="unsupported"):
+        OBSERVER.encode_depth_image_colormap(message)
+    message.encoding = "16UC1"
+    message.step = 8
+    message.data = bytes(3 * 8 - 1)
+    with pytest.raises(ValueError, match="payload"):
+        OBSERVER.encode_depth_image_colormap(message)
+
+
+def test_depth_writer_coalesces_bursts_to_the_minimum_interval(tmp_path):
+    clock = {"t": 100.0}
+    depth = np.full((8, 8), 1000, dtype="<u2")
+
+    def message():
+        return SimpleNamespace(
+            header=_header(frame="camera"),
+            width=8,
+            height=8,
+            step=16,
+            encoding="16UC1",
+            data=depth.tobytes(),
+        )
+
+    writer = OBSERVER.DepthFrameWriter(
+        tmp_path / "depth-latest.jpg",
+        min_interval_s=0.1,
+        monotonic=lambda: clock["t"],
+    )
+    assert writer.write(message()) is True  # first frame always due
+    clock["t"] = 100.05
+    assert writer.write(message()) is False  # within the throttle window
+    clock["t"] = 100.15
+    assert writer.write(message()) is True  # interval elapsed
+
+
 def test_ros_array_fields_are_accepted_without_ros_imports():
     joint = SimpleNamespace(
         header=_header(),
@@ -523,3 +604,4 @@ def test_launcher_and_service_are_isolated_and_non_blocking():
     assert "Requires=" not in service
     assert "go2w_runtime_observer.sh run" in service
     assert "--camera-output" in launcher
+    assert "--depth-output" in launcher

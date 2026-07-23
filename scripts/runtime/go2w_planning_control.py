@@ -54,6 +54,17 @@ RUNTIME_STALE_AFTER_S = 1.0
 MAX_RUNTIME_FUTURE_S = 0.25
 MAX_CAMERA_JPEG_BYTES = 512 * 1024
 CAMERA_STALE_AFTER_S = 2.0
+# Real-time RGB tile.  The observer writes at the camera rate (30 Hz); this is
+# the poll interval advertised to the browser for the live camera tile so the
+# effective refresh clears the >=10 Hz target (previously a flat 200 ms = 5 Hz).
+CAMERA_POLL_INTERVAL_MS = 80
+# Colorized depth tile.  The observer writes depth at ~10 Hz (every 3rd 30 Hz
+# frame); the browser is asked to poll slightly faster (75 ms, ~13 Hz) than that
+# so it catches every distinct frame rather than beating against an equal rate.
+DEPTH_STALE_AFTER_S = 2.0
+DEPTH_POLL_INTERVAL_MS = 75
+# Default advertised poll interval for lower-rate JSON/perception endpoints.
+DEFAULT_POLL_INTERVAL_MS = 200
 HOME_FAST_VERIFY_TOLERANCE_RAD = math.radians(1.0)
 MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 2.0
 # The passive observer publishes at 20 Hz, while recorded delivery can lag its
@@ -3111,7 +3122,15 @@ class PiperGraspRunner:
             "--speed-percent", str(speed_percent),
             "--planning-session-id", planning_session_id,
         ]
+        # The wrapper's stdout is per-action forensic evidence: the shared
+        # action log is truncated by every later attempt, which has already
+        # destroyed the output needed to diagnose a lift-stage stop.  Keep it
+        # next to the receipt directory instead.
+        wrapper_log = receipt_dir.parent / f"{receipt_dir.name}.wrapper.log"
+        receipt_dir.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as log:
+            log.write(f"Full-grasp wrapper output: {wrapper_log}\n")
+        with wrapper_log.open("w", encoding="utf-8") as log:
             completed = subprocess.run(
                 arguments,
                 cwd=self.script.parents[2],
@@ -3123,6 +3142,13 @@ class PiperGraspRunner:
                 timeout=480.0,
             )
         start_receipt_path = receipt_dir / "executor-start-receipt.json"
+        if start_receipt_path.is_symlink() or not start_receipt_path.is_file():
+            raise RuntimeError(
+                "no executor-start evidence was fetched -- the CAN transport "
+                "may never have opened, or the receipt fetch failed (remote "
+                "evidence is preserved in that case); wrapper exit "
+                f"{completed.returncode}; inspect {wrapper_log}",
+            )
         start_receipt = self._validate_executor_start_receipt(
             start_receipt_path,
             expected_artifact_id=expected_artifact_id,
@@ -3131,7 +3157,13 @@ class PiperGraspRunner:
             expected_planning_session_id=planning_session_id,
         )
         if completed.returncode != 0 or not (receipt_dir / "lift-receipt.json").is_file():
-            raise RuntimeError(f"full grasp stopped safely; inspect {self.log_path}")
+            if (receipt_dir / "approach_close-receipt.json").is_file():
+                raise RuntimeError(
+                    "executor stopped between grasp close and lift -- the "
+                    "object may still be HELD in the gripper; wrapper exit "
+                    f"{completed.returncode}; inspect {wrapper_log}",
+                )
+            raise RuntimeError(f"full grasp stopped safely; inspect {wrapper_log}")
         return start_receipt
 
     @classmethod
@@ -3963,6 +3995,7 @@ def _runtime_handler(
     base_handler: type,
     reader: RuntimeStateReader,
     camera_reader: CameraSnapshotReader,
+    depth_reader: CameraSnapshotReader,
     live_perception: LivePerceptionRenderer,
     session_service: ReadOnlySessionService | None,
     session_artifacts: InteractiveArtifactReader | None,
@@ -4931,6 +4964,7 @@ def _runtime_handler(
             etag: str | None = None,
             perception_state: str | None = None,
             reference_age_s: float | None = None,
+            poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS,
         ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -4948,7 +4982,7 @@ def _runtime_handler(
                 )
             if age_s is not None:
                 self.send_header("X-Z-Manip-Camera-Age-Ms", str(max(0, round(age_s * 1000))))
-            self.send_header("X-Z-Manip-Poll-Interval-Ms", "200")
+            self.send_header("X-Z-Manip-Poll-Interval-Ms", str(int(poll_interval_ms)))
             self.send_header("Content-Security-Policy", go2w_debug_ui.SECURITY_POLICY)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
@@ -4982,6 +5016,7 @@ def _runtime_handler(
                         camera_state="live",
                         age_s=age_s,
                         etag=etag,
+                        poll_interval_ms=CAMERA_POLL_INTERVAL_MS,
                     )
                     return True
                 self._camera_headers(
@@ -4991,6 +5026,64 @@ def _runtime_handler(
                     camera_state="live",
                     age_s=age_s,
                     etag=etag,
+                    poll_interval_ms=CAMERA_POLL_INTERVAL_MS,
+                )
+                if include_body:
+                    self.wfile.write(payload)
+                return True
+            error_payload = (json.dumps({"error": message}, separators=(",", ":")) + "\n").encode("utf-8")
+            http_status = {
+                "stale": HTTPStatus.SERVICE_UNAVAILABLE,
+                "invalid": HTTPStatus.CONFLICT,
+            }.get(status, HTTPStatus.NOT_FOUND)
+            self._camera_headers(
+                http_status,
+                content_type="application/json; charset=utf-8",
+                length=len(error_payload),
+                camera_state=status,
+                age_s=age_s,
+            )
+            if include_body:
+                self.wfile.write(error_payload)
+            return True
+
+        def _depth_route(self, *, include_body: bool) -> bool:
+            route = urlsplit(self.path)
+            if route.path != "/api/depth/latest.jpg":
+                return False
+            if route.query or route.fragment:
+                payload = b'{"error":"depth endpoint accepts no query string"}\n'
+                self._camera_headers(
+                    HTTPStatus.BAD_REQUEST,
+                    content_type="application/json; charset=utf-8",
+                    length=len(payload),
+                    camera_state="invalid",
+                    age_s=None,
+                )
+                if include_body:
+                    self.wfile.write(payload)
+                return True
+            status, payload, etag, age_s, message = depth_reader.snapshot()
+            if status == "live" and payload is not None and etag is not None:
+                if self.headers.get("If-None-Match") == etag:
+                    self._camera_headers(
+                        HTTPStatus.NOT_MODIFIED,
+                        content_type="image/jpeg",
+                        length=0,
+                        camera_state="live",
+                        age_s=age_s,
+                        etag=etag,
+                        poll_interval_ms=DEPTH_POLL_INTERVAL_MS,
+                    )
+                    return True
+                self._camera_headers(
+                    HTTPStatus.OK,
+                    content_type="image/jpeg",
+                    length=len(payload),
+                    camera_state="live",
+                    age_s=age_s,
+                    etag=etag,
+                    poll_interval_ms=DEPTH_POLL_INTERVAL_MS,
                 )
                 if include_body:
                     self.wfile.write(payload)
@@ -5126,6 +5219,7 @@ def _runtime_handler(
                 and not self._interactive_get_route(include_body=True)
                 and not self._live_perception_route(include_body=True)
                 and not self._camera_route(include_body=True)
+                and not self._depth_route(include_body=True)
                 and not self._runtime_route(include_body=True)
             ):
                 super().do_GET()
@@ -5140,6 +5234,7 @@ def _runtime_handler(
                 and not self._interactive_get_route(include_body=False)
                 and not self._live_perception_route(include_body=False)
                 and not self._camera_route(include_body=False)
+                and not self._depth_route(include_body=False)
                 and not self._runtime_route(include_body=False)
             ):
                 super().do_HEAD()
@@ -5166,6 +5261,7 @@ def create_server(
     control_backend: PlanningOnlyRunner,
     runtime_state: Path | None,
     camera_image: Path | None = None,
+    depth_image: Path | None = None,
     interactive_service: ReadOnlySessionService | None = None,
     interactive_run_root: Path | None = None,
     home_runner: PiperHomeRunner | None = None,
@@ -5184,6 +5280,7 @@ def create_server(
         follow_bundle_symlink=True,
     )
     camera_reader = CameraSnapshotReader(camera_image)
+    depth_reader = CameraSnapshotReader(depth_image, stale_after_s=DEPTH_STALE_AFTER_S)
     session_artifacts = (
         None
         if interactive_service is None
@@ -5196,6 +5293,7 @@ def create_server(
         base_handler,
         RuntimeStateReader(runtime_state),
         camera_reader,
+        depth_reader,
         LivePerceptionRenderer(camera_reader, session_artifacts),
         interactive_service,
         session_artifacts,
@@ -5227,6 +5325,14 @@ def _arguments() -> argparse.Namespace:
         "--camera-image",
         type=Path,
         help="fixed observer-written JPEG served only at /api/camera/latest.jpg",
+    )
+    parser.add_argument(
+        "--depth-image",
+        type=Path,
+        help=(
+            "fixed observer-written colorized depth JPEG served only at "
+            "/api/depth/latest.jpg"
+        ),
     )
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--home-script", type=Path)
@@ -5324,6 +5430,7 @@ def main() -> int:
         control_backend=runner,
         runtime_state=args.runtime_state,
         camera_image=args.camera_image,
+        depth_image=args.depth_image,
         interactive_service=interactive_service,
         interactive_run_root=go2w_interactive_sessions.RUN_ROOT,
         home_runner=home_runner,
@@ -5342,6 +5449,11 @@ def main() -> int:
     print(
         "camera image: "
         + ("offline (not configured)" if args.camera_image is None else str(args.camera_image.expanduser().resolve())),
+        flush=True,
+    )
+    print(
+        "depth image: "
+        + ("offline (not configured)" if args.depth_image is None else str(args.depth_image.expanduser().resolve())),
         flush=True,
     )
     print(

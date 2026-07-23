@@ -332,16 +332,21 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert "static / stable" in lowered
     assert "mad95" in lowered
     assert 'data-testid="live-camera-frame"' in lowered
-    assert 'fetch("/api/camera/latest.jpg"' in lowered
+    assert 'data-testid="live-depth-frame"' in lowered
+    assert '"/api/camera/latest.jpg"' in lowered
+    assert '"/api/depth/latest.jpg"' in lowered
+    assert "fetch(tile.endpoint" in lowered
     assert 'id="recorded-image-stack"' in lowered
     assert lowered.index('data-testid="live-camera-frame"') < lowered.index('id="recorded-image-stack"')
+    assert lowered.index('data-testid="live-depth-frame"') < lowered.index('id="recorded-image-stack"')
     assert "position: sticky" in lowered
     assert ".image-frame img[hidden], .empty-image[hidden] { display: none; }" in lowered
     assert 'data-feed-key="live_camera"' in lowered
+    assert 'data-feed-key="live_depth"' in lowered
     assert 'data-reorder="up"' in lowered
     assert 'data-reorder="down"' in lowered
     assert 'aria-live="polite"' in lowered
-    assert "z-manip.perception-feed-order.v1" in lowered
+    assert "z-manip.perception-feed-order.v2" in lowered
     assert "new set(parsed).size === default_feed_order.length" in lowered
     assert "parsed.every(key => default_feed_order.includes(key))" in lowered
     assert "window.localstorage.setitem" in lowered

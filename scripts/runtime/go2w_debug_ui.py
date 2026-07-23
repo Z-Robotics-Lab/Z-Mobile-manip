@@ -321,6 +321,7 @@ def make_handler(
                 route in {
                     "/api/runtime",
                     "/api/camera/latest.jpg",
+                    "/api/depth/latest.jpg",
                     "/api/home/status",
                     "/api/grasp/status",
                     "/api/sessions/status",

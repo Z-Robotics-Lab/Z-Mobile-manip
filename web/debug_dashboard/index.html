@@ -929,6 +929,18 @@
             <img id="camera-image" alt="Live D435 RGB camera feed" hidden>
             <div class="empty-image" id="camera-placeholder">Waiting for the subscribe-only camera observer.</div>
           </div>
+          <div class="image-frame live-camera" data-testid="live-depth-frame" data-feed-key="live_depth">
+            <div class="image-frame-toolbar">
+              <span class="image-label">D435 depth live</span>
+              <div class="image-frame-actions">
+                <span class="camera-state offline" id="depth-state" aria-live="polite">OFFLINE</span>
+                <button class="image-reorder-button" type="button" data-reorder="up" aria-label="Move D435 depth live up" title="Move up">&#8593;</button>
+                <button class="image-reorder-button" type="button" data-reorder="down" aria-label="Move D435 depth live down" title="Move down">&#8595;</button>
+              </div>
+            </div>
+            <img id="depth-image" alt="Live colorized D435 depth feed" hidden>
+            <div class="empty-image" id="depth-placeholder">Waiting for the subscribe-only depth observer.</div>
+          </div>
           <div id="recorded-image-stack"></div>
           <p class="sr-only" id="feed-order-status" aria-live="polite"></p>
         </div>
@@ -1056,8 +1068,17 @@
       segmentation_overlay: "/api/perception/live/overlay.jpg",
       candidate_overlay: "/api/perception/live/candidates.jpg"
     };
-    const FEED_ORDER_STORAGE_KEY = "z-manip.perception-feed-order.v1";
-    const DEFAULT_FEED_ORDER = ["live_camera", "segmentation_mask", "segmentation_overlay", "candidate_overlay"];
+    const FEED_ORDER_STORAGE_KEY = "z-manip.perception-feed-order.v2";
+    const DEFAULT_FEED_ORDER = ["live_camera", "live_depth", "segmentation_mask", "segmentation_overlay", "candidate_overlay"];
+    // Browser poll floors.  The server advertises a per-tile X-Z-Manip-Poll-
+    // Interval-Ms (80 ms RGB, 100 ms depth); these floors protect the server if
+    // that header is ever missing while still allowing >=10 Hz refresh.
+    const CAMERA_POLL_FLOOR_MS = 60;
+    const DEPTH_POLL_FLOOR_MS = 60;
+    // Above these frame ages the tile badge switches from green "LIVE" to amber
+    // "LAGGING" so a frozen-but-not-yet-stale source can never read as fresh.
+    const CAMERA_FRESH_MAX_MS = 400;
+    const DEPTH_FRESH_MAX_MS = 500;
     const HOME_JOINTS_RAD = [0.003543018381548489, 0.07997098632638018, -0.14369295731669315, -0.03166027263117714, 0.2632654643708247, 0.0];
     // Match the server-side measured Home verifier.  A tighter UI-only gate
     // made valid feedback at 0.361° look non-Home even though execution accepts 1°.
@@ -1095,6 +1116,9 @@
       cameraTimer: null,
       cameraEtag: null,
       cameraHasFrame: false,
+      depthTimer: null,
+      depthEtag: null,
+      depthHasFrame: false,
       perceptionFeedTimer: null,
       perceptionFeeds: {},
       feedOrder: loadFeedOrder(),
@@ -2123,24 +2147,58 @@
       state.runtimeTimer = window.setTimeout(refreshRuntime, delayMs);
     }
 
-    function renderCameraState(status, detail = "") {
+    // Shared renderer for the two live tiles (RGB + colorized depth).  A live
+    // frame whose age exceeds freshMaxMs is shown amber "LAGGING" rather than
+    // green "LIVE" so a frozen-but-not-yet-stale source can never read as fresh.
+    function renderLiveTileState(tile, status, detail = "", ageMs = null) {
       const normalized = ["live", "stale", "offline", "invalid"].includes(status) ? status : "offline";
-      const badge = byId("camera-state");
-      badge.className = `camera-state ${normalized}`;
-      badge.textContent = normalized.toUpperCase();
+      const lagging = normalized === "live" && Number.isFinite(ageMs) && ageMs > tile.freshMaxMs;
+      const badge = byId(tile.badgeId);
+      badge.className = `camera-state ${lagging ? "stale" : normalized}`;
+      badge.textContent = normalized === "live"
+        ? (Number.isFinite(ageMs) ? `${lagging ? "LAGGING" : "LIVE"} · ${ageMs} ms` : "LIVE")
+        : normalized.toUpperCase();
       badge.title = detail;
-      const placeholder = byId("camera-placeholder");
-      if (!state.cameraHasFrame) {
+      const placeholder = byId(tile.placeholderId);
+      if (!tile.hasFrame()) {
         placeholder.hidden = false;
-        placeholder.textContent = normalized === "live"
-          ? "Loading the latest D435 RGB frame."
-          : detail || "Waiting for the subscribe-only camera observer.";
+        placeholder.textContent = normalized === "live" ? tile.loadingText : (detail || tile.waitingText);
       }
+    }
+
+    const CAMERA_TILE = {
+      badgeId: "camera-state", placeholderId: "camera-placeholder", imageId: "camera-image",
+      endpoint: "/api/camera/latest.jpg", floorMs: CAMERA_POLL_FLOOR_MS, freshMaxMs: CAMERA_FRESH_MAX_MS,
+      loadingText: "Loading the latest D435 RGB frame.",
+      waitingText: "Waiting for the subscribe-only camera observer.",
+      etagKey: "cameraEtag", hasFrameKey: "cameraHasFrame", timerKey: "cameraTimer",
+      hasFrame: () => state.cameraHasFrame, schedule: delay => scheduleCameraPoll(delay)
+    };
+    const DEPTH_TILE = {
+      badgeId: "depth-state", placeholderId: "depth-placeholder", imageId: "depth-image",
+      endpoint: "/api/depth/latest.jpg", floorMs: DEPTH_POLL_FLOOR_MS, freshMaxMs: DEPTH_FRESH_MAX_MS,
+      loadingText: "Loading the latest colorized depth frame.",
+      waitingText: "Waiting for the subscribe-only depth observer.",
+      etagKey: "depthEtag", hasFrameKey: "depthHasFrame", timerKey: "depthTimer",
+      hasFrame: () => state.depthHasFrame, schedule: delay => scheduleDepthPoll(delay)
+    };
+
+    function renderCameraState(status, detail = "", ageMs = null) {
+      renderLiveTileState(CAMERA_TILE, status, detail, ageMs);
+    }
+
+    function renderDepthState(status, detail = "", ageMs = null) {
+      renderLiveTileState(DEPTH_TILE, status, detail, ageMs);
     }
 
     function scheduleCameraPoll(delayMs) {
       if (state.cameraTimer !== null) window.clearTimeout(state.cameraTimer);
       state.cameraTimer = window.setTimeout(refreshCamera, delayMs);
+    }
+
+    function scheduleDepthPoll(delayMs) {
+      if (state.depthTimer !== null) window.clearTimeout(state.depthTimer);
+      state.depthTimer = window.setTimeout(refreshDepth, delayMs);
     }
 
     function readBlobAsDataUrl(blob) {
@@ -2152,44 +2210,57 @@
       });
     }
 
-    async function refreshCamera() {
+    // One real-time image tile polling loop, shared by RGB and depth.  Honours
+    // the server-advertised poll interval (floored per tile) and always keeps
+    // polling so a recovered source refreshes automatically.
+    async function refreshLiveTile(tile, render) {
       try {
         const headers = {};
-        if (state.cameraEtag) headers["If-None-Match"] = state.cameraEtag;
-        const response = await fetch("/api/camera/latest.jpg", {
+        if (state[tile.etagKey]) headers["If-None-Match"] = state[tile.etagKey];
+        const response = await fetch(tile.endpoint, {
           cache: "no-store",
           credentials: "same-origin",
           headers
         });
-        const suggested = Number.parseInt(response.headers.get("X-Z-Manip-Poll-Interval-Ms") || "200", 10);
-        const delay = Number.isFinite(suggested) ? Math.max(200, suggested) : 200;
+        const suggested = Number.parseInt(response.headers.get("X-Z-Manip-Poll-Interval-Ms") || String(tile.floorMs), 10);
+        const delay = Number.isFinite(suggested) ? Math.max(tile.floorMs, suggested) : tile.floorMs;
+        const ageMs = Number.parseInt(response.headers.get("X-Z-Manip-Camera-Age-Ms") || "", 10);
+        const ageText = Number.isFinite(ageMs) ? ageMs : "0";
         if (response.status === 304) {
-          renderCameraState("live", `latest frame age ${response.headers.get("X-Z-Manip-Camera-Age-Ms") || "0"} ms`);
-          scheduleCameraPoll(delay);
+          render("live", `latest frame age ${ageText} ms`, ageMs);
+          tile.schedule(delay);
           return;
         }
         if (!response.ok) {
-          const cameraState = response.headers.get("X-Z-Manip-Camera-State") || (response.status === 503 ? "stale" : "offline");
-          renderCameraState(cameraState, `camera endpoint HTTP ${response.status}`);
-          scheduleCameraPoll(cameraState === "stale" ? delay : 500);
+          const tileState = response.headers.get("X-Z-Manip-Camera-State") || (response.status === 503 ? "stale" : "offline");
+          render(tileState, `endpoint HTTP ${response.status}`, ageMs);
+          tile.schedule(tileState === "stale" ? delay : 500);
           return;
         }
         if (!(response.headers.get("Content-Type") || "").startsWith("image/jpeg")) {
-          throw new Error("camera endpoint returned a non-JPEG response");
+          throw new Error("endpoint returned a non-JPEG response");
         }
-        state.cameraEtag = response.headers.get("ETag");
+        state[tile.etagKey] = response.headers.get("ETag");
         const dataUrl = await readBlobAsDataUrl(await response.blob());
-        const image = byId("camera-image");
+        const image = byId(tile.imageId);
         image.src = dataUrl;
         image.hidden = false;
-        byId("camera-placeholder").hidden = true;
-        state.cameraHasFrame = true;
-        renderCameraState("live", `latest frame age ${response.headers.get("X-Z-Manip-Camera-Age-Ms") || "0"} ms`);
-        scheduleCameraPoll(delay);
+        byId(tile.placeholderId).hidden = true;
+        state[tile.hasFrameKey] = true;
+        render("live", `latest frame age ${ageText} ms`, ageMs);
+        tile.schedule(delay);
       } catch (error) {
-        renderCameraState("offline", String(error));
-        scheduleCameraPoll(1000);
+        render("offline", String(error), null);
+        tile.schedule(1000);
       }
+    }
+
+    function refreshCamera() {
+      return refreshLiveTile(CAMERA_TILE, renderCameraState);
+    }
+
+    function refreshDepth() {
+      return refreshLiveTile(DEPTH_TILE, renderDepthState);
     }
 
     async function refreshRuntime() {
@@ -3415,6 +3486,7 @@
     refreshGraspStatus();
     refreshApproachStatus();
     refreshCamera();
+    refreshDepth();
     refreshPerceptionFeeds();
     refreshComponentStatus();
     loadBundle().then(() => {
