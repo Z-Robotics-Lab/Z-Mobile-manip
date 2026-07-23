@@ -1953,6 +1953,40 @@ class DepthServoRunner:
             self._workflow.update(values)
             self._revision += 1
 
+    # A perception attempt "seeds" the FIND and reacquisition flow when it both
+    # identified the target and produced a valid 3-D bundle for it.  Grasp
+    # geometry is deliberately re-synthesized from fresh, close-range perception
+    # at the manipulation handoff, so a post-capture grasp-geometry miss at FIND
+    # range (backend exit 4 -> GRASP_GEOMETRY_FAILED, e.g. an OBB just outside
+    # the gripper aperture on a coarse ~1-2 m cloud) is expected and harmless.
+    # It must NOT be conflated with a detection, grounding, tracker, or camera
+    # failure.  The read-only session service assigns GRASP_GEOMETRY_FAILED only
+    # after grounding and tracking already produced a valid, target-identified
+    # report -- grounding_failed, tracker_reported_loss, and camera timeouts
+    # each carry their own distinct error codes and remain hard misses -- so
+    # advancing on it keeps the target-identity contract and the fail-closed
+    # behavior for every genuine loss intact.
+    _SEED_VALID_FAILURE_CODES = frozenset({"GRASP_GEOMETRY_FAILED"})
+
+    @classmethod
+    def _perception_seeded_target(cls, attempt: dict[str, Any]) -> bool:
+        """Return whether perception detected the target with a valid 3-D seed.
+
+        This is strictly weaker than the planning-grade "succeeded" contract:
+        it advances the visual approach on detection plus a valid bundle even
+        when grasp synthesis failed at range.  "blocked" and every unknown
+        state stay fail-closed.
+        """
+
+        status = attempt.get("status")
+        if status == "succeeded":
+            return True
+        if status != "failed":
+            return False
+        error = attempt.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        return code in cls._SEED_VALID_FAILURE_CODES
+
     def _run_perception(self, target: str, *, reacquisition: bool) -> bool:
         if self._session_service is None:
             self._set_workflow(
@@ -1975,7 +2009,12 @@ class DepthServoRunner:
         except Exception as error:
             self._set_workflow(failure=f"perception reacquisition failed: {error}")
             return False
-        return attempt.get("status") == "succeeded"
+        # Detection + a valid 3-D seed advances FIND and reacquisition; a
+        # grasp-geometry miss at range does not send a tracked target back into
+        # a wrist search (bug: FIND entered search on a plainly detected target;
+        # the reacquisition variant made the search->approach transition flip
+        # nondeterministically as the OBB extent straddled the aperture gate).
+        return self._perception_seeded_target(attempt)
 
     def _handoff_after_base_stop(
         self,
@@ -5674,6 +5713,13 @@ def main() -> int:
                 home_joints,
                 go2w_wrist_search.DetectorProbe(args.camera_image),
                 motion=motion,
+                # Per-view search telemetry (one JSON object per observed view:
+                # detector source, confidence, latency, joint error) for offline
+                # inspection of why a sweep confirmed or exhausted.  No clean
+                # per-view VLM client seam exists in this flow yet -- only the
+                # loopback open-vocabulary DetectorProbe is wired here -- so
+                # vlm_detector is intentionally left unset rather than forced.
+                search_records_path=run_root / "wrist-search-records.jsonl",
             )
         except (OSError, KeyError, TypeError, ValueError):
             wrist_search = None

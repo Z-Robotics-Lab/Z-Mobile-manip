@@ -1218,6 +1218,183 @@ def test_depth_servo_wrist_search_find_seeds_second_perception(tmp_path):
     runner.stop()
 
 
+def test_perception_seed_gating_separates_detection_from_grasp_geometry():
+    seeded = CONTROL.DepthServoRunner._perception_seeded_target
+    # A grasp-geometry miss at range still carries a detected, identified
+    # target with a valid 3-D bundle: it advances FIND and reacquisition.
+    assert seeded({"status": "succeeded"}) is True
+    assert seeded({
+        "status": "failed",
+        "backend_exit_code": 4,
+        "error": {"code": "GRASP_GEOMETRY_FAILED", "message": "no antipodal ..."},
+    }) is True
+    # Genuine losses stay fail-closed hard misses -> the flow must still search.
+    assert seeded({
+        "status": "failed",
+        "error": {"code": "PERCEPTION_TRACKER_LOST"},
+    }) is False
+    assert seeded({
+        "status": "failed",
+        "error": {"code": "PERCEPTION_TARGET_NOT_FOUND"},
+    }) is False
+    assert seeded({
+        "status": "failed",
+        "error": {"code": "PERCEPTION_CAMERA_FRAME_TIMEOUT"},
+    }) is False
+    assert seeded({
+        "status": "failed",
+        "error": {"code": "PERCEPTION_PROCESS_FAILED"},
+    }) is False
+    # Missing/typeless error and non-"failed" states never advance.
+    assert seeded({"status": "failed", "target": "charger"}) is False
+    assert seeded({"status": "failed", "error": None}) is False
+    assert seeded({"status": "blocked"}) is False
+
+
+def test_depth_servo_current_view_grasp_geometry_miss_advances_without_search(tmp_path):
+    events = []
+
+    class Sessions:
+        def __init__(self):
+            self.calls = 0
+
+        def start_perception(self, target):
+            self.calls += 1
+            events.append("perception")
+            # Detected + valid seed, but the OBB is just outside the aperture at
+            # FIND range: the close-range handoff re-plans grasp geometry.
+            return {
+                "status": "failed",
+                "backend_exit_code": 4,
+                "error": {
+                    "code": "GRASP_GEOMETRY_FAILED",
+                    "message": "no antipodal or aperture-bounded OBB grasp",
+                },
+                "target": target,
+            }
+
+    sessions = Sessions()
+    search = _RecordingSearch(True, events, {"phase": "idle", "failure": None})
+    runner = _acquire_runner(tmp_path, sessions, search)
+
+    result = runner.start(
+        "shadow",
+        target="charger",
+        acquire_target=True,
+        speed_percent=8,
+    )
+    deadline = time.monotonic() + 3.0
+    while runner._process is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert result["started"] is True
+    # A detected target never falls into wrist search on a grasp-geometry miss.
+    assert search.calls == []
+    assert sessions.calls == 1
+    assert events == ["perception"]
+    status = runner.status()["workflow"]
+    assert status["phase"] not in {"blocked", "wrist_search", "seeding_tracker"}
+    assert runner._process is not None
+    runner.stop()
+
+
+def test_depth_servo_tracker_loss_still_falls_back_to_wrist_search(tmp_path):
+    events = []
+
+    class Sessions:
+        def __init__(self):
+            self.calls = 0
+
+        def start_perception(self, target):
+            self.calls += 1
+            events.append("perception")
+            return {
+                "status": "failed",
+                "backend_exit_code": 5,
+                "error": {"code": "PERCEPTION_TRACKER_LOST"},
+                "target": target,
+            }
+
+    sessions = Sessions()
+    search = _RecordingSearch(
+        False,
+        events,
+        {"phase": "exhausted", "failure": "bounded local search exhausted"},
+    )
+    runner = _acquire_runner(tmp_path, sessions, search)
+
+    result = runner.start(
+        "shadow",
+        target="charger",
+        acquire_target=True,
+        speed_percent=8,
+    )
+    deadline = time.monotonic() + 3.0
+    while runner.status()["workflow"]["active"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    status = runner.status()
+    assert result["started"] is True
+    # Tracker loss is a genuine miss: the detector-only wrist sweep must run.
+    assert events == ["perception", "search"]
+    assert sessions.calls == 1
+    assert status["workflow"]["phase"] == "blocked"
+    assert status["workflow"]["failure"] == "bounded local search exhausted"
+    assert runner._process is None
+
+
+def test_depth_servo_wrist_search_reseed_grasp_geometry_advances_once(tmp_path):
+    events = []
+
+    class Sessions:
+        def __init__(self):
+            self.calls = 0
+
+        def start_perception(self, target):
+            self.calls += 1
+            events.append("perception")
+            if self.calls == 1:
+                # Current view cannot confirm -> genuine miss -> wrist search.
+                return {
+                    "status": "failed",
+                    "error": {"code": "PERCEPTION_TARGET_NOT_FOUND"},
+                    "target": target,
+                }
+            # Reseed after the sweep: detector confirmed, grasp geometry still
+            # misses at range.  This must advance exactly once, never loop back
+            # into a second search (the nondeterministic search->search bug).
+            return {
+                "status": "failed",
+                "backend_exit_code": 4,
+                "error": {"code": "GRASP_GEOMETRY_FAILED"},
+                "target": target,
+            }
+
+    sessions = Sessions()
+    search = _RecordingSearch(True, events, {"phase": "found", "failure": None})
+    runner = _acquire_runner(tmp_path, sessions, search)
+
+    result = runner.start(
+        "shadow",
+        target="charger",
+        acquire_target=True,
+        speed_percent=8,
+    )
+    deadline = time.monotonic() + 3.0
+    while runner._process is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert result["started"] is True
+    # Exactly one search and one reseed, then advance -- no search->search loop.
+    assert events == ["perception", "search", "perception"]
+    assert len(search.calls) == 1
+    assert sessions.calls == 2
+    status = runner.status()["workflow"]
+    assert status["phase"] not in {"blocked", "wrist_search", "seeding_tracker"}
+    assert runner._process is not None
+    runner.stop()
+
+
 def test_depth_servo_view_recovery_stops_base_before_wrist_search(tmp_path):
     for recovery_phase in ("view_recovery", "search_required"):
         phase_dir = tmp_path / recovery_phase
