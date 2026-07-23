@@ -163,6 +163,85 @@ def test_high_target_requests_look_up_and_raise_intent():
     assert decision.arm_view.mode is ArmViewMode.LOOK_UP
 
 
+def test_unactionable_body_posture_skips_latch_and_keeps_approaching():
+    # When body attitude cannot move the view (e.g. Go2W ai-w rejects Euler),
+    # a view-at-risk target outside the handoff corridor must not latch the
+    # controller in POSTURE_ADJUST; it keeps approaching while the wrist arm
+    # view corrects elevation.
+    controller = ReactiveTargetController()
+    geometry = _geometry(
+        camera_xyz=(0.0, 0.30, 0.65),
+        base_xyz=(0.72, 0.0, -0.35),
+        arm_xyz=(0.60, 0.0, -0.20),
+    )
+
+    latched = controller.update(
+        geometry, now_s=2.0, tracking=True, body_settled=True,
+    )
+    assert latched.phase is ReactivePhase.POSTURE_ADJUST
+
+    controller.reset()
+    skipped = controller.update(
+        geometry,
+        now_s=2.0,
+        tracking=True,
+        body_settled=True,
+        body_posture_actionable=False,
+    )
+
+    assert skipped.phase is ReactivePhase.BASE_APPROACH
+    assert skipped.base.linear_x_mps > 0.0
+    assert skipped.posture == PostureIntent()
+    assert skipped.arm_view.mode is ArmViewMode.LOOK_DOWN
+
+
+def test_unactionable_body_posture_reaches_handoff_probe_then_ready():
+    # Inside the corridor with a view still at risk, the actionable path traps
+    # in POSTURE_ADJUST, while the unactionable path proceeds to the explicit
+    # IK probe and only declares HANDOFF_READY once IK is feasible.
+    controller = ReactiveTargetController()
+    geometry = _geometry(
+        camera_xyz=(0.0, -0.20, 0.55),
+        base_xyz=(0.55, 0.13, 0.0),
+        arm_xyz=(0.50, 0.0, 0.10),
+    )
+
+    trapped = controller.update(
+        geometry,
+        now_s=3.0,
+        tracking=True,
+        body_settled=True,
+        desired_target_lateral_m=0.13,
+    )
+    assert trapped.phase is ReactivePhase.POSTURE_ADJUST
+
+    controller.reset()
+    probe = controller.update(
+        geometry,
+        now_s=3.0,
+        tracking=True,
+        body_settled=True,
+        ik_feasible=None,
+        desired_target_lateral_m=0.13,
+        body_posture_actionable=False,
+    )
+    assert probe.phase is ReactivePhase.HANDOFF_PROBE
+    assert probe.needs_ik_probe is True
+    assert probe.handoff_ready is False
+
+    ready = controller.update(
+        geometry,
+        now_s=3.05,
+        tracking=True,
+        body_settled=True,
+        ik_feasible=True,
+        desired_target_lateral_m=0.13,
+        body_posture_actionable=False,
+    )
+    assert ready.phase is ReactivePhase.HANDOFF_READY
+    assert ready.handoff_ready is True
+
+
 def test_posture_motion_requires_measured_settle_and_stable_reacquisition():
     config = ReactiveServoConfig(reacquire_stable_s=0.25)
     controller = ReactiveTargetController(config)

@@ -50,6 +50,12 @@ ARM_STATUS_TIMEOUT_S = 0.50
 ARM_INTENT_TTL_NS = 250_000_000
 ARM_INTENT_SCHEMA = "z_manip.piper_reactive_view_intent.v1"
 ARM_STATUS_SCHEMA = "z_manip.piper_reactive_view_status.v1"
+# Read-only close-range IK feasibility channel.  A resident close-range
+# planning runner may certify grasp/pregrasp IK on this topic so the reactive
+# controller can declare HANDOFF_READY.  When no producer is present the probe
+# is unavailable (None) and the controller stays fail-closed in HANDOFF_PROBE.
+IK_PROBE_SCHEMA = "z_manip.reactive_ik_probe.v1"
+IK_PROBE_TIMEOUT_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -402,6 +408,56 @@ def _runtime_state_transforms(
     return base, arm, timestamp_ns
 
 
+def _euler_body_unavailable(document: dict[str, Any] | None) -> bool:
+    """Return true when the posture adapter positively reports no Euler DOF.
+
+    The Go2W ai-w wheeled-sport service answers Euler(1007) with RPC 3203 for
+    the whole epoch, so body pitch/roll can never move the wrist-camera view.
+    Only positive evidence (``euler`` false with a known unavailable state)
+    disables body posture; a missing/ambiguous capability keeps the legacy
+    body-posture behaviour.
+    """
+
+    capabilities = (
+        document.get("capabilities") if isinstance(document, dict) else None
+    )
+    return bool(
+        isinstance(capabilities, dict)
+        and capabilities.get("euler") is False
+        and capabilities.get("euler_state") in {
+            "UNKNOWN",
+            "UNSUPPORTED_FOR_EPOCH",
+            "TRANSIENT_FAULT",
+        }
+    )
+
+
+def _ik_probe_state(
+    document: dict[str, Any] | None,
+    *,
+    age_s: float,
+    timeout_s: float = IK_PROBE_TIMEOUT_S,
+) -> bool | None:
+    """Reduce a resident close-range IK-probe report to the handoff contract.
+
+    Returns ``True``/``False`` only for a fresh, schema-valid explicit verdict;
+    any absence, staleness, or malformed payload returns ``None`` so the
+    reactive controller keeps requesting the probe (fail-closed HANDOFF_PROBE)
+    rather than declaring a handoff on missing evidence.
+    """
+
+    if document is None or not math.isfinite(age_s) or age_s > timeout_s:
+        return None
+    if document.get("schema") != IK_PROBE_SCHEMA:
+        return None
+    feasible = document.get("feasible")
+    if feasible is True:
+        return True
+    if feasible is False:
+        return False
+    return None
+
+
 def _posture_feedback_state(
     document: dict[str, Any] | None,
     *,
@@ -428,15 +484,7 @@ def _posture_feedback_state(
         and capabilities.get("euler") is True
         and capabilities.get("euler_state") == "SUPPORTED_OBSERVED"
     )
-    euler_unavailable = (
-        isinstance(capabilities, dict)
-        and capabilities.get("euler") is False
-        and capabilities.get("euler_state") in {
-            "UNKNOWN",
-            "UNSUPPORTED_FOR_EPOCH",
-            "TRANSIENT_FAULT",
-        }
-    )
+    euler_unavailable = _euler_body_unavailable(document)
     blocked = stop_latched or phase in {
         "blocked",
         "fault",
@@ -595,6 +643,7 @@ class DepthServoCore:
             "reason": decision.reason,
             "handoff_ready": decision.handoff_ready,
             "needs_ik_probe": decision.needs_ik_probe,
+            "ik_feasible": self._ik_feasible,
             "side": (
                 None if self._side_sign is None else (
                     "left" if self._side_sign > 0 else "right"
@@ -771,6 +820,7 @@ class DepthServoCore:
         posture_blocked: bool,
         posture_shadow_verified: bool,
         posture_detail: str,
+        body_posture_actionable: bool = True,
     ) -> DepthServoOutput:
         fresh_tracking = (
             tracking is True and age_s <= self.settings.target_timeout_s
@@ -835,6 +885,7 @@ class DepthServoCore:
             body_settled=body_settled,
             ik_feasible=self._ik_feasible,
             desired_target_lateral_m=self.desired_target_lateral_m,
+            body_posture_actionable=body_posture_actionable,
         )
         self._last_decision = decision
         if (
@@ -894,6 +945,7 @@ class DepthServoCore:
         posture_blocked: bool = False,
         posture_shadow_verified: bool = False,
         posture_detail: str = "",
+        body_posture_actionable: bool = True,
     ) -> DepthServoOutput:
         now = float(now_s)
         if self._done:
@@ -910,6 +962,7 @@ class DepthServoCore:
                 posture_blocked=posture_blocked,
                 posture_shadow_verified=posture_shadow_verified,
                 posture_detail=posture_detail,
+                body_posture_actionable=body_posture_actionable,
             )
         if tracking is not True or age_s > self.settings.target_timeout_s:
             phase = (
@@ -1091,6 +1144,8 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_posture_intent_s = 0.0
             self.arm_view_status: dict[str, Any] | None = None
             self.arm_view_status_received_s: float | None = None
+            self.ik_probe_status: dict[str, Any] | None = None
+            self.ik_probe_status_received_s: float | None = None
             self.arm_view_intent_seq = 0
             self.last_arm_view_intent: dict[str, Any] | None = None
             self.whole_body: WholeBodyRuntimeController | None = None
@@ -1148,6 +1203,12 @@ def _run_ros(args: argparse.Namespace) -> int:
                 String,
                 "/z_manip/reactive/arm_view_status",
                 self._arm_view_state,
+                qos,
+            )
+            self.create_subscription(
+                String,
+                "/z_manip/reactive/ik_probe",
+                self._ik_probe_state_message,
                 qos,
             )
             self.create_timer(1.0 / args.rate_hz, self._tick)
@@ -1314,6 +1375,18 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self.arm_view_status = document
                 self.arm_view_status_received_s = time.monotonic()
 
+        def _ik_probe_state_message(self, message: String) -> None:
+            try:
+                document = json.loads(message.data)
+            except json.JSONDecodeError:
+                return
+            if (
+                isinstance(document, dict)
+                and document.get("schema") == IK_PROBE_SCHEMA
+            ):
+                self.ik_probe_status = document
+                self.ik_probe_status_received_s = time.monotonic()
+
         def _posture_feedback(self) -> tuple[bool, bool, bool, str]:
             age_s = (
                 math.inf
@@ -1324,6 +1397,31 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self.posture_status,
                 age_s=age_s,
             )
+
+        def _posture_body_actionable(self) -> bool:
+            # Only the epoch-stable verdict may disable body posture for the
+            # whole session: UNKNOWN and TRANSIENT_FAULT are by definition
+            # recoverable, so latching them here would permanently strand a
+            # capable platform on the arm-only path after one blip.  Absent or
+            # ambiguous evidence keeps the legacy body-posture behaviour.
+            document = self.posture_status
+            if not isinstance(document, dict):
+                return True
+            capabilities = document.get("capabilities")
+            if not isinstance(capabilities, dict):
+                return True
+            return not (
+                capabilities.get("euler") is False
+                and capabilities.get("euler_state") == "UNSUPPORTED_FOR_EPOCH"
+            )
+
+        def _ik_probe_feedback(self) -> bool | None:
+            age_s = (
+                math.inf
+                if self.ik_probe_status_received_s is None
+                else time.monotonic() - self.ik_probe_status_received_s
+            )
+            return _ik_probe_state(self.ik_probe_status, age_s=age_s)
 
         def _arm_feedback(self) -> tuple[bool, bool, bool, str]:
             age_s = (
@@ -1375,6 +1473,11 @@ def _run_ros(args: argparse.Namespace) -> int:
                 roll = self.whole_body_command.body_roll_target_rad
                 target = (roll, self.whole_body_command.body_pitch_target_rad)
             else:
+                if not self._posture_body_actionable():
+                    # Defense in depth: never relay a body-posture intent the
+                    # motion service rejects for the whole epoch -- each retry
+                    # contends on the single WebRTC owner for nothing.
+                    return
                 status = self.core.reactive_status
                 if status is None or status.get("phase") not in {
                     ReactivePhase.POSTURE_ADJUST.value,
@@ -1489,6 +1592,11 @@ def _run_ros(args: argparse.Namespace) -> int:
                 if self.arm_view_status_received_s is None
                 else max(0.0, time.monotonic() - self.arm_view_status_received_s)
             )
+            ik_probe_age_s = (
+                None
+                if self.ik_probe_status_received_s is None
+                else max(0.0, time.monotonic() - self.ik_probe_status_received_s)
+            )
             document = {
                 "schema": STATUS_SCHEMA,
                 "running": running,
@@ -1537,6 +1645,11 @@ def _run_ros(args: argparse.Namespace) -> int:
                     "age_s": arm_view_age_s,
                     "document": self.arm_view_status,
                     "last_intent": self.last_arm_view_intent,
+                },
+                "ik_probe": {
+                    "age_s": ik_probe_age_s,
+                    "feasible": self._ik_probe_feedback(),
+                    "document": self.ik_probe_status,
                 },
                 "whole_body": (
                     {
@@ -1811,6 +1924,11 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self._write_status()
                 return
             settled, blocked, shadow_verified, detail = self._posture_feedback()
+            # Feed the read-only close-range IK verdict before the FSM step so a
+            # resident planning runner can certify HANDOFF_READY on the same
+            # tick; absent a producer the probe is None and the controller stays
+            # fail-closed in HANDOFF_PROBE.
+            self.core.set_ik_probe_result(self._ik_probe_feedback())
             fallback = self.core.tick(
                 now_s=time.monotonic(),
                 tracking=self.tracking,
@@ -1818,6 +1936,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 posture_blocked=blocked,
                 posture_shadow_verified=shadow_verified,
                 posture_detail=detail,
+                body_posture_actionable=self._posture_body_actionable(),
             )
             candidate = self._whole_body_output(
                 fallback,

@@ -670,6 +670,64 @@ def test_explicit_euler_not_implemented_uses_nonblocking_base_arm_fallback():
     assert "3203" in detail
 
 
+def test_euler_body_unavailable_needs_positive_capability_evidence():
+    unavailable = {
+        "capabilities": {"euler": False, "euler_state": "UNSUPPORTED_FOR_EPOCH"},
+    }
+    supported = {
+        "capabilities": {"euler": True, "euler_state": "SUPPORTED_OBSERVED"},
+    }
+
+    assert SERVO._euler_body_unavailable(unavailable) is True
+    assert SERVO._euler_body_unavailable(supported) is False
+    assert SERVO._euler_body_unavailable(None) is False
+    assert SERVO._euler_body_unavailable({"mode": "live"}) is False
+
+
+def test_ik_probe_reducer_is_fail_closed_on_absence_or_staleness():
+    fresh_true = {"schema": SERVO.IK_PROBE_SCHEMA, "feasible": True}
+    fresh_false = {"schema": SERVO.IK_PROBE_SCHEMA, "feasible": False}
+
+    assert SERVO._ik_probe_state(fresh_true, age_s=0.10) is True
+    assert SERVO._ik_probe_state(fresh_false, age_s=0.10) is False
+    # Stale, wrong schema, malformed verdict, and absence all stay unresolved
+    # so the controller keeps requesting the probe instead of handing off.
+    assert SERVO._ik_probe_state(fresh_true, age_s=5.0) is None
+    assert SERVO._ik_probe_state({"schema": "other", "feasible": True}, age_s=0.1) is None
+    assert SERVO._ik_probe_state({"schema": SERVO.IK_PROBE_SCHEMA}, age_s=0.1) is None
+    assert SERVO._ik_probe_state(None, age_s=0.1) is None
+
+
+def test_unactionable_body_posture_core_skips_posture_and_approaches():
+    def _run(actionable):
+        core = _reactive_core()
+        assert _observe_in_frames(
+            core,
+            camera_xyz=(0.0, 0.30, 0.65),
+            base_xyz=(0.72, 0.0, -0.35),
+            arm_xyz=(0.60, 0.0, -0.20),
+            stamp_s=2.0,
+        )
+        output = core.tick(
+            now_s=2.05,
+            tracking=True,
+            body_settled=True,
+            body_posture_actionable=actionable,
+        )
+        return core, output
+
+    _, trapped = _run(True)
+    core, skipped = _run(False)
+
+    assert trapped.phase == "posture_adjust"
+    assert skipped.phase == "approach"
+    assert skipped.published_linear_x > 0.0
+    # The IK probe is unwired here, so the status exposes an unresolved verdict
+    # for the dashboard without forcing a handoff.
+    assert core.reactive_status is not None
+    assert core.reactive_status["ik_feasible"] is None
+
+
 def test_whole_body_posture_convergence_uses_velocity_not_tiny_pose_step():
     command = SERVO.WholeBodyRuntimeCommand(
         base_forward_mps=0.0,

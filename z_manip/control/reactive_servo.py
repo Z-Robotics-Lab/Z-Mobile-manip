@@ -284,6 +284,7 @@ class ReactiveTargetController:
         self.reset()
 
     def reset(self) -> None:
+        self._body_posture_actionable = True
         self.phase = ReactivePhase.WAITING_TARGET
         self._last_geometry: TargetGeometry | None = None
         self._last_seen_s: float | None = None
@@ -381,10 +382,15 @@ class ReactiveTargetController:
         if age_s <= self.config.tracking_loss_grace_s:
             self._handoff_since_s = None
             self.phase = ReactivePhase.VIEW_RECOVERY
+            recovery_posture = (
+                self._posture(geometry)
+                if self._body_posture_actionable
+                else PostureIntent()
+            )
             return ReactiveServoDecision(
                 phase=self.phase,
                 base=BaseMotionIntent(),
-                posture=self._posture(geometry),
+                posture=recovery_posture,
                 arm_view=self._arm_view(geometry, search=True),
                 geometry=geometry,
                 reason="hold the base and recover the last observed viewing ray",
@@ -409,6 +415,7 @@ class ReactiveTargetController:
         body_settled: bool,
         ik_feasible: bool | None = None,
         desired_target_lateral_m: float = 0.0,
+        body_posture_actionable: bool = True,
     ) -> ReactiveServoDecision:
         now = float(now_s)
         if not math.isfinite(now):
@@ -418,6 +425,10 @@ class ReactiveTargetController:
             raise ValueError("desired target lateral offset must be finite")
         if not tracking or geometry is None:
             self._reacquire_since_s = None
+            # The loss stair must obey the same structural-capability verdict
+            # as live tracking: VIEW_RECOVERY on an Euler-less platform must
+            # not command body posture the service will only reject.
+            self._body_posture_actionable = bool(body_posture_actionable)
             return self._lost(now_s=now)
 
         self._last_geometry = geometry
@@ -525,6 +536,16 @@ class ReactiveTargetController:
             geometry.base_planar_distance_m <= self.config.posture_entry_planar_m
         )
 
+        if not body_posture_actionable:
+            # The body attitude actuator cannot move the wrist-camera view
+            # (e.g. the Go2W ai-w service rejects Euler(1007) for the epoch).
+            # Never latch a body-posture request the platform structurally
+            # cannot satisfy: the wrist arm view keeps the target in frame
+            # while the FSM proceeds toward the handoff corridor / IK probe,
+            # instead of oscillating between POSTURE_ADJUST and REACQUIRE.
+            self._posture_requested = False
+            self._reacquire_since_s = None
+
         if self._posture_requested:
             if not body_settled:
                 self.phase = ReactivePhase.POSTURE_ADJUST
@@ -551,7 +572,7 @@ class ReactiveTargetController:
             self._posture_requested = False
             self._reacquire_since_s = None
 
-        if in_posture_zone and view_at_risk:
+        if in_posture_zone and view_at_risk and body_posture_actionable:
             self._posture_requested = True
             self.phase = ReactivePhase.POSTURE_ADJUST
             return ReactiveServoDecision(
