@@ -133,7 +133,7 @@ def test_timed_lift_stretches_schedule_at_lower_requested_speed() -> None:
 def test_timed_lift_fails_closed_instead_of_bursting_late_targets() -> None:
     class LateClock(FakeClock):
         def sleep(self, duration: float) -> None:
-            self.value += max(0.0, float(duration)) + 0.20
+            self.value += max(0.0, float(duration)) + 0.40
 
     path = np.vstack((_q(0.0), _q(0.05), _q(0.10)))
     clock = LateClock()

@@ -91,12 +91,14 @@ def main() -> int:
             "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5", NUC_HOST,
         ]
         scp = [
-            "scp", "-q", "-i", str(NUC_KEY), "-o", "BatchMode=yes",
+            "scp", "-q", "-p", "-i", str(NUC_KEY), "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5",
         ]
         created = run([*ssh, f"mkdir -p {shlex.quote(remote_dir)}"], timeout=10.0)
         if created.returncode != 0:
             raise RuntimeError(f"cannot create NUC action directory: {created.stdout.strip()}")
+        started = None
+        receipts_fetched = False
         try:
             copied = run([
                 *scp,
@@ -140,6 +142,11 @@ def main() -> int:
                 command.extend(("--prior-receipt-dir", remote_prior))
             remote_shell = (
                 "set -e; "
+                # The reactive-view executor is a live CAN owner in its own
+                # right; systemd Conflicts= only pairs it with the passive
+                # bridge, so the grasp executor must evict it explicitly or
+                # two owners can transmit on can0 mid-motion.
+                "systemctl --user stop z-mobile-manip-piper-reactive-view.service; "
                 "systemctl --user stop z-manip-piper-passive-feedback.service; "
                 "trap 'sudo -n /usr/local/sbin/z-manip-piper-passive-can-gate can0 8 >/tmp/z-manip-passive-restore.log 2>&1 || true; systemctl --user start z-manip-piper-passive-feedback.service' EXIT; "
                 "cd ~/pyAgxArm; "
@@ -152,21 +159,37 @@ def main() -> int:
             # blocks.  Do not manufacture a local receipt directory when the
             # NUC never opened the real transport.
             start_receipt = f"{remote_receipts}/executor-start-receipt.json"
-            started = run(
-                [*ssh, f"test -f {shlex.quote(start_receipt)}"],
-                timeout=10.0,
-            )
-            if started.returncode == 0:
+            # Receipts (including a pick-hold workflow-state.json that is the
+            # ONLY continuation evidence for a physically held object) must
+            # survive one transient ssh/scp blip: retry the probe and fetch,
+            # and never delete the remote copy until the fetch has landed.
+            for _attempt in range(3):
+                started = run(
+                    [*ssh, f"test -f {shlex.quote(start_receipt)}"],
+                    timeout=10.0,
+                )
+                if started.returncode in (0, 1):
+                    break
+                time.sleep(1.0)
+            if started is not None and started.returncode == 0:
                 args.receipt_dir.parent.mkdir(parents=True, exist_ok=True)
                 args.receipt_dir.mkdir(mode=0o700)
-                fetched = run([
-                    *scp,
-                    f"{NUC_HOST}:{remote_receipts}/*.json",
-                    f"{args.receipt_dir}/",
-                ], timeout=20.0)
-                if fetched.returncode != 0:
+                fetch_error = ""
+                for _attempt in range(3):
+                    fetched = run([
+                        *scp,
+                        f"{NUC_HOST}:{remote_receipts}/*.json",
+                        f"{args.receipt_dir}/",
+                    ], timeout=20.0)
+                    if fetched.returncode == 0:
+                        receipts_fetched = True
+                        break
+                    fetch_error = fetched.stdout.strip()
+                    time.sleep(1.0)
+                if not receipts_fetched:
                     raise RuntimeError(
-                        f"cannot fetch full-grasp receipts: {fetched.stdout.strip()}",
+                        "cannot fetch full-grasp receipts after retries "
+                        f"(remote evidence preserved at {remote_dir}): {fetch_error}",
                     )
             if executed.returncode != 0:
                 raise RuntimeError(f"NUC full grasp stopped safely (exit {executed.returncode})")
@@ -180,7 +203,16 @@ def main() -> int:
             }, sort_keys=True))
             return 0
         finally:
-            run([*ssh, f"rm -rf {shlex.quote(remote_dir)}"], timeout=10.0)
+            # Keep the remote action dir whenever transport-start evidence
+            # exists but the receipts never landed locally -- deleting it
+            # would strand a held object with no continuation state.
+            evidence_at_risk = (
+                started is not None
+                and started.returncode == 0
+                and not receipts_fetched
+            )
+            if not evidence_at_risk:
+                run([*ssh, f"rm -rf {shlex.quote(remote_dir)}"], timeout=10.0)
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2

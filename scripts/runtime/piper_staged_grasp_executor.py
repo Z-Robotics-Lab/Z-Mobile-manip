@@ -62,6 +62,12 @@ SOURCE_AGE_HARD_CAP_S = {
 }
 RECEIPT_MAX_AGE_S = 180.0
 OPEN_APERTURE_M = 0.07
+# The close/lift grasp predicates require a measured aperture at or below
+# OPEN_APERTURE_M - 0.005 (= 0.065 m).  A rigid object wider than that holds
+# the fingers above the gate forever, so planning must reject such widths up
+# front instead of guaranteeing an execution-time SafetyError; 3 mm of
+# measurement/compliance headroom below the gate.
+MAX_PLANNED_GRASP_WIDTH_M = 0.062
 GRIPPER_CLOSE_STEPS = 8
 GRIPPER_CLOSE_INTERVAL_S = 0.20
 GRIPPER_POST_CLOSE_SETTLE_S = 0.50
@@ -84,7 +90,10 @@ EXECUTION_MAX_COALESCED_SEGMENT_RAD = math.radians(180.0)
 # at every vertex).  Fifteen percent is the speed at which the recorded timing
 # was first validated; lower requested speeds stretch, never compress, it.
 LIFT_STREAM_REFERENCE_SPEED_PERCENT = 15
-LIFT_STREAM_MAX_SCHEDULE_LAG_S = 0.15
+# 0.30 s at the 50 Hz stream keeps the arm within a bounded 15-sample drift
+# on a non-realtime host; the previous 0.15 s tripped on ordinary scheduler
+# jitter and its failure path unloaded a holding arm.
+LIFT_STREAM_MAX_SCHEDULE_LAG_S = 0.30
 RESAMPLED_PATH_TOLERANCE_RAD = 1e-5
 # The physical J3 encoder currently reports +0.005515 rad at the URDF's
 # nominal zero stop.  Keep the reconciliation gate narrowly above that
@@ -149,6 +158,7 @@ class CommandGuard:
 
     started: bool = False
     path_motion_started: bool = False
+    holding_load: bool = False
 
     def mark_before_command(self) -> None:
         """Mark before calling an SDK command, including calls that may raise."""
@@ -212,8 +222,11 @@ def close_target_m(
     """Compute a conservative close command from the planned object width."""
     width = float(required_width_m)
     margin = float(squeeze_margin_m)
-    if not math.isfinite(width) or not 0.003 <= width <= OPEN_APERTURE_M:
-        raise SafetyError("required_width_m is outside the 0.003-0.070m range")
+    if not math.isfinite(width) or not 0.003 <= width <= MAX_PLANNED_GRASP_WIDTH_M:
+        raise SafetyError(
+            "required_width_m is outside the 0.003-0.062m range "
+            "(the execution grasp gate needs a measured aperture <= 0.065m)"
+        )
     if not math.isfinite(margin) or not 0.001 <= margin <= 0.010:
         raise SafetyError("squeeze margin is outside the 0.001-0.010m range")
     return max(0.002, width - margin)
@@ -1412,6 +1425,16 @@ def emergency_stop_after_failure(robot: Any, guard: CommandGuard) -> None:
     # A gripper/status failure while the arm is holding must not release
     # torque: PiPER's electronic e-stop unloads this tabletop installation.
     # Reserve it for failures after a real planned joint move was transmitted.
+    if guard.holding_load:
+        # A loaded arm must fail toward holding: the electronic e-stop unloads
+        # this installation and drops the object mid-air.  Stop commanding and
+        # leave the last servo target torqued for operator recovery.
+        print(
+            "CRITICAL: command fault while holding load; "
+            "arm left torqued at its last target",
+            file=sys.stderr,
+        )
+        return
     if not guard.path_motion_started:
         return
     try:
@@ -1608,6 +1631,7 @@ def execute_stage(
                 minimum_force_n=0.0,
                 commanded_close_target_m=close_target_m(artifact.required_width_m),
             )
+            guard.holding_load = True
             timed_lift, lift_times_s = timed_stage_path(artifact, "lift")
             if (
                 float(np.max(np.abs(timed_lift[0] - path[0]))) > 1e-5
