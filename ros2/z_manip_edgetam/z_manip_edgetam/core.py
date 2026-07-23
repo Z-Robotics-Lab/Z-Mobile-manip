@@ -1313,6 +1313,7 @@ class FailClosedTracker:
         min_motion_reanchor_area_ratio: float = 0.60,
         max_motion_reanchor_displacement_ratio: float = 1.25,
         max_contained_collapse_recovery_frames: int = 2,
+        max_tracking_coast_frames: int = 32,
         max_centroid_speed_mps: float = 2.0,
         max_mask_area_ratio: float = 0.35,
         max_rejected_mask_ratio: float = 0.12,
@@ -1393,6 +1394,12 @@ class FailClosedTracker:
             raise ValueError(
                 'max_contained_collapse_recovery_frames must be 1 or 2',
             )
+        if (
+            isinstance(max_tracking_coast_frames, bool)
+            or not isinstance(max_tracking_coast_frames, int)
+            or max_tracking_coast_frames < 0
+        ):
+            raise ValueError('max_tracking_coast_frames must be a non-negative integer')
         if not math.isfinite(max_centroid_speed_mps) or max_centroid_speed_mps <= 0.0:
             raise ValueError('max_centroid_speed_mps must be finite and positive')
         if not math.isfinite(max_mask_area_ratio) or not 0.0 < max_mask_area_ratio <= 1.0:
@@ -1436,6 +1443,7 @@ class FailClosedTracker:
         self._max_contained_collapse_recovery_frames = int(
             max_contained_collapse_recovery_frames,
         )
+        self._max_tracking_coast_frames = int(max_tracking_coast_frames)
         self._max_centroid_speed_mps = float(max_centroid_speed_mps)
         self._max_mask_area_ratio = float(max_mask_area_ratio)
         self._max_rejected_mask_ratio = float(max_rejected_mask_ratio)
@@ -1530,6 +1538,14 @@ class FailClosedTracker:
                 width=frame.width,
                 height=frame.height,
             )
+            if getattr(result, 'coasting', False):
+                # Keep the identity alive across a brief occlusion-driven gap
+                # without publishing an observation.  The validated anchor,
+                # centroid, and continuity references are intentionally left
+                # unchanged; only the service timeline advances.
+                self._register_coast()
+                self._commit_service_update(frame.stamp_ns)
+                return None
             continuity_metrics = self._current_continuity_metrics(current_mask)
             if continuity_metrics is not None:
                 if self._is_contained_scale_collapse(current_mask):
@@ -1635,6 +1651,12 @@ class FailClosedTracker:
                 width=width,
                 height=height,
             )
+            if getattr(_result, 'coasting', False):
+                # A coast during 2-D acquisition makes no forward progress but
+                # keeps the identity alive and advances the service timeline.
+                self._register_coast()
+                self._commit_service_update(stamp_ns)
+                return False
             continuity_metrics = self._current_continuity_metrics(current_mask)
             if continuity_metrics is not None and self._is_contained_scale_collapse(
                 current_mask,
@@ -1662,7 +1684,7 @@ class FailClosedTracker:
         image_jpeg: bytes,
         width: int,
         height: int,
-    ) -> tuple[TrackResult, np.ndarray, MaskCleanupDiagnostics]:
+    ) -> tuple[TrackResult, np.ndarray | None, MaskCleanupDiagnostics | None]:
         if not self.active or self._last_stamp_ns is None:
             raise TrackerFailure('cannot update without an initialized identity')
         if isinstance(stamp_ns, bool) or stamp_ns <= self._last_stamp_ns:
@@ -1677,6 +1699,12 @@ class FailClosedTracker:
             )
         frame_seq = self._next_frame_seq
         result = self._client.update(image_jpeg, frame_seq=frame_seq)
+        if getattr(result, 'coasting', False):
+            # Session-preserving keep-alive: the service kept the identity but
+            # produced no trustworthy mask this frame.  Enforce identity
+            # lockstep, then defer to the caller (no mask/depth is available).
+            self._validate_coast(result, width=width, height=height, frame_seq=frame_seq)
+            return result, None, None
         self._validate_result(
             result,
             width=width,
@@ -1700,6 +1728,38 @@ class FailClosedTracker:
         )
         self._validate_component_cleanup(diagnostics)
         return result, current_mask, diagnostics
+
+    def _register_coast(self) -> None:
+        """Bound how long tracking may coast without a published observation."""
+        self._coast_streak += 1
+        if self._coast_streak > self._max_tracking_coast_frames:
+            raise TrackerFailure(
+                'EdgeTAM tracking coasted beyond the configured window '
+                f'({self._coast_streak} > {self._max_tracking_coast_frames} frames)',
+                reason_code='tracking_coast_exhausted',
+            )
+
+    def _validate_coast(
+        self,
+        result: object,
+        *,
+        width: int,
+        height: int,
+        frame_seq: int,
+    ) -> None:
+        """Enforce identity lockstep on a session-preserving coast frame."""
+        if getattr(result, 'frame_seq', None) != frame_seq:
+            raise TrackerFailure('EdgeTAM coast sequence changed')
+        if tuple(getattr(result, 'image_size', ())) != (width, height):
+            raise TrackerFailure('EdgeTAM coast image dimensions changed')
+        session_id = getattr(result, 'session_id', '')
+        track_id = getattr(result, 'track_id', '')
+        if not session_id or not track_id:
+            raise TrackerFailure('EdgeTAM returned an empty identity')
+        if session_id != self._session_id:
+            raise TrackerFailure('EdgeTAM session identity changed')
+        if track_id != self._track_id:
+            raise TrackerFailure('EdgeTAM target identity changed')
 
     def _validate_component_cleanup(
         self,
@@ -2046,6 +2106,7 @@ class FailClosedTracker:
         self._pending_anomaly_followup_frames = 0
         self._pending_recovery_streak = 0
         self._pending_recovery_mask = None
+        self._coast_streak = 0
 
     def _raise_update_failure(self, error: Exception) -> None:
         self._clear()
@@ -2093,6 +2154,7 @@ class FailClosedTracker:
         self._pending_anomaly_followup_frames = 0
         self._pending_recovery_streak = 0
         self._pending_recovery_mask: np.ndarray | None = None
+        self._coast_streak = 0
 
     def _bounded_mask(
         self,

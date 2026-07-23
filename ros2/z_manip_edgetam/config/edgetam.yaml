@@ -44,7 +44,18 @@ z_manip_edgetam:
     # A strictly contained collapse is held unpublished; two consecutive
     # source frames must recover before the validated mask can advance.
     max_contained_collapse_recovery_frames: 2
-    max_centroid_speed_mps: 2.0
+    # When EdgeTAM returns no trustworthy mask (brief self-occlusion by the
+    # holding hand, motion blur), keep the identity alive and coast for up to
+    # this many consecutive service frames instead of destroying the session
+    # and forcing a VLM re-grounding. Matches the service streaming-memory
+    # horizon (stream_history_frames=32); the service enforces the same bound.
+    max_tracking_coast_frames: 32
+    # 3-D centroid speed gate. This is Δt-adaptive (speed = Δcentroid/Δt using
+    # real validated timestamps), so low fps is self-correcting; the gate only
+    # trips on genuinely fast motion. 2.0 m/s rejected legitimate handheld
+    # hand-off motion; 3.0 m/s keeps a hard teleport guard while giving the
+    # handheld "bring the object to the robot" case headroom. Non-identity.
+    max_centroid_speed_mps: 3.0
     # Raw floods fail before cleanup. Only bounded remote specks may be removed;
     # a comparable disconnected component is an identity ambiguity.
     max_mask_area_ratio: 0.35

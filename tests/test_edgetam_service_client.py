@@ -10,9 +10,11 @@ import pytest
 import z_manip.perception.edgetam_service_client as edgetam_client_module
 from z_manip.perception.edgetam_service_client import (
     PROTOCOL_VERSION,
+    EdgeTamCoast,
     EdgeTamProtocolError,
     EdgeTamServiceClient,
     EdgeTamServiceError,
+    EdgeTamTrack,
     EdgeTamTrackingLost,
     EdgeTamTransportError,
     UrllibJsonTransport,
@@ -161,6 +163,80 @@ def test_update_fails_closed_on_malformed_or_lost_tracking(mutate):
     assert not client.active
     with pytest.raises(EdgeTamTrackingLost, match="no active"):
         client.update(JPEG)
+
+
+def _coast_response(*, frame_seq=1, session_id="pick-17", track_id="track-a"):
+    return {
+        "protocol": PROTOCOL_VERSION,
+        "status": "coasting",
+        "session_id": session_id,
+        "track_id": track_id,
+        "frame_seq": frame_seq,
+        "image_size": [10, 8],
+    }
+
+
+def test_coast_frame_preserves_identity_and_relocks():
+    transport = FakeTransport(
+        [
+            _track_response(),
+            _coast_response(frame_seq=1),
+            _track_response(frame_seq=2, mask=_mask(offset=1)),
+        ],
+    )
+    client = EdgeTamServiceClient(transport=transport)
+
+    client.init(JPEG, [1, 1, 9, 7], session_id="pick-17")
+    coast = client.update(JPEG)
+    relock = client.update(JPEG)
+
+    assert isinstance(coast, EdgeTamCoast)
+    assert coast.coasting is True
+    assert coast.track_id == "track-a"
+    assert coast.frame_seq == 1
+    assert not hasattr(coast, "mask")
+    # The session stays active and the timeline advances so the next frame
+    # relocks the same identity without a re-grounding.
+    assert client.active
+    assert isinstance(relock, EdgeTamTrack)
+    assert relock.coasting is False
+    assert relock.track_id == "track-a"
+    assert relock.frame_seq == 2
+    assert transport.calls[1][2]["frame_seq"] == 1
+    assert transport.calls[2][2]["frame_seq"] == 2
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (lambda r: r.update(track_id="track-b"), EdgeTamTrackingLost),
+        (lambda r: r.update(session_id="pick-99"), EdgeTamProtocolError),
+        (lambda r: r.update(frame_seq=5), EdgeTamTrackingLost),
+        (lambda r: r.update(image_size=[11, 8]), EdgeTamTrackingLost),
+    ],
+    ids=["track-jump", "session-jump", "sequence-jump", "image-size-change"],
+)
+def test_coast_frame_enforces_identity_lockstep(mutate, error):
+    coast = _coast_response(frame_seq=1)
+    mutate(coast)
+    transport = FakeTransport([_track_response(), coast])
+    client = EdgeTamServiceClient(transport=transport)
+    client.init(JPEG, [1, 1, 9, 7], session_id="pick-17")
+
+    with pytest.raises(error):
+        client.update(JPEG)
+
+    assert not client.active
+
+
+def test_init_never_accepts_a_coast_status():
+    transport = FakeTransport([_coast_response(frame_seq=0)])
+    client = EdgeTamServiceClient(transport=transport)
+
+    with pytest.raises(EdgeTamTrackingLost):
+        client.init(JPEG, [1, 1, 9, 7], session_id="pick-17")
+
+    assert not client.active
 
 
 def test_out_of_order_caller_frame_is_rejected_before_network_and_clears_lock():

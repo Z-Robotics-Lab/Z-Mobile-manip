@@ -1296,3 +1296,130 @@ def test_result_bbox_must_exactly_bound_mask() -> None:
     with pytest.raises(TrackerFailure, match='exact half-open'):
         subject.update(frame(11))
     assert not subject.active
+
+
+@dataclass(frozen=True)
+class FakeCoast:
+    """Session-preserving keep-alive result mirroring EdgeTamCoast."""
+
+    session_id: str
+    track_id: str
+    frame_seq: int
+    image_size: tuple[int, int]
+    coasting: bool = True
+
+
+class ScriptedClient(FakeClient):
+    """Fake client replaying a fixed 'track'/'coast'/'coast_badid' script."""
+
+    def __init__(self, script: list[str]) -> None:
+        super().__init__()
+        self._script = list(script)
+        self._index = 0
+
+    def update(self, _image_jpeg: bytes, *, frame_seq: int | None = None) -> object:
+        assert frame_seq is not None
+        self.update_calls.append(frame_seq)
+        kind = self._script[self._index]
+        self._index += 1
+        if kind == 'track':
+            return make_track(
+                session_id=self.session_id,
+                frame_seq=frame_seq,
+                bbox=self.next_bbox,
+                track_id=self.next_track_id,
+            )
+        if kind == 'coast':
+            return FakeCoast(self.session_id, self.next_track_id, frame_seq, (6, 5))
+        if kind == 'coast_badid':
+            return FakeCoast(self.session_id, 'intruder', frame_seq, (6, 5))
+        raise AssertionError(kind)
+
+
+def _coast_tracker(
+    script: list[str],
+    *,
+    max_coast: int = 32,
+) -> tuple[FailClosedTracker, ScriptedClient]:
+    client = ScriptedClient(script)
+    subject = FailClosedTracker(
+        client,
+        min_depth_m=0.1,
+        max_depth_m=3.0,
+        min_points=2,
+        max_points=100,
+        max_tracking_coast_frames=max_coast,
+        session_id_factory=lambda: 'test-session',
+    )
+    initialize(subject)
+    return subject, client
+
+
+def test_coast_preserves_identity_and_relocks_without_reset() -> None:
+    subject, client = _coast_tracker(['track', 'coast', 'track'])
+
+    first = subject.update(frame(11))
+    coasted = subject.update(frame(12))
+    relock = subject.update(frame(13))
+
+    assert first is not None and relock is not None
+    # The coast produced no observation but did not tear the identity down.
+    assert coasted is None
+    assert subject.active
+    assert client.reset_calls == 0
+    assert first.track_id == relock.track_id == 'target-7'
+    assert first.session_id == relock.session_id
+    # The service timeline advanced in strict lockstep across the coast.
+    assert client.update_calls == [1, 2, 3]
+
+
+def test_coast_leaves_validated_anchor_untouched() -> None:
+    subject, _client = _coast_tracker(['track', 'coast'])
+    subject.update(frame(11))
+    anchor_before = subject._last_mask.copy()
+    validated_before = subject._last_validated_stamp_ns
+
+    assert subject.update(frame(12)) is None
+
+    assert subject.active
+    assert np.array_equal(subject._last_mask, anchor_before)
+    # Only the service timeline advances; the validated anchor stamp is frozen.
+    assert subject._last_validated_stamp_ns == validated_before
+    assert subject._last_stamp_ns == 12
+
+
+def test_coast_beyond_window_fails_closed_with_typed_reason() -> None:
+    subject, client = _coast_tracker(
+        ['track', 'coast', 'coast', 'coast'],
+        max_coast=2,
+    )
+    subject.update(frame(11))
+    assert subject.update(frame(12)) is None
+    assert subject.update(frame(13)) is None
+
+    with pytest.raises(TrackerFailure, match='coasted beyond') as error:
+        subject.update(frame(14))
+
+    assert error.value.reason_code == 'tracking_coast_exhausted'
+    assert not subject.active
+    assert client.reset_calls >= 1
+
+
+def test_coast_identity_mismatch_is_immediately_terminal() -> None:
+    subject, _client = _coast_tracker(['track', 'coast_badid'])
+    subject.update(frame(11))
+
+    with pytest.raises(TrackerFailure, match='identity changed'):
+        subject.update(frame(12))
+
+    assert not subject.active
+
+
+@pytest.mark.parametrize('bad', [-1, True])
+def test_invalid_coast_window_is_rejected(bad: object) -> None:
+    with pytest.raises(ValueError, match='max_tracking_coast_frames'):
+        FailClosedTracker(
+            FakeClient(),
+            min_points=2,
+            max_tracking_coast_frames=bad,
+        )

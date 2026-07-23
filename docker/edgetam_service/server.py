@@ -51,7 +51,19 @@ class ServiceConfig:
     device: str = "cuda"
     session_timeout_s: float = 30.0
     max_sessions: int = 4
-    max_frames_per_session: int = 1800
+    # The streaming state is pruned every frame (``_prune_streaming_state``) so
+    # GPU memory is bounded independently of frame count.  A low per-session
+    # frame ceiling therefore only forced a periodic identity-destroying
+    # re-acquisition (~2-3 min at field Hz) with no memory benefit.  Keep a
+    # high default; operators can still lower it with the environment override.
+    max_frames_per_session: int = 100_000
+    # A frame whose model mask is empty/too-small/low-score does not end the
+    # identity: EdgeTAM's streaming memory can bridge a brief occlusion and
+    # relock the same track.  Coast (keep the session, advance the timeline,
+    # return no mask) for up to this many *consecutive* such frames before
+    # declaring the identity lost.  0 restores the legacy "kill on first
+    # empty mask" behavior.  32 matches the default streaming-history horizon.
+    max_coast_frames: int = 32
     max_request_bytes: int = 10_700_000
     max_jpeg_bytes: int = 8_000_000
     max_image_pixels: int = 4_194_304
@@ -76,6 +88,9 @@ class ServiceConfig:
                     "EDGETAM_MAX_FRAMES_PER_SESSION",
                     cls.max_frames_per_session,
                 ),
+            ),
+            max_coast_frames=int(
+                os.environ.get("EDGETAM_MAX_COAST_FRAMES", cls.max_coast_frames),
             ),
             max_request_bytes=int(
                 os.environ.get("EDGETAM_MAX_REQUEST_BYTES", cls.max_request_bytes),
@@ -106,6 +121,8 @@ class ServiceConfig:
             raise ValueError("EDGETAM_SESSION_TIMEOUT_S must be positive")
         if config.max_sessions < 1 or config.max_frames_per_session < 1:
             raise ValueError("session and frame limits must be positive")
+        if config.max_coast_frames < 0:
+            raise ValueError("EDGETAM_MAX_COAST_FRAMES cannot be negative")
         if config.max_request_bytes < 1024 or config.max_jpeg_bytes < 1024:
             raise ValueError("request and JPEG limits are too small")
         if config.max_image_pixels < 1 or config.min_mask_pixels < 1:
@@ -127,6 +144,9 @@ class TrackingSession:
     last_access_s: float
     lock: threading.RLock = field(default_factory=threading.RLock)
     closed: bool = False
+    # Consecutive coasting frames (empty/low-score model mask) since the last
+    # published mask.  Reset to zero on every tracking frame.
+    coast_frames: int = 0
 
 
 def _json_int(value: object, name: str, *, minimum: int = 0) -> int:
@@ -241,22 +261,25 @@ def decode_jpeg(value: object, config: ServiceConfig) -> np.ndarray:
 def encode_coco_rle(mask: np.ndarray) -> dict[str, object]:
     array = np.asarray(mask, dtype=bool)
     flat = array.reshape(-1, order="F")
-    counts: list[int] = []
-    current = False
-    run = 0
-    for pixel in flat:
-        value = bool(pixel)
-        if value == current:
-            run += 1
-        else:
-            counts.append(run)
-            current = value
-            run = 1
-    counts.append(run)
+    # Vectorized run-length encoding.  This is byte-for-byte equivalent to the
+    # previous per-pixel loop but avoids ~8 ms/frame of Python interpreter
+    # overhead on a 640x480 mask, shortening the inference round trip.
+    if flat.size == 0:
+        counts: list[int] = [0]
+    else:
+        changes = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+        boundaries = np.concatenate(
+            (np.array([0], dtype=np.int64), changes, np.array([flat.size], dtype=np.int64)),
+        )
+        counts = np.diff(boundaries).tolist()
+        # COCO RLE counts always begin with a background (False) run; prepend a
+        # zero-length run when the first pixel is foreground.
+        if bool(flat[0]):
+            counts = [0] + counts
     return {
         "encoding": "coco_rle",
         "size": [int(array.shape[0]), int(array.shape[1])],
-        "counts": counts,
+        "counts": [int(count) for count in counts],
     }
 
 
@@ -556,6 +579,16 @@ class EdgeTamApplication:
                     frame_seq,
                 )
             except TrackingFailure as exc:
+                # The model forward pass already advanced EdgeTAM's streaming
+                # memory for this frame; only the *mask* was empty/low-score.
+                # Coast (keep the identity, advance the timeline, publish no
+                # mask) so a brief occlusion or motion-blur frame cannot destroy
+                # a session that the streaming memory can still relock.
+                if session.coast_frames < self.config.max_coast_frames:
+                    session.coast_frames += 1
+                    session.last_frame_seq = frame_seq
+                    session.last_access_s = time.monotonic()
+                    return self._coast_response(session)
                 self._drop(session)
                 raise ServiceFault(
                     HTTPStatus.GONE,
@@ -567,6 +600,7 @@ class EdgeTamApplication:
                 # now-unreachable inference state resident in the session map.
                 self._drop(session)
                 raise
+            session.coast_frames = 0
             session.last_frame_seq = frame_seq
             session.last_access_s = time.monotonic()
             return self._track_response(session, mask, score)
@@ -678,6 +712,25 @@ class EdgeTamApplication:
                 self.backend.reset(session.inference_state)
             finally:
                 session.lock.release()
+
+    def _coast_response(self, session: TrackingSession) -> dict[str, object]:
+        """Report a session-preserving coast with no mask observation.
+
+        Identity fields (session_id, track_id, frame_seq, image_size) stay in
+        strict lockstep with the tracking contract; only the mask/bbox/score
+        are withheld because the model produced no trustworthy target this
+        frame.  The consumer must treat this as keep-alive, never as an
+        observation to publish or verify.
+        """
+        width, height = session.image_size
+        return {
+            "protocol": PROTOCOL_VERSION,
+            "status": "coasting",
+            "session_id": session.session_id,
+            "track_id": session.track_id,
+            "frame_seq": session.last_frame_seq,
+            "image_size": [width, height],
+        }
 
     def _track_response(
         self,

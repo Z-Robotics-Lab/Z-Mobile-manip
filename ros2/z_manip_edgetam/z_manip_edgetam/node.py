@@ -386,6 +386,9 @@ class EdgeTamAdapter(Node):
                     'max_contained_collapse_recovery_frames',
                 ).value,
             ),
+            max_tracking_coast_frames=int(
+                self.get_parameter('max_tracking_coast_frames').value,
+            ),
             max_centroid_speed_mps=float(
                 self.get_parameter('max_centroid_speed_mps').value,
             ),
@@ -561,7 +564,14 @@ class EdgeTamAdapter(Node):
             'min_motion_reanchor_area_ratio': 0.60,
             'max_motion_reanchor_displacement_ratio': 1.25,
             'max_contained_collapse_recovery_frames': 2,
-            'max_centroid_speed_mps': 2.0,
+            # Keep the EdgeTAM identity alive across up to this many consecutive
+            # coasting (empty/low-score-mask) service frames instead of failing
+            # closed on the first one; matches the service streaming-memory
+            # horizon.  0 restores legacy behavior.
+            'max_tracking_coast_frames': 32,
+            # Δt-adaptive 3-D centroid gate; 3.0 m/s gives handheld hand-off
+            # headroom while retaining a hard teleport guard. See edgetam.yaml.
+            'max_centroid_speed_mps': 3.0,
             'max_mask_area_ratio': 0.35,
             'max_rejected_mask_ratio': 0.08,
             'max_largest_rejected_to_selected_ratio': 0.20,
@@ -687,6 +697,8 @@ class EdgeTamAdapter(Node):
             )
         if int(self.get_parameter('target_mask_dilation_px').value) < 0:
             raise ValueError('target_mask_dilation_px cannot be negative')
+        if int(self.get_parameter('max_tracking_coast_frames').value) < 0:
+            raise ValueError('max_tracking_coast_frames cannot be negative')
         filter_fraction = float(
             self.get_parameter('depth_filter_min_valid_fraction').value,
         )

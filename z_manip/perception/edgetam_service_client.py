@@ -84,6 +84,28 @@ class EdgeTamTrack:
     score: float
     mask: np.ndarray
 
+    # Discriminates from :class:`EdgeTamCoast` without an isinstance import.
+    coasting: bool = False
+
+
+@dataclass(frozen=True, eq=False)
+class EdgeTamCoast:
+    """A session-preserving keep-alive frame that carries no mask.
+
+    The service produced no trustworthy target mask this frame (brief
+    occlusion / motion blur) but kept the identity alive.  Identity fields stay
+    in strict lockstep with the tracking contract.  Callers must never treat a
+    coast as an observation: it has no mask, bbox, or score and must not be
+    published or verified.
+    """
+
+    session_id: str
+    track_id: str
+    frame_seq: int
+    image_size: tuple[int, int]
+
+    coasting: bool = True
+
 
 def _json_int(value: object, *, name: str, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -350,7 +372,12 @@ class EdgeTamServiceClient:
             self._last_activity_s = self._monotonic()
             return track
 
-    def update(self, image_jpeg: bytes, *, frame_seq: int | None = None) -> EdgeTamTrack:
+    def update(
+        self,
+        image_jpeg: bytes,
+        *,
+        frame_seq: int | None = None,
+    ) -> EdgeTamTrack | EdgeTamCoast:
         with self._lock:
             self._require_active()
             now = self._monotonic()
@@ -373,19 +400,28 @@ class EdgeTamServiceClient:
             }
             try:
                 response = self._request("POST", "/v1/sessions/update", payload)
-                track = self._parse_track(
-                    response,
-                    expected_session=str(self._session_id),
-                    expected_seq=frame_seq,
-                    expected_track=str(self._track_id),
-                    expected_size=self._image_size,
-                )
+                if response.get("status") == "coasting":
+                    result: EdgeTamTrack | EdgeTamCoast = self._parse_coast(
+                        response,
+                        expected_session=str(self._session_id),
+                        expected_seq=frame_seq,
+                        expected_track=str(self._track_id),
+                        expected_size=self._image_size,
+                    )
+                else:
+                    result = self._parse_track(
+                        response,
+                        expected_session=str(self._session_id),
+                        expected_seq=frame_seq,
+                        expected_track=str(self._track_id),
+                        expected_size=self._image_size,
+                    )
             except Exception:
                 self._clear()
                 raise
             self._last_frame_seq = frame_seq
             self._last_activity_s = self._monotonic()
-            return track
+            return result
 
     def reset(self) -> None:
         with self._lock:
@@ -502,6 +538,47 @@ class EdgeTamServiceClient:
             bbox_xyxy=bbox,
             score=score,
             mask=mask,
+        )
+
+    def _parse_coast(
+        self,
+        response: Mapping[str, Any],
+        *,
+        expected_session: str,
+        expected_seq: int,
+        expected_track: str | None,
+        expected_size: tuple[int, int] | None,
+    ) -> EdgeTamCoast:
+        """Validate a session-preserving coast frame.
+
+        The identity contract is enforced exactly as for a tracking frame
+        (protocol, session_id, track_id, frame_seq, image_size); only the
+        mask/bbox/score are absent because there is no observation to publish.
+        """
+        if response.get("protocol") != PROTOCOL_VERSION:
+            raise EdgeTamProtocolError("EdgeTAM protocol version mismatch")
+        if response.get("session_id") != expected_session:
+            raise EdgeTamProtocolError("EdgeTAM session identity changed")
+        frame_seq = _json_int(response.get("frame_seq"), name="frame_seq")
+        if frame_seq != expected_seq:
+            raise EdgeTamTrackingLost(
+                f"EdgeTAM coast sequence changed: expected {expected_seq}, got {frame_seq}",
+            )
+        track_id = response.get("track_id")
+        if not isinstance(track_id, str) or not track_id or len(track_id) > 256:
+            raise EdgeTamProtocolError("track_id must be a non-empty bounded string")
+        if expected_track is not None and track_id != expected_track:
+            raise EdgeTamTrackingLost("EdgeTAM track identity changed")
+        image_size = _image_size(response.get("image_size"))
+        if image_size[0] * image_size[1] > self._max_image_pixels:
+            raise EdgeTamProtocolError("image_size exceeds the configured pixel limit")
+        if expected_size is not None and image_size != expected_size:
+            raise EdgeTamTrackingLost("EdgeTAM image dimensions changed within a session")
+        return EdgeTamCoast(
+            session_id=expected_session,
+            track_id=track_id,
+            frame_seq=frame_seq,
+            image_size=image_size,
         )
 
     def _encode_jpeg(self, image_jpeg: bytes) -> str:
