@@ -99,6 +99,7 @@ def main() -> int:
             raise RuntimeError(f"cannot create NUC action directory: {created.stdout.strip()}")
         started = None
         receipts_fetched = False
+        receipt_proved_absent = False
         try:
             copied = run([
                 *scp,
@@ -171,9 +172,16 @@ def main() -> int:
                 if started.returncode in (0, 1):
                     break
                 time.sleep(1.0)
-            if started is not None and started.returncode == 0:
+            receipt_proved_absent = started is not None and started.returncode == 1
+            if not receipt_proved_absent:
+                # The receipt is present (probe 0) or its presence is UNKNOWN
+                # (ssh blip, probe 255).  An unknown probe must still attempt
+                # the fetch: receipts may exist remotely, and skipping here
+                # while the finally block deletes the remote would destroy the
+                # only continuation evidence for a physically held object.
                 args.receipt_dir.parent.mkdir(parents=True, exist_ok=True)
-                args.receipt_dir.mkdir(mode=0o700)
+                if not args.receipt_dir.exists():
+                    args.receipt_dir.mkdir(mode=0o700)
                 fetch_error = ""
                 for _attempt in range(3):
                     fetched = run([
@@ -186,14 +194,18 @@ def main() -> int:
                         break
                     fetch_error = fetched.stdout.strip()
                     time.sleep(1.0)
-                if not receipts_fetched:
+                if not receipts_fetched and started is not None and started.returncode == 0:
+                    # The receipt definitely exists but could not be fetched;
+                    # surface that as the primary failure.  With an unknown
+                    # probe, fall through so a nonzero executor exit reports
+                    # its own (more informative) error instead.
                     raise RuntimeError(
                         "cannot fetch full-grasp receipts after retries "
                         f"(remote evidence preserved at {remote_dir}): {fetch_error}",
                     )
             if executed.returncode != 0:
                 raise RuntimeError(f"NUC full grasp stopped safely (exit {executed.returncode})")
-            if started.returncode != 0:
+            if not (args.receipt_dir / "executor-start-receipt.json").is_file():
                 raise RuntimeError("NUC executor succeeded without transport-start evidence")
             print(json.dumps({
                 "schema": "z_manip.piper_full_grasp_remote.v1",
@@ -203,15 +215,16 @@ def main() -> int:
             }, sort_keys=True))
             return 0
         finally:
-            # Keep the remote action dir whenever transport-start evidence
-            # exists but the receipts never landed locally -- deleting it
-            # would strand a held object with no continuation state.
-            evidence_at_risk = (
-                started is not None
-                and started.returncode == 0
-                and not receipts_fetched
-            )
-            if not evidence_at_risk:
+            # Delete the remote action dir ONLY when the evidence is secured:
+            # receipts landed locally, or the probe PROVED no start receipt
+            # exists (transport never opened, nothing can be held).  Any other
+            # state -- unknown probe, early exception before the probe ran,
+            # failed fetch -- preserves the remote copy, because deleting it
+            # could strand a held object with no continuation state.  The cost
+            # of a false keep is one stale directory; the cost of a false
+            # delete is unrecoverable.
+            evidence_secured = receipts_fetched or receipt_proved_absent
+            if evidence_secured:
                 run([*ssh, f"rm -rf {shlex.quote(remote_dir)}"], timeout=10.0)
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)

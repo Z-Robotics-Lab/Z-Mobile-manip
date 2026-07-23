@@ -130,7 +130,15 @@ def test_timed_lift_stretches_schedule_at_lower_requested_speed() -> None:
     assert 0.60 <= clock.value <= 0.65
 
 
-def test_timed_lift_fails_closed_instead_of_bursting_late_targets() -> None:
+def test_timed_lift_resyncs_through_bounded_host_jitter() -> None:
+    """A late host re-anchors the schedule instead of abandoning the lift.
+
+    Live NUC evidence 2026-07-23: four consecutive mobile handoffs grasped
+    the object and then died at the old fail-closed lag gate ~1.5s into the
+    lift stream, stranding a held object.  Bounded jitter must stretch the
+    schedule, command every target exactly once, and complete.
+    """
+
     class LateClock(FakeClock):
         def sleep(self, duration: float) -> None:
             self.value += max(0.0, float(duration)) + 0.40
@@ -139,7 +147,34 @@ def test_timed_lift_fails_closed_instead_of_bursting_late_targets() -> None:
     clock = LateClock()
     robot = StreamingRobot(path[0])
 
-    with pytest.raises(EXECUTOR.SafetyError, match="schedule lag"):
+    final = EXECUTOR.execute_timed_joint_path(
+        robot,
+        path,
+        np.asarray((0.0, 0.05, 0.10)),
+        EXECUTOR.CommandGuard(),
+        speed_percent=15,
+        segment_timeout_s=1.0,
+        start_tolerance_rad=0.01,
+        feedback_tolerance_rad=0.01,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    move_targets = [value for name, value in robot.commands if name == "move_j"]
+    assert len(move_targets) == len(path) - 1
+    np.testing.assert_allclose(final, path[-1])
+
+
+def test_timed_lift_fails_closed_when_resync_budget_is_exhausted() -> None:
+    class StalledClock(FakeClock):
+        def sleep(self, duration: float) -> None:
+            self.value += max(0.0, float(duration)) + 2.0
+
+    path = np.vstack((_q(0.0), _q(0.05), _q(0.10)))
+    clock = StalledClock()
+    robot = StreamingRobot(path[0])
+
+    with pytest.raises(EXECUTOR.SafetyError, match="resync budget"):
         EXECUTOR.execute_timed_joint_path(
             robot,
             path,
@@ -153,4 +188,7 @@ def test_timed_lift_fails_closed_instead_of_bursting_late_targets() -> None:
             sleep=clock.sleep,
         )
 
-    assert not any(name == "move_j" for name, _value in robot.commands)
+    # One target was legitimately commanded before the budget ran out; the
+    # abort must not burst the remainder.
+    move_targets = [value for name, value in robot.commands if name == "move_j"]
+    assert len(move_targets) == 1

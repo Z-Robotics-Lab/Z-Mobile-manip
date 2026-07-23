@@ -94,6 +94,14 @@ LIFT_STREAM_REFERENCE_SPEED_PERCENT = 15
 # on a non-realtime host; the previous 0.15 s tripped on ordinary scheduler
 # jitter and its failure path unloaded a holding arm.
 LIFT_STREAM_MAX_SCHEDULE_LAG_S = 0.30
+# A late host RE-ANCHORS the remaining schedule instead of aborting: aborting
+# mid-lift strands a held object, while shifting the schedule only stretches
+# the planned velocity profile (never compresses it) and still commands one
+# fresh-fault-checked target per tick.  The cumulative shift is bounded; a
+# host stalled beyond this budget still aborts.  Live NUC evidence 2026-07-23:
+# four consecutive mobile handoffs grasped and then died at this gate ~1.5s
+# into the lift stream.
+LIFT_STREAM_MAX_TOTAL_RESYNC_S = 3.0
 RESAMPLED_PATH_TOLERANCE_RAD = 1e-5
 # The physical J3 encoder currently reports +0.005515 rad at the URDF's
 # nominal zero stop.  Keep the reconciliation gate narrowly above that
@@ -1305,6 +1313,7 @@ def execute_timed_joint_path(
     feedback_tolerance_rad: float,
     reference_speed_percent: int = LIFT_STREAM_REFERENCE_SPEED_PERCENT,
     max_schedule_lag_s: float = LIFT_STREAM_MAX_SCHEDULE_LAG_S,
+    max_total_resync_s: float = LIFT_STREAM_MAX_TOTAL_RESYNC_S,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> np.ndarray:
@@ -1312,8 +1321,10 @@ def execute_timed_joint_path(
 
     Targets retain the planner's bounded quintic velocity/acceleration profile.
     Requested speeds below the validated reference stretch the schedule; higher
-    speeds never compress it.  A delayed host aborts instead of bursting stale
-    targets onto CAN, and the final target still requires fresh feedback.
+    speeds never compress it.  A delayed host re-anchors the remaining
+    schedule (bounded by ``max_total_resync_s``) rather than bursting stale
+    targets onto CAN or abandoning a held object mid-lift, and the final
+    target still requires fresh feedback.
     """
     positions = np.asarray(path, dtype=float)
     times = np.asarray(times_s, dtype=float)
@@ -1334,6 +1345,8 @@ def execute_timed_joint_path(
         raise ValueError("reference speed percent is outside the executor range")
     if not math.isfinite(max_schedule_lag_s) or max_schedule_lag_s <= 0.0:
         raise ValueError("maximum schedule lag must be finite and positive")
+    if not math.isfinite(max_total_resync_s) or max_total_resync_s < 0.0:
+        raise ValueError("maximum total resync must be finite and non-negative")
 
     check_arm_status(robot, require_idle=False)
     actual, _ = read_joint_feedback(robot)
@@ -1348,6 +1361,8 @@ def execute_timed_joint_path(
     before_final_stamp = -math.inf
     before_final_status_stamp = -math.inf
     actual_before_final = actual
+    resync_total_s = 0.0
+    resync_count = 0
     for index, target in enumerate(positions[1:], start=1):
         due = started + float(times[index]) * time_scale
         remaining = due - monotonic()
@@ -1355,9 +1370,28 @@ def execute_timed_joint_path(
             sleep(remaining)
         lag = monotonic() - due
         if lag > max_schedule_lag_s:
-            raise SafetyError(
-                f"timed path schedule lag {lag:.3f}s exceeds "
-                f"{max_schedule_lag_s:.3f}s",
+            # Re-anchor: shift the whole remaining schedule by the observed
+            # lag so this target is commanded now and later targets keep
+            # their planned relative spacing.  No stale burst is possible --
+            # each loop iteration still commands exactly one target after a
+            # fresh fault check -- and the profile is only stretched in wall
+            # time.  Aborting here mid-lift would strand a held object; only
+            # a host stalled beyond the cumulative budget aborts.
+            resync_total_s += lag
+            resync_count += 1
+            if resync_total_s > max_total_resync_s:
+                raise SafetyError(
+                    f"timed path schedule lag {lag:.3f}s exceeds "
+                    f"{max_schedule_lag_s:.3f}s and the cumulative resync "
+                    f"budget {max_total_resync_s:.1f}s is exhausted "
+                    f"({resync_total_s:.3f}s over {resync_count} resyncs)",
+                )
+            started += lag
+            print(
+                f"lift stream resync {resync_count}: lag {lag:.3f}s, "
+                f"cumulative {resync_total_s:.3f}s of "
+                f"{max_total_resync_s:.1f}s",
+                flush=True,
             )
         # Fault feedback remains authoritative during streaming.  The
         # per-waypoint idle/in-tolerance gate is intentionally absent: it was
