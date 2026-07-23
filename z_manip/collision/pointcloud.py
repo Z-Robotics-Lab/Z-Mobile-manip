@@ -127,6 +127,16 @@ class RobotCollisionModel:
     point_radius_m: float = 0.005
     scene_noise_tolerance_m: float = 0.0
     scene_noise_min_support_points: int = 1
+    # Optional, default-off relaxation for the finger-vs-scene approach check.
+    # When enabled the checker fits the horizontal support surface beneath the
+    # grasp target and drops scene samples inside a tight in-plane band from the
+    # cloud that finger capsules are tested against.  Every other capsule (palm,
+    # wrist, arm) and every other collision family keep the full cloud, so only
+    # table/floor grazing under a top-down grasp is exempted, not real obstacles.
+    finger_support_plane_exclusion: bool = False
+    finger_support_plane_band_m: float = 0.006
+    finger_support_plane_radius_m: float = 0.18
+    finger_support_plane_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
 
     def __post_init__(self) -> None:
         if not self.capsules:
@@ -142,6 +152,20 @@ class RobotCollisionModel:
             raise ValueError("scene collision margins must be finite and non-negative")
         if self.scene_noise_min_support_points < 1:
             raise ValueError("scene noise support count must be positive")
+        if (
+            not np.isfinite(self.finger_support_plane_band_m)
+            or self.finger_support_plane_band_m < 0.0
+            or not np.isfinite(self.finger_support_plane_radius_m)
+            or self.finger_support_plane_radius_m <= 0.0
+        ):
+            raise ValueError(
+                "finger support-plane band/radius must be finite, band>=0, radius>0",
+            )
+        normal = np.asarray(self.finger_support_plane_normal, dtype=float)
+        if normal.shape != (3,) or not np.all(np.isfinite(normal)) or float(
+            np.linalg.norm(normal)
+        ) <= 1e-9:
+            raise ValueError("finger support-plane normal must be a finite nonzero 3-vector")
         names = [capsule.name for capsule in self.capsules]
         if len(names) != len(set(names)):
             raise ValueError("capsule names must be unique")
@@ -169,6 +193,18 @@ class RobotCollisionModel:
             scene_noise_tolerance_m=float(data.get("scene_noise_tolerance_m", 0.0)),
             scene_noise_min_support_points=int(
                 data.get("scene_noise_min_support_points", 1)
+            ),
+            finger_support_plane_exclusion=bool(
+                data.get("finger_support_plane_exclusion", False)
+            ),
+            finger_support_plane_band_m=float(
+                data.get("finger_support_plane_band_m", 0.006)
+            ),
+            finger_support_plane_radius_m=float(
+                data.get("finger_support_plane_radius_m", 0.18)
+            ),
+            finger_support_plane_normal=tuple(
+                data.get("finger_support_plane_normal", (0.0, 0.0, 1.0))
             ),
         )
 
@@ -364,6 +400,11 @@ class PointCloudCollisionChecker:
         self._tree: cKDTree | None = None
         self._scene_stamp_s: float | None = None
         self._scene_problem = "no perception cloud has been received"
+        # Lazily fitted finger-vs-scene support-plane exclusion (default off).
+        self._finger_scene_tree: cKDTree | None = None
+        self._finger_scene_points: np.ndarray | None = None
+        self._finger_scene_excluded = 0
+        self._finger_scene_ready = False
         self._target_points: np.ndarray | None = None
         self._target_tree: cKDTree | None = None
         self._target_allowed_capsules: frozenset[str] = frozenset()
@@ -401,10 +442,17 @@ class PointCloudCollisionChecker:
             if pair not in ignored
         )
 
+    def _clear_finger_scene_exclusion(self) -> None:
+        self._finger_scene_tree = None
+        self._finger_scene_points = None
+        self._finger_scene_excluded = 0
+        self._finger_scene_ready = False
+
     def _clear_scene(self, reason: str) -> None:
         self._points = None
         self._tree = None
         self._clear_departure_contact()
+        self._clear_finger_scene_exclusion()
         self._scene_stamp_s = None
         self._scene_problem = reason
 
@@ -451,6 +499,7 @@ class PointCloudCollisionChecker:
         self._points = filtered
         self._tree = cKDTree(filtered) if len(filtered) else None
         self._clear_departure_contact()
+        self._clear_finger_scene_exclusion()
         self._scene_stamp_s = float(stamp_s)
         if len(filtered) < self.config.min_scene_points:
             self._scene_problem = (
@@ -495,6 +544,7 @@ class PointCloudCollisionChecker:
         self._attached_target_tree_tip = None
         self._attached_target_allow_scene_contact = False
         self._clear_departure_contact()
+        self._clear_finger_scene_exclusion()
         return len(filtered)
 
     def _support_contact_mask(
@@ -861,15 +911,82 @@ class PointCloudCollisionChecker:
             world_capsules.append(_WorldCapsule(capsule, start, end))
         return tuple(world_capsules), None
 
-    def _check_scene_capsule(self, capsule: _WorldCapsule) -> CollisionResult | None:
-        assert self._tree is not None and self._points is not None
+    @staticmethod
+    def _is_finger_capsule(spec: CapsuleSpec) -> bool:
+        """Identify parallel-jaw finger capsules by their conventional prefix."""
+
+        return spec.name.startswith("finger")
+
+    def _ensure_finger_scene_exclusion(self) -> None:
+        """Fit the support surface beneath the target and drop its in-plane band.
+
+        The reduced cloud is consulted only for finger-capsule scene checks and
+        only when the model explicitly enables it.  Fitting is deterministic:
+        the support plane is horizontal (a configured base-frame normal) and its
+        offset is anchored to the lowest target extent, i.e. the object's contact
+        with the table or floor.  A tight symmetric band about that plane, capped
+        to a lateral radius under the target, is removed.  Genuine obstacles above
+        the band or outside the radius stay in the finger cloud.
+        """
+
+        if self._finger_scene_ready:
+            return
+        self._finger_scene_ready = True
+        self._finger_scene_tree = self._tree
+        self._finger_scene_points = self._points
+        self._finger_scene_excluded = 0
+        if (
+            not self.model.finger_support_plane_exclusion
+            or self._points is None
+            or self._tree is None
+            or self._target_points is None
+            or len(self._points) == 0
+        ):
+            return
+        normal = np.asarray(self.model.finger_support_plane_normal, dtype=float)
+        normal = normal / float(np.linalg.norm(normal))
+        target = self._target_points
+        centroid = np.mean(target, axis=0)
+        band = float(self.model.finger_support_plane_band_m)
+        radius = float(self.model.finger_support_plane_radius_m)
+        points = self._points
+        offsets = points - centroid
+        axial = offsets @ normal
+        lateral = np.linalg.norm(offsets - axial[:, None] * normal, axis=1)
+        near = lateral <= radius
+        if not np.any(near):
+            return
+        # Anchor the plane to the object's support contact: the lowest target
+        # extent along the normal is where the object meets the table or floor.
+        support_height = float(np.min(target @ normal))
+        heights = points @ normal
+        inlier = near & (np.abs(heights - support_height) <= band)
+        excluded = int(np.count_nonzero(inlier))
+        if excluded == 0:
+            return
+        kept = np.ascontiguousarray(points[~inlier], dtype=float)
+        self._finger_scene_points = kept
+        self._finger_scene_tree = cKDTree(kept) if len(kept) else None
+        self._finger_scene_excluded = excluded
+
+    def _check_scene_capsule(
+        self,
+        capsule: _WorldCapsule,
+        *,
+        tree: cKDTree | None = None,
+        points: np.ndarray | None = None,
+    ) -> CollisionResult | None:
+        if tree is None and points is None:
+            tree, points = self._tree, self._points
+        if tree is None or points is None or len(points) == 0:
+            return None
         center = 0.5 * (capsule.start + capsule.end)
         half_length = 0.5 * float(np.linalg.norm(capsule.end - capsule.start))
         threshold = capsule.spec.radius + self.config.clearance + self.config.point_radius
-        candidate_indices = self._tree.query_ball_point(center, half_length + threshold)
+        candidate_indices = tree.query_ball_point(center, half_length + threshold)
         if not candidate_indices:
             return None
-        candidates = self._points[np.asarray(candidate_indices, dtype=int)]
+        candidates = points[np.asarray(candidate_indices, dtype=int)]
         distances = _point_segment_distances(candidates, capsule.start, capsule.end)
         closest = float(np.min(distances))
         deep_threshold = max(0.0, threshold - self.config.scene_noise_tolerance)
@@ -1121,9 +1238,22 @@ class PointCloudCollisionChecker:
         attached_scene_collision = self._check_attached_target_scene(base_t_tip)
         if attached_scene_collision is not None:
             return attached_scene_collision
+        finger_exclusion = (
+            self.model.finger_support_plane_exclusion
+            and self._target_points is not None
+        )
+        if finger_exclusion:
+            self._ensure_finger_scene_exclusion()
         for capsule in capsules:
             if capsule.spec.check_scene:
-                scene_collision = self._check_scene_capsule(capsule)
+                if finger_exclusion and self._is_finger_capsule(capsule.spec):
+                    scene_collision = self._check_scene_capsule(
+                        capsule,
+                        tree=self._finger_scene_tree,
+                        points=self._finger_scene_points,
+                    )
+                else:
+                    scene_collision = self._check_scene_capsule(capsule)
                 if scene_collision is not None:
                     return scene_collision
             if capsule.spec.check_target:

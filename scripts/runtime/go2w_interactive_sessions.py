@@ -98,6 +98,7 @@ MAX_WORKER_RESPONSE_BYTES = 8 * 1024 * 1024
 SEARCH_TIMEOUT_S = "6"
 SYMMETRY_SAMPLES = "4"
 MAX_HYPOTHESES = "64"
+MAX_CANDIDATES = "64"
 MAX_FEASIBLE_PLANS = "1"
 SUPPORT_APPROACH_PRIOR_WEIGHT = "0.05"
 SUPERVISED_SCENE_CLEARANCE_M = "0.001"
@@ -1080,6 +1081,10 @@ class FixedReadOnlyBackend:
             "15",
             "--min-bundle-target-points",
             "400",
+            # Keep 400 as the near-field ceiling but scale the demand down with
+            # the seed's median depth so a genuinely far, small target is not
+            # geometrically killed by a flat count sized for a near object.
+            "--distance-aware-bundle-gate",
         )
         perception_args = base_perception_args + (
             # A close-range handoff commonly asks for the exact same target
@@ -1579,6 +1584,8 @@ class FixedReadOnlyBackend:
             SYMMETRY_SAMPLES,
             "--max-hypotheses",
             MAX_HYPOTHESES,
+            "--max-candidates",
+            MAX_CANDIDATES,
             "--max-feasible-plans",
             MAX_FEASIBLE_PLANS,
             "--support-approach-prior-weight",

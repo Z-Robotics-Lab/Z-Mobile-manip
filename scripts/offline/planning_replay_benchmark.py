@@ -175,6 +175,7 @@ def planner_command(
     symmetry_samples: int,
     max_hypotheses: int,
     max_feasible_plans: int,
+    max_candidates: int,
     support_approach_prior_weight: float,
     scene_clearance_m: float,
     scene_point_radius_m: float,
@@ -209,6 +210,7 @@ def planner_command(
         "--search-timeout-s", str(search_timeout_s),
         "--symmetry-samples", str(symmetry_samples),
         "--max-hypotheses", str(max_hypotheses),
+        "--max-candidates", str(max_candidates),
         "--max-feasible-plans", str(max_feasible_plans),
         "--support-approach-prior-weight", str(support_approach_prior_weight),
         "--scene-clearance-m", str(scene_clearance_m),
@@ -348,6 +350,7 @@ def run_trial(
         symmetry_samples=options.symmetry_samples,
         max_hypotheses=options.max_hypotheses,
         max_feasible_plans=options.max_feasible_plans,
+        max_candidates=options.max_candidates,
         support_approach_prior_weight=options.support_approach_prior_weight,
         scene_clearance_m=options.scene_clearance_m,
         scene_point_radius_m=options.scene_point_radius_m,
@@ -635,6 +638,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-timeout-s", type=_positive, default=6.0)
     parser.add_argument("--symmetry-samples", type=int, default=4)
     parser.add_argument("--max-hypotheses", type=int, default=64)
+    parser.add_argument("--max-candidates", type=int, default=64)
     parser.add_argument("--max-feasible-plans", type=int, default=1)
     parser.add_argument("--support-approach-prior-weight", type=float, default=0.05)
     parser.add_argument("--scene-clearance-m", type=_positive, default=0.001)

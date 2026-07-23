@@ -657,3 +657,67 @@ def test_attached_target_contact_modes_are_mutually_exclusive(tmp_path):
             allow_scene_contact=True,
             allow_initial_scene_contact=True,
         )
+
+
+def _finger_checker(tmp_path, *, exclusion, band=0.006, radius=0.18):
+    chain, frames = _chain_and_frames(tmp_path)
+    model = RobotCollisionModel(
+        capsules=(
+            CapsuleSpec(
+                "finger_test",
+                "tool",
+                "tool",
+                0.02,
+                start_offset=(0.0, 0.0, 0.0),
+                end_offset=(0.0, 0.0, 0.001),
+            ),
+        ),
+        finger_support_plane_exclusion=exclusion,
+        finger_support_plane_band_m=band,
+        finger_support_plane_radius_m=radius,
+    )
+    return PointCloudCollisionChecker(
+        chain=chain,
+        model=model,
+        frame_provider=frames,
+        config=PointCloudCollisionConfig(
+            clearance=0.01,
+            point_radius=0.0,
+            min_scene_points=1,
+            max_scene_age_s=0.5,
+            segment_joint_step=0.02,
+        ),
+        now_fn=lambda: 10.0,
+    )
+
+
+def test_finger_support_plane_exclusion_clears_in_plane_graze(tmp_path):
+    # Object standing on a support plane at z=0.0, offset laterally so it does
+    # not itself contact the finger.  A single floor sample sits right under the
+    # finger at the fitted support height.
+    target = np.array([[0.20, 0.10, z] for z in np.linspace(0.0, 0.05, 6)])
+    floor_graze = np.array([[0.20, 0.0, 0.0]])
+    joints = np.array([0.20])
+
+    off = _finger_checker(tmp_path, exclusion=False)
+    off.update_scene(floor_graze, stamp_s=10.0)
+    off.update_target(target)
+    assert off.check_state(joints).kind == "scene"  # graze vetoes the finger
+
+    on = _finger_checker(tmp_path, exclusion=True)
+    on.update_scene(floor_graze, stamp_s=10.0)
+    on.update_target(target)
+    assert on.check_state(joints).valid  # in-plane sample excluded for the finger
+
+
+def test_finger_support_plane_exclusion_keeps_off_plane_obstacle(tmp_path):
+    # Same geometry but the object (hence the fitted support plane) is high up,
+    # so the sample under the finger is far below the plane and must stay active.
+    target = np.array([[0.20, 0.10, z] for z in np.linspace(0.30, 0.35, 6)])
+    obstacle = np.array([[0.20, 0.0, 0.0]])
+    joints = np.array([0.20])
+
+    on = _finger_checker(tmp_path, exclusion=True)
+    on.update_scene(obstacle, stamp_s=10.0)
+    on.update_target(target)
+    assert on.check_state(joints).kind == "scene"  # off-plane obstacle preserved

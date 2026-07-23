@@ -35,6 +35,15 @@ class IKConfig:
     continuation_timeout_s: float = 0.18
     continuation_seed_timeout_s: float = 0.08
     continuation_fallback_seeds: int = 2
+    # Optional, default-off anisotropic acceptance (FROZEN-SAFETY study flag).
+    # When ``orientation_free_axis_tolerance_rad`` is positive, orientation
+    # acceptance is split: the residual rotation *about* ``orientation_free_axis``
+    # (expressed in the goal tip frame) may reach this relaxed tolerance while
+    # the transverse residual — which carries finger closing-line alignment —
+    # must still stay within ``orientation_tolerance_rad``.  Zero preserves the
+    # historical isotropic geodesic gate exactly.
+    orientation_free_axis_tolerance_rad: float = 0.0
+    orientation_free_axis: tuple[float, float, float] = (0.0, 1.0, 0.0)
 
     def __post_init__(self) -> None:
         positive = (
@@ -58,6 +67,20 @@ class IKConfig:
             raise ValueError("IK feasible-solution count must be positive")
         if self.continuation_fallback_seeds < 0:
             raise ValueError("IK continuation fallback seed count cannot be negative")
+        if (
+            not np.isfinite(self.orientation_free_axis_tolerance_rad)
+            or self.orientation_free_axis_tolerance_rad < 0.0
+        ):
+            raise ValueError(
+                "orientation_free_axis_tolerance_rad must be finite and non-negative",
+            )
+        free_axis = np.asarray(self.orientation_free_axis, dtype=float)
+        if free_axis.shape != (3,) or not np.all(np.isfinite(free_axis)) or float(
+            np.linalg.norm(free_axis)
+        ) <= 1e-9:
+            raise ValueError(
+                "orientation_free_axis must be a finite nonzero 3-vector",
+            )
 
 
 @dataclass(frozen=True)

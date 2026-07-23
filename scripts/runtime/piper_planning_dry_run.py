@@ -968,6 +968,15 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="planning-only number of complete plans retained before returning",
     )
     parser.add_argument(
+        "--max-candidates",
+        type=_positive_int,
+        help=(
+            "planning-only count of scored hypotheses that receive exact IK and "
+            "collision checks; the deterministic diversity down-select keeps this "
+            "many of --max-hypotheses.  Raise to evaluate the full hypothesis set"
+        ),
+    )
+    parser.add_argument(
         "--support-approach-prior-weight",
         type=_support_approach_prior_weight,
         default=0.0,
@@ -1013,6 +1022,27 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "URDF mesh self-collision remains unchanged"
         ),
     )
+    parser.add_argument(
+        "--finger-support-plane-exclusion",
+        action="store_true",
+        help=(
+            "planning-only: drop scene samples inside a tight in-plane band of the "
+            "fitted support surface from the finger-vs-scene approach check only; "
+            "palm/wrist/arm capsules and all other collision families are unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--finger-support-plane-band-m",
+        type=_positive_float,
+        default=0.006,
+        help="planning-only half-thickness of the excluded support-plane band",
+    )
+    parser.add_argument(
+        "--finger-support-plane-radius-m",
+        type=_positive_float,
+        default=0.18,
+        help="planning-only lateral radius under the target within which support points are excluded",
+    )
     return parser.parse_args(argv)
 
 
@@ -1038,6 +1068,7 @@ def _load_planner(args: argparse.Namespace) -> tuple[object, object, bool]:
         args.symmetry_samples,
         args.max_hypotheses,
         args.max_feasible_plans,
+        args.max_candidates,
     )
     cached = _PLANNER_CACHE.get(key)
     if cached is None:
@@ -1049,6 +1080,7 @@ def _load_planner(args: argparse.Namespace) -> tuple[object, object, bool]:
                 args.symmetry_samples,
                 args.max_hypotheses,
                 args.max_feasible_plans,
+                args.max_candidates,
             )
         ):
             config = replace(
@@ -1074,6 +1106,11 @@ def _load_planner(args: argparse.Namespace) -> tuple[object, object, bool]:
                         config.grasp_plan.max_feasible_plans
                         if args.max_feasible_plans is None
                         else args.max_feasible_plans
+                    ),
+                    max_candidates=(
+                        config.grasp_plan.max_candidates
+                        if args.max_candidates is None
+                        else args.max_candidates
                     ),
                 ),
             )
@@ -1172,6 +1209,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "applied_clearance_m": planner.collision_model.scene_clearance_m,
         }
 
+    if args.finger_support_plane_exclusion:
+        # Supervised, planning-only relaxation of the finger-vs-scene approach
+        # check near the fitted support surface.  Every other capsule and every
+        # other collision family keep the full perceived cloud.
+        planner.collision_model = replace(
+            planner.collision_model,
+            finger_support_plane_exclusion=True,
+            finger_support_plane_band_m=args.finger_support_plane_band_m,
+            finger_support_plane_radius_m=args.finger_support_plane_radius_m,
+        )
+    uncertainty["finger_support_plane_exclusion"] = bool(
+        planner.collision_model.finger_support_plane_exclusion
+    )
+
     grasps_base = transform_poses(archive["grasps"], base_from_camera)
     centroid_base = transform_points(
         np.asarray(archive["centroid"], dtype=float).reshape(1, 3),
@@ -1251,7 +1302,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "planning_search_timeout_s": config.grasp_plan.search_timeout_s,
         "planning_symmetry_samples": config.grasp_plan.symmetry_samples,
         "planning_max_hypotheses": config.grasp_plan.max_hypotheses,
+        "planning_max_candidates": config.grasp_plan.max_candidates,
         "planning_max_feasible_plans": config.grasp_plan.max_feasible_plans,
+        "planning_max_width_m": config.grasp_plan.max_width_m,
         "support_approach_prior_weight": args.support_approach_prior_weight,
         "lateral_approach_prior_weight": (
             config.grasp_plan.lateral_approach_prior_weight

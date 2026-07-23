@@ -165,7 +165,7 @@
     "fallback_lift_retreat_m": 0.025,
     "symmetry_samples": 4,
     "min_width_m": 0.012,
-    "max_width_m": 0.068,
+    "max_width_m": 0.062,
     "planning_timeout_s": 4.0,
     "max_candidates": 32,
     "max_cartesian_joint_step_rad": 0.55,

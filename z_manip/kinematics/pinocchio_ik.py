@@ -255,6 +255,40 @@ class PinocchioIKSolver:
     def _weighted_cost(error_twist: np.ndarray, weights: np.ndarray) -> float:
         return float(np.linalg.norm(weights * np.asarray(error_twist, dtype=float)))
 
+    def _orientation_accepted(
+        self,
+        desired_world: object,
+        tip_world: object,
+        geodesic_error: float,
+    ) -> bool:
+        """Accept an orientation residual, optionally anisotropically.
+
+        With the free-axis tolerance disabled (the default) this is exactly the
+        historical isotropic geodesic gate.  When enabled, the residual rotation
+        is split at the goal tip frame into the component *about* the configured
+        free axis and the transverse remainder; the transverse part still carries
+        the finger closing-line alignment and keeps the tight tolerance, while the
+        free-axis roll — a task-free DOF for a parallel jaw — may relax further.
+        """
+
+        free_tolerance = self.config.orientation_free_axis_tolerance_rad
+        if free_tolerance <= 0.0:
+            return geodesic_error < self.config.orientation_tolerance_rad
+        pin = self.pin
+        residual = np.asarray(
+            pin.log3(desired_world.rotation @ tip_world.rotation.T),
+            dtype=float,
+        )
+        axis = np.asarray(self.config.orientation_free_axis, dtype=float)
+        axis = axis / float(np.linalg.norm(axis))
+        free_axis_base = desired_world.rotation @ axis
+        axial = abs(float(residual @ free_axis_base))
+        transverse = float(np.linalg.norm(residual - (residual @ free_axis_base) * free_axis_base))
+        return (
+            transverse < self.config.orientation_tolerance_rad
+            and axial < free_tolerance
+        )
+
     def _attempt(
         self,
         goal: np.ndarray,
@@ -280,7 +314,9 @@ class PinocchioIKSolver:
                 best_joints = joints.copy()
             if (
                 position_error < self.config.position_tolerance_m
-                and orientation_error < self.config.orientation_tolerance_rad
+                and self._orientation_accepted(
+                    desired_world, tip_world, orientation_error
+                )
             ):
                 return self._solution(
                     joints,
