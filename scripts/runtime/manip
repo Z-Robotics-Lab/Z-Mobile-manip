@@ -18,7 +18,8 @@ usage() {
   cat <<'EOF'
 Usage:
   manip start                    Start the local UI/API only
-  manip stop                     Safely stop the local UI/API
+  manip stop                     Stop the whole stack (UI + PC vision + NUC robot services)
+  manip stop ui                  Safely stop only the local UI/API
   manip restart                  Safely restart the local UI/API
   manip bringup                  Bring up the complete PC/NUC vision stack
   manip status [component]       Show all or one component status
@@ -58,6 +59,10 @@ endpoint_flag_true() {
 }
 
 require_idle_ui() {
+  if endpoint_flag_true /api/approach/status running; then
+    printf 'Refusing: a visual approach is running. Press Full Stop in the UI first.\n' >&2
+    return 1
+  fi
   if endpoint_flag_true /api/home/status running; then
     printf 'Refusing: Home is running. Wait for it to finish.\n' >&2
     return 1
@@ -87,6 +92,19 @@ start_ui() {
   printf 'Z-Manip UI is ready: %s/\n' "$UI_URL"
 }
 
+stop_stack() {
+  # Battery swaps and shutdowns must never hard-kill a process that is
+  # holding a lock (a SIGKILLed JACK registry init poisoned /dev/shm on
+  # 2026-07-23); every stop below is a clean systemd/docker stop.
+  if "$SYSTEMCTL" --user is-active --quiet "$UI_UNIT" 2>/dev/null; then
+    require_idle_ui
+  fi
+  "$COMPONENT_MANAGER" shutdown
+  printf 'Full Z-Manip stack stopped (PC + NUC robot services).\n'
+  printf 'Infra containers (navstack, sim) were left untouched.\n'
+  printf 'Safe to power the NUC off now; later restart everything with: manip bringup\n'
+}
+
 stop_ui() {
   if ! "$SYSTEMCTL" --user is-active --quiet "$UI_UNIT" 2>/dev/null; then
     printf 'Z-Manip UI is already stopped.\n'
@@ -114,8 +132,14 @@ case "$command" in
     start_ui
     ;;
   stop)
-    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
-    stop_ui
+    if [[ $# -eq 1 ]]; then
+      stop_stack
+    elif [[ $# -eq 2 && "$2" == ui ]]; then
+      stop_ui
+    else
+      usage >&2
+      exit 2
+    fi
     ;;
   restart)
     [[ $# -eq 1 ]] || { usage >&2; exit 2; }

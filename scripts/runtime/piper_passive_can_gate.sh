@@ -30,7 +30,7 @@ if ! [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 
 unsafe_processes="$(pgrep -af \
-  'piper_sdk|piper_ctrl|piper_driver|piper_ros|agx_arm' || true)"
+  'piper_sdk|piper_ctrl|piper_driver|piper_ros|agx_arm|piper_reactive_view|piper_full_grasp|piper_staged_grasp|piper_wrist_search' || true)"
 if [[ -n "$unsafe_processes" ]]; then
   echo "refusing passive CAN bring-up while an arm process is present:" >&2
   echo "$unsafe_processes" >&2

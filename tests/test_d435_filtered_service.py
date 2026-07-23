@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVICE = ROOT / "configs" / "d435i-filtered.service"
+SERVICE = ROOT / "configs" / "d435i.service"
 
 
 def test_d435_service_persistently_filters_the_aligned_source_depth():

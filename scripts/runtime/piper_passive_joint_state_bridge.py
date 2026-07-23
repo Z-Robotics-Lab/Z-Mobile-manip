@@ -58,7 +58,6 @@ def run(interface: str, topic: str, publish_hz: float, snapshot_span_s: float) -
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import JointState
 
-    tx_at_start = counter(interface, "tx_packets")
     rclpy.init()
     node = rclpy.create_node(
         "piper_passive_joint_state_bridge",
@@ -70,49 +69,80 @@ def run(interface: str, topic: str, publish_hz: float, snapshot_span_s: float) -
     received_by_id: dict[int, float] = {}
     publish_period = 1.0 / publish_hz
     next_publish = time.monotonic()
+    channel: socket.socket | None = None
+    tx_at_start = 0
     last_tx_check = next_publish
     try:
-        with open_receive_socket(interface) as channel:
-            while rclpy.ok():
+        while rclpy.ok():
+            if channel is None:
+                # Single-owner executor windows cycle can0 down and up around
+                # bounded arm motion.  A receive-only bridge must outlive those
+                # windows instead of crash-looping through systemd restarts:
+                # wait for the interface, then rebaseline the TX counter
+                # exactly as a fresh process start would.
                 try:
-                    frame = channel.recv(CAN_FRAME.size)
-                except TimeoutError:
+                    channel = open_receive_socket(interface)
+                    tx_at_start = counter(interface, "tx_packets")
+                except OSError:
+                    time.sleep(0.5)
                     continue
-                if len(frame) != CAN_FRAME.size:
+                received_by_id.clear()
+                last_tx_check = time.monotonic()
+            try:
+                frame = channel.recv(CAN_FRAME.size)
+            except TimeoutError:
+                continue
+            except OSError:
+                channel.close()
+                channel = None
+                received_by_id.clear()
+                time.sleep(0.2)
+                continue
+            if len(frame) != CAN_FRAME.size:
+                continue
+            can_id, dlc, data = CAN_FRAME.unpack(frame)
+            frame_id = can_id & CAN_SFF_MASK
+            if frame_id not in PAIR_BY_ID or dlc != 8:
+                continue
+            now = time.monotonic()
+            received_by_id[frame_id] = now
+            for index, value in decode_joint_pair(frame_id, data[:dlc]):
+                positions[index] = value
+            if now - last_tx_check >= 1.0:
+                try:
+                    tx_now = counter(interface, "tx_packets")
+                except OSError:
+                    channel.close()
+                    channel = None
+                    received_by_id.clear()
                     continue
-                can_id, dlc, data = CAN_FRAME.unpack(frame)
-                frame_id = can_id & CAN_SFF_MASK
-                if frame_id not in PAIR_BY_ID or dlc != 8:
-                    continue
-                now = time.monotonic()
-                received_by_id[frame_id] = now
-                for index, value in decode_joint_pair(frame_id, data[:dlc]):
-                    positions[index] = value
-                if now - last_tx_check >= 1.0:
-                    if counter(interface, "tx_packets") != tx_at_start:
-                        raise RuntimeError(
-                            "can0 TX counter changed while passive bridge was active; "
-                            "stopping rather than coexisting with an unknown transmitter"
-                        )
-                    last_tx_check = now
-                if now < next_publish or any(value is None for value in positions):
-                    continue
-                if (
-                    len(received_by_id) != len(JOINT_FEEDBACK_IDS)
-                    or max(received_by_id.values()) - min(received_by_id.values())
-                    > snapshot_span_s
-                ):
-                    continue
-                message = JointState()
-                message.header.stamp = node.get_clock().now().to_msg()
-                message.header.frame_id = "piper_base_link"
-                message.name = list(JOINT_NAMES)
-                message.position = [float(value) for value in positions]
-                publisher.publish(message)
-                next_publish = now + publish_period
+                if tx_now != tx_at_start:
+                    raise RuntimeError(
+                        "can0 TX counter changed while passive bridge was active; "
+                        "stopping rather than coexisting with an unknown transmitter"
+                    )
+                last_tx_check = now
+            if now < next_publish or any(value is None for value in positions):
+                continue
+            if (
+                len(received_by_id) != len(JOINT_FEEDBACK_IDS)
+                or max(received_by_id.values()) - min(received_by_id.values())
+                > snapshot_span_s
+            ):
+                continue
+            message = JointState()
+            message.header.stamp = node.get_clock().now().to_msg()
+            message.header.frame_id = "piper_base_link"
+            message.name = list(JOINT_NAMES)
+            message.position = [float(value) for value in positions]
+            publisher.publish(message)
+            next_publish = now + publish_period
     finally:
+        if channel is not None:
+            channel.close()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
     return 0
 
 

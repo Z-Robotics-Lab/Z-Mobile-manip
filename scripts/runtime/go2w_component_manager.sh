@@ -44,6 +44,7 @@ SSH="${Z_MANIP_SSH_BIN:-ssh}"
 usage() {
   cat >&2 <<'EOF'
 usage: go2w_component_manager.sh bringup
+       go2w_component_manager.sh shutdown
        go2w_component_manager.sh install
        go2w_component_manager.sh status [all|ui|nuc-camera|passive-feedback|observer|rgbd|grounding|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control]
        go2w_component_manager.sh restart {ui|nuc-camera|passive-feedback|observer|rgbd|grounding|edgetam|perception|perception-all|reactive-control|posture-bridge|whole-body|mobile-control}
@@ -103,7 +104,7 @@ runner_socket_private() {
   group="$(stat -c %g "$path" 2>/dev/null)" || return 1
   mode="$(stat -c %a "$path" 2>/dev/null)" || return 1
   [[ "$owner" == "$(id -u)" && "$group" == "$(id -g)" ]] || return 1
-  ((8#$mode & 077 == 0))
+  (( (8#$mode & 077) == 0 ))
 }
 
 resident_runners_current() {
@@ -515,9 +516,31 @@ restart_one() {
   esac
 }
 
+shutdown_stack() {
+  printf '[%s] full-stack shutdown begin\n' "$(date --iso-8601=seconds)"
+  # The UI owns workflows: stop it first so nothing new can start mid-way.
+  # Every stop below is a clean systemd/docker stop -- a process hard-killed
+  # while holding a lock poisons shared state (JACK /dev/shm, 2026-07-23).
+  $SYSTEMCTL --user stop "$UI_UNIT" 2>/dev/null || true
+  $SYSTEMCTL --user stop "$OBSERVER_UNIT" "$GROUNDING_UNIT" "$POSTURE_UNIT" 2>/dev/null || true
+  "$LAB_SCRIPT" stop >/dev/null 2>&1 || true
+  $DOCKER stop z-manip-edgetam z-mobile-manip-posture-intent z-manip-runtime-observer >/dev/null 2>&1 || true
+  if remote_command 'systemctl --user stop z-mobile-manip-go2w-reactive-live.service z-mobile-manip-piper-reactive-view.service z-manip-piper-passive-feedback.service d435i.service webrtc-video.service 2>/dev/null; true' >/dev/null 2>&1; then
+    printf 'NUC robot services stopped cleanly\n'
+  else
+    printf 'NUC unreachable; its services were not stopped\n' >&2
+  fi
+  printf '[%s] full-stack shutdown complete\n' "$(date --iso-8601=seconds)"
+}
+
 cold_bringup_steps() {
   printf '[%s] cold bringup begin\n' "$(date --iso-8601=seconds)"
   install_pc_units || return 1
+  # A process killed while initialising the JACK client registry leaves a
+  # poisoned BDB mutex in /dev/shm and every later WebRTC-stack import on the
+  # NUC hangs before its first log line (2026-07-23). Clear the stale
+  # registry only while the WebRTC owner is down.
+  remote_command 'systemctl --user is-active --quiet z-mobile-manip-go2w-reactive-live.service || rm -rf /dev/shm/jack_db-1000' >/dev/null 2>&1 || true
   if ! remote_camera_device_ready; then
     printf 'D435 USB device is absent on the NUC; reconnect its USB cable before bringup\n' >&2
     return 1
@@ -531,10 +554,13 @@ cold_bringup_steps() {
   wait_until "NUC passive feedback" passive_feedback_ready || return 1
   restart_one grounding || return 1
   restart_one edgetam || return 1
-  restart_one rgbd || return 1
-  restart_one perception || return 1
+  # The RGB-D health gate reads camera-latest.jpg, which the runtime observer
+  # writes.  On a genuinely cold start (manip stop also stops the observer)
+  # the observer must be running before the RGB-D wait can ever pass.
   $SYSTEMCTL --user enable --now "$OBSERVER_UNIT" || return 1
   wait_until "runtime observer" observer_ready || return 1
+  restart_one rgbd || return 1
+  restart_one perception || return 1
   # ``enable --now`` leaves an already-running Python UI on its old imported
   # modules.  Cold bringup is also the supported post-update reload path, so
   # force one bounded UI restart after the resident workers are recreated.
@@ -546,6 +572,13 @@ cold_bringup_steps() {
   wait_until "posture relay" posture_bridge_ready || return 1
   if ! $DOCKER image inspect "$WHOLE_BODY_IMAGE" >/dev/null 2>&1; then
     $DOCKER build -t "$WHOLE_BODY_IMAGE" "$STACK_ROOT/docker/whole_body_runtime" || return 1
+  fi
+  if $DOCKER exec z-manip-hw bash -lc \
+      'source /opt/ros/jazzy/setup.bash && timeout 10 ros2 topic echo /go2w/posture_state std_msgs/msg/String --once' \
+      >/dev/null 2>&1; then
+    printf 'NUC WebRTC owner is publishing posture state\n'
+  else
+    printf 'WARNING: /go2w/posture_state is silent after bringup; check the NUC reactive-live journal (stale JACK lock? robot powered off?)\n' >&2
   fi
   printf '[%s] cold bringup healthy\n' "$(date --iso-8601=seconds)"
 }
@@ -616,6 +649,15 @@ case "$action" in
       exit "$rc"
     fi
     status_one "$component"
+    ;;
+  shutdown)
+    [[ "$component" == all ]] || usage
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+      printf 'another component restart is already running\n' >&2
+      exit 75
+    fi
+    shutdown_stack 2>&1 | tee -a "$MANAGER_LOG"
     ;;
   bringup)
     exec 9>"$LOCK_FILE"
