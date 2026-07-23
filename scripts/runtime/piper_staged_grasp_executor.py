@@ -70,6 +70,11 @@ OPEN_APERTURE_M = 0.07
 MAX_PLANNED_GRASP_WIDTH_M = 0.062
 GRIPPER_CLOSE_STEPS = 8
 GRIPPER_CLOSE_INTERVAL_S = 0.20
+# Minimum measurable gripper motor load that proves an object is between the
+# fingers when the aperture shows no stall gap above the close target.  Must
+# sit above force-sensor noise and below the weakest real hold observed live
+# (0.114N on a plastic bottle, 2026-07-23).
+EMPTY_CLOSE_RESCUE_FORCE_N = 0.08
 GRIPPER_POST_CLOSE_SETTLE_S = 0.50
 DEFAULT_SPEED_PERCENT = 5
 MAX_SPEED_PERCENT = 50
@@ -279,8 +284,21 @@ def verify_nonempty_grasp(
     if (
         commanded_close_target_m is not None
         and feedback.aperture_m <= float(commanded_close_target_m) + 0.001
+        and abs(feedback.force_n) < EMPTY_CLOSE_RESCUE_FORCE_N
     ):
-        raise SafetyError("gripper reached the empty close target without a contact gap")
+        # No stall gap above the commanded target AND no measurable motor
+        # load: nothing is between the fingers.  The gap test alone is no
+        # longer sufficient evidence of emptiness: with learned-stereo depth
+        # the planned width matches the true object width to ~1mm, so a soft
+        # object (plastic bottle) compresses to within the 1mm gap margin
+        # while clearly held (live 2026-07-23 17:50: aperture 57.8mm,
+        # target 56.7mm, force -0.114N, lift refused on a real grasp).  A
+        # firmware that reports zero force while holding still fails closed
+        # here, exactly as before.
+        raise SafetyError(
+            "gripper reached the empty close target without a contact gap "
+            "or grasp force",
+        )
 
 
 def verify_gripper_ready(feedback: GripperFeedback) -> None:

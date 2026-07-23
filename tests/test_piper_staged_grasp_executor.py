@@ -584,9 +584,9 @@ def test_close_target_and_nonempty_verification_are_width_based():
     weak = EXECUTOR.GripperFeedback(0.027, 0.0, 1.0, "width", True, True, True)
     with pytest.raises(EXECUTOR.SafetyError, match="force"):
         EXECUTOR.verify_nonempty_grasp(weak, 0.03)
-    reached_target = EXECUTOR.GripperFeedback(
+    reached_target_no_force = EXECUTOR.GripperFeedback(
         0.0265,
-        0.8,
+        0.02,
         1.0,
         "width",
         True,
@@ -595,10 +595,29 @@ def test_close_target_and_nonempty_verification_are_width_based():
     )
     with pytest.raises(EXECUTOR.SafetyError, match="empty close target"):
         EXECUTOR.verify_nonempty_grasp(
-            reached_target,
+            reached_target_no_force,
             0.03,
+            minimum_force_n=0.0,
             commanded_close_target_m=0.026,
         )
+    # A soft object compressed to the close target is HELD, not empty: the
+    # stall gap vanishes but the motor stays loaded (live 2026-07-23 bottle:
+    # aperture at target, force -0.114N, lift wrongly refused).
+    compressed_soft_hold = EXECUTOR.GripperFeedback(
+        0.0265,
+        -0.114,
+        1.0,
+        "width",
+        True,
+        True,
+        True,
+    )
+    EXECUTOR.verify_nonempty_grasp(
+        compressed_soft_hold,
+        0.03,
+        minimum_force_n=0.0,
+        commanded_close_target_m=0.026,
+    )
 
 
 def test_pregrasp_opens_and_confirms_gripper_before_segmented_move_j(tmp_path):
