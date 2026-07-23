@@ -153,6 +153,7 @@ class _FakeModel:
 
     def predict(self, **kwargs):
         assert kwargs["half"] is False
+        self.last_predict_kwargs = dict(kwargs)
         return [_FakeResult()]
 
 
@@ -190,6 +191,52 @@ def test_runtime_keeps_dynamic_prompt_inference_fp32():
         (("red bottle",), ("embedding", "red bottle")),
         (("bottle",), ("embedding", "bottle")),
     ]
+
+
+def test_runtime_defaults_to_640_forward_resolution():
+    runtime = SERVICE.GroundingRuntime(
+        model_id="unused.pt",
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+    )
+    assert runtime.image_size == SERVICE.DEFAULT_IMAGE_SIZE == 640
+    runtime._model = _FakeModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (64, 64), color=(127, 127, 127))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+
+    runtime.ground(encoded.getvalue(), "bottle")
+    assert runtime._model.last_predict_kwargs["imgsz"] == 640
+
+
+def test_runtime_forwards_configured_image_size_to_predict():
+    runtime = SERVICE.GroundingRuntime(
+        model_id="unused.pt",
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+        image_size=960,
+    )
+    assert runtime.image_size == 960
+    runtime._model = _FakeModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (64, 64), color=(127, 127, 127))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+
+    runtime.ground(encoded.getvalue(), "bottle")
+    assert runtime._model.last_predict_kwargs["imgsz"] == 960
+
+
+def test_runtime_rejects_non_stride_image_size():
+    for bad in (0, 31, 100, -960):
+        with pytest.raises(ValueError):
+            SERVICE.GroundingRuntime(
+                model_id="unused.pt",
+                minimum_confidence=0.35,
+                maximum_area_ratio=0.45,
+                image_size=bad,
+            )
 
 
 def test_runtime_text_embedding_cache_is_bounded_and_exact():

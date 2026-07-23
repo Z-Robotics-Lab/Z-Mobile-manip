@@ -29,6 +29,9 @@ REQUEST_SCHEMA = "z_manip.local_grounding_request.v1"
 RESPONSE_SCHEMA = "z_manip.local_grounding_response.v1"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 DEFAULT_TEXT_EMBEDDING_CACHE_SIZE = 64
+# YOLOE forward resolution. 640 is the historical baked value; deployment passes
+# a larger size for distant small-object recall (see --imgsz / Dockerfile CMD).
+DEFAULT_IMAGE_SIZE = 640
 
 _ZH_NOUNS: tuple[tuple[str, str], ...] = (
     ("电源适配器", "power adapter"),
@@ -224,13 +227,17 @@ class GroundingRuntime:
         minimum_confidence: float,
         maximum_area_ratio: float,
         text_embedding_cache_size: int = DEFAULT_TEXT_EMBEDDING_CACHE_SIZE,
+        image_size: int = DEFAULT_IMAGE_SIZE,
     ) -> None:
         if text_embedding_cache_size < 1:
             raise ValueError("text_embedding_cache_size must be positive")
+        if image_size < 32 or image_size % 32 != 0:
+            raise ValueError("image_size must be a positive multiple of 32")
         self.model_id = model_id
         self.minimum_confidence = minimum_confidence
         self.maximum_area_ratio = maximum_area_ratio
         self.text_embedding_cache_size = text_embedding_cache_size
+        self.image_size = image_size
         self._lock = threading.Lock()
         self._model: Any = None
         self._device = "unloaded"
@@ -309,7 +316,7 @@ class GroundingRuntime:
             result = self._model.predict(
                 source=image,
                 device=self._device,
-                imgsz=640,
+                imgsz=self.image_size,
                 conf=min(0.20, self.minimum_confidence),
                 iou=0.55,
                 # YOLOE builds new text embeddings whenever the prompt changes.
@@ -480,6 +487,7 @@ def _arguments() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TEXT_EMBEDDING_CACHE_SIZE,
     )
+    parser.add_argument("--imgsz", type=int, default=DEFAULT_IMAGE_SIZE)
     return parser.parse_args()
 
 
@@ -492,6 +500,7 @@ def main() -> int:
         minimum_confidence=args.minimum_confidence,
         maximum_area_ratio=args.maximum_area_ratio,
         text_embedding_cache_size=args.text_embedding_cache_size,
+        image_size=args.imgsz,
     )
     runtime.load()
     runtime.warmup()
@@ -499,7 +508,7 @@ def main() -> int:
     server.runtime = runtime
     print(
         f"local grounding ready on {args.host}:{args.port} model={args.model} "
-        f"device={runtime.device}",
+        f"imgsz={runtime.image_size} device={runtime.device}",
         flush=True,
     )
     try:
