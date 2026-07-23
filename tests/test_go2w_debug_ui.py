@@ -415,6 +415,35 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert 'byid("approach-only").addeventlistener("click", startapproachonly)' in lowered
 
 
+def test_dashboard_has_live_colored_point_cloud_tile():
+    source = HTML.read_text(encoding="utf-8")
+    lowered = source.lower()
+
+    # A new left-column PERCEPTION FEED tile with its own reorderable frame.
+    assert 'data-testid="live-cloud-frame"' in lowered
+    assert 'data-feed-key="live_cloud"' in lowered
+    assert '"live_cloud"' in lowered
+    assert '<canvas id="cloud-canvas"' in lowered
+    assert 'id="cloud-state"' in lowered
+    # Truthful active-source badge in addition to the age badge.
+    assert 'id="cloud-source"' in lowered
+    assert "ffs" in lowered
+    assert "d435 raw" in lowered
+    assert 'id="cloud-reset-view"' in lowered
+    # Binary point-cloud endpoint + validation, no external fetches.
+    assert '"/api/cloud/latest.bin"' in lowered
+    assert "function parsecloudbinary" in lowered
+    assert "class cloudview" in lowered
+    assert "refreshcloudtile()" in lowered
+    assert "rendercloudsource(" in lowered
+    # The live tiles (including the cloud) precede the recorded artifact stack.
+    assert lowered.index('data-testid="live-cloud-frame"') < lowered.index('id="recorded-image-stack"')
+    # Still offline/self-contained: no external renderer or network origin.
+    assert "http://" not in lowered
+    assert "https://" not in lowered
+    assert "cdn" not in lowered
+
+
 def test_dashboard_explains_blocked_attempt_while_showing_last_good_bundle():
     source = HTML.read_text(encoding="utf-8")
 

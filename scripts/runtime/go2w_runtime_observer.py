@@ -46,6 +46,42 @@ DEPTH_COLORMAP_FAR_M = 4.00
 # browser polls slightly faster than this so it catches every distinct frame.
 # CPU stays well under one core alongside the 30 Hz RGB path.
 DEPTH_WRITE_MIN_INTERVAL_S = 0.075
+# --- Live colored point-cloud tile -------------------------------------------
+# The observer projects the color image onto the selected depth image (both are
+# already registered in the color optical frame, so pixel (u,v) corresponds 1:1)
+# into an XYZ+RGB cloud for the dashboard's interactive 3D tile.  The depth
+# source is selected at runtime: the learned-stereo Fast-FoundationStereo topic
+# (/camera/ffs_depth_aligned/image_raw, 16UC1 mm) when it is flowing, otherwise
+# the raw D435 aligned depth (/camera/aligned_depth_to_color/image_raw).  Both
+# publish per-frameset-identical stamps to the color image, so color<->depth is
+# paired by exact/near-exact stamp.  Points are decimated to ~15-20k, invalid or
+# out-of-range depth is dropped, and a compact binary is written atomically at
+# ~5 Hz (throttled like DepthFrameWriter).
+FFS_DEPTH_TOPIC = "/camera/ffs_depth_aligned/image_raw"
+CLOUD_NEAR_M = 0.15
+CLOUD_FAR_M = 5.00
+# Decimation stride is derived so the full-resolution grid lands near this many
+# samples before invalid-depth rejection (640x480 -> stride 4 -> 160x120=19200).
+CLOUD_TARGET_GRID_POINTS = 18000
+CLOUD_MAX_POINTS = 20000
+# ~5 Hz.  FFS relay caps at ~10 Hz and raw aligned depth runs at 30 Hz; this
+# throttle coalesces either to roughly 5 Hz so the tile payload and browser
+# parse cost stay bounded.
+CLOUD_WRITE_MIN_INTERVAL_S = 0.18
+# Color/depth are stamp-matched within this bound.  Frameset stamps are
+# identical, so 15 ms accepts the exact match while rejecting a neighbouring
+# (~33 ms away) frame — never colorize depth with a frame from another moment.
+CLOUD_MAX_PAIR_SKEW_S = 0.015
+# FFS is "active" while a frame arrived within this window; otherwise the tile
+# falls back to raw D435 depth.  Re-evaluated on every depth frame so the tile
+# flips to FFS automatically once that service goes live, and back on loss.
+CLOUD_SOURCE_ACTIVE_WINDOW_S = 1.00
+CLOUD_COLOR_BUFFER = 30
+CLOUD_MAGIC = b"ZMPC"
+CLOUD_VERSION = 1
+CLOUD_SOURCE_FLAGS = {"d435_raw": 0, "ffs": 1}
+# Little-endian compact header: magic, version, source_flag, count, stamp_ns.
+CLOUD_HEADER_STRUCT = struct.Struct("<4sHHIQ")
 DEFAULT_TOPICS = {
     "joint_state": ("/piper/state", "sensor_msgs/msg/JointState", 0.50),
     "color": ("/camera/color/image_raw", "sensor_msgs/msg/Image", 1.00),
@@ -1145,6 +1181,348 @@ class DepthFrameWriter:
         return True
 
 
+def decode_color_to_rgb(message: object):
+    """Decode one bounded raw ROS color image into a contiguous HxWx3 RGB array."""
+
+    import numpy as np
+
+    try:
+        width = int(message.width)
+        height = int(message.height)
+        step = int(message.step)
+        encoding = str(message.encoding).lower()
+        data = memoryview(message.data)
+    except (AttributeError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"invalid raw color image: {error}") from error
+    channels_by_encoding = {"mono8": 1, "rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4}
+    channels = channels_by_encoding.get(encoding)
+    if channels is None:
+        raise ValueError(f"unsupported raw color encoding: {encoding!r}")
+    if (
+        width <= 0
+        or height <= 0
+        or width > 8192
+        or height > 8192
+        or step < width * channels
+        or step > width * channels + 65536
+        or len(data) < height * step
+    ):
+        raise ValueError("raw color dimensions, step, or payload are invalid")
+    rows = np.frombuffer(data, dtype=np.uint8, count=height * step).reshape(height, step)
+    pixels = rows[:, : width * channels].reshape(height, width, channels)
+    if encoding in ("rgb8", "rgba8"):
+        rgb = pixels[:, :, :3]
+    elif encoding in ("bgr8", "bgra8"):
+        rgb = pixels[:, :, 2::-1]
+    else:  # mono8
+        rgb = np.repeat(pixels[:, :, :1], 3, axis=2)
+    return np.ascontiguousarray(rgb)
+
+
+def decode_depth_to_metres(message: object):
+    """Decode one bounded raw ROS depth image into a HxW float32 metre array."""
+
+    import numpy as np
+
+    try:
+        width = int(message.width)
+        height = int(message.height)
+        step = int(message.step)
+        encoding = str(message.encoding).lower()
+        data = memoryview(message.data)
+    except (AttributeError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"invalid raw depth image: {error}") from error
+    dtype_by_encoding = {
+        "16uc1": (np.uint16, 2, "mm"),
+        "mono16": (np.uint16, 2, "mm"),
+        "32fc1": (np.float32, 4, "m"),
+    }
+    spec = dtype_by_encoding.get(encoding)
+    if spec is None:
+        raise ValueError(f"unsupported raw depth encoding: {encoding!r}")
+    dtype, bytes_per_pixel, units = spec
+    if (
+        width <= 0
+        or height <= 0
+        or width > 8192
+        or height > 8192
+        or step < width * bytes_per_pixel
+        or step > width * bytes_per_pixel + 65536
+        or len(data) < height * step
+    ):
+        raise ValueError("raw depth dimensions, step, or payload are invalid")
+    rows = np.frombuffer(data, dtype=np.uint8, count=height * step).reshape(height, step)
+    pixels = rows[:, : width * bytes_per_pixel].reshape(height, width, bytes_per_pixel)
+    depth = np.ascontiguousarray(pixels).view(dtype).reshape(height, width)
+    if units == "mm":
+        return depth.astype(np.float32) / 1000.0
+    return depth.astype(np.float32)
+
+
+def compute_cloud_stride(
+    width: int,
+    height: int,
+    *,
+    target: int = CLOUD_TARGET_GRID_POINTS,
+) -> int:
+    """Choose a decimation stride so the sampled grid lands near ``target``."""
+
+    total = int(width) * int(height)
+    if total <= 0 or total <= int(target):
+        return 1
+    return max(1, round(math.sqrt(total / float(target))))
+
+
+def encode_point_cloud(
+    color: object,
+    depth: object,
+    camera_matrix: object,
+    *,
+    source: str,
+    source_topic: str | None = None,
+    near_m: float = CLOUD_NEAR_M,
+    far_m: float = CLOUD_FAR_M,
+    stride: int | None = None,
+    max_points: int = CLOUD_MAX_POINTS,
+) -> tuple[bytes, dict[str, object]]:
+    """Project a stamp-matched color+depth pair into a compact XYZ+RGB binary.
+
+    Depth is assumed registered to the color optical frame (both raw D435
+    aligned depth and the FFS relay publish color-registered depth), so pixel
+    (u, v) shares intrinsics with the color pixel.  Invalid, zero, and
+    out-of-``[near_m, far_m]`` depth is dropped; the grid is decimated to a
+    bounded point budget.  Returns the little-endian binary plus a manifest.
+    """
+
+    import numpy as np
+
+    if source not in CLOUD_SOURCE_FLAGS:
+        raise ValueError(f"unsupported cloud source: {source!r}")
+    intrinsics = _finite_list(getattr(camera_matrix, "k", camera_matrix))
+    if intrinsics is None or len(intrinsics) != 9 or intrinsics[0] <= 0.0 or intrinsics[4] <= 0.0:
+        raise ValueError("camera intrinsics are invalid")
+    fx, fy = float(intrinsics[0]), float(intrinsics[4])
+    cx, cy = float(intrinsics[2]), float(intrinsics[5])
+    if not (math.isfinite(near_m) and math.isfinite(far_m)) or far_m <= near_m:
+        raise ValueError("cloud near/far range is invalid")
+    rgb = decode_color_to_rgb(color)
+    metres = decode_depth_to_metres(depth)
+    if rgb.shape[:2] != metres.shape:
+        raise ValueError("color and depth dimensions differ")
+    height, width = metres.shape
+    if stride is None:
+        stride = compute_cloud_stride(width, height)
+    stride = max(1, int(stride))
+    us = np.arange(0, width, stride)
+    vs = np.arange(0, height, stride)
+    sub_depth = metres[np.ix_(vs, us)]
+    sub_rgb = rgb[np.ix_(vs, us)]
+    uu = np.broadcast_to(us[None, :], sub_depth.shape)
+    vv = np.broadcast_to(vs[:, None], sub_depth.shape)
+    valid = np.isfinite(sub_depth) & (sub_depth >= float(near_m)) & (sub_depth <= float(far_m))
+    grid_total = int(sub_depth.size)
+    valid_count = int(valid.sum())
+    zf = sub_depth[valid].astype(np.float32)
+    uf = uu[valid].astype(np.float32)
+    vf = vv[valid].astype(np.float32)
+    cf = sub_rgb[valid].astype(np.uint8)
+    xf = (uf - cx) * zf / fx
+    yf = (vf - cy) * zf / fy
+    count = int(zf.shape[0])
+    if count > int(max_points):
+        keep = np.linspace(0, count - 1, int(max_points)).astype(np.int64)
+        xf, yf, zf, cf = xf[keep], yf[keep], zf[keep], cf[keep]
+        count = int(max_points)
+    xyz = np.empty((count, 3), dtype="<f4")
+    xyz[:, 0] = xf
+    xyz[:, 1] = yf
+    xyz[:, 2] = zf
+    rgb_bytes = np.ascontiguousarray(cf, dtype=np.uint8)
+    depth_stamp = stamp_ns(depth)
+    color_stamp = getattr(color, "stamp", None)
+    header_stamp = int(depth_stamp) if depth_stamp is not None else 0
+    source_flag = CLOUD_SOURCE_FLAGS[source]
+    header = CLOUD_HEADER_STRUCT.pack(
+        CLOUD_MAGIC,
+        CLOUD_VERSION,
+        source_flag,
+        count,
+        header_stamp,
+    )
+    payload = header + xyz.tobytes() + rgb_bytes.tobytes()
+    skew_ns = (
+        abs(int(color_stamp) - int(depth_stamp))
+        if depth_stamp is not None and color_stamp is not None
+        else None
+    )
+    manifest: dict[str, object] = {
+        "schema": "z_manip.point_cloud_frame.v1",
+        "version": CLOUD_VERSION,
+        "source": source,
+        "source_flag": source_flag,
+        "source_topic": source_topic,
+        "frame": frame_id(depth),
+        "count": count,
+        "stride": stride,
+        "near_m": float(near_m),
+        "far_m": float(far_m),
+        "valid_fraction": round(valid_count / grid_total, 4) if grid_total else 0.0,
+        "source_timestamp_ns": header_stamp,
+        "depth_timestamp_ns": depth_stamp,
+        "color_timestamp_ns": color_stamp,
+        "skew_ns": skew_ns,
+        "point_bytes": len(payload),
+        "received_unix_ns": time.time_ns(),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    return payload, manifest
+
+
+@dataclass
+class ColorFrame:
+    """One buffered raw color image kept for stamp-matched colorization."""
+
+    stamp: int
+    width: int
+    height: int
+    step: int
+    encoding: str
+    data: bytes
+
+
+class PointCloudWriter:
+    """Build and atomically commit the live colored cloud at ~5 Hz.
+
+    Holds a bounded ring of recent color frames plus the latest color
+    intrinsics, and on each depth frame from the *active* source (FFS when it
+    is flowing, else raw D435 aligned depth) stamp-matches a color frame,
+    projects a decimated XYZ+RGB cloud, and writes ``cloud-latest.bin`` before
+    its ``cloud-latest.json`` manifest.  Source selection is re-evaluated on
+    every depth frame so the tile flips to FFS automatically once it is live.
+    """
+
+    def __init__(
+        self,
+        cloud_path: Path,
+        *,
+        source_topics: dict[str, str] | None = None,
+        min_interval_s: float = CLOUD_WRITE_MIN_INTERVAL_S,
+        max_pair_skew_s: float = CLOUD_MAX_PAIR_SKEW_S,
+        source_active_window_s: float = CLOUD_SOURCE_ACTIVE_WINDOW_S,
+        near_m: float = CLOUD_NEAR_M,
+        far_m: float = CLOUD_FAR_M,
+        color_buffer: int = CLOUD_COLOR_BUFFER,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.cloud_path = cloud_path.expanduser().resolve()
+        self.manifest_path = self.cloud_path.with_suffix(".json")
+        self.source_topics = dict(source_topics or {})
+        self.min_interval_s = max(0.0, float(min_interval_s))
+        self.max_pair_skew_ns = max(0, round(float(max_pair_skew_s) * 1_000_000_000))
+        self.source_active_window_s = max(0.0, float(source_active_window_s))
+        self.near_m = float(near_m)
+        self.far_m = float(far_m)
+        self.color_buffer = max(1, int(color_buffer))
+        self._monotonic = monotonic
+        self._colors: dict[int, ColorFrame] = {}
+        self._camera_matrix: list[float] | None = None
+        self._last_seen: dict[str, float] = {}
+        self._last_write_monotonic: float | None = None
+
+    def observe_camera_info(self, message: object) -> bool:
+        intrinsics = _finite_list(getattr(message, "k", None))
+        if (
+            intrinsics is None
+            or len(intrinsics) != 9
+            or intrinsics[0] <= 0.0
+            or intrinsics[4] <= 0.0
+        ):
+            return False
+        self._camera_matrix = [float(value) for value in intrinsics]
+        return True
+
+    def observe_color(self, message: object) -> bool:
+        stamp = stamp_ns(message)
+        if stamp is None:
+            return False
+        try:
+            frame = ColorFrame(
+                stamp=stamp,
+                width=int(message.width),
+                height=int(message.height),
+                step=int(message.step),
+                encoding=str(message.encoding),
+                data=bytes(message.data),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+        self._colors[stamp] = frame
+        while len(self._colors) > self.color_buffer:
+            del self._colors[next(iter(self._colors))]
+        return True
+
+    def active_source(self, now: float) -> str:
+        last = self._last_seen.get("ffs")
+        if last is not None and (now - last) <= self.source_active_window_s:
+            return "ffs"
+        return "d435_raw"
+
+    def _due(self, now: float) -> bool:
+        return (
+            self._last_write_monotonic is None
+            or now - self._last_write_monotonic >= self.min_interval_s
+        )
+
+    def _match_color(self, depth_stamp: int | None) -> ColorFrame | None:
+        if depth_stamp is None or not self._colors:
+            return None
+        best: ColorFrame | None = None
+        best_skew: int | None = None
+        for stamp, frame in self._colors.items():
+            skew = abs(stamp - depth_stamp)
+            if best_skew is None or skew < best_skew:
+                best_skew, best = skew, frame
+        if best is None or best_skew is None or best_skew > self.max_pair_skew_ns:
+            return None
+        return best
+
+    def observe_depth(self, source: str, message: object) -> bool:
+        """Colorize and persist one cloud from the active source, or skip.
+
+        Returns ``True`` only when a cloud was written so callers can reflect it
+        in telemetry.  Skips silently when the frame is from the non-active
+        source, the throttle is not due, intrinsics are missing, or no color
+        frame matches the depth stamp within the bounded skew.
+        """
+
+        if source not in CLOUD_SOURCE_FLAGS:
+            return False
+        now = self._monotonic()
+        self._last_seen[source] = now
+        if source != self.active_source(now):
+            return False
+        if not self._due(now):
+            return False
+        if self._camera_matrix is None:
+            return False
+        color = self._match_color(stamp_ns(message))
+        if color is None:
+            return False
+        payload, manifest = encode_point_cloud(
+            color,
+            message,
+            self._camera_matrix,
+            source=source,
+            source_topic=self.source_topics.get(source),
+            near_m=self.near_m,
+            far_m=self.far_m,
+        )
+        atomic_write_bytes(self.cloud_path, payload)
+        atomic_write_json(self.manifest_path, manifest)
+        self._last_write_monotonic = now
+        return True
+
+
 def _callback(
     state: RuntimeObserverState,
     key: str,
@@ -1171,6 +1549,7 @@ def _callback(
 def _color_callback(
     state: RuntimeObserverState,
     writer: CameraFrameWriter | None,
+    cloud_builder: PointCloudWriter | None = None,
 ) -> Callable[[object], None]:
     def observe(message: object) -> None:
         payload = summarize_image(message)
@@ -1182,7 +1561,28 @@ def _color_callback(
             except Exception as error:  # Preserve the last known-good camera JPEG.
                 payload["camera_jpeg_available"] = False
                 payload["camera_jpeg_error"] = f"{type(error).__name__}: {error}"[:512]
+        if cloud_builder is not None and payload.get("valid") is True:
+            try:  # Buffer the raw color frame for stamp-matched colorization.
+                cloud_builder.observe_color(message)
+            except Exception:  # A malformed color frame never blocks telemetry.
+                pass
         state.observe("color", payload, stamp_ns(message))
+
+    return observe
+
+
+def _camera_info_callback(
+    state: RuntimeObserverState,
+    cloud_builder: PointCloudWriter | None = None,
+) -> Callable[[object], None]:
+    def observe(message: object) -> None:
+        payload = summarize_camera_info(message)
+        if cloud_builder is not None and payload.get("valid") is True:
+            try:
+                cloud_builder.observe_camera_info(message)
+            except Exception:  # Invalid intrinsics never block telemetry.
+                pass
+        state.observe("camera_info", payload, stamp_ns(message))
 
     return observe
 
@@ -1190,6 +1590,7 @@ def _color_callback(
 def _depth_callback(
     state: RuntimeObserverState,
     writer: DepthFrameWriter | None,
+    cloud_builder: PointCloudWriter | None = None,
 ) -> Callable[[object], None]:
     def observe(message: object) -> None:
         payload = summarize_image(message)
@@ -1202,7 +1603,29 @@ def _depth_callback(
             except Exception as error:  # Preserve the last known-good depth JPEG.
                 payload["depth_jpeg_available"] = False
                 payload["depth_jpeg_error"] = f"{type(error).__name__}: {error}"[:512]
+        if cloud_builder is not None and payload.get("valid") is True:
+            try:  # Raw D435 aligned depth feeds the cloud as the fallback source.
+                cloud_builder.observe_depth("d435_raw", message)
+            except Exception:  # Preserve the last known-good cloud.
+                pass
         state.observe("depth", payload, stamp_ns(message))
+
+    return observe
+
+
+def _cloud_depth_callback(
+    cloud_builder: PointCloudWriter | None,
+    source: str,
+) -> Callable[[object], None]:
+    """Feed a dedicated depth topic (e.g. FFS) into the cloud builder only."""
+
+    def observe(message: object) -> None:
+        if cloud_builder is None:
+            return
+        try:
+            cloud_builder.observe_depth(source, message)
+        except Exception:  # Preserve the last known-good cloud.
+            pass
 
     return observe
 
@@ -1307,6 +1730,19 @@ def run_ros_observer(args: argparse.Namespace) -> int:
             min_interval_s=args.depth_write_min_interval_s,
         )
     )
+    cloud_builder = (
+        None
+        if args.cloud_output is None
+        else PointCloudWriter(
+            args.cloud_output,
+            source_topics={"ffs": args.ffs_depth_topic, "d435_raw": args.depth_topic},
+            min_interval_s=args.cloud_write_min_interval_s,
+            max_pair_skew_s=args.cloud_max_pair_skew_s,
+            source_active_window_s=args.cloud_source_active_window_s,
+            near_m=args.cloud_near_m,
+            far_m=args.cloud_far_m,
+        )
+    )
     rclpy.init()
     node = rclpy.create_node(
         "z_manip_runtime_observer_read_only",
@@ -1335,19 +1771,19 @@ def run_ros_observer(args: argparse.Namespace) -> int:
         node.create_subscription(
             Image,
             args.color_topic,
-            _color_callback(state, camera_writer),
+            _color_callback(state, camera_writer, cloud_builder),
             qos_profile_sensor_data,
         ),
         node.create_subscription(
             Image,
             args.depth_topic,
-            _depth_callback(state, depth_writer),
+            _depth_callback(state, depth_writer, cloud_builder),
             qos_profile_sensor_data,
         ),
         node.create_subscription(
             CameraInfo,
             args.camera_info_topic,
-            _callback(state, "camera_info", summarize_camera_info),
+            _camera_info_callback(state, cloud_builder),
             qos_profile_sensor_data,
         ),
         node.create_subscription(
@@ -1399,6 +1835,19 @@ def run_ros_observer(args: argparse.Namespace) -> int:
             tf_static_qos,
         ),
     ]
+    if cloud_builder is not None:
+        # The learned-stereo FFS depth topic feeds only the colored-cloud
+        # builder; it is not part of the runtime-state topic accounting.  The
+        # builder prefers it whenever it is flowing and falls back to the raw
+        # aligned depth otherwise.
+        subscriptions.append(
+            node.create_subscription(
+                Image,
+                args.ffs_depth_topic,
+                _cloud_depth_callback(cloud_builder, "ffs"),
+                qos_profile_sensor_data,
+            )
+        )
     del subscriptions  # rclpy's node retains subscription ownership.
     started = time.monotonic()
     next_write = started
@@ -1475,6 +1924,43 @@ def _arguments() -> argparse.Namespace:
         default=DEPTH_WRITE_MIN_INTERVAL_S,
         help="minimum seconds between colorized depth-tile writes (~10 Hz)",
     )
+    parser.add_argument(
+        "--cloud-output",
+        type=Path,
+        help=(
+            "fixed atomically replaced colored point-cloud binary "
+            "(cloud-latest.bin + sibling .json manifest), written at ~5 Hz "
+            "next to --camera-output"
+        ),
+    )
+    parser.add_argument(
+        "--ffs-depth-topic",
+        default=FFS_DEPTH_TOPIC,
+        help=(
+            "priority learned-stereo depth topic for the colored cloud; the "
+            "builder falls back to --depth-topic when it is not flowing"
+        ),
+    )
+    parser.add_argument(
+        "--cloud-write-min-interval-s",
+        type=float,
+        default=CLOUD_WRITE_MIN_INTERVAL_S,
+        help="minimum seconds between colored-cloud writes (~5 Hz)",
+    )
+    parser.add_argument(
+        "--cloud-max-pair-skew-s",
+        type=float,
+        default=CLOUD_MAX_PAIR_SKEW_S,
+        help="maximum color<->depth stamp skew accepted when colorizing",
+    )
+    parser.add_argument(
+        "--cloud-source-active-window-s",
+        type=float,
+        default=CLOUD_SOURCE_ACTIVE_WINDOW_S,
+        help="window within which a recent FFS frame keeps FFS the active source",
+    )
+    parser.add_argument("--cloud-near-m", type=float, default=CLOUD_NEAR_M)
+    parser.add_argument("--cloud-far-m", type=float, default=CLOUD_FAR_M)
     parser.add_argument("--ros-domain-id", type=int, default=int(os.environ.get("ROS_DOMAIN_ID", "20")))
     parser.add_argument("--joint-topic", default=DEFAULT_TOPICS["joint_state"][0])
     parser.add_argument("--color-topic", default=DEFAULT_TOPICS["color"][0])
@@ -1563,6 +2049,26 @@ def _arguments() -> argparse.Namespace:
         ):
             parser.error("depth_output must be different from camera_output")
     for name in (
+        "cloud_write_min_interval_s",
+        "cloud_max_pair_skew_s",
+        "cloud_source_active_window_s",
+    ):
+        value = float(getattr(values, name))
+        if not math.isfinite(value) or value < 0.0:
+            parser.error(f"{name} must be finite and non-negative")
+    if not math.isfinite(values.cloud_near_m) or not math.isfinite(values.cloud_far_m):
+        parser.error("cloud_near_m and cloud_far_m must be finite")
+    if values.cloud_near_m < 0.0 or values.cloud_far_m <= values.cloud_near_m:
+        parser.error("cloud_far_m must be greater than a non-negative cloud_near_m")
+    if values.cloud_output is not None:
+        if values.cloud_output.suffix.lower() != ".bin":
+            parser.error("cloud_output must use a .bin suffix")
+        resolved_cloud = values.cloud_output.expanduser().resolve()
+        for other in ("output", "camera_output", "depth_output"):
+            candidate = getattr(values, other)
+            if candidate is not None and resolved_cloud == candidate.expanduser().resolve():
+                parser.error(f"cloud_output must be different from {other}")
+    for name in (
         "joint_topic",
         "color_topic",
         "depth_topic",
@@ -1570,6 +2076,7 @@ def _arguments() -> argparse.Namespace:
         "scene_cloud_topic",
         "target_cloud_topic",
         "depth_filter_manifest_topic",
+        "ffs_depth_topic",
         "tf_topic",
         "tf_static_topic",
     ):

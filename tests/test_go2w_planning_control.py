@@ -2984,8 +2984,122 @@ def test_workbench_service_passes_only_the_fixed_camera_artifact_path():
     source = SERVICE.read_text(encoding="utf-8")
     assert "--camera-image %h/Z-Robotics-Lab/artifacts/go2w_real/latest/camera-latest.jpg" in source
     assert "--depth-image %h/Z-Robotics-Lab/artifacts/go2w_real/latest/depth-latest.jpg" in source
+    assert "--cloud-bin %h/Z-Robotics-Lab/artifacts/go2w_real/latest/cloud-latest.bin" in source
     assert "/api/camera" not in source
     assert "/api/depth" not in source
+    assert "/api/cloud" not in source
+
+
+def _cloud_binary(count: int, *, source_flag: int = 1, stamp_ns: int = 1700, magic: bytes = b"ZMPC") -> bytes:
+    import numpy as np
+
+    header = CONTROL.CLOUD_HEADER_STRUCT.pack(magic, 1, source_flag, count, stamp_ns)
+    xyz = np.tile(np.array([0.1, -0.2, 1.0], dtype="<f4"), (count, 1))
+    rgb = np.tile(np.array([12, 34, 56], dtype=np.uint8), (count, 1))
+    return header + xyz.tobytes() + rgb.tobytes()
+
+
+def test_cloud_reader_rejects_torn_foreign_or_oversized_binaries(tmp_path):
+    path = tmp_path / "cloud-latest.bin"
+
+    # A valid ZMPC binary reads live and exposes its source and point count.
+    path.write_bytes(_cloud_binary(4, source_flag=1))
+    status, payload, etag, _age, source, count, message = CONTROL.CloudSnapshotReader(path).snapshot()
+    assert status == "live" and source == "ffs" and count == 4
+    assert payload is not None and etag is not None and message == ""
+
+    # Wrong magic is not a cloud.
+    path.write_bytes(_cloud_binary(4, magic=b"XXXX"))
+    status, payload, *_rest = CONTROL.CloudSnapshotReader(path).snapshot()
+    assert status == "invalid" and payload is None
+
+    # A truncated body (declared count does not match length) is rejected.
+    path.write_bytes(_cloud_binary(4)[:-6])
+    status, payload, *_rest = CONTROL.CloudSnapshotReader(path).snapshot()
+    assert status == "invalid" and payload is None
+
+    # Oversized files never load.
+    path.write_bytes(b"\x00" * (CONTROL.MAX_CLOUD_BIN_BYTES + 1))
+    status, payload, *_rest = CONTROL.CloudSnapshotReader(path).snapshot()
+    assert status == "invalid" and payload is None
+
+
+def test_cloud_endpoint_is_fixed_bounded_fresh_conditional_get_and_head(tmp_path):
+    class FakeControl:
+        def status(self):
+            return {"available": True, "running": False, "state": "idle"}
+
+        def start(self):
+            raise AssertionError("cloud reads must never start planning")
+
+    cloud_path = tmp_path / "cloud-latest.bin"
+    binary = _cloud_binary(6, source_flag=0)  # 0 == raw D435 aligned depth
+    cloud_path.write_bytes(binary)
+    cloud_path.with_suffix(".json").write_text(
+        json.dumps({
+            "schema": "z_manip.point_cloud_frame.v1",
+            "count": 6,
+            "source": "d435_raw",
+            "valid_fraction": 0.71,
+        }),
+        encoding="utf-8",
+    )
+    server = CONTROL.create_server(
+        _bundle(tmp_path / "debug_bundle.json"),
+        port=0,
+        index_path=HTML,
+        control_backend=FakeControl(),
+        runtime_state=None,
+        cloud_bin=cloud_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        connection.request("GET", "/api/cloud/latest.bin")
+        response = connection.getresponse()
+        body = response.read()
+        assert response.status == 200
+        etag = response.getheader("ETag")
+        assert response.getheader("Content-Type") == "application/octet-stream"
+        assert response.getheader("Cache-Control") == "no-store"
+        assert response.getheader("X-Z-Manip-Cloud-State") == "live"
+        assert response.getheader("X-Z-Manip-Cloud-Source") == "d435_raw"
+        assert response.getheader("X-Z-Manip-Cloud-Count") == "6"
+        assert response.getheader("X-Z-Manip-Poll-Interval-Ms") == str(CONTROL.CLOUD_POLL_INTERVAL_MS)
+        assert body == binary
+
+        connection.request("HEAD", "/api/cloud/latest.bin", headers={"If-None-Match": etag})
+        response = connection.getresponse()
+        assert response.status == 304
+        assert response.getheader("ETag") == etag
+        assert response.getheader("X-Z-Manip-Cloud-Source") == "d435_raw"
+        assert response.read() == b""
+
+        connection.request("GET", "/api/cloud/latest.bin?path=/etc/passwd")
+        response = connection.getresponse()
+        assert response.status == 400
+        assert b"no query" in response.read()
+
+        connection.request("GET", "/api/cloud/latest.json")
+        response = connection.getresponse()
+        manifest = json.loads(response.read())
+        assert response.status == 200
+        assert manifest["source"] == "d435_raw"
+        assert manifest["valid_fraction"] == 0.71
+
+        stale_ns = time.time_ns() - 3_000_000_000
+        os.utime(cloud_path, ns=(stale_ns, stale_ns))
+        connection.request("GET", "/api/cloud/latest.bin")
+        response = connection.getresponse()
+        assert response.status == 503
+        assert response.getheader("X-Z-Manip-Cloud-State") == "stale"
+        response.read()
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
 
 
 def test_runtime_reader_has_no_process_ros_can_or_transport_surface():

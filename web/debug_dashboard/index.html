@@ -510,6 +510,23 @@
     .camera-state.offline, .camera-state.invalid { border-color: #71333a; color: var(--red); }
     .empty-image { height: 100%; display: grid; place-items: center; color: var(--muted); font: 11px var(--mono); }
 
+    /* Live colored point-cloud tile: a self-contained Canvas2D 3D view. */
+    .image-frame.live-cloud {
+      flex: 0 0 clamp(230px, 34vh, 340px);
+      border-color: #31505a;
+      box-shadow: 0 5px 12px rgba(0, 0, 0, .34);
+      background: #070b0e;
+    }
+    .cloud-canvas { width: 100%; height: 100%; display: block; background: #070b0e; cursor: grab; touch-action: none; }
+    .cloud-canvas.dragging { cursor: grabbing; }
+    .cloud-reset {
+      position: absolute;
+      z-index: 3;
+      right: 7px;
+      bottom: 7px;
+      pointer-events: auto;
+    }
+
     .viewport-panel { display: grid; grid-template-rows: 37px minmax(0, 1fr) auto; }
     .viewport-toolbar { display: flex; align-items: center; gap: 8px; }
     .candidate-picker {
@@ -941,6 +958,20 @@
             <img id="depth-image" alt="Live colorized D435 depth feed" hidden>
             <div class="empty-image" id="depth-placeholder">Waiting for the subscribe-only depth observer.</div>
           </div>
+          <div class="image-frame live-cloud" data-testid="live-cloud-frame" data-feed-key="live_cloud">
+            <div class="image-frame-toolbar">
+              <span class="image-label">3D point cloud live</span>
+              <div class="image-frame-actions">
+                <span class="camera-state offline" id="cloud-source" aria-live="polite" title="Active depth source">—</span>
+                <span class="camera-state offline" id="cloud-state" aria-live="polite">OFFLINE</span>
+                <button class="image-reorder-button" type="button" data-reorder="up" aria-label="Move 3D point cloud live up" title="Move up">&#8593;</button>
+                <button class="image-reorder-button" type="button" data-reorder="down" aria-label="Move 3D point cloud live down" title="Move down">&#8595;</button>
+              </div>
+            </div>
+            <canvas id="cloud-canvas" class="cloud-canvas" aria-label="Live colored point cloud; drag to orbit, scroll to zoom"></canvas>
+            <div class="empty-image" id="cloud-placeholder">Waiting for the subscribe-only cloud observer.</div>
+            <button class="tool-button cloud-reset" type="button" id="cloud-reset-view">Reset view</button>
+          </div>
           <div id="recorded-image-stack"></div>
           <p class="sr-only" id="feed-order-status" aria-live="polite"></p>
         </div>
@@ -1069,7 +1100,7 @@
       candidate_overlay: "/api/perception/live/candidates.jpg"
     };
     const FEED_ORDER_STORAGE_KEY = "z-manip.perception-feed-order.v2";
-    const DEFAULT_FEED_ORDER = ["live_camera", "live_depth", "segmentation_mask", "segmentation_overlay", "candidate_overlay"];
+    const DEFAULT_FEED_ORDER = ["live_camera", "live_depth", "live_cloud", "segmentation_mask", "segmentation_overlay", "candidate_overlay"];
     // Browser poll floors.  The server advertises a per-tile X-Z-Manip-Poll-
     // Interval-Ms (80 ms RGB, 100 ms depth); these floors protect the server if
     // that header is ever missing while still allowing >=10 Hz refresh.
@@ -1079,6 +1110,11 @@
     // "LAGGING" so a frozen-but-not-yet-stale source can never read as fresh.
     const CAMERA_FRESH_MAX_MS = 400;
     const DEPTH_FRESH_MAX_MS = 500;
+    // Colored point-cloud tile.  The observer writes ~5 Hz; the browser polls a
+    // little faster (floor 120 ms) and treats a frame older than 900 ms as
+    // amber "LAGGING" so a frozen cloud can never read as fresh.
+    const CLOUD_POLL_FLOOR_MS = 120;
+    const CLOUD_FRESH_MAX_MS = 900;
     const HOME_JOINTS_RAD = [0.003543018381548489, 0.07997098632638018, -0.14369295731669315, -0.03166027263117714, 0.2632654643708247, 0.0];
     // Match the server-side measured Home verifier.  A tighter UI-only gate
     // made valid feedback at 0.361° look non-Home even though execution accepts 1°.
@@ -1119,6 +1155,10 @@
       depthTimer: null,
       depthEtag: null,
       depthHasFrame: false,
+      cloudTimer: null,
+      cloudEtag: null,
+      cloudHasFrame: false,
+      cloudView: null,
       perceptionFeedTimer: null,
       perceptionFeeds: {},
       feedOrder: loadFeedOrder(),
@@ -2261,6 +2301,312 @@
 
     function refreshDepth() {
       return refreshLiveTile(DEPTH_TILE, renderDepthState);
+    }
+
+    // Self-contained Canvas2D colored-point-cloud renderer (no external deps).
+    // Points arrive in the camera optical frame (X right, Y down, Z forward);
+    // they are viewed as (x, -y, z) so screen-up is real-world up, then orbited
+    // with the same yaw/pitch/zoom math as the Geometry view.  Rendering uses a
+    // per-pixel z-buffer into one ImageData so ~20k opaque colored points draw
+    // without per-point fillStyle churn.  Drag = orbit, shift/middle-drag = pan,
+    // wheel = zoom.  Nearer points (smaller view-axis depth) win the z-buffer.
+    const CLOUD_BG_RGBA = new Uint8Array([7, 11, 14, 255]);
+    class CloudView {
+      constructor(canvas) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext("2d", { willReadFrequently: true });
+        this.xyz = null;
+        this.rgb = null;
+        this.count = 0;
+        // Default: viewer behind the camera looking into the scene (+Z away),
+        // slightly elevated (~20 deg) and rotated for a gentle oblique so the
+        // floor plane and objects read immediately, zoomed to ~80% fill.
+        this.defaultOrbit = { yaw: -0.22, pitch: 0.18, zoom: 1, panX: 0, panY: 0 };
+        this.orbit = Object.assign({}, this.defaultOrbit);
+        this.framing = null;
+        this.viewport = { width: 1, height: 1, ratio: 1 };
+        this._image = null;
+        this._u32 = null;
+        this._zbuf = null;
+        this._drag = null;
+        this._raf = null;
+        this._observer = null;
+        this._bind();
+        if (typeof ResizeObserver === "function") {
+          this._observer = new ResizeObserver(() => this.resize());
+          this._observer.observe(canvas);
+        }
+        this.resize();
+      }
+
+      _bind() {
+        const canvas = this.canvas;
+        canvas.addEventListener("pointerdown", event => {
+          if (canvas.setPointerCapture) canvas.setPointerCapture(event.pointerId);
+          this._drag = { x: event.clientX, y: event.clientY, button: event.button };
+          canvas.classList.add("dragging");
+        });
+        canvas.addEventListener("pointermove", event => {
+          if (!this._drag) return;
+          const dx = event.clientX - this._drag.x;
+          const dy = event.clientY - this._drag.y;
+          this._drag.x = event.clientX;
+          this._drag.y = event.clientY;
+          if (event.shiftKey || this._drag.button === 1) {
+            this.orbit.panX += dx;
+            this.orbit.panY += dy;
+          } else {
+            this.orbit.yaw += dx * 0.008;
+            this.orbit.pitch = Math.max(-1.45, Math.min(1.45, this.orbit.pitch + dy * 0.008));
+          }
+          this._schedule();
+        });
+        const release = () => { this._drag = null; canvas.classList.remove("dragging"); };
+        canvas.addEventListener("pointerup", release);
+        canvas.addEventListener("pointercancel", release);
+        canvas.addEventListener("wheel", event => {
+          if (event.preventDefault) event.preventDefault();
+          this.orbit.zoom = Math.max(0.2, Math.min(12, this.orbit.zoom * Math.exp(-event.deltaY * 0.001)));
+          this._schedule();
+        }, { passive: false });
+      }
+
+      resize() {
+        const rect = this.canvas.getBoundingClientRect
+          ? this.canvas.getBoundingClientRect()
+          : { width: this.canvas.clientWidth || 1, height: this.canvas.clientHeight || 1 };
+        const width = Math.max(1, Math.round(rect.width || 1));
+        const height = Math.max(1, Math.round(rect.height || 1));
+        const ratio = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+        this.viewport = { width, height, ratio };
+        const pixelWidth = Math.round(width * ratio);
+        const pixelHeight = Math.round(height * ratio);
+        if (this.canvas.width !== pixelWidth) this.canvas.width = pixelWidth;
+        if (this.canvas.height !== pixelHeight) this.canvas.height = pixelHeight;
+        this._image = this.ctx.createImageData(pixelWidth, pixelHeight);
+        this._u32 = new Uint32Array(this._image.data.buffer);
+        this._zbuf = new Float32Array(pixelWidth * pixelHeight);
+        this._schedule();
+      }
+
+      setCloud(xyz, rgb, count) {
+        this.xyz = xyz;
+        this.rgb = rgb;
+        this.count = count | 0;
+        if (!this.framing) this.framing = this._fit();
+        this._schedule();
+      }
+
+      resetView() {
+        this.orbit = Object.assign({}, this.defaultOrbit);
+        this.framing = this._fit();
+        this._schedule();
+      }
+
+      // Robust auto-fit: per-axis 5th-95th percentile box (in viewer coords)
+      // so edge noise and a few far outliers never shrink the framing.  Called
+      // only on the first cloud and on Reset view, never per frame, so a
+      // stationary scene does not shake.
+      _fit() {
+        if (!this.xyz || !this.count) return null;
+        const step = Math.max(1, Math.floor(this.count / 4000));
+        const xs = [], ys = [], zs = [];
+        for (let i = 0; i < this.count; i += step) {
+          xs.push(this.xyz[i * 3]);
+          ys.push(-this.xyz[i * 3 + 1]);
+          zs.push(this.xyz[i * 3 + 2]);
+        }
+        if (!xs.length) return null;
+        const percentile = (values, fraction) => {
+          values.sort((a, b) => a - b);
+          const index = Math.min(values.length - 1, Math.max(0, Math.round((values.length - 1) * fraction)));
+          return values[index];
+        };
+        const loX = percentile(xs, 0.05), hiX = percentile(xs, 0.95);
+        const loY = percentile(ys, 0.05), hiY = percentile(ys, 0.95);
+        const loZ = percentile(zs, 0.05), hiZ = percentile(zs, 0.95);
+        if (!Number.isFinite(loX)) return null;
+        return {
+          cx: (loX + hiX) / 2,
+          cy: (loY + hiY) / 2,
+          cz: (loZ + hiZ) / 2,
+          span: Math.max(hiX - loX, hiY - loY, hiZ - loZ, 0.3),
+        };
+      }
+
+      _schedule() {
+        if (this._raf !== null) return;
+        this._raf = window.requestAnimationFrame(() => { this._raf = null; this.render(); });
+      }
+
+      render() {
+        const image = this._image;
+        if (!image) return;
+        const pixelWidth = this.canvas.width;
+        const pixelHeight = this.canvas.height;
+        const u32 = this._u32;
+        const zbuf = this._zbuf;
+        // Little-endian RGBA background (R=07,G=0B,B=0E,A=FF) as one uint32.
+        u32.fill((CLOUD_BG_RGBA[3] << 24) | (CLOUD_BG_RGBA[2] << 16) | (CLOUD_BG_RGBA[1] << 8) | CLOUD_BG_RGBA[0]);
+        zbuf.fill(Infinity);
+        const framing = this.framing || this._fit();
+        if (framing && this.xyz && this.count) {
+          const data = image.data;
+          const ratio = this.viewport.ratio;
+          const scale = Math.min(pixelWidth, pixelHeight) * 0.8 / framing.span * this.orbit.zoom;
+          const cyaw = Math.cos(this.orbit.yaw), syaw = Math.sin(this.orbit.yaw);
+          const cpit = Math.cos(this.orbit.pitch), spit = Math.sin(this.orbit.pitch);
+          const ox = pixelWidth * 0.5 + this.orbit.panX * ratio;
+          const oy = pixelHeight * 0.5 + this.orbit.panY * ratio;
+          const size = Math.max(2, Math.round(ratio * 2));
+          const xyz = this.xyz, rgb = this.rgb, count = this.count;
+          for (let i = 0; i < count; i++) {
+            const wx = xyz[i * 3] - framing.cx;
+            const wy = -xyz[i * 3 + 1] - framing.cy;
+            const wz = xyz[i * 3 + 2] - framing.cz;
+            const x1 = cyaw * wx - syaw * wz;
+            const z1 = syaw * wx + cyaw * wz;
+            const y2 = cpit * wy - spit * z1;
+            const z2 = spit * wy + cpit * z1;
+            const sx = (ox + x1 * scale) | 0;
+            const sy = (oy - y2 * scale) | 0;
+            if (sx < 0 || sy < 0 || sx >= pixelWidth || sy >= pixelHeight) continue;
+            const r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
+            for (let dy = 0; dy < size; dy++) {
+              const py = sy + dy;
+              if (py >= pixelHeight) break;
+              const rowBase = py * pixelWidth;
+              for (let dx = 0; dx < size; dx++) {
+                const px = sx + dx;
+                if (px >= pixelWidth) break;
+                const idx = rowBase + px;
+                if (z2 < zbuf[idx]) {
+                  zbuf[idx] = z2;
+                  const o = idx * 4;
+                  data[o] = r; data[o + 1] = g; data[o + 2] = b; data[o + 3] = 255;
+                }
+              }
+            }
+          }
+        }
+        this.ctx.putImageData(image, 0, 0);
+      }
+
+      destroy() {
+        if (this._observer) this._observer.disconnect();
+        if (this._raf !== null) window.cancelAnimationFrame(this._raf);
+      }
+    }
+
+    function ensureCloudView() {
+      if (state.cloudView) return state.cloudView;
+      const canvas = byId("cloud-canvas");
+      if (!canvas) return null;
+      try {
+        state.cloudView = new CloudView(canvas);
+      } catch (_error) {
+        state.cloudView = null;
+      }
+      return state.cloudView;
+    }
+
+    const CLOUD_TILE = {
+      badgeId: "cloud-state", placeholderId: "cloud-placeholder",
+      floorMs: CLOUD_POLL_FLOOR_MS, freshMaxMs: CLOUD_FRESH_MAX_MS,
+      loadingText: "Loading the latest colored point cloud.",
+      waitingText: "Waiting for the subscribe-only cloud observer.",
+      hasFrame: () => state.cloudHasFrame
+    };
+
+    function renderCloudState(status, detail = "", ageMs = null) {
+      renderLiveTileState(CLOUD_TILE, status, detail, ageMs);
+    }
+
+    // Truthful depth-source badge: never leave the active source ambiguous.
+    function renderCloudSource(source) {
+      const badge = byId("cloud-source");
+      if (!badge) return;
+      if (source === "ffs") {
+        badge.className = "camera-state live";
+        badge.textContent = "FFS";
+        badge.title = "Active depth source: Fast-FoundationStereo learned stereo";
+      } else if (source === "d435_raw") {
+        badge.className = "camera-state tracked";
+        badge.textContent = "D435 RAW";
+        badge.title = "Active depth source: raw D435 aligned depth (FFS not flowing)";
+      } else {
+        badge.className = "camera-state offline";
+        badge.textContent = "—";
+        badge.title = "Active depth source unknown";
+      }
+    }
+
+    // Parse and validate one ZMPC colored-cloud binary into typed-array views.
+    // The dashboard host is x86 little-endian, matching the observer writer, so
+    // Float32Array views over the buffer need no byte swapping (offset 20 is
+    // 4-byte aligned).  Returns null on any header or length mismatch.
+    function parseCloudBinary(buffer) {
+      if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 20) return null;
+      const view = new DataView(buffer);
+      if (view.getUint8(0) !== 0x5A || view.getUint8(1) !== 0x4D
+        || view.getUint8(2) !== 0x50 || view.getUint8(3) !== 0x43) return null;
+      const version = view.getUint16(4, true);
+      const sourceFlag = view.getUint16(6, true);
+      const count = view.getUint32(8, true);
+      if (version !== 1) return null;
+      if (buffer.byteLength !== 20 + count * 15) return null;
+      const xyz = new Float32Array(buffer, 20, count * 3);
+      const rgb = new Uint8Array(buffer, 20 + count * 12, count * 3);
+      return { count, sourceFlag, xyz, rgb };
+    }
+
+    function scheduleCloudPoll(delayMs) {
+      if (state.cloudTimer !== null) window.clearTimeout(state.cloudTimer);
+      state.cloudTimer = window.setTimeout(refreshCloudTile, delayMs);
+    }
+
+    // Colored point-cloud tile poll loop.  Follows the shared freshness pattern
+    // (server-advertised poll interval, ETag conditional GET, always keep
+    // polling so a recovered source refreshes) but parses a binary payload into
+    // the interactive CloudView instead of decoding a JPEG into an <img>.
+    async function refreshCloudTile() {
+      const view = ensureCloudView();
+      try {
+        const headers = {};
+        if (state.cloudEtag) headers["If-None-Match"] = state.cloudEtag;
+        const response = await fetch("/api/cloud/latest.bin", {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers
+        });
+        const suggested = Number.parseInt(response.headers.get("X-Z-Manip-Poll-Interval-Ms") || String(CLOUD_POLL_FLOOR_MS), 10);
+        const delay = Number.isFinite(suggested) ? Math.max(CLOUD_POLL_FLOOR_MS, suggested) : CLOUD_POLL_FLOOR_MS;
+        const ageMs = Number.parseInt(response.headers.get("X-Z-Manip-Cloud-Age-Ms") || "", 10);
+        const ageText = Number.isFinite(ageMs) ? ageMs : "0";
+        renderCloudSource(response.headers.get("X-Z-Manip-Cloud-Source"));
+        if (response.status === 304) {
+          renderCloudState("live", `latest cloud age ${ageText} ms`, ageMs);
+          scheduleCloudPoll(delay);
+          return;
+        }
+        if (!response.ok) {
+          const tileState = response.headers.get("X-Z-Manip-Cloud-State") || (response.status === 503 ? "stale" : "offline");
+          renderCloudState(tileState, `endpoint HTTP ${response.status}`, ageMs);
+          scheduleCloudPoll(tileState === "stale" ? delay : 500);
+          return;
+        }
+        const parsed = parseCloudBinary(await response.arrayBuffer());
+        if (!parsed) throw new Error("cloud endpoint returned an invalid ZMPC binary");
+        state.cloudEtag = response.headers.get("ETag");
+        if (view) view.setCloud(parsed.xyz, parsed.rgb, parsed.count);
+        state.cloudHasFrame = true;
+        byId("cloud-placeholder").hidden = true;
+        renderCloudState("live", `latest cloud age ${ageText} ms · ${parsed.count} pts`, ageMs);
+        scheduleCloudPoll(delay);
+      } catch (error) {
+        renderCloudState("offline", String(error), null);
+        scheduleCloudPoll(1000);
+      }
     }
 
     async function refreshRuntime() {
@@ -3482,11 +3828,16 @@
     bindSessionControls();
     bindComponentControls();
     bindFeedOrderControls();
+    byId("cloud-reset-view").addEventListener("click", () => {
+      const view = ensureCloudView();
+      if (view) view.resetView();
+    });
     refreshHomeStatus();
     refreshGraspStatus();
     refreshApproachStatus();
     refreshCamera();
     refreshDepth();
+    refreshCloudTile();
     refreshPerceptionFeeds();
     refreshComponentStatus();
     loadBundle().then(() => {

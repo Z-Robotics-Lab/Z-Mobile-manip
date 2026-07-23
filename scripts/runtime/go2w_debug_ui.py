@@ -322,6 +322,8 @@ def make_handler(
                     "/api/runtime",
                     "/api/camera/latest.jpg",
                     "/api/depth/latest.jpg",
+                    "/api/cloud/latest.bin",
+                    "/api/cloud/latest.json",
                     "/api/home/status",
                     "/api/grasp/status",
                     "/api/sessions/status",

@@ -11,6 +11,7 @@ DDS_CONFIG="${Z_MANIP_DDS_CONFIG:-$ROOT_DIR/docker/runtime/cyclonedds-go2w-pc.xm
 OUTPUT="${Z_MANIP_RUNTIME_OBSERVER_OUTPUT:-$ROOT_DIR/../artifacts/go2w_real/latest/runtime-observer.json}"
 CAMERA_OUTPUT_NAME="camera-latest.jpg"
 DEPTH_OUTPUT_NAME="depth-latest.jpg"
+CLOUD_OUTPUT_NAME="cloud-latest.bin"
 OBSERVER="$SCRIPT_DIR/go2w_runtime_observer.py"
 URDF="${Z_MANIP_ROBOT_URDF:-$WORKSPACE_ROOT/go2W_Sim/assets/urdf/go2w_sensored.urdf}"
 CALIBRATION="${Z_MANIP_CAMERA_CALIBRATION:-$WORKSPACE_ROOT/artifacts/go2w_real/calibration/piper_wrist_camera_calibration.json}"
@@ -53,6 +54,7 @@ run_observer() {
         --output "/artifacts/$output_name" \
         --camera-output "/artifacts/$CAMERA_OUTPUT_NAME" \
         --depth-output "/artifacts/$DEPTH_OUTPUT_NAME" \
+        --cloud-output "/artifacts/$CLOUD_OUTPUT_NAME" \
         --ros-domain-id "$DOMAIN_ID" \
         --urdf /model/robot.urdf \
         --calibration /model/camera-calibration.json \

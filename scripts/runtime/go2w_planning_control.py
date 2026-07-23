@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import signal
 import stat as stat_module
+import struct
 import subprocess
 import threading
 import time
@@ -63,6 +64,20 @@ CAMERA_POLL_INTERVAL_MS = 80
 # so it catches every distinct frame rather than beating against an equal rate.
 DEPTH_STALE_AFTER_S = 2.0
 DEPTH_POLL_INTERVAL_MS = 75
+# Live colored point-cloud tile.  The observer writes the cloud binary at ~5 Hz;
+# the browser is asked to poll slightly faster (~6.7 Hz) so it catches every
+# distinct frame.  The compact XYZ+RGB binary stays well under 1 MiB at the
+# ~15-20k decimated point budget.
+CLOUD_STALE_AFTER_S = 2.0
+CLOUD_POLL_INTERVAL_MS = 150
+MAX_CLOUD_BIN_BYTES = 1024 * 1024
+MAX_CLOUD_MANIFEST_BYTES = 8 * 1024
+CLOUD_MAGIC = b"ZMPC"
+# Must match go2w_runtime_observer.CLOUD_HEADER_STRUCT: magic, version,
+# source_flag, count, stamp_ns (little-endian, 20 bytes).
+CLOUD_HEADER_STRUCT = struct.Struct("<4sHHIQ")
+CLOUD_POINT_BYTES = 12 + 3  # float32 xyz triplet + uint8 rgb triplet
+CLOUD_SOURCE_NAMES = {0: "d435_raw", 1: "ffs"}
 # Default advertised poll interval for lower-rate JSON/perception endpoints.
 DEFAULT_POLL_INTERVAL_MS = 200
 HOME_FAST_VERIFY_TOLERANCE_RAD = math.radians(1.0)
@@ -1091,6 +1106,99 @@ class CameraSnapshotReader:
                 )
                 self._cache_key = fingerprint
             return "live", self._payload, self._etag, age_s, ""
+
+
+def _parse_cloud_header(payload: bytes) -> tuple[str, int] | None:
+    """Validate a ZMPC colored-cloud binary and return its (source, count).
+
+    Rejects a wrong magic/version, an unknown source flag, or any payload whose
+    length does not exactly match the declared point count, so a torn or
+    foreign file can never be served as a cloud.
+    """
+
+    if len(payload) < CLOUD_HEADER_STRUCT.size:
+        return None
+    magic, version, source_flag, count, _stamp = CLOUD_HEADER_STRUCT.unpack_from(payload, 0)
+    if magic != CLOUD_MAGIC or version != 1:
+        return None
+    source_name = CLOUD_SOURCE_NAMES.get(source_flag)
+    if source_name is None:
+        return None
+    if len(payload) != CLOUD_HEADER_STRUCT.size + count * CLOUD_POINT_BYTES:
+        return None
+    return source_name, count
+
+
+class CloudSnapshotReader:
+    """Read one fixed, bounded, recent colored-cloud binary from the observer.
+
+    Mirrors :class:`CameraSnapshotReader` (stat-cache, freshness window, ETag
+    conditional GET) but validates the compact ZMPC header instead of a JPEG
+    signature and exposes the active depth source and point count so the tile
+    badge can never present an ambiguous source.
+    """
+
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        max_bytes: int = MAX_CLOUD_BIN_BYTES,
+        stale_after_s: float = CLOUD_STALE_AFTER_S,
+        clock_ns: Any = time.time_ns,
+    ) -> None:
+        if max_bytes <= CLOUD_HEADER_STRUCT.size or max_bytes > MAX_CLOUD_BIN_BYTES:
+            raise ValueError("cloud byte limit must be within the fixed 1 MiB cap")
+        if not math.isfinite(stale_after_s) or not 0.0 < stale_after_s <= 10.0:
+            raise ValueError("cloud stale threshold must be within 10 seconds")
+        self.path = None if path is None else path.expanduser().resolve()
+        self.manifest_path = None if self.path is None else self.path.with_suffix(".json")
+        self.max_bytes = int(max_bytes)
+        self.stale_after_ns = round(stale_after_s * 1_000_000_000)
+        self._clock_ns = clock_ns
+        self._lock = threading.Lock()
+        self._cache_key: object = object()
+        self._payload: bytes | None = None
+        self._etag: str | None = None
+        self._source: str | None = None
+        self._count: int = 0
+
+    def snapshot(
+        self,
+    ) -> tuple[str, bytes | None, str | None, float | None, str | None, int, str]:
+        with self._lock:
+            now_ns = int(self._clock_ns())
+            if self.path is None:
+                return "offline", None, None, None, None, 0, "cloud is not configured"
+            try:
+                stat = self.path.stat()
+            except FileNotFoundError:
+                return "offline", None, None, None, None, 0, "cloud is unavailable"
+            except OSError as error:
+                return "offline", None, None, None, None, 0, f"cloud is unreadable: {error}"
+            if not stat_module.S_ISREG(stat.st_mode):
+                return "invalid", None, None, None, None, 0, "cloud is not a regular file"
+            age_ns = now_ns - stat.st_mtime_ns
+            age_s = max(0, age_ns) / 1_000_000_000.0
+            if stat.st_mtime_ns > now_ns + round(MAX_CAMERA_FUTURE_S * 1_000_000_000):
+                return "invalid", None, None, age_s, None, 0, "cloud timestamp is in the future"
+            if stat.st_size < CLOUD_HEADER_STRUCT.size or stat.st_size > self.max_bytes:
+                return "invalid", None, None, age_s, None, 0, "cloud violates the 1 MiB size limit"
+            if age_ns > self.stale_after_ns:
+                return "stale", None, self._etag, age_s, self._source, self._count, "cloud is stale"
+            fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            if fingerprint != self._cache_key:
+                try:
+                    payload = self.path.read_bytes()
+                except OSError as error:
+                    return "offline", None, None, age_s, None, 0, f"cloud is unreadable: {error}"
+                parsed = _parse_cloud_header(payload)
+                if parsed is None or len(payload) > self.max_bytes:
+                    return "invalid", None, None, age_s, None, 0, "cloud is not a bounded ZMPC binary"
+                self._source, self._count = parsed
+                self._payload = payload
+                self._etag = '"cloud-' + hashlib.sha256(payload).hexdigest()[:24] + '"'
+                self._cache_key = fingerprint
+            return "live", self._payload, self._etag, age_s, self._source, self._count, ""
 
 
 class InteractiveArtifactError(ValueError):
@@ -3996,6 +4104,7 @@ def _runtime_handler(
     reader: RuntimeStateReader,
     camera_reader: CameraSnapshotReader,
     depth_reader: CameraSnapshotReader,
+    cloud_reader: CloudSnapshotReader,
     live_perception: LivePerceptionRenderer,
     session_service: ReadOnlySessionService | None,
     session_artifacts: InteractiveArtifactReader | None,
@@ -5104,6 +5213,155 @@ def _runtime_handler(
                 self.wfile.write(error_payload)
             return True
 
+        def _cloud_headers(
+            self,
+            status: HTTPStatus,
+            *,
+            content_type: str,
+            length: int,
+            cloud_state: str,
+            age_s: float | None,
+            etag: str | None = None,
+            source: str | None = None,
+            count: int | None = None,
+            poll_interval_ms: int = CLOUD_POLL_INTERVAL_MS,
+        ) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "no-store")
+            if etag is not None:
+                self.send_header("ETag", etag)
+            self.send_header("X-Z-Manip-Cloud-State", cloud_state)
+            if source is not None:
+                self.send_header("X-Z-Manip-Cloud-Source", source)
+            if count is not None:
+                self.send_header("X-Z-Manip-Cloud-Count", str(max(0, int(count))))
+            if age_s is not None:
+                self.send_header("X-Z-Manip-Cloud-Age-Ms", str(max(0, round(age_s * 1000))))
+            self.send_header("X-Z-Manip-Poll-Interval-Ms", str(int(poll_interval_ms)))
+            self.send_header("Content-Security-Policy", go2w_debug_ui.SECURITY_POLICY)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.end_headers()
+
+        def _cloud_route(self, *, include_body: bool) -> bool:
+            route = urlsplit(self.path)
+            if route.path != "/api/cloud/latest.bin":
+                return False
+            if route.query or route.fragment:
+                payload = b'{"error":"cloud endpoint accepts no query string"}\n'
+                self._cloud_headers(
+                    HTTPStatus.BAD_REQUEST,
+                    content_type="application/json; charset=utf-8",
+                    length=len(payload),
+                    cloud_state="invalid",
+                    age_s=None,
+                )
+                if include_body:
+                    self.wfile.write(payload)
+                return True
+            status, payload, etag, age_s, source, count, message = cloud_reader.snapshot()
+            if status == "live" and payload is not None and etag is not None:
+                if self.headers.get("If-None-Match") == etag:
+                    self._cloud_headers(
+                        HTTPStatus.NOT_MODIFIED,
+                        content_type="application/octet-stream",
+                        length=0,
+                        cloud_state="live",
+                        age_s=age_s,
+                        etag=etag,
+                        source=source,
+                        count=count,
+                    )
+                    return True
+                self._cloud_headers(
+                    HTTPStatus.OK,
+                    content_type="application/octet-stream",
+                    length=len(payload),
+                    cloud_state="live",
+                    age_s=age_s,
+                    etag=etag,
+                    source=source,
+                    count=count,
+                )
+                if include_body:
+                    self.wfile.write(payload)
+                return True
+            error_payload = (json.dumps({"error": message}, separators=(",", ":")) + "\n").encode("utf-8")
+            http_status = {
+                "stale": HTTPStatus.SERVICE_UNAVAILABLE,
+                "invalid": HTTPStatus.CONFLICT,
+            }.get(status, HTTPStatus.NOT_FOUND)
+            self._cloud_headers(
+                http_status,
+                content_type="application/json; charset=utf-8",
+                length=len(error_payload),
+                cloud_state=status,
+                age_s=age_s,
+                source=source,
+                count=count if count else None,
+            )
+            if include_body:
+                self.wfile.write(error_payload)
+            return True
+
+        def _cloud_manifest_route(self, *, include_body: bool) -> bool:
+            route = urlsplit(self.path)
+            if route.path != "/api/cloud/latest.json":
+                return False
+            if route.query or route.fragment:
+                self._json(
+                    {"error": "cloud manifest endpoint accepts no query string"},
+                    status=HTTPStatus.BAD_REQUEST,
+                    include_body=include_body,
+                )
+                return True
+            manifest_path = cloud_reader.manifest_path
+            if manifest_path is None:
+                self._json(
+                    {"error": "cloud manifest is not configured"},
+                    status=HTTPStatus.NOT_FOUND,
+                    include_body=include_body,
+                )
+                return True
+            try:
+                stat = manifest_path.stat()
+                if not stat_module.S_ISREG(stat.st_mode) or stat.st_size > MAX_CLOUD_MANIFEST_BYTES:
+                    raise OSError("cloud manifest is not a bounded regular file")
+                payload = manifest_path.read_bytes()
+            except OSError as error:
+                self._json(
+                    {"error": f"cloud manifest is unavailable: {error}"},
+                    status=HTTPStatus.NOT_FOUND,
+                    include_body=include_body,
+                )
+                return True
+            etag = '"cloud-manifest-' + hashlib.sha256(payload).hexdigest()[:20] + '"'
+            if self.headers.get("If-None-Match") == etag:
+                self._cloud_headers(
+                    HTTPStatus.NOT_MODIFIED,
+                    content_type="application/json; charset=utf-8",
+                    length=0,
+                    cloud_state="live",
+                    age_s=None,
+                    etag=etag,
+                )
+                return True
+            self._cloud_headers(
+                HTTPStatus.OK,
+                content_type="application/json; charset=utf-8",
+                length=len(payload),
+                cloud_state="live",
+                age_s=None,
+                etag=etag,
+            )
+            if include_body:
+                self.wfile.write(payload)
+            return True
+
         def _live_perception_route(self, *, include_body: bool) -> bool:
             route = urlsplit(self.path)
             kind = LIVE_PERCEPTION_ROUTES.get(route.path)
@@ -5220,6 +5478,8 @@ def _runtime_handler(
                 and not self._live_perception_route(include_body=True)
                 and not self._camera_route(include_body=True)
                 and not self._depth_route(include_body=True)
+                and not self._cloud_route(include_body=True)
+                and not self._cloud_manifest_route(include_body=True)
                 and not self._runtime_route(include_body=True)
             ):
                 super().do_GET()
@@ -5235,6 +5495,8 @@ def _runtime_handler(
                 and not self._live_perception_route(include_body=False)
                 and not self._camera_route(include_body=False)
                 and not self._depth_route(include_body=False)
+                and not self._cloud_route(include_body=False)
+                and not self._cloud_manifest_route(include_body=False)
                 and not self._runtime_route(include_body=False)
             ):
                 super().do_HEAD()
@@ -5262,6 +5524,7 @@ def create_server(
     runtime_state: Path | None,
     camera_image: Path | None = None,
     depth_image: Path | None = None,
+    cloud_bin: Path | None = None,
     interactive_service: ReadOnlySessionService | None = None,
     interactive_run_root: Path | None = None,
     home_runner: PiperHomeRunner | None = None,
@@ -5281,6 +5544,7 @@ def create_server(
     )
     camera_reader = CameraSnapshotReader(camera_image)
     depth_reader = CameraSnapshotReader(depth_image, stale_after_s=DEPTH_STALE_AFTER_S)
+    cloud_reader = CloudSnapshotReader(cloud_bin)
     session_artifacts = (
         None
         if interactive_service is None
@@ -5294,6 +5558,7 @@ def create_server(
         RuntimeStateReader(runtime_state),
         camera_reader,
         depth_reader,
+        cloud_reader,
         LivePerceptionRenderer(camera_reader, session_artifacts),
         interactive_service,
         session_artifacts,
@@ -5332,6 +5597,14 @@ def _arguments() -> argparse.Namespace:
         help=(
             "fixed observer-written colorized depth JPEG served only at "
             "/api/depth/latest.jpg"
+        ),
+    )
+    parser.add_argument(
+        "--cloud-bin",
+        type=Path,
+        help=(
+            "fixed observer-written colored point-cloud binary served only at "
+            "/api/cloud/latest.bin (+ manifest at /api/cloud/latest.json)"
         ),
     )
     parser.add_argument("--port", type=int, default=8766)
@@ -5431,6 +5704,7 @@ def main() -> int:
         runtime_state=args.runtime_state,
         camera_image=args.camera_image,
         depth_image=args.depth_image,
+        cloud_bin=args.cloud_bin,
         interactive_service=interactive_service,
         interactive_run_root=go2w_interactive_sessions.RUN_ROOT,
         home_runner=home_runner,
@@ -5454,6 +5728,11 @@ def main() -> int:
     print(
         "depth image: "
         + ("offline (not configured)" if args.depth_image is None else str(args.depth_image.expanduser().resolve())),
+        flush=True,
+    )
+    print(
+        "cloud binary: "
+        + ("offline (not configured)" if args.cloud_bin is None else str(args.cloud_bin.expanduser().resolve())),
         flush=True,
     )
     print(

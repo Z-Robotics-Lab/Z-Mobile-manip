@@ -286,6 +286,170 @@ def test_depth_writer_coalesces_bursts_to_the_minimum_interval(tmp_path):
     assert writer.write(message()) is True  # interval elapsed
 
 
+def _color_message(stamp_ns: int, width: int, height: int, encoding: str, rgb):
+    if encoding == "bgr8":
+        data = rgb[:, :, ::-1]
+    else:
+        data = rgb
+    return SimpleNamespace(
+        header=_header(stamp_ns, "camera_color_optical_frame"),
+        width=width,
+        height=height,
+        step=width * data.shape[2],
+        encoding=encoding,
+        data=np.ascontiguousarray(data).tobytes(),
+    )
+
+
+def _depth_message(stamp_ns: int, width: int, height: int, depth_u16):
+    return SimpleNamespace(
+        header=_header(stamp_ns, "camera_color_optical_frame"),
+        width=width,
+        height=height,
+        step=width * 2,
+        encoding="16UC1",
+        data=np.ascontiguousarray(depth_u16, dtype="<u2").tobytes(),
+    )
+
+
+_CLOUD_K = [605.87, 0.0, 331.78, 0.0, 605.21, 240.24, 0.0, 0.0, 1.0]
+
+
+def test_point_cloud_encoder_header_decimation_and_invalid_rejection():
+    width, height = 640, 480
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    rgb[:, :, 0] = 200  # red channel marker
+    depth = np.full((height, width), 1000, dtype="<u2")  # 1.0 m valid return
+    depth[:240, :320] = 0  # top-left quadrant invalid (no return)
+    color = _color_message(1_700_000_000_000_000_001, width, height, "rgb8", rgb)
+    color.stamp = 1_700_000_000_000_000_001
+    depth_msg = _depth_message(1_700_000_000_000_000_001, width, height, depth)
+
+    payload, manifest = OBSERVER.encode_point_cloud(
+        color,
+        depth_msg,
+        _CLOUD_K,
+        source="ffs",
+        source_topic="/camera/ffs_depth_aligned/image_raw",
+    )
+
+    magic, version, source_flag, count, stamp = OBSERVER.CLOUD_HEADER_STRUCT.unpack_from(payload, 0)
+    assert magic == OBSERVER.CLOUD_MAGIC
+    assert version == OBSERVER.CLOUD_VERSION == 1
+    assert source_flag == OBSERVER.CLOUD_SOURCE_FLAGS["ffs"] == 1
+    assert stamp == 1_700_000_000_000_000_001
+    # Header + float32 xyz triplets + uint8 rgb triplets, exactly.
+    assert len(payload) == OBSERVER.CLOUD_HEADER_STRUCT.size + count * (12 + 3)
+    assert count == manifest["count"] > 0
+    assert count <= OBSERVER.CLOUD_MAX_POINTS
+    assert manifest["stride"] == OBSERVER.compute_cloud_stride(width, height) == 4
+    # One quadrant of the decimated grid was invalid depth; it must be dropped.
+    assert manifest["valid_fraction"] == pytest.approx(0.75, abs=0.02)
+    assert manifest["source"] == "ffs"
+    assert manifest["frame"] == "camera_color_optical_frame"
+    assert manifest["source_topic"] == "/camera/ffs_depth_aligned/image_raw"
+    assert manifest["point_bytes"] == len(payload)
+
+    xyz = np.frombuffer(payload, dtype="<f4", count=count * 3, offset=20).reshape(count, 3)
+    colors = np.frombuffer(
+        payload,
+        dtype=np.uint8,
+        count=count * 3,
+        offset=20 + count * 12,
+    ).reshape(count, 3)
+    assert np.all(np.abs(xyz[:, 2] - 1.0) < 1e-4)  # every kept point is the 1.0 m plane
+    assert int(colors[:, 0].min()) == 200 and int(colors[:, 1].max()) == 0
+
+
+def test_point_cloud_encoder_rejects_bad_intrinsics_and_dimension_mismatch():
+    width, height = 64, 48
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    color = _color_message(10, width, height, "rgb8", rgb)
+    color.stamp = 10
+    depth_msg = _depth_message(10, width, height, np.full((height, width), 800, dtype="<u2"))
+    with pytest.raises(ValueError, match="intrinsics"):
+        OBSERVER.encode_point_cloud(color, depth_msg, [0.0] * 9, source="ffs")
+    mismatched = _depth_message(10, width, height + 8, np.full((height + 8, width), 800, dtype="<u2"))
+    with pytest.raises(ValueError, match="dimensions differ"):
+        OBSERVER.encode_point_cloud(color, mismatched, _CLOUD_K, source="d435_raw")
+    with pytest.raises(ValueError, match="unsupported cloud source"):
+        OBSERVER.encode_point_cloud(color, depth_msg, _CLOUD_K, source="mystery")
+
+
+def test_point_cloud_writer_throttles_and_rejects_mismatched_stamp(tmp_path):
+    clock = {"t": 100.0}
+    writer = OBSERVER.PointCloudWriter(
+        tmp_path / "cloud-latest.bin",
+        source_topics={"ffs": "/ffs", "d435_raw": "/raw"},
+        min_interval_s=0.18,
+        max_pair_skew_s=0.015,
+        monotonic=lambda: clock["t"],
+    )
+    width, height = 64, 48
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    depth = np.full((height, width), 900, dtype="<u2")
+    info = SimpleNamespace(k=list(_CLOUD_K))
+    assert writer.observe_camera_info(info) is True
+    assert writer.observe_color(_color_message(1_000_000_000, width, height, "rgb8", rgb)) is True
+
+    # A depth frame whose stamp differs from every buffered color by more than
+    # the skew window must never be colorized with a stale color frame.
+    skewed = _depth_message(1_000_000_000 + 20_000_000, width, height, depth)
+    assert writer.observe_depth("d435_raw", skewed) is False
+    assert not (tmp_path / "cloud-latest.bin").exists()
+
+    matched = _depth_message(1_000_000_000, width, height, depth)
+    assert writer.observe_depth("d435_raw", matched) is True
+    assert (tmp_path / "cloud-latest.bin").read_bytes()[:4] == OBSERVER.CLOUD_MAGIC
+    manifest = json.loads((tmp_path / "cloud-latest.json").read_text(encoding="utf-8"))
+    assert manifest["source"] == "d435_raw" and manifest["skew_ns"] == 0
+
+    # Within the throttle window a second matched frame is coalesced away.
+    clock["t"] = 100.05
+    assert writer.observe_depth("d435_raw", matched) is False
+    clock["t"] = 100.30
+    assert writer.observe_depth("d435_raw", matched) is True
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_point_cloud_writer_prefers_ffs_and_flips_back_to_raw(tmp_path):
+    clock = {"t": 500.0}
+    writer = OBSERVER.PointCloudWriter(
+        tmp_path / "cloud-latest.bin",
+        source_topics={"ffs": "/ffs", "d435_raw": "/raw"},
+        min_interval_s=0.0,
+        max_pair_skew_s=0.05,
+        source_active_window_s=1.0,
+        monotonic=lambda: clock["t"],
+    )
+    width, height = 32, 24
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    depth = np.full((height, width), 700, dtype="<u2")
+    writer.observe_camera_info(SimpleNamespace(k=list(_CLOUD_K)))
+
+    def frames(stamp):
+        writer.observe_color(_color_message(stamp, width, height, "rgb8", rgb))
+        return _depth_message(stamp, width, height, depth)
+
+    # Only raw so far -> raw is active and writes.
+    assert writer.observe_depth("d435_raw", frames(1)) is True
+    assert writer.active_source(clock["t"]) == "d435_raw"
+
+    # FFS appears -> it becomes the active source and writes.
+    assert writer.observe_depth("ffs", frames(2)) is True
+    assert writer.active_source(clock["t"]) == "ffs"
+    assert json.loads((tmp_path / "cloud-latest.json").read_text())["source"] == "ffs"
+
+    # While FFS is fresh, a raw frame is suppressed (no silent source ambiguity).
+    assert writer.observe_depth("d435_raw", frames(3)) is False
+
+    # FFS goes quiet past the active window -> the tile flips back to raw.
+    clock["t"] = 502.0
+    assert writer.observe_depth("d435_raw", frames(4)) is True
+    assert writer.active_source(clock["t"]) == "d435_raw"
+    assert json.loads((tmp_path / "cloud-latest.json").read_text())["source"] == "d435_raw"
+
+
 def test_ros_array_fields_are_accepted_without_ros_imports():
     joint = SimpleNamespace(
         header=_header(),
@@ -605,3 +769,4 @@ def test_launcher_and_service_are_isolated_and_non_blocking():
     assert "go2w_runtime_observer.sh run" in service
     assert "--camera-output" in launcher
     assert "--depth-output" in launcher
+    assert "--cloud-output" in launcher
