@@ -60,7 +60,7 @@ vlm_edgetam_bridge:
     # Race a duplicate only when the first request remains outstanding. This
     # removes remote provider queue tails while retaining the same model/schema.
     vlm_hedge_delay_s: 0.05
-    vlm_min_confidence: 0.20
+    vlm_min_confidence: 0.15
     vlm_max_target_area_ratio: 0.95
     vlm_max_semantic_conflict_coverage_ratio: 0.95
     jpeg_quality: 85

@@ -629,7 +629,7 @@ class VlmEdgeTamBridge(Node):
             'vlm_provider_retries': 1,
             'vlm_timeout_retries': 0,
             'vlm_hedge_delay_s': 0.05,
-            'vlm_min_confidence': 0.20,
+            'vlm_min_confidence': 0.15,
             'vlm_max_target_area_ratio': 0.95,
             'vlm_max_semantic_conflict_coverage_ratio': 0.95,
             'jpeg_quality': 85,

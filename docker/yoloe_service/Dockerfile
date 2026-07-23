@@ -32,4 +32,4 @@ EXPOSE 8771
 HEALTHCHECK --interval=10s --timeout=2s --start-period=30s --retries=3 \
   CMD python -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8771/health',timeout=1)); assert d['ready'] and d['backend']=='yoloe'" || exit 1
 
-CMD ["python", "/app/local_grounding_service.py", "--host", "127.0.0.1", "--port", "8771", "--model", "/models/yoloe-11s-seg.pt", "--minimum-confidence", "0.20"]
+CMD ["python", "/app/local_grounding_service.py", "--host", "127.0.0.1", "--port", "8771", "--model", "/models/yoloe-11s-seg.pt", "--minimum-confidence", "0.15"]

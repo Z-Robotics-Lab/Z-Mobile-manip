@@ -857,7 +857,7 @@ class OpenRouterVLM:
             self.transport,
         )
         self.min_confidence = float(
-            os.environ.get("Z_MANIP_VLM_MIN_CONFIDENCE", "0.20")
+            os.environ.get("Z_MANIP_VLM_MIN_CONFIDENCE", "0.15")
             if min_confidence is None else min_confidence
         )
         self.max_target_area_ratio = float(
@@ -1361,7 +1361,7 @@ class OpenRouterVLM:
         value: Mapping[str, object],
         latency_s: float,
         *,
-        min_confidence: float = 0.20,
+        min_confidence: float = 0.15,
         max_target_area_ratio: float = 0.95,
         min_target_border_margin_ratio: float = 0.002,
         max_semantic_conflict_coverage_ratio: float = 0.95,
