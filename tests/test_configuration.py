@@ -62,9 +62,9 @@ def test_deployment_config_resolves_robot_path_and_builds_typed_settings():
     assert config.visual_servo.rotate_only_bearing_rad == pytest.approx(
         0.0698131701,
     )
-    assert config.grasp_plan.max_feasible_plans == 2
-    assert config.grasp_plan.max_hypotheses == 32
-    assert config.grasp_plan.search_timeout_s == pytest.approx(12.0)
+    assert config.grasp_plan.max_feasible_plans == 1
+    assert config.grasp_plan.max_hypotheses == 64
+    assert config.grasp_plan.search_timeout_s == pytest.approx(6.0)
     assert config.grasp_plan.min_width_m == pytest.approx(0.012)
     assert config.tool_geometry.contact_tcp_z_m == pytest.approx(0.116675)
     assert config.tool_geometry.collision_open_aperture_m == pytest.approx(0.07)
