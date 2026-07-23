@@ -397,11 +397,14 @@ def test_rear_lean_floor_asymmetrically_bounds_shoulder_pitch_joint():
     assert at_floor.lower[j2_control] >= -1e-9
     assert at_floor.upper[j2_control] > 0.0
 
-    # Already rearward of the floor: a bounded escape *toward* the floor and the
-    # problem stays feasible (no lower > upper infeasibility).
+    # Already rearward of the floor: the joint may HOLD or move forward but is
+    # never pushed -- a positive lower bound here was a live regression (the
+    # home pose sits below the floor, so a forced "escape" became a persistent
+    # unsolicited upward push that tilted the camera off the target).
     behind = optimizer.linearize(_state(arm_joints_rad=(0.0, 0.0, -1.0, 0, 0, 0)), task)
-    assert behind.lower[j2_control] > 0.0
-    assert behind.lower[j2_control] <= behind.upper[j2_control] + 1e-12
+    assert behind.lower[j2_control] >= -1e-9
+    assert behind.lower[j2_control] <= 1e-9
+    assert behind.upper[j2_control] > 0.0
 
     # Disabled by default: the full URDF rearward range is preserved.
     default = WholeBodyShadowOptimizer(model)

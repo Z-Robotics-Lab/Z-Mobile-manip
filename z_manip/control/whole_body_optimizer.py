@@ -516,14 +516,19 @@ class WholeBodyShadowOptimizer:
         )
         rear_index = self.config.rear_lean_joint_index
         if rear_index is not None:
-            # Block only the rearward (decreasing) direction of the shoulder
-            # pitch joint so the upper arm cannot lean back into the rear NUC.
-            # Clamping to ``upper`` keeps the bound feasible: a pose already
-            # rearward of the floor retains a bounded escape velocity toward it
-            # rather than raising the ``lower > upper`` infeasibility below.
-            floor_velocity = (
-                self.config.rear_lean_floor_rad - joints[rear_index]
-            ) / dt
+            # Block only the rearward (decreasing) direction of the selected
+            # joint so the upper arm cannot lean back into the rear NUC.  The
+            # floor must NEVER force recovery motion: an earlier version set a
+            # positive lower velocity bound whenever the joint sat below the
+            # floor, which turned the ordinary home pose (J2=0, below a 9deg
+            # floor) into a persistent unsolicited upward push that tilted the
+            # camera off the target during live approach.  Below the floor the
+            # joint may hold or move forward, exactly like the NUC executor's
+            # own no-unsolicited-margin-recovery rule.
+            floor_velocity = min(
+                0.0,
+                (self.config.rear_lean_floor_rad - joints[rear_index]) / dt,
+            )
             lower[4 + rear_index] = min(
                 max(lower[4 + rear_index], floor_velocity),
                 upper[4 + rear_index],
