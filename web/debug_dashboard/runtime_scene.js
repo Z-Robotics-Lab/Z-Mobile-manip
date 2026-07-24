@@ -24,20 +24,20 @@
     autoResize: true,
     interactive: true,
     reducedMotion: null,
-    background: "#070b0e",
-    grid: "#1b2a32",
-    scenePoint: "#68767d",
-    targetPoint: "#49d9df",
-    actualRobot: "#d8e2e6",
-    plannedRobot: "#6f9dff",
-    collision: "#f0b758",
-    witness: "#ff6673",
+    background: "#0a0a0a",
+    grid: "#1f1f1f",
+    scenePoint: "#565b5d",
+    targetPoint: "#ffffff",
+    actualRobot: "#9aa1a4",
+    plannedRobot: "#5b8cff",
+    collision: "#c99a4a",
+    witness: "#c96a70",
   });
-  const AXIS_COLORS = Object.freeze(["#ff6673", "#54d68c", "#659cff"]);
+  const AXIS_COLORS = Object.freeze(["#c96a70", "#5fa877", "#5b8cff"]);
   const PATH_COLORS = Object.freeze({
-    transit: "#659cff",
-    approach: "#f0b758",
-    lift: "#54d68c",
+    transit: "#5b8cff",
+    approach: "#c99a4a",
+    lift: "#5fa877",
   });
   const IDENTITY = Object.freeze([
     Object.freeze([1, 0, 0, 0]),
@@ -1158,7 +1158,7 @@
       const spacing = 0.1;
       for (let index = -6; index <= 6; index += 1) {
         const offset = index * spacing;
-        const alpha = index === 0 ? "#3b515c" : this.options.grid;
+        const alpha = index === 0 ? "#333333" : this.options.grid;
         this._line(
           project(transformPoint(base, [-extent, offset, 0])),
           project(transformPoint(base, [extent, offset, 0])),
@@ -1206,13 +1206,13 @@
         [-halfX, halfY, near],
       ].map(value => transformPoint(matrix, value));
       for (const corner of corners) {
-        this._line(project(cameraOrigin), project(corner), "#b899ff", 1.4);
+        this._line(project(cameraOrigin), project(corner), "#7a8288", 1.4);
       }
       for (let index = 0; index < corners.length; index += 1) {
         this._line(
           project(corners[index]),
           project(corners[(index + 1) % corners.length]),
-          "#b899ff",
+          "#7a8288",
           1.2,
         );
       }
@@ -1247,12 +1247,12 @@
       for (const link of robot.links) {
         const start = project(link[0]);
         const end = project(link[1]);
-        this._line(start, end, "#030608", width + 4, ghost ? [6, 5] : []);
+        this._line(start, end, "#080808", width + 4, ghost ? [6, 5] : []);
         this._line(start, end, color, width, ghost ? [6, 5] : []);
       }
       for (const joint of robot.joints) {
         const screen = project(joint);
-        this._circle(screen, ghost ? 4.5 : 6, ghost ? "rgba(111,157,255,.3)" : "#1a262c", color, 2);
+        this._circle(screen, ghost ? 4.5 : 6, ghost ? "rgba(111,157,255,.3)" : "#171717", color, 2);
       }
       this._drawGripper(project, robot, ghost);
       context.lineCap = "butt";
@@ -1397,7 +1397,7 @@
           this._drawGrasps(project, view.span);
           this._drawCollision(project, pixelScale);
         }
-        context.strokeStyle = "#243139";
+        context.strokeStyle = "#262626";
         context.lineWidth = 1;
         context.strokeRect(0.5, 0.5, width - 1, height - 1);
         this._lastRenderMs = clockNow();

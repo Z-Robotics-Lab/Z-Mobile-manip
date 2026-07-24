@@ -296,7 +296,7 @@ def test_dashboard_is_offline_and_calibration_gates_base_overlays():
     assert 'data-testid="rejection-disclosure"' in lowered
     assert 'data-testid="rejection-stage-filter"' in lowered
     assert 'data-testid="rejection-candidate-filter"' in lowered
-    assert "max-height: min(42vh, 420px)" in lowered
+    assert "max-height: min(38vh, 380px)" in lowered
     assert 'id="session-run-perception"' in lowered
     assert 'id="session-run-planning"' in lowered
     assert 'id="session-clear-demo"' in lowered

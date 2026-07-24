@@ -281,4 +281,7 @@ def test_dashboard_component_controls_keep_live_feeds_bounded_and_updating():
     assert "math.max(200, suggested)" in html
     assert "route.startswith(\"/api/perception/live/\")" in server
     assert 'status in {"200", "304", "409", "503"}' in server
-    assert "grid-template-rows: auto auto auto auto minmax(620px, 1fr) auto" in html
+    # The app shell bounds the live-feed region: the middle grid row must be
+    # minmax(0, 1fr) so feed tiles scroll inside their column instead of
+    # growing the page unbounded.
+    assert "grid-template-rows: auto minmax(0, 1fr) auto" in html

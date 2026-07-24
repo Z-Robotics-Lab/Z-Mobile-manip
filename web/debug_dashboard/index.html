@@ -3,940 +3,486 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Z-Manip Debug Dashboard</title>
+  <title>Z Manip Control Panel</title>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #070b0d;
-      --panel: #0d1418;
-      --panel-2: #121b20;
-      --panel-raised: #162126;
-      --line: #233138;
-      --line-strong: #3b5059;
-      --text: #edf4f6;
-      --muted: #91a3ab;
-      --cyan: #52dbe3;
-      --green: #62dda0;
-      --amber: #f2b958;
-      --red: #ff6d78;
-      --blue: #72a7ff;
-      --violet: #b899ff;
-      --radius: 6px;
-      --radius-sm: 5px;
-      --shadow: 0 12px 36px rgba(0, 0, 0, .22);
-      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg: #0a0a0a;
+      --panel: #0f0f0f;
+      --panel-2: #131313;
+      --elev: #171717;
+      --line: #1f1f1f;
+      --line-2: #2a2a2a;
+      --line-3: #383838;
+      --text: #ededed;
+      --muted: #a1a1a1;
+      --dim: #6b6b6b;
+      --faint: #454545;
+      --ok: #3fb567;
+      --ok-dim: #2c7a48;
+      --warn: #d6a53c;
+      --warn-dim: #7c6326;
+      --err: #e5595f;
+      --err-dim: #7a3438;
+      --info: #6a93e0;
+      --radius: 8px;
+      --radius-sm: 6px;
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, ui-sans-serif, system-ui, sans-serif;
+      --micro: 10px;
     }
 
     * { box-sizing: border-box; }
 
     .sr-only {
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      padding: 0;
-      margin: -1px;
-      overflow: hidden;
-      clip: rect(0, 0, 0, 0);
-      white-space: nowrap;
-      border: 0;
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
     }
 
-    html, body { min-height: 100%; }
-
+    html, body { height: 100%; }
     body {
       margin: 0;
       background: var(--bg);
       color: var(--text);
       font-family: var(--sans);
-      font-size: 14px;
-      line-height: 1.4;
+      font-size: 13px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, select, input { font: inherit; color: inherit; }
+
+    /* Micro section label shared across panels */
+    .eyebrow {
+      color: var(--dim);
+      font: 600 var(--micro)/1 var(--sans);
+      letter-spacing: .12em;
+      text-transform: uppercase;
     }
 
-    button, select { font: inherit; }
-
+    /* ---------- App shell: header + workspace + diagnostics drawer ---------- */
     .shell {
-      width: min(1880px, 100%);
-      min-height: 100vh;
-      margin: 0 auto;
-      padding: 18px;
+      height: 100vh;
       display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      /* topbar, workflow, component console, stages, workspace, errors */
-      grid-template-rows: auto auto auto auto minmax(620px, 1fr) auto;
-      gap: 12px;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      padding: 10px;
     }
 
+    /* ---------- Top bar ---------- */
     .topbar {
-      min-height: 76px;
-      border: 1px solid var(--line);
-      background: color-mix(in srgb, var(--panel) 92%, transparent);
-      border-radius: var(--radius);
       display: flex;
       align-items: center;
       gap: 18px;
-      padding: 13px 16px;
-      box-shadow: var(--shadow);
+      padding: 8px 14px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: var(--radius);
+      min-height: 46px;
     }
+    .brand { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+    .brand h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
+    .brand p { margin: 0; color: var(--dim); font: 10px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 34ch; }
 
-    .brand { min-width: 230px; }
-    .brand h1 { margin: 0; font-size: 20px; line-height: 1.1; letter-spacing: -.01em; font-weight: 720; }
-    .brand p { margin: 5px 0 0; color: var(--muted); font: 11px var(--mono); }
-
-    .mode-flags { display: flex; gap: 7px; flex-wrap: wrap; }
-    .flag {
-      border: 1px solid var(--green);
-      color: var(--green);
-      padding: 6px 9px;
-      border-radius: 4px;
-      font: 700 11px var(--mono);
-      letter-spacing: .06em;
-    }
-    .flag.bad { border-color: var(--red); color: var(--red); }
     .runtime-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      min-width: 112px;
-      border: 1px solid var(--line-strong);
-      border-radius: 999px;
-      padding: 6px 9px;
-      color: var(--muted);
-      font: 700 10px var(--mono);
-      letter-spacing: .05em;
-      white-space: nowrap;
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 9px; border: 1px solid var(--line-2); border-radius: 999px;
+      color: var(--dim); font: 600 10px var(--sans); letter-spacing: .06em; text-transform: uppercase; white-space: nowrap;
     }
-    .runtime-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 16%, transparent); }
-    .runtime-badge.live { border-color: #277a57; color: var(--green); }
-    .runtime-badge.stale { border-color: #8a672d; color: var(--amber); }
-    .runtime-badge.offline { border-color: #71333a; color: var(--red); }
+    .runtime-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .runtime-badge.live { color: var(--ok); border-color: var(--ok-dim); }
+    .runtime-badge.stale { color: var(--warn); border-color: var(--warn-dim); }
+    .runtime-badge.offline { color: var(--dim); border-color: var(--line-2); }
 
-    .run-control {
-      min-width: 280px;
-      display: grid;
-      grid-template-columns: minmax(158px, auto) 1fr;
-      gap: 4px 9px;
-      align-items: center;
-    }
-    .run-button {
-      grid-row: 1 / span 2;
-      border: 1px solid var(--cyan);
-      border-radius: 4px;
-      background: #102126;
-      color: #8df3f4;
-      padding: 8px 11px;
-      font: 700 10px var(--mono);
-      letter-spacing: .045em;
-      text-transform: uppercase;
-      white-space: nowrap;
-      cursor: pointer;
-    }
-    .run-button:hover, .run-button:focus-visible { background: #153039; outline: 1px solid var(--cyan); }
-    .run-button:disabled { border-color: var(--line-strong); background: #11171a; color: var(--muted); cursor: not-allowed; }
-    .run-state { color: var(--muted); font: 700 10px var(--mono); text-transform: uppercase; }
-    .run-state.running { color: var(--cyan); }
-    .run-state.passed { color: var(--green); }
-    .run-state.blocked, .run-state.error { color: var(--amber); }
-    .run-note { color: var(--muted); font: 9px var(--mono); white-space: nowrap; }
+    .head-meta { display: flex; align-items: center; gap: 22px; margin-left: 6px; }
+    .meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .meta span { color: var(--dim); font: 600 9px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; }
+    .meta strong { font: 600 12px var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 20ch; }
+    .meta strong.safe { color: var(--ok); }
+    .meta strong.unsafe { color: var(--err); }
+    .meta strong.unknown { color: var(--warn); }
 
-    .session-console {
-      border: 1px solid var(--line);
-      background: color-mix(in srgb, var(--panel) 94%, transparent);
-      border-radius: var(--radius);
-      padding: 11px;
-      display: grid;
-      grid-template-columns: minmax(180px, .62fr) minmax(360px, 1.4fr) minmax(230px, .8fr) minmax(230px, .85fr);
-      gap: 10px;
-      align-items: stretch;
-      box-shadow: var(--shadow);
+    .mode-flags { margin-left: auto; display: flex; gap: 6px; }
+    .flag {
+      padding: 4px 8px; border: 1px solid var(--ok-dim); border-radius: 5px;
+      color: var(--ok); font: 600 9px var(--mono); letter-spacing: .08em; white-space: nowrap;
     }
-    .session-step {
-      min-width: 0;
-      border: 0;
-      border-right: 1px solid var(--line);
-      border-radius: 0;
-      background: transparent;
-      padding: 9px 12px 9px 7px;
-      display: grid;
-      gap: 9px;
-    }
-    .session-step:nth-child(4) { border-right: 0; }
-    .session-step-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-    .session-step-title { color: #d9e3e7; font: 700 11px var(--sans); letter-spacing: .065em; text-transform: uppercase; }
-    .session-step-index {
-      display: inline-grid;
-      place-items: center;
-      width: 22px;
-      height: 22px;
-      margin-right: 5px;
-      border: 1px solid color-mix(in srgb, var(--cyan) 72%, transparent);
-      border-radius: 50%;
-      color: var(--cyan);
-      font: 700 10px var(--mono);
-    }
-    .session-button.home { border-color: var(--green); color: var(--green); background: #10231a; }
-    .session-button.home:hover, .session-button.home:focus-visible { background: #163426; outline-color: var(--green); }
-    .session-state.passed { color: var(--green); }
-    .session-state.blocked { color: var(--amber); }
-    .target-row { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 7px; }
-    .target-input {
-      width: 100%;
-      min-width: 0;
-      border: 1px solid var(--line-strong);
-      border-radius: 4px;
-      background: #080d10;
-      color: var(--text);
-      padding: 8px 9px;
-      font: 11px var(--mono);
-    }
-    .target-input:focus-visible { border-color: var(--cyan); outline: 1px solid color-mix(in srgb, var(--cyan) 45%, transparent); }
-    .session-button {
-      border: 1px solid var(--cyan);
-      border-radius: var(--radius-sm);
-      background: #102126;
-      color: #8df3f4;
-      min-height: 36px;
-      padding: 8px 12px;
-      font: 750 10px var(--sans);
-      letter-spacing: .075em;
-      text-transform: uppercase;
-      white-space: nowrap;
-      cursor: pointer;
-    }
-    .session-button:hover, .session-button:focus-visible { background: #153039; outline: 1px solid var(--cyan); }
-    .session-button:disabled { border-color: var(--line-strong); background: #11171a; color: var(--muted); cursor: not-allowed; outline: none; }
-    .session-button.plan { border-color: var(--blue); color: #a9c6ff; background: #101927; }
-    .session-button.perform { border-color: var(--amber); color: #ffd995; background: #281d0d; }
-    .session-button.perform:hover, .session-button.perform:focus-visible { background: #382713; outline-color: var(--amber); }
-    .perform-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-    .session-button.perform-direct { border-color: var(--green); color: #9df5c6; background: #10231a; }
-    .session-button.perform-direct:hover, .session-button.perform-direct:focus-visible { background: #163426; outline-color: var(--green); }
-    .session-state { min-height: 15px; color: var(--muted); font: 10px/1.45 var(--mono); overflow-wrap: anywhere; }
-    .session-state.running { color: var(--cyan); }
-    .session-state.succeeded { color: var(--green); }
-    .session-state.failed, .session-state.blocked, .session-state.error { color: var(--amber); }
-    .session-selection { color: var(--muted); font: 9px var(--mono); overflow-wrap: anywhere; }
-    .session-safety { display: flex; flex-direction: column; justify-content: center; gap: 7px; }
-    .session-safety strong { color: var(--green); font: 700 11px var(--mono); }
-    .session-safety span { color: var(--muted); font: 9px var(--mono); }
-    .speed-control { display: grid; grid-template-columns: auto minmax(54px, 1fr) auto; align-items: center; gap: 6px; color: var(--muted); font: 9px var(--mono); }
-    .speed-input { width: 100%; min-width: 54px; border: 1px solid var(--line-strong); border-radius: 4px; background: #080d10; color: #ffd995; padding: 6px; font: 700 11px var(--mono); }
-    .speed-input:focus-visible { border-color: var(--amber); outline: 1px solid var(--amber); }
-    .maintenance-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 3px; }
-    .session-button.maintenance { min-height: 30px; padding: 6px; border-color: #7c5a29; color: #ffd995; background: #231a10; }
+    .flag.bad { border-color: var(--warn-dim); color: var(--warn); }
 
-    .operation-deck {
-      grid-column: 1 / -1;
-      border-top: 1px solid var(--line);
-      padding: 13px 7px 2px;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: 14px;
-      align-items: stretch;
-    }
-    .operation-intro { display: grid; align-content: center; gap: 6px; min-width: 0; }
-    .operation-intro h2 { margin: 0; font-size: 15px; font-weight: 720; letter-spacing: -.01em; }
-    .operation-intro p { margin: 0; max-width: 34ch; color: var(--muted); font: 10px/1.5 var(--mono); }
-    .operation-sequence { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
-    .operation-sequence::before {
-      content: "";
-      position: absolute;
-      z-index: 0;
-      top: 50%;
-      left: 15%;
-      right: 15%;
-      height: 1px;
-      background: var(--cyan);
-      opacity: .35;
-    }
-    .operation-button {
-      position: relative;
-      z-index: 1;
-      min-width: 0;
-      min-height: 62px;
-      border: 1px solid var(--line-strong);
-      border-radius: 7px;
-      background: var(--panel-raised);
-      color: var(--text);
-      padding: 10px 12px;
-      display: grid;
-      grid-template-columns: 32px minmax(0, 1fr);
-      align-items: center;
-      gap: 10px;
-      text-align: left;
-      cursor: pointer;
-      transition: border-color .16s ease, background .16s ease, transform .16s ease;
-    }
-    .operation-button:hover:not(:disabled), .operation-button:focus-visible:not(:disabled) {
-      border-color: var(--cyan);
-      background: #18272d;
-      outline: 2px solid color-mix(in srgb, var(--cyan) 24%, transparent);
-      outline-offset: 2px;
-      transform: translateY(-1px);
-    }
-    .operation-button:disabled { cursor: not-allowed; opacity: .42; }
-    .operation-button.ready { border-color: color-mix(in srgb, var(--cyan) 66%, var(--line)); }
-    .operation-button.complete { border-color: var(--green); background: #11241c; }
-    .operation-button.running { border-color: var(--amber); background: #281f10; }
-    .operation-icon { width: 32px; height: 32px; color: var(--cyan); }
-    .operation-button.complete .operation-icon { color: var(--green); }
-    .operation-button.running .operation-icon { color: var(--amber); }
-    .operation-copy { min-width: 0; display: grid; gap: 3px; }
-    .operation-copy strong { font: 750 11px var(--sans); letter-spacing: .065em; text-transform: uppercase; }
-    .operation-copy span { color: var(--muted); font: 9px/1.35 var(--mono); white-space: normal; }
-    .operation-automation { display: grid; align-content: center; gap: 7px; min-width: 0; }
-    .operation-automation .perform-actions { grid-template-columns: 1fr 1fr; }
-    .operation-state { min-height: 30px; }
-    .approach-deck {
-      grid-column: 1 / -1;
-      border-top: 1px solid var(--line);
-      padding: 12px 7px 2px;
-      display: grid;
-      grid-template-columns: minmax(220px, .75fr) minmax(330px, 1fr) minmax(320px, 1.1fr);
-      gap: 12px;
-      align-items: center;
-    }
-    .approach-copy { display: grid; gap: 5px; }
-    .approach-copy strong { color: #d9e3e7; font: 720 12px var(--sans); letter-spacing: .055em; text-transform: uppercase; }
-    .approach-copy span { color: var(--muted); font: 9px/1.45 var(--mono); }
-    .approach-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 7px; }
-    .session-button.approach-live { border-color: var(--amber); color: #ffd995; background: #281d0d; }
-    .session-button.approach-stop { border-color: var(--red); color: #ff9ba6; background: #291216; }
-    .approach-readout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
-    .approach-metric { border: 1px solid var(--line); border-radius: 4px; background: #10171b; padding: 6px 7px; min-width: 0; }
-    .approach-metric span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
-    .approach-metric strong { display: block; margin-top: 3px; color: var(--cyan); font: 10px var(--mono); overflow-wrap: anywhere; }
-    .approach-metric strong.ready { color: var(--green); }
-    .approach-metric strong.waiting { color: var(--amber); }
-    .approach-metric strong.unavailable { color: var(--muted); }
-    .approach-progress { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 5px; }
-    .approach-phase { position: relative; border: 1px solid var(--line); border-radius: 999px; padding: 5px 7px; color: var(--muted); background: #0b1114; font: 700 8px var(--mono); text-align: center; text-transform: uppercase; }
-    .approach-phase.active { border-color: var(--amber); color: #ffd995; background: #281d0d; }
-    .approach-phase.complete { border-color: #277a57; color: var(--green); background: #10231a; }
-    .approach-phase.blocked { border-color: #71333a; color: var(--red); background: #291216; }
-    .component-console { border: 1px solid var(--line); border-radius: var(--radius); background: #0d1215; }
-    .component-console > summary { cursor: pointer; padding: 8px 11px; color: #b9c7cc; font: 700 10px var(--mono); letter-spacing: .055em; text-transform: uppercase; }
-    .component-console-body { padding: 0 10px 10px; display: grid; gap: 8px; }
-    .component-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font: 9px var(--mono); }
-    .component-toolbar .component-button { min-width: 190px; border-color: #2c7560; background: #10231c; color: var(--green); }
-    .component-grid { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 7px; }
-    .component-card { border: 1px solid var(--line); border-radius: 4px; background: var(--panel); padding: 7px; display: grid; gap: 6px; min-width: 0; }
-    .component-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: #cbd7dc; font: 700 9px var(--mono); text-transform: uppercase; }
-    .component-state { color: var(--muted); font: 9px var(--mono); overflow-wrap: anywhere; min-height: 22px; }
-    .component-state.healthy { color: var(--green); }
-    .component-state.degraded { color: var(--amber); }
-    .component-state.offline { color: var(--red); }
-    .component-actions { display: grid; grid-template-columns: 1fr auto; gap: 5px; }
-    .component-button { border: 1px solid #315765; border-radius: 3px; background: #102027; color: var(--cyan); min-height: 27px; padding: 5px 7px; font: 700 9px var(--mono); cursor: pointer; text-transform: uppercase; }
-    .component-button.log { border-color: var(--line-strong); background: #11181c; color: var(--muted); }
-    .component-button:disabled { cursor: not-allowed; opacity: .45; }
-    .component-log { margin: 0; max-height: 190px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; background: #080c0f; padding: 8px; color: #aebcc2; font: 9px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
-
-    .run-meta {
-      margin-left: auto;
-      display: grid;
-      grid-template-columns: repeat(3, auto);
-      gap: 9px 22px;
-      align-items: center;
-    }
-    .meta { min-width: 115px; }
-    .meta span { display: block; color: var(--muted); font: 10px var(--mono); text-transform: uppercase; }
-    .meta strong { display: block; margin-top: 2px; font: 12px var(--mono); overflow-wrap: anywhere; }
-
-    .stage-rail {
-      border: 1px solid var(--line);
-      background: color-mix(in srgb, var(--panel) 96%, transparent);
-      border-radius: var(--radius);
-      min-height: 64px;
-      padding: 8px 10px;
-      display: grid;
-      grid-template-columns: repeat(10, minmax(84px, 1fr));
-      gap: 4px;
-      overflow-x: auto;
-    }
-
-    .stage {
-      position: relative;
-      min-width: 84px;
-      border-bottom: 2px solid var(--line-strong);
-      padding: 4px 8px 9px 20px;
-      color: var(--muted);
-      font: 10px var(--mono);
-      text-transform: uppercase;
-      white-space: nowrap;
-    }
-    .stage::before {
-      content: "";
-      position: absolute;
-      left: 6px;
-      top: 7px;
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      background: var(--line-strong);
-    }
-    .stage strong { display: block; margin-top: 5px; color: var(--text); font-size: 10px; }
-    .stage.ok { border-color: var(--green); }
-    .stage.ok::before { background: var(--green); }
-    .stage.failed { border-color: var(--red); }
-    .stage.failed::before { background: var(--red); }
-    .stage.blocked { border-color: var(--amber); }
-    .stage.blocked::before { background: var(--amber); }
-
+    /* ---------- Workspace: 3 columns ---------- */
     .workspace {
       min-height: 0;
       display: grid;
-      grid-template-columns: minmax(270px, 21%) minmax(560px, 1fr) minmax(300px, 21%);
-      gap: 12px;
+      grid-template-columns: minmax(240px, 21%) minmax(0, 1fr) minmax(300px, 21%);
+      gap: 10px;
     }
 
     .panel {
-      min-width: 0;
-      min-height: 0;
+      min-width: 0; min-height: 0;
+      display: flex; flex-direction: column;
       border: 1px solid var(--line);
-      background: color-mix(in srgb, var(--panel) 97%, transparent);
+      background: var(--panel);
       border-radius: var(--radius);
       overflow: hidden;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, .16);
     }
-
     .panel-title {
-      height: 37px;
-      padding: 0 11px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      color: #bcc8cd;
-      font: 700 11px var(--sans);
-      letter-spacing: .075em;
-      text-transform: uppercase;
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 12px; border-bottom: 1px solid var(--line);
+      color: var(--dim); font: 600 var(--micro)/1 var(--sans);
+      letter-spacing: .12em; text-transform: uppercase; flex: 0 0 auto;
     }
+    .panel-title .subtle { margin-left: auto; color: var(--faint); font: 10px var(--mono); letter-spacing: 0; text-transform: none; }
 
-    .panel-title .subtle { color: var(--muted); font-weight: 400; letter-spacing: 0; text-transform: none; }
-
-    .image-stack {
-      height: 100%;
-      padding: 8px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      overflow-y: auto;
-    }
+    /* ---------- Left: perception feed ---------- */
+    .image-stack { flex: 1 1 auto; min-height: 0; padding: 8px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+    #recorded-image-stack { display: contents; }
 
     .image-frame {
-      position: relative;
-      min-height: 0;
-      border: 1px solid var(--line);
-      background: #06090b;
-      border-radius: 6px;
-      overflow: hidden;
+      position: relative; min-height: 0;
+      border: 1px solid var(--line); background: #060606; border-radius: var(--radius-sm); overflow: hidden;
     }
     .image-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
     .image-frame img[hidden], .empty-image[hidden] { display: none; }
-    .image-frame.recorded { flex: 0 0 clamp(170px, 24vh, 240px); }
-    #recorded-image-stack { display: contents; }
-    .image-frame.live-camera {
-      position: sticky;
-      top: 0;
-      z-index: 2;
-      flex: 0 0 clamp(190px, 28vh, 275px);
-      border-color: #31505a;
-      box-shadow: 0 5px 12px rgba(0, 0, 0, .34);
-    }
+    .image-frame.live-camera { flex: 1 1 0; min-height: 118px; }
+    .image-frame.live-cloud { flex: 1.25 1 0; min-height: 150px; background: #060606; }
+    .image-frame.recorded { flex: 0 0 auto; height: clamp(92px, 13vh, 150px); }
+
     .image-frame-toolbar {
-      position: absolute;
-      z-index: 3;
-      top: 7px;
-      left: 7px;
-      right: 7px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 7px;
-      pointer-events: none;
+      position: absolute; z-index: 3; top: 6px; left: 6px; right: 6px;
+      display: flex; align-items: center; justify-content: space-between; gap: 6px; pointer-events: none;
     }
     .image-label {
-      padding: 3px 6px;
-      background: rgba(6, 9, 11, .84);
-      border: 1px solid #34434b;
-      border-radius: 3px;
-      font: 10px var(--mono);
-      color: #d9e3e7;
-      pointer-events: auto;
+      padding: 2px 6px; background: rgba(10, 10, 10, .82); border: 1px solid var(--line-2); border-radius: 4px;
+      font: 9px var(--sans); letter-spacing: .04em; color: var(--muted); pointer-events: auto;
     }
-    .image-frame-actions {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      pointer-events: auto;
-    }
+    .image-frame-actions { display: inline-flex; align-items: center; gap: 4px; pointer-events: auto; }
     .image-reorder-button {
-      min-width: 26px;
-      min-height: 24px;
-      border: 1px solid #34434b;
-      border-radius: 3px;
-      background: rgba(6, 9, 11, .9);
-      color: #d9e3e7;
-      font: 700 12px var(--mono);
-      line-height: 1;
-      cursor: pointer;
+      min-width: 22px; min-height: 20px; border: 1px solid var(--line-2); border-radius: 4px;
+      background: rgba(10, 10, 10, .85); color: var(--muted); font: 700 11px var(--mono); line-height: 1; cursor: pointer;
     }
-    .image-reorder-button:hover, .image-reorder-button:focus-visible {
-      border-color: var(--cyan);
-      color: var(--cyan);
-      outline: 2px solid color-mix(in srgb, var(--cyan) 36%, transparent);
-      outline-offset: 1px;
-    }
-    .image-reorder-button:disabled {
-      border-color: #28343a;
-      color: #56646a;
-      cursor: not-allowed;
-      opacity: .68;
-    }
+    .image-reorder-button:hover:not(:disabled), .image-reorder-button:focus-visible { border-color: var(--line-3); color: var(--text); outline: none; }
+    .image-reorder-button:disabled { color: var(--faint); cursor: not-allowed; opacity: .6; }
+
+    /* Small status pills — the one place color carries meaning */
     .camera-state {
-      padding: 3px 6px;
-      border: 1px solid var(--line-strong);
-      border-radius: 999px;
-      background: rgba(6, 9, 11, .88);
-      color: var(--muted);
-      font: 700 9px var(--mono);
-      letter-spacing: .05em;
+      padding: 2px 6px; border: 1px solid var(--line-2); border-radius: 999px;
+      background: rgba(10, 10, 10, .82); color: var(--dim);
+      font: 600 8px var(--sans); letter-spacing: .07em; text-transform: uppercase; pointer-events: auto;
     }
-    .camera-state.live, .camera-state.fresh { border-color: #277a57; color: var(--green); }
-    .camera-state.tracked { border-color: #247782; color: var(--cyan); }
-    .camera-state.stale { border-color: #8a672d; color: var(--amber); }
-    .camera-state.offline, .camera-state.invalid { border-color: #71333a; color: var(--red); }
-    .empty-image { height: 100%; display: grid; place-items: center; color: var(--muted); font: 11px var(--mono); }
+    .camera-state.live, .camera-state.fresh { border-color: var(--ok-dim); color: var(--ok); }
+    .camera-state.tracked { border-color: var(--info); color: var(--info); }
+    .camera-state.stale { border-color: var(--warn-dim); color: var(--warn); }
+    .camera-state.offline, .camera-state.invalid { border-color: var(--line-2); color: var(--dim); }
 
-    /* Live colored point-cloud tile: a self-contained Canvas2D 3D view. */
-    .image-frame.live-cloud {
-      flex: 0 0 clamp(230px, 34vh, 340px);
-      border-color: #31505a;
-      box-shadow: 0 5px 12px rgba(0, 0, 0, .34);
-      background: #070b0e;
-    }
-    .cloud-canvas { width: 100%; height: 100%; display: block; background: #070b0e; cursor: grab; touch-action: none; }
+    .empty-image { position: absolute; inset: 0; display: grid; place-items: center; padding: 10px; text-align: center; color: var(--dim); font: 10px var(--mono); }
+
+    .cloud-canvas { width: 100%; height: 100%; display: block; background: #060606; cursor: grab; touch-action: none; }
     .cloud-canvas.dragging { cursor: grabbing; }
-    .cloud-reset {
-      position: absolute;
-      z-index: 3;
-      right: 7px;
-      bottom: 7px;
-      pointer-events: auto;
-    }
+    .cloud-reset { position: absolute; z-index: 3; right: 6px; bottom: 6px; pointer-events: auto; }
 
-    .viewport-panel { display: grid; grid-template-rows: 37px minmax(0, 1fr) auto; }
-    .viewport-toolbar { display: flex; align-items: center; gap: 8px; }
+    /* ---------- Center: geometry / scene (the hero) ---------- */
+    .viewport-panel { min-width: 0; }
+    .viewport-toolbar { margin-left: auto; display: flex; align-items: center; gap: 8px; }
     .candidate-picker {
-      max-width: 220px;
-      border: 1px solid var(--line-strong);
-      border-radius: 4px;
-      background: #111a1f;
-      color: var(--text);
-      padding: 4px 24px 4px 7px;
-      font: 10px var(--mono);
+      max-width: 190px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--elev); color: var(--text);
+      padding: 3px 20px 3px 7px; font: 10px var(--mono);
     }
-    .candidate-toggle { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font: 10px var(--mono); text-transform: none; white-space: nowrap; }
-    .candidate-toggle input { accent-color: var(--cyan); }
+    .candidate-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--dim); font: 10px var(--sans); letter-spacing: 0; text-transform: none; white-space: nowrap; }
+    .candidate-toggle input { accent-color: var(--muted); }
     .tool-button {
-      border: 1px solid var(--line-strong);
-      border-radius: 4px;
-      color: var(--text);
-      background: #131a1e;
-      padding: 4px 8px;
-      font: 10px var(--mono);
-      cursor: pointer;
+      border: 1px solid var(--line-2); border-radius: 5px; color: var(--muted); background: transparent;
+      padding: 4px 9px; font: 10px var(--sans); letter-spacing: .02em; cursor: pointer;
     }
-    .tool-button:hover, .tool-button:focus-visible { border-color: var(--cyan); outline: none; }
+    .tool-button:hover, .tool-button:focus-visible { border-color: var(--line-3); color: var(--text); outline: none; }
 
-    .canvas-wrap { position: relative; min-height: 420px; background: #070b0e; overflow: hidden; }
+    .canvas-wrap { position: relative; flex: 1 1 auto; min-height: 0; background: #0a0a0a; overflow: hidden; }
     #scene-canvas { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
     #scene-canvas.dragging { cursor: grabbing; }
     .canvas-hud {
-      position: absolute;
-      left: 10px;
-      bottom: 10px;
-      display: flex;
-      gap: 10px;
-      color: var(--muted);
-      font: 10px var(--mono);
-      pointer-events: none;
+      position: absolute; left: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 10px;
+      color: var(--dim); font: 10px var(--mono); pointer-events: none;
     }
-    .legend { display: inline-flex; align-items: center; gap: 4px; }
+    .legend { display: inline-flex; align-items: center; gap: 5px; }
     .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 
     .calibration-lock {
-      position: absolute;
-      top: 10px;
-      left: 50%;
-      transform: translateX(-50%);
-      max-width: calc(100% - 22px);
-      padding: 7px 10px;
-      border: 1px solid var(--amber);
-      border-radius: 4px;
-      color: #ffd995;
-      background: rgba(30, 22, 8, .94);
-      font: 700 10px var(--mono);
-      text-align: center;
-      pointer-events: none;
+      position: absolute; top: 12px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 24px);
+      padding: 6px 11px; border: 1px solid var(--warn-dim); border-radius: 6px; color: var(--warn);
+      background: rgba(20, 16, 6, .94); font: 600 10px var(--mono); text-align: center; pointer-events: none;
     }
     .calibration-lock[hidden] { display: none; }
 
     .trajectory-strip {
-      min-height: 48px;
-      border-top: 1px solid var(--line);
-      padding: 8px 11px;
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      color: var(--muted);
-      font: 10px var(--mono);
-      flex-wrap: wrap;
+      flex: 0 0 auto; border-top: 1px solid var(--line); padding: 7px 12px;
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap; color: var(--dim); font: 10px var(--mono);
     }
     .trajectory-strip strong { color: var(--text); }
     .segment-key { display: inline-flex; gap: 5px; align-items: center; }
-    .segment-line { width: 18px; height: 2px; background: currentColor; }
-    .joint-ribbon { width: 100%; display: grid; grid-template-columns: repeat(6, minmax(62px, 1fr)); gap: 5px; }
-    .joint-tile { position: relative; overflow: hidden; min-height: 42px; border: 1px solid var(--line); border-radius: 4px; background: #0d1418; padding: 6px 7px; }
-    .joint-tile span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
-    .joint-tile strong { display: block; margin-top: 3px; font: 11px var(--mono); }
-    .joint-bar { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--cyan); transition: width .12s linear; }
-    .runtime-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 5px; }
-    .runtime-metric { min-height: 48px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel-2); padding: 7px; }
-    .runtime-metric span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
-    .runtime-metric strong { display: block; margin-top: 4px; font: 10px var(--mono); }
-    .runtime-note { margin: 7px 0 0; color: var(--muted); font: 9px var(--mono); overflow-wrap: anywhere; }
+    .segment-line { width: 16px; height: 2px; background: currentColor; }
+    .joint-ribbon { width: 100%; display: grid; grid-template-columns: repeat(6, minmax(56px, 1fr)); gap: 5px; }
+    .joint-tile { position: relative; overflow: hidden; min-height: 38px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); padding: 5px 7px; }
+    .joint-tile span { display: block; color: var(--dim); font: 8px var(--sans); letter-spacing: .06em; text-transform: uppercase; }
+    .joint-tile strong { display: block; margin-top: 2px; font: 11px var(--mono); }
+    .joint-bar { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--muted); transition: width .12s linear; }
 
-    .diagnostics { display: grid; grid-template-rows: auto minmax(0, 1fr); }
-    .diag-scroll { min-height: 0; overflow: auto; padding: 9px; display: grid; gap: 9px; align-content: start; }
-    .section { border-bottom: 1px solid var(--line); padding-bottom: 9px; }
-    .section:last-child { border-bottom: 0; }
-    .section h2 { margin: 0 0 7px; color: #b9c6cb; font: 700 10px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    /* ---------- Right: control strip ---------- */
+    .controls { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; gap: 10px; }
+    .cblock { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); padding: 10px; display: grid; gap: 8px; }
+    .cblock-head { display: flex; align-items: center; gap: 8px; }
+    .cblock-head .eyebrow { flex: 0 0 auto; }
+    .cblock-head .hint { margin-left: auto; color: var(--faint); font: 9px var(--mono); }
 
-    .safety-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
-    .safety-item { border: 1px solid var(--line); background: var(--panel-2); border-radius: 4px; padding: 7px; min-height: 48px; }
-    .safety-item span { display: block; color: var(--muted); font: 9px var(--mono); text-transform: uppercase; }
-    .safety-item strong { display: block; margin-top: 4px; font: 700 11px var(--mono); }
-    .safe { color: var(--green); }
-    .unsafe { color: var(--red); }
-    .unknown { color: var(--amber); }
+    /* Buttons — quiet by default, one white primary */
+    .btn {
+      appearance: none; border: 1px solid var(--line-2); border-radius: var(--radius-sm);
+      background: transparent; color: var(--text); padding: 7px 10px; min-height: 32px;
+      font: 500 12px var(--sans); letter-spacing: .01em; cursor: pointer; white-space: nowrap;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      transition: border-color .14s ease, background .14s ease, color .14s ease;
+    }
+    .btn:hover:not(:disabled), .btn:focus-visible:not(:disabled) { border-color: var(--line-3); background: var(--elev); outline: none; }
+    .btn:disabled { color: var(--faint); border-color: var(--line); cursor: not-allowed; }
+    .btn.primary { background: var(--text); border-color: var(--text); color: #0a0a0a; font-weight: 600; }
+    .btn.primary:hover:not(:disabled), .btn.primary:focus-visible:not(:disabled) { background: #fff; border-color: #fff; }
+    .btn.primary:disabled { background: #2a2a2a; border-color: #2a2a2a; color: var(--faint); }
+    .btn.danger { color: var(--err); border-color: var(--err-dim); }
+    .btn.danger:hover:not(:disabled), .btn.danger:focus-visible:not(:disabled) { background: rgba(122, 52, 56, .18); border-color: var(--err); }
+    .btn.small { min-height: 28px; padding: 5px 8px; font-size: 11px; }
+    .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .btn-grid.one { grid-template-columns: 1fr; }
 
-    .gate-box { border: 1px solid var(--line-strong); border-left-width: 3px; border-radius: 4px; padding: 8px; background: #11181c; }
-    .gate-box.ok { border-left-color: var(--green); }
-    .gate-box.failed { border-left-color: var(--red); }
-    .gate-box.blocked { border-left-color: var(--amber); }
-    .gate-box strong { font: 700 11px var(--mono); }
-    .gate-box p { margin: 5px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .target-row { display: grid; gap: 6px; }
+    .target-input {
+      width: 100%; min-width: 0; border: 1px solid var(--line-2); border-radius: var(--radius-sm);
+      background: var(--elev); color: var(--text); padding: 8px 9px; font: 12px var(--sans);
+    }
+    .target-input::placeholder { color: var(--faint); }
+    .target-input:focus-visible { border-color: var(--line-3); outline: none; }
 
-    .collision-card { border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 4px; padding: 8px; background: #11181c; }
-    .collision-card.empty { border-left-color: var(--line-strong); color: var(--muted); font: 10px var(--mono); }
-    .trajectory-card { border-left-color: var(--cyan); }
-    .trajectory-card.accepted { border-left-color: var(--green); }
-    .collision-title { color: var(--amber); font: 700 10px var(--mono); text-transform: uppercase; }
-    .trajectory-card .collision-title { color: var(--cyan); }
-    .trajectory-card.accepted .collision-title { color: var(--green); }
+    /* Status text lines (JS reassigns className to `session-state <state>`) */
+    .session-state { color: var(--muted); font: 11px/1.4 var(--mono); overflow-wrap: anywhere; }
+    .session-state.running { color: var(--info); }
+    .session-state.succeeded, .session-state.passed { color: var(--ok); }
+    .session-state.failed, .session-state.blocked, .session-state.error { color: var(--warn); }
+    .step-selections { display: grid; gap: 2px; }
+    .session-selection { color: var(--faint); font: 9px var(--mono); overflow-wrap: anywhere; }
+
+    .speed-control { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font: 10px var(--sans); letter-spacing: .04em; text-transform: uppercase; }
+    .speed-input { width: 58px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--elev); color: var(--text); padding: 5px 6px; font: 600 12px var(--mono); }
+    .speed-input:focus-visible { border-color: var(--line-3); outline: none; }
+    .speed-note { color: var(--faint); font: 9px var(--mono); overflow-wrap: anywhere; }
+
+    /* Mobile find -> grasp readouts */
+    .approach-readout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+    .approach-metric { border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); padding: 5px 7px; min-width: 0; }
+    .approach-metric.wide { grid-column: 1 / -1; }
+    .approach-metric span { display: block; color: var(--dim); font: 8px var(--sans); letter-spacing: .06em; text-transform: uppercase; }
+    .approach-metric strong { display: block; margin-top: 2px; color: var(--text); font: 10px var(--mono); overflow-wrap: anywhere; }
+
+    /* Phase breadcrumb */
+    .approach-progress { display: flex; flex-wrap: wrap; gap: 4px; }
+    .approach-phase {
+      border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--dim);
+      background: var(--panel-2); font: 600 8px var(--sans); letter-spacing: .05em; text-transform: uppercase; white-space: nowrap;
+    }
+    .approach-phase.active { border-color: var(--warn-dim); color: var(--warn); background: rgba(124, 99, 38, .15); }
+    .approach-phase.complete { border-color: var(--ok-dim); color: var(--ok); }
+    .approach-phase.blocked { border-color: var(--err-dim); color: var(--err); }
+
+    /* Service health rows — dot + name + status, actions revealed on hover */
+    .component-list { display: grid; gap: 1px; }
+    .component-card {
+      position: relative; display: grid; grid-template-columns: 92px minmax(0, 1fr); column-gap: 8px; align-items: center;
+      padding: 4px 8px; border: 1px solid transparent; border-radius: 5px;
+    }
+    .component-card:hover { border-color: var(--line); background: var(--panel-2); }
+    .cname { color: var(--muted); font: 500 11px var(--sans); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    [data-component-badge] { display: none; }
+    .component-state { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--dim); font: 9px var(--mono); white-space: nowrap; overflow: hidden; }
+    .component-state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
+    .component-state.healthy::before { background: var(--ok); }
+    .component-state.degraded::before { background: var(--warn); }
+    .component-state.offline::before { background: var(--err); }
+    .component-state.degraded { color: var(--warn); }
+    .component-state.offline { color: var(--err); }
+    .component-actions {
+      position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+      display: none; gap: 4px; align-items: center; padding-left: 10px;
+      background: linear-gradient(90deg, transparent, var(--panel-2) 18%);
+    }
+    .component-card:hover .component-actions, .component-card:focus-within .component-actions { display: inline-flex; }
+    .component-button {
+      border: 1px solid var(--line-2); border-radius: 4px; background: transparent; color: var(--dim);
+      min-height: 22px; padding: 2px 7px; font: 500 9px var(--sans); letter-spacing: .04em; cursor: pointer;
+    }
+    .component-button:hover:not(:disabled), .component-button:focus-visible { border-color: var(--line-3); color: var(--text); outline: none; }
+    .component-button.log { color: var(--faint); }
+    .component-button:disabled { opacity: .45; cursor: not-allowed; }
+    .component-toolbar { display: flex; align-items: center; gap: 8px; color: var(--faint); font: 9px var(--mono); }
+    .component-toolbar span { flex: 1 1 auto; overflow-wrap: anywhere; }
+    .component-log {
+      margin: 4px 0 0; max-height: 180px; overflow: auto; border: 1px solid var(--line); border-radius: 5px;
+      background: #060606; padding: 8px; color: var(--muted); font: 9px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+    }
+    .component-log[hidden] { display: none; }
+
+    /* Pipeline issues / log tail */
+    .error-list { display: flex; flex-direction: column; gap: 5px; max-height: 150px; overflow-y: auto; }
+    .error-chip {
+      border-left: 2px solid var(--err); padding: 4px 8px; background: var(--panel-2); border-radius: 0 4px 4px 0;
+      color: var(--muted); font: 10px var(--mono); overflow-wrap: anywhere;
+    }
+    .error-chip.blocked { border-color: var(--warn); }
+    .all-clear { color: var(--ok); font: 10px var(--mono); }
+
+    /* ---------- Diagnostics drawer (collapsed by default) ---------- */
+    .diag-drawer { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); overflow: hidden; }
+    .diag-drawer > summary {
+      list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; padding: 9px 14px;
+      color: var(--dim); font: 600 var(--micro) var(--sans); letter-spacing: .12em; text-transform: uppercase;
+    }
+    .diag-drawer > summary::-webkit-details-marker { display: none; }
+    .diag-drawer > summary::before { content: "▸"; color: var(--faint); transition: transform .15s ease; }
+    .diag-drawer[open] > summary::before { transform: rotate(90deg); }
+    .diag-drawer > summary .subtle { margin-left: auto; color: var(--faint); font: 10px var(--mono); letter-spacing: 0; text-transform: none; }
+    .diag-grid {
+      border-top: 1px solid var(--line); padding: 12px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; align-items: start;
+      max-height: 52vh; overflow: auto;
+    }
+    .section { min-width: 0; }
+    .section h2 { margin: 0 0 8px; color: var(--dim); font: 600 var(--micro) var(--sans); letter-spacing: .1em; text-transform: uppercase; }
+    .section.span-2 { grid-column: span 2; }
+
+    .stage-rail { display: flex; flex-wrap: wrap; gap: 4px; }
+    .stage {
+      position: relative; padding: 4px 8px 4px 18px; border: 1px solid var(--line); border-radius: 5px;
+      color: var(--dim); font: 9px var(--mono); text-transform: uppercase; white-space: nowrap; background: var(--panel-2);
+    }
+    .stage::before { content: ""; position: absolute; left: 7px; top: 50%; transform: translateY(-50%); width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+    .stage strong { margin-left: 5px; color: var(--muted); font-size: 9px; }
+    .stage.ok::before { background: var(--ok); }
+    .stage.failed::before { background: var(--err); }
+    .stage.blocked::before { background: var(--warn); }
+
+    .runtime-grid, .safety-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .runtime-metric, .safety-item { border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); padding: 6px 8px; min-height: 42px; }
+    .runtime-metric span, .safety-item span { display: block; color: var(--dim); font: 8px var(--sans); letter-spacing: .05em; text-transform: uppercase; }
+    .runtime-metric strong, .safety-item strong { display: block; margin-top: 3px; font: 10px var(--mono); }
+    .runtime-note { margin: 8px 0 0; color: var(--dim); font: 9px var(--mono); overflow-wrap: anywhere; }
+    .safe { color: var(--ok); } .unsafe { color: var(--err); } .unknown { color: var(--warn); }
+
+    .gate-box { border: 1px solid var(--line); border-left: 2px solid var(--line-3); border-radius: 5px; padding: 8px; background: var(--panel-2); }
+    .gate-box.ok { border-left-color: var(--ok); }
+    .gate-box.failed { border-left-color: var(--err); }
+    .gate-box.blocked { border-left-color: var(--warn); }
+    .gate-box strong { font: 600 11px var(--mono); }
+    .gate-box p { margin: 5px 0 0; color: var(--dim); font-size: 10px; overflow-wrap: anywhere; }
+
+    .collision-card { border: 1px solid var(--line); border-left: 2px solid var(--warn); border-radius: 5px; padding: 8px; background: var(--panel-2); }
+    .collision-card.empty { border-left-color: var(--line-3); color: var(--dim); font: 10px var(--mono); }
+    .trajectory-card { border-left-color: var(--info); }
+    .trajectory-card.accepted { border-left-color: var(--ok); }
+    .collision-title { color: var(--warn); font: 600 10px var(--mono); text-transform: uppercase; }
+    .trajectory-card .collision-title { color: var(--info); }
+    .trajectory-card.accepted .collision-title { color: var(--ok); }
     .collision-metrics { margin-top: 7px; display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
-    .collision-metric { border: 1px solid var(--line); border-radius: 3px; padding: 5px; }
-    .collision-metric span { display: block; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
+    .collision-metric { border: 1px solid var(--line); border-radius: 4px; padding: 5px; }
+    .collision-metric span { display: block; color: var(--dim); font: 8px var(--sans); letter-spacing: .05em; text-transform: uppercase; }
     .collision-metric strong { display: block; margin-top: 2px; font: 10px var(--mono); }
-    .collision-note { margin: 6px 0 0; color: var(--muted); font: 9px var(--mono); overflow-wrap: anywhere; }
+    .collision-note { margin: 6px 0 0; color: var(--dim); font: 9px var(--mono); overflow-wrap: anywhere; }
 
     table { border-collapse: collapse; width: 100%; table-layout: fixed; font: 10px var(--mono); }
-    th { color: var(--muted); font-weight: 500; text-align: left; border-bottom: 1px solid var(--line); padding: 5px; }
-    td { border-bottom: 1px solid #202a30; padding: 6px 5px; vertical-align: top; overflow-wrap: anywhere; }
+    th { color: var(--dim); font-weight: 500; text-align: left; border-bottom: 1px solid var(--line); padding: 5px; }
+    td { border-bottom: 1px solid var(--line); padding: 6px 5px; vertical-align: top; overflow-wrap: anywhere; }
     tbody tr { cursor: pointer; }
-    tbody tr:hover, tbody tr.selected { background: #172228; }
-    .stage-text { color: var(--amber); }
-    .reason { color: #b9c5ca; }
-    .empty-table { color: var(--muted); padding: 8px 2px; font: 10px var(--mono); }
+    tbody tr:hover, tbody tr.selected { background: var(--panel-2); }
+    .stage-text { color: var(--warn); }
+    .reason { color: var(--muted); }
+    .empty-table { color: var(--dim); padding: 8px 2px; font: 10px var(--mono); }
 
-    .rejection-disclosure { border: 1px solid var(--line); border-radius: 5px; background: #0e1418; overflow: hidden; }
+    .rejection-disclosure { border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); overflow: hidden; }
     .rejection-disclosure > summary {
-      min-height: 38px;
-      padding: 8px 9px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      color: #c6d1d5;
-      font: 700 10px var(--mono);
-      letter-spacing: .05em;
-      text-transform: uppercase;
-      cursor: pointer;
-      list-style: none;
+      list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 8px 9px; color: var(--muted); font: 600 10px var(--sans); letter-spacing: .05em; text-transform: uppercase;
     }
     .rejection-disclosure > summary::-webkit-details-marker { display: none; }
-    .rejection-disclosure > summary::after { content: "▾"; margin-left: auto; color: var(--cyan); transition: transform .16s ease; }
+    .rejection-disclosure > summary::after { content: "▾"; margin-left: auto; color: var(--faint); transition: transform .15s ease; }
     .rejection-disclosure[open] > summary::after { transform: rotate(180deg); }
-    .rejection-summary { min-width: 0; color: var(--muted); font-weight: 400; letter-spacing: 0; text-transform: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .rejection-summary { min-width: 0; color: var(--dim); font-weight: 400; letter-spacing: 0; text-transform: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .rejection-body { border-top: 1px solid var(--line); padding: 8px; }
     .rejection-controls { display: grid; grid-template-columns: 1fr 1fr auto; gap: 7px; align-items: end; margin-bottom: 8px; }
-    .rejection-controls label { display: grid; gap: 3px; color: var(--muted); font: 9px var(--mono); text-transform: uppercase; }
-    .rejection-controls select {
-      min-width: 0;
-      width: 100%;
-      border: 1px solid var(--line-strong);
-      border-radius: 4px;
-      background: #111a1f;
-      color: var(--text);
-      padding: 5px 22px 5px 6px;
-      font: 10px var(--mono);
-    }
-    .rejection-controls select:focus-visible { border-color: var(--cyan); outline: none; }
-    .rejection-visible-count { color: var(--muted); font: 9px var(--mono); white-space: nowrap; padding-bottom: 6px; }
-    .rejection-scroll { max-height: min(42vh, 420px); overflow: auto; border: 1px solid var(--line); border-radius: 4px; }
-    .rejection-scroll thead { position: sticky; top: 0; z-index: 1; background: #121a1f; }
+    .rejection-controls label { display: grid; gap: 3px; color: var(--dim); font: 9px var(--sans); letter-spacing: .05em; text-transform: uppercase; }
+    .rejection-controls select { width: 100%; border: 1px solid var(--line-2); border-radius: 5px; background: var(--elev); color: var(--text); padding: 5px 20px 5px 6px; font: 10px var(--mono); }
+    .rejection-controls select:focus-visible { border-color: var(--line-3); outline: none; }
+    .rejection-visible-count { color: var(--dim); font: 9px var(--mono); white-space: nowrap; padding-bottom: 6px; }
+    .rejection-scroll { max-height: min(38vh, 380px); overflow: auto; border: 1px solid var(--line); border-radius: 5px; }
+    .rejection-scroll thead { position: sticky; top: 0; z-index: 1; background: var(--panel-2); }
     .rejection-scroll .reason { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 
-    .error-dock {
-      min-height: 48px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: #0d1215;
-      display: grid;
-      grid-template-columns: 150px 1fr;
-      align-items: stretch;
-    }
-
+    /* ---------- Fatal overlay ---------- */
     button { -webkit-tap-highlight-color: transparent; }
     button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
-      outline: 2px solid color-mix(in srgb, var(--cyan) 48%, transparent);
-      outline-offset: 2px;
+      outline: 2px solid var(--line-3); outline-offset: 2px;
     }
-
     @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+      *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
     }
-    .error-label { border-right: 1px solid var(--line); padding: 10px 12px; color: var(--muted); font: 700 10px var(--mono); letter-spacing: .05em; }
-    .error-list { display: flex; gap: 8px; align-items: center; overflow-x: auto; padding: 7px 9px; }
-    .error-chip { flex: 0 0 auto; max-width: 430px; border-left: 2px solid var(--red); padding: 4px 8px; color: #d2dadd; font: 10px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .error-chip.blocked { border-color: var(--amber); }
-    .all-clear { color: var(--green); font: 10px var(--mono); }
-
-    .fatal {
-      position: fixed;
-      inset: 0;
-      display: grid;
-      place-items: center;
-      padding: 30px;
-      background: var(--bg);
-      z-index: 20;
-    }
+    .fatal { position: fixed; inset: 0; display: grid; place-items: center; padding: 30px; background: var(--bg); z-index: 40; }
     .fatal[hidden] { display: none; }
-    .fatal-box { max-width: 680px; border: 1px solid var(--red); background: #171014; padding: 22px; border-radius: var(--radius); }
-    .fatal-box h2 { margin: 0 0 8px; color: var(--red); font: 700 16px var(--mono); }
-    .fatal-box pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #e7cdd1; }
+    .fatal-box { max-width: 680px; border: 1px solid var(--err-dim); background: var(--panel); padding: 22px; border-radius: var(--radius); }
+    .fatal-box h2 { margin: 0 0 8px; color: var(--err); font: 600 15px var(--sans); }
+    .fatal-box pre { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); font: 11px var(--mono); }
 
-    @media (max-width: 1450px) {
-      .topbar { align-items: flex-start; flex-wrap: wrap; }
-      .run-meta { flex: 0 0 100%; margin-left: 0; width: 100%; grid-template-columns: repeat(6, minmax(0, 1fr)); }
-      .meta { min-width: 0; }
+    /* ---------- Responsive ---------- */
+    @media (max-width: 1600px) {
+      .head-meta { gap: 16px; }
+      .workspace { grid-template-columns: minmax(220px, 22%) minmax(0, 1fr) minmax(280px, 23%); }
     }
-
-    @media (max-width: 1180px) {
-      .shell { grid-template-rows: auto auto auto auto; }
-      .workspace { grid-template-columns: minmax(240px, .75fr) minmax(520px, 1.6fr); }
-      .diagnostics { grid-column: 1 / -1; max-height: 440px; }
-      .run-meta { grid-template-columns: repeat(2, auto); }
-      .session-console { grid-template-columns: 1fr 1fr; }
-      .session-step:nth-child(2) { border-right: 0; }
-      .session-step:nth-child(4) { border-right: 0; }
-      .session-safety { grid-column: 1 / -1; }
-      .operation-deck { grid-template-columns: 1fr; }
-      .approach-deck { grid-template-columns: 1fr 1fr; }
-      .approach-readout { grid-column: 1 / -1; }
-      .operation-intro p { max-width: none; }
-      .component-grid { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
+    @media (max-width: 1300px) {
+      .shell { height: auto; min-height: 100vh; }
+      .workspace { grid-template-columns: minmax(200px, 1fr) minmax(0, 1.6fr); grid-auto-rows: minmax(0, auto); }
+      .controls { grid-column: 1 / -1; flex-direction: row; flex-wrap: wrap; }
+      .controls > * { flex: 1 1 260px; }
+      .canvas-wrap { min-height: 420px; }
+      .brand p { display: none; }
+      .head-meta { display: none; }
     }
-
-    @media (max-width: 780px) {
-      .shell { padding: 8px; overflow: hidden; }
-      .shell > *, .topbar, .stage-rail, .workspace, .error-dock { width: 100%; min-width: 0; }
-      .topbar { align-items: flex-start; flex-wrap: wrap; }
-      .run-control { width: 100%; }
-      .session-console { grid-template-columns: minmax(0, 1fr); }
-      .session-step { border-right: 0; border-bottom: 1px solid var(--line); padding: 10px 5px 12px; }
-      .session-safety { grid-column: auto; }
-      .operation-deck { padding: 12px 4px 2px; }
-      .approach-deck { grid-template-columns: 1fr; padding: 12px 4px 2px; }
-      .approach-readout { grid-column: auto; }
-      .approach-actions { grid-template-columns: 1fr; }
-      .approach-progress { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-      .operation-sequence { grid-template-columns: 1fr; gap: 8px; }
-      .operation-sequence::before { top: 12%; bottom: 12%; left: 16px; right: auto; width: 1px; height: auto; }
-      .operation-automation .perform-actions { grid-template-columns: 1fr; }
-      .component-grid { grid-template-columns: minmax(0, 1fr); }
-      .target-row { grid-template-columns: minmax(0, 1fr); }
-      .run-meta { margin-left: 0; width: 100%; grid-template-columns: repeat(2, 1fr); }
+    @media (max-width: 820px) {
       .workspace { display: flex; flex-direction: column; }
-      .panel { width: 100%; min-width: 0; min-height: 460px; }
-      .viewport-panel .panel-title { height: auto; min-height: 72px; align-items: flex-start; flex-direction: column; padding: 8px 10px; }
-      .viewport-toolbar { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; }
-      .viewport-toolbar #view-frame { grid-column: 1 / -1; }
-      .candidate-picker { width: 100%; max-width: none; min-width: 0; }
-      .image-stack { min-height: 740px; }
-      .stage-rail { grid-template-columns: repeat(10, 110px); }
-      .error-dock { grid-template-columns: 90px minmax(0, 1fr); }
-      .error-list { min-width: 0; }
-      .rejection-controls { grid-template-columns: 1fr 1fr; }
-      .rejection-visible-count { grid-column: 1 / -1; padding-bottom: 0; }
-      .joint-ribbon { grid-template-columns: repeat(3, 1fr); }
+      .panel { min-height: 360px; }
+      .image-stack { min-height: 520px; }
+      .topbar { flex-wrap: wrap; }
+      .mode-flags { margin-left: 0; }
     }
   </style>
 </head>
 <body>
-  <main class="shell" aria-label="Z-Manip debugging and fixed Home dashboard">
+  <main class="shell" aria-label="Z Manip Control Panel">
     <header class="topbar">
       <div class="brand">
-        <h1>Z-Manip Debug</h1>
+        <h1>Z Manip Control Panel</h1>
         <p id="run-id">waiting for artifact bundle</p>
+      </div>
+      <span class="runtime-badge offline" id="runtime-badge" aria-live="polite">RUNTIME OFFLINE</span>
+      <div class="head-meta">
+        <div class="meta"><span>Pipeline</span><strong id="pipeline-state">—</strong></div>
+        <div class="meta"><span>Selected</span><strong id="selected-candidate">none</strong></div>
+        <div class="meta"><span>Updated</span><strong id="updated-time">—</strong></div>
       </div>
       <div class="mode-flags" aria-label="Safety mode">
         <span class="flag" id="read-only-flag">READ ONLY</span>
         <span class="flag" id="planning-only-flag">PLANNING ONLY</span>
       </div>
-      <span class="runtime-badge offline" id="runtime-badge" aria-live="polite">RUNTIME OFFLINE</span>
-      <div class="run-meta">
-        <div class="meta"><span>Pipeline</span><strong id="pipeline-state">—</strong></div>
-        <div class="meta"><span>Perception frame</span><strong id="perception-frame">—</strong></div>
-        <div class="meta"><span>Planning frame</span><strong id="planning-frame">—</strong></div>
-        <div class="meta"><span>Source stamp</span><strong id="source-stamp">—</strong></div>
-        <div class="meta"><span>Updated</span><strong id="updated-time">—</strong></div>
-        <div class="meta"><span>Selected</span><strong id="selected-candidate">none</strong></div>
-      </div>
     </header>
 
-    <section class="session-console" aria-label="Interactive Home, perception, planning and grasp controls">
-      <div class="session-step">
-        <div class="session-step-head">
-          <span class="session-step-title"><span class="session-step-index">0</span> Robot Home</span>
-          <span class="session-selection" id="home-selection">2% speed</span>
-        </div>
-        <button class="session-button home" id="session-go-home" type="button">Reset + Home</button>
-        <div class="session-state" id="home-session-state" aria-live="polite">Return Home before starting a new perception and grasp plan.</div>
-      </div>
-      <div class="session-step">
-        <div class="session-step-head">
-          <span class="session-step-title"><span class="session-step-index">1</span> Perception</span>
-          <span class="session-selection" id="perception-selection">no session selected</span>
-        </div>
-        <div class="target-row">
-          <input class="target-input" id="perception-target" type="text" maxlength="160" autocomplete="off" spellcheck="false" placeholder="Describe the current object, e.g. white block with red port" aria-label="Current target object description">
-          <button class="session-button" id="session-run-perception" type="button" disabled>Run perception</button>
-        </div>
-        <div class="session-state" id="perception-session-state" aria-live="polite">Enter the object currently visible in the live D435 feed.</div>
-      </div>
-      <div class="session-step">
-        <div class="session-step-head">
-          <span class="session-step-title"><span class="session-step-index">2</span> Planning</span>
-          <span class="session-selection" id="planning-selection">selected perception required</span>
-        </div>
-        <button class="session-button plan" id="session-run-planning" type="button" disabled>Run planning</button>
-        <div class="session-state" id="planning-session-state" aria-live="polite">Planning unlocks after a successful perception session.</div>
-      </div>
-      <div class="session-step session-safety" aria-label="Interactive action safety boundary">
-        <div class="session-step-head">
-          <span class="session-step-title"><span class="session-step-index">3</span> Motion limits</span>
-          <span class="session-selection" id="grasp-selection">fixed · 5%</span>
-        </div>
-        <label class="speed-control" for="motion-speed">Speed
-          <input class="speed-input" id="motion-speed" type="number" min="1" max="50" step="1" value="5" inputmode="numeric" aria-describedby="motion-speed-note">
-          <span>%</span>
-        </label>
-        <span>Home uses a server-owned measured pose; the browser cannot submit joint targets.</span>
-        <span id="motion-speed-note">1–50%. Perform plans at Home, keeps one connection, places back, then returns Home.</span>
-        <div class="maintenance-actions">
-          <button class="session-button maintenance" id="session-clear-demo" type="button">Clear demo</button>
-          <button class="session-button maintenance" id="session-restart-service" type="button">Restart UI</button>
-        </div>
-        <span id="maintenance-state" aria-live="polite">Clears current overlays or restarts only this local webpage/API.</span>
-      </div>
-      <section class="operation-deck" aria-label="Grasp execution controls">
-        <div class="operation-automation">
-          <div class="perform-actions" aria-label="Automated grasp controls">
-            <button class="session-button perform" id="session-perform-grasp" type="button" disabled>Perception + perform</button>
-            <button class="session-button perform-direct" id="session-perform-selected" type="button" disabled>Direct perform</button>
-          </div>
-          <div class="session-state operation-state" id="grasp-session-state" aria-live="polite">Plan first, then run the complete automated cycle.</div>
-        </div>
-      </section>
-      <section class="approach-deck" aria-label="Go2W depth visual approach controls">
-        <div class="approach-copy">
-          <strong>Mobile find → grasp</strong>
-          <span>Detect in the current D435 view. If absent, run a bounded J4/J5 wrist-camera search; then track, coarsely align, and walk into the close-range handoff zone before fresh perception, IK, planning, and grasp.</span>
-          <div class="session-state" id="approach-session-state" aria-live="polite">Enter the target description, then run the complete mobile grasp.</div>
-        </div>
-        <div class="approach-actions">
-          <button class="session-button approach-live" id="approach-auto" type="button" disabled>Find → approach → grasp</button>
-          <button class="session-button approach-live" id="approach-only" type="button" disabled>Approach only</button>
-          <button class="session-button" id="approach-shadow" type="button" disabled>Shadow check</button>
-          <button class="session-button approach-stop" id="approach-stop" type="button">Full stop</button>
-        </div>
-        <div class="approach-readout" aria-label="Depth visual servo telemetry">
-          <div class="approach-metric"><span>Target x / y / z</span><strong id="approach-target">—</strong></div>
-          <div class="approach-metric"><span>Camera 3D / elevation</span><strong id="approach-camera-range">—</strong></div>
-          <div class="approach-metric"><span>Planar / base 3D</span><strong id="approach-base-range">—</strong></div>
-          <div class="approach-metric"><span>Target height / arm 3D</span><strong id="approach-arm-range">—</strong></div>
-          <div class="approach-metric"><span>Body height / pitch target</span><strong id="approach-posture">—</strong></div>
-          <div class="approach-metric"><span>Posture feedback age</span><strong id="approach-feedback-age">—</strong></div>
-          <div class="approach-metric"><span>Control owner</span><strong id="approach-owner">—</strong></div>
-          <div class="approach-metric"><span>Optimizer phase / residual</span><strong id="approach-optimizer">—</strong></div>
-          <div class="approach-metric"><span>FOV / IK handoff</span><strong id="approach-handoff">—</strong></div>
-          <div class="approach-metric"><span>Range / bearing error</span><strong id="approach-errors">—</strong></div>
-          <div class="approach-metric"><span>Command vx / wz</span><strong id="approach-command">—</strong></div>
-          <div class="approach-metric"><span>Reactive view</span><strong id="approach-reactive">—</strong></div>
-          <div class="approach-metric"><span>Wrist search</span><strong id="approach-search">idle</strong></div>
-          <div class="approach-metric"><span>SPORT transport / Euler</span><strong id="approach-sport-proof">—</strong></div>
-          <div class="approach-metric"><span>Posture execution proof</span><strong id="approach-posture-proof">CALCULATED — · GATED — · ACKED — · MEASURED —</strong></div>
-          <div class="approach-metric"><span>Arm execution proof</span><strong id="approach-arm-proof">CALCULATED — · GATED — · ACKED — · MEASURED —</strong></div>
-          <div class="approach-metric"><span>Fixed fixture guard</span><strong id="approach-fixed-guard">UNAVAILABLE · forwarding evidence —</strong></div>
-        </div>
-        <div class="approach-progress" id="approach-progress" aria-label="Mobile grasp workflow progress">
-          <span class="approach-phase" data-approach-phase="detect">Detect</span>
-          <span class="approach-phase" data-approach-phase="search">Search</span>
-          <span class="approach-phase" data-approach-phase="track">Track</span>
-          <span class="approach-phase" data-approach-phase="approach">Base approach</span>
-          <span class="approach-phase" data-approach-phase="posture">Posture</span>
-          <span class="approach-phase" data-approach-phase="reacquire">Reacquire</span>
-          <span class="approach-phase" data-approach-phase="handoff">Handoff</span>
-          <span class="approach-phase" data-approach-phase="grasp">Grasp</span>
-        </div>
-      </section>
-    </section>
-
-    <details class="component-console" id="component-console">
-      <summary>Robot services · status, logs and restart</summary>
-      <div class="component-console-body">
-        <div class="component-toolbar"><span>Cold start after a NUC/PC reboot. Status checks never send motion commands.</span><button class="component-button" id="component-bringup" type="button">Bring up complete stack</button></div>
-        <div class="component-grid" id="component-grid">
-          <div class="component-card" data-component-card="ui"><div class="component-head"><span>UI workbench</span><span data-component-badge="ui">—</span></div><div class="component-state" data-component-state="ui">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="ui">Restart</button><button class="component-button log" type="button" data-component-log="ui">Logs</button></div></div>
-          <div class="component-card" data-component-card="nuc-camera"><div class="component-head"><span>NUC D435</span><span data-component-badge="nuc-camera">—</span></div><div class="component-state" data-component-state="nuc-camera">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="nuc-camera">Restart</button><button class="component-button log" type="button" data-component-log="nuc-camera">Logs</button></div></div>
-          <div class="component-card" data-component-card="passive-feedback"><div class="component-head"><span>Passive feedback</span><span data-component-badge="passive-feedback">—</span></div><div class="component-state" data-component-state="passive-feedback">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="passive-feedback">Restart</button><button class="component-button log" type="button" data-component-log="passive-feedback">Logs</button></div></div>
-          <div class="component-card" data-component-card="observer"><div class="component-head"><span>Runtime observer</span><span data-component-badge="observer">—</span></div><div class="component-state" data-component-state="observer">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="observer">Restart</button><button class="component-button log" type="button" data-component-log="observer">Logs</button></div></div>
-          <div class="component-card" data-component-card="rgbd"><div class="component-head"><span>RGB-D bridge</span><span data-component-badge="rgbd">—</span></div><div class="component-state" data-component-state="rgbd">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="rgbd">Restart</button><button class="component-button log" type="button" data-component-log="rgbd">Logs</button></div></div>
-          <div class="component-card" data-component-card="edgetam"><div class="component-head"><span>EdgeTAM</span><span data-component-badge="edgetam">—</span></div><div class="component-state" data-component-state="edgetam">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="edgetam">Restart</button><button class="component-button log" type="button" data-component-log="edgetam">Logs</button></div></div>
-          <div class="component-card" data-component-card="perception"><div class="component-head"><span>Perception ROS</span><span data-component-badge="perception">—</span></div><div class="component-state" data-component-state="perception">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="perception">Restart</button><button class="component-button log" type="button" data-component-log="perception">Logs</button></div></div>
-          <div class="component-card" data-component-card="perception-all"><div class="component-head"><span>All perception</span><span data-component-badge="perception-all">—</span></div><div class="component-state" data-component-state="perception-all">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="perception-all">Restart all</button><button class="component-button log" type="button" data-component-log="perception-all">Logs</button></div></div>
-          <div class="component-card" data-component-card="reactive-control"><div class="component-head"><span>Go2W WebRTC owner</span><span data-component-badge="reactive-control">—</span></div><div class="component-state" data-component-state="reactive-control">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="reactive-control">Restart</button><button class="component-button log" type="button" data-component-log="reactive-control">Logs</button></div></div>
-          <div class="component-card" data-component-card="posture-bridge"><div class="component-head"><span>Posture relay</span><span data-component-badge="posture-bridge">—</span></div><div class="component-state" data-component-state="posture-bridge">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="posture-bridge">Restart</button><button class="component-button log" type="button" data-component-log="posture-bridge">Logs</button></div></div>
-          <div class="component-card" data-component-card="whole-body"><div class="component-head"><span>Pinocchio + CasADi</span><span data-component-badge="whole-body">—</span></div><div class="component-state" data-component-state="whole-body">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="whole-body">Rebuild</button><button class="component-button log" type="button" data-component-log="whole-body">Logs</button></div></div>
-          <div class="component-card" data-component-card="mobile-control"><div class="component-head"><span>Mobile control chain</span><span data-component-badge="mobile-control">—</span></div><div class="component-state" data-component-state="mobile-control">Checking…</div><div class="component-actions"><button class="component-button" type="button" data-component-restart="mobile-control">Restart chain</button><button class="component-button log" type="button" data-component-log="mobile-control">Logs</button></div></div>
-        </div>
-        <pre class="component-log" id="component-log" hidden aria-live="polite"></pre>
-      </div>
-    </details>
-
-    <section class="stage-rail" id="stage-rail" aria-label="Pipeline stages"></section>
-
-    <section class="workspace">
-      <section class="panel" aria-label="Live and recorded perception images">
-        <div class="panel-title"><span>Perception feed</span><span class="subtle">live + recorded</span></div>
+    <div class="workspace">
+      <!-- LEFT: perception feed -->
+      <section class="panel" aria-label="Perception feed">
+        <div class="panel-title"><span>Perception feed</span><span class="subtle">live + tracking</span></div>
         <div class="image-stack" id="image-stack">
           <div class="image-frame live-camera" data-testid="live-camera-frame" data-feed-key="live_camera">
             <div class="image-frame-toolbar">
-              <span class="image-label">D435 RGB live</span>
+              <span class="image-label">D435 RGB</span>
               <div class="image-frame-actions">
                 <span class="camera-state offline" id="camera-state" aria-live="polite">OFFLINE</span>
                 <button class="image-reorder-button" type="button" data-reorder="up" aria-label="Move D435 RGB live up" title="Move up">&#8593;</button>
@@ -948,7 +494,7 @@
           </div>
           <div class="image-frame live-camera" data-testid="live-depth-frame" data-feed-key="live_depth">
             <div class="image-frame-toolbar">
-              <span class="image-label">D435 depth live</span>
+              <span class="image-label">D435 depth</span>
               <div class="image-frame-actions">
                 <span class="camera-state offline" id="depth-state" aria-live="polite">OFFLINE</span>
                 <button class="image-reorder-button" type="button" data-reorder="up" aria-label="Move D435 depth live up" title="Move up">&#8593;</button>
@@ -960,7 +506,7 @@
           </div>
           <div class="image-frame live-cloud" data-testid="live-cloud-frame" data-feed-key="live_cloud">
             <div class="image-frame-toolbar">
-              <span class="image-label">3D point cloud live</span>
+              <span class="image-label">3D point cloud</span>
               <div class="image-frame-actions">
                 <span class="camera-state offline" id="cloud-source" aria-live="polite" title="Active depth source">—</span>
                 <span class="camera-state offline" id="cloud-state" aria-live="polite">OFFLINE</span>
@@ -970,23 +516,24 @@
             </div>
             <canvas id="cloud-canvas" class="cloud-canvas" aria-label="Live colored point cloud; drag to orbit, scroll to zoom"></canvas>
             <div class="empty-image" id="cloud-placeholder">Waiting for the subscribe-only cloud observer.</div>
-            <button class="tool-button cloud-reset" type="button" id="cloud-reset-view">Reset view</button>
+            <button class="tool-button cloud-reset" type="button" id="cloud-reset-view">Reset</button>
           </div>
           <div id="recorded-image-stack"></div>
           <p class="sr-only" id="feed-order-status" aria-live="polite"></p>
         </div>
       </section>
 
-      <section class="panel viewport-panel" aria-label="Three-dimensional debug view">
+      <!-- CENTER: geometry / scene (hero) -->
+      <section class="panel viewport-panel" aria-label="Geometry scene view">
         <div class="panel-title">
-          <span>Geometry / plan view</span>
+          <span>Geometry / scene</span>
           <div class="viewport-toolbar">
             <span class="subtle" id="view-frame">frame: —</span>
             <span class="camera-state live" id="geometry-view-mode" data-testid="geometry-view-mode" aria-live="polite">LIVE</span>
             <span class="camera-state live" id="geometry-live-state" data-testid="geometry-live-state" aria-live="polite" title="Live geometry freshness">LIVE</span>
             <button class="tool-button" type="button" id="geometry-view-toggle" data-testid="geometry-view-toggle" hidden>Show session</button>
             <select class="candidate-picker" id="candidate-selector" data-testid="candidate-selector" aria-label="Select grasp candidate"></select>
-            <label class="candidate-toggle"><input type="checkbox" id="show-all-candidates">show all</label>
+            <label class="candidate-toggle"><input type="checkbox" id="show-all-candidates">all</label>
             <button class="tool-button" type="button" id="reset-view">Reset view</button>
           </div>
         </div>
@@ -997,70 +544,193 @@
           </div>
           <div class="canvas-hud" aria-hidden="true">
             <span class="legend" style="color:#78868d"><i class="dot"></i>scene</span>
-            <span class="legend" style="color:#48d7de"><i class="dot"></i>target</span>
+            <span class="legend" style="color:#8f9aa0"><i class="dot"></i>target</span>
             <span class="legend" style="color:#d8e2e6"><i class="dot"></i>actual</span>
-            <span class="legend" style="color:#659cff"><i class="dot"></i>plan ghost</span>
-            <span class="legend" style="color:#ff6673"><i class="dot"></i>X</span>
-            <span class="legend" style="color:#54d68c"><i class="dot"></i>Y</span>
-            <span class="legend" style="color:#659cff"><i class="dot"></i>Z</span>
-            <span class="legend" style="color:#f0b758"><i class="dot"></i>collision</span>
+            <span class="legend" style="color:#5b8cff"><i class="dot"></i>plan ghost</span>
+            <span class="legend" style="color:#c96a70"><i class="dot"></i>X</span>
+            <span class="legend" style="color:#5fa877"><i class="dot"></i>Y</span>
+            <span class="legend" style="color:#5b8cff"><i class="dot"></i>Z</span>
+            <span class="legend" style="color:#c99a4a"><i class="dot"></i>collision</span>
           </div>
         </div>
         <div class="trajectory-strip" id="trajectory-strip"></div>
       </section>
 
-      <aside class="panel diagnostics" aria-label="Safety and planning diagnostics">
-        <div class="panel-title"><span>Diagnostics</span><span class="subtle" id="candidate-count">0 candidates</span></div>
-        <div class="diag-scroll">
-          <section class="section">
-            <h2>Live runtime</h2>
-            <div class="runtime-grid" id="runtime-grid"></div>
-            <p class="runtime-note" id="runtime-note">Waiting for the subscribe-only ROS observer.</p>
-          </section>
-          <section class="section">
-            <h2>Safety evidence</h2>
-            <div class="safety-grid" id="safety-grid"></div>
-          </section>
-          <section class="section">
-            <h2>Frame gate</h2>
-            <div class="gate-box" id="calibration-gate"></div>
-          </section>
-          <section class="section">
-            <h2>Trajectory optimization</h2>
-            <div id="trajectory-refinement-evidence"></div>
-          </section>
-          <section class="section">
-            <h2>Selected collision witness</h2>
-            <div id="collision-evidence"></div>
-          </section>
-          <section class="section rejection-section">
-            <details class="rejection-disclosure" id="rejection-disclosure" data-testid="rejection-disclosure">
-              <summary>
-                <span>Candidate rejections</span>
-                <span class="rejection-summary" id="rejection-summary">0 total</span>
-              </summary>
-              <div class="rejection-body">
-                <div class="rejection-controls">
-                  <label>Stage
-                    <select id="rejection-stage-filter" data-testid="rejection-stage-filter" aria-label="Filter rejection stage"></select>
-                  </label>
-                  <label>Candidate
-                    <select id="rejection-candidate-filter" data-testid="rejection-candidate-filter" aria-label="Filter rejection candidate"></select>
-                  </label>
-                  <span class="rejection-visible-count" id="rejection-visible-count" aria-live="polite">0 shown</span>
-                </div>
-                <div class="rejection-scroll" id="rejection-table" data-testid="rejection-scroll"></div>
-              </div>
-            </details>
-          </section>
+      <!-- RIGHT: control strip -->
+      <aside class="controls" aria-label="Robot controls">
+        <div class="cblock">
+          <div class="cblock-head"><span class="eyebrow">Target object</span></div>
+          <div class="target-row">
+            <input class="target-input" id="perception-target" type="text" maxlength="160" autocomplete="off" spellcheck="false" placeholder="e.g. white block with red port" aria-label="Current target object description">
+          </div>
+        </div>
+
+        <div class="cblock" aria-label="Mobile find to grasp controls">
+          <div class="cblock-head"><span class="eyebrow">Mobile find → grasp</span></div>
+          <div class="approach-progress" id="approach-progress" aria-label="Mobile grasp workflow progress">
+            <span class="approach-phase" data-approach-phase="detect">Detect</span>
+            <span class="approach-phase" data-approach-phase="search">Search</span>
+            <span class="approach-phase" data-approach-phase="track">Track</span>
+            <span class="approach-phase" data-approach-phase="approach">Approach</span>
+            <span class="approach-phase" data-approach-phase="posture">Posture</span>
+            <span class="approach-phase" data-approach-phase="reacquire">Reacquire</span>
+            <span class="approach-phase" data-approach-phase="handoff">Handoff</span>
+            <span class="approach-phase" data-approach-phase="grasp">Grasp</span>
+          </div>
+          <div class="btn-grid">
+            <button class="btn primary" id="approach-auto" type="button" disabled>Find + grasp</button>
+            <button class="btn" id="approach-only" type="button" disabled>Approach</button>
+            <button class="btn" id="approach-shadow" type="button" disabled>Shadow check</button>
+            <button class="btn danger" id="approach-stop" type="button">Stop</button>
+          </div>
+          <div class="session-state" id="approach-session-state" aria-live="polite">Enter the target description, then run the complete mobile grasp.</div>
+          <div class="approach-readout">
+            <div class="approach-metric wide"><span>Target x / y / z</span><strong id="approach-target">—</strong></div>
+            <div class="approach-metric"><span>Control owner</span><strong id="approach-owner">—</strong></div>
+            <div class="approach-metric"><span>Wrist search</span><strong id="approach-search">idle</strong></div>
+          </div>
+        </div>
+
+        <div class="cblock" aria-label="Pipeline steps">
+          <div class="cblock-head">
+            <span class="eyebrow">Pipeline steps</span>
+            <label class="speed-control" for="motion-speed">Speed
+              <input class="speed-input" id="motion-speed" type="number" min="1" max="50" step="1" value="5" inputmode="numeric" aria-describedby="motion-speed-note">%
+            </label>
+          </div>
+          <div class="btn-grid">
+            <button class="btn" id="session-go-home" type="button">Reset + Home</button>
+            <button class="btn" id="session-run-perception" type="button" disabled>Run perception</button>
+            <button class="btn" id="session-run-planning" type="button" disabled>Run planning</button>
+            <button class="btn" id="session-perform-grasp" type="button" disabled>Perceive + grasp</button>
+            <button class="btn" id="session-perform-selected" type="button" disabled>Direct grasp</button>
+          </div>
+          <div class="session-state" id="home-session-state" aria-live="polite">Return Home before starting a new perception and grasp plan.</div>
+          <div class="session-state" id="perception-session-state" aria-live="polite">Enter the object currently visible in the live D435 feed.</div>
+          <div class="session-state" id="planning-session-state" aria-live="polite">Planning unlocks after a successful perception session.</div>
+          <div class="session-state" id="grasp-session-state" aria-live="polite">Plan first, then run the complete automated cycle.</div>
+          <div class="step-selections">
+            <span class="session-selection" id="home-selection">2% speed</span>
+            <span class="session-selection" id="perception-selection">no session selected</span>
+            <span class="session-selection" id="planning-selection">selected perception required</span>
+            <span class="session-selection" id="grasp-selection">fixed · 5%</span>
+          </div>
+          <span class="speed-note" id="motion-speed-note">1–50%. Perform plans at Home, keeps one connection, places back, then returns Home.</span>
+          <div class="btn-grid">
+            <button class="btn small" id="session-clear-demo" type="button">Clear demo</button>
+            <button class="btn small" id="session-restart-service" type="button">Restart UI</button>
+          </div>
+          <span class="speed-note" id="maintenance-state" aria-live="polite">Clears current overlays or restarts only this local webpage/API.</span>
+        </div>
+
+        <div class="cblock" aria-label="Robot service health">
+          <div class="cblock-head">
+            <span class="eyebrow">Service health</span>
+            <button class="component-button" id="component-bringup" type="button">Bring up stack</button>
+          </div>
+          <div class="component-list" id="component-grid">
+            <div class="component-card" data-component-card="ui"><span class="cname">UI workbench</span><span class="component-state" data-component-state="ui">Checking…</span><span data-component-badge="ui">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="ui">Restart</button><button class="component-button log" type="button" data-component-log="ui">Logs</button></span></div>
+            <div class="component-card" data-component-card="nuc-camera"><span class="cname">NUC D435</span><span class="component-state" data-component-state="nuc-camera">Checking…</span><span data-component-badge="nuc-camera">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="nuc-camera">Restart</button><button class="component-button log" type="button" data-component-log="nuc-camera">Logs</button></span></div>
+            <div class="component-card" data-component-card="passive-feedback"><span class="cname">Passive fb</span><span class="component-state" data-component-state="passive-feedback">Checking…</span><span data-component-badge="passive-feedback">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="passive-feedback">Restart</button><button class="component-button log" type="button" data-component-log="passive-feedback">Logs</button></span></div>
+            <div class="component-card" data-component-card="observer"><span class="cname">Observer</span><span class="component-state" data-component-state="observer">Checking…</span><span data-component-badge="observer">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="observer">Restart</button><button class="component-button log" type="button" data-component-log="observer">Logs</button></span></div>
+            <div class="component-card" data-component-card="rgbd"><span class="cname">RGB-D bridge</span><span class="component-state" data-component-state="rgbd">Checking…</span><span data-component-badge="rgbd">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="rgbd">Restart</button><button class="component-button log" type="button" data-component-log="rgbd">Logs</button></span></div>
+            <div class="component-card" data-component-card="edgetam"><span class="cname">EdgeTAM</span><span class="component-state" data-component-state="edgetam">Checking…</span><span data-component-badge="edgetam">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="edgetam">Restart</button><button class="component-button log" type="button" data-component-log="edgetam">Logs</button></span></div>
+            <div class="component-card" data-component-card="perception"><span class="cname">Perception ROS</span><span class="component-state" data-component-state="perception">Checking…</span><span data-component-badge="perception">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="perception">Restart</button><button class="component-button log" type="button" data-component-log="perception">Logs</button></span></div>
+            <div class="component-card" data-component-card="perception-all"><span class="cname">All perception</span><span class="component-state" data-component-state="perception-all">Checking…</span><span data-component-badge="perception-all">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="perception-all">Restart all</button><button class="component-button log" type="button" data-component-log="perception-all">Logs</button></span></div>
+            <div class="component-card" data-component-card="reactive-control"><span class="cname">WebRTC owner</span><span class="component-state" data-component-state="reactive-control">Checking…</span><span data-component-badge="reactive-control">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="reactive-control">Restart</button><button class="component-button log" type="button" data-component-log="reactive-control">Logs</button></span></div>
+            <div class="component-card" data-component-card="posture-bridge"><span class="cname">Posture relay</span><span class="component-state" data-component-state="posture-bridge">Checking…</span><span data-component-badge="posture-bridge">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="posture-bridge">Restart</button><button class="component-button log" type="button" data-component-log="posture-bridge">Logs</button></span></div>
+            <div class="component-card" data-component-card="whole-body"><span class="cname">IK · Pinocchio</span><span class="component-state" data-component-state="whole-body">Checking…</span><span data-component-badge="whole-body">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="whole-body">Rebuild</button><button class="component-button log" type="button" data-component-log="whole-body">Logs</button></span></div>
+            <div class="component-card" data-component-card="mobile-control"><span class="cname">Mobile chain</span><span class="component-state" data-component-state="mobile-control">Checking…</span><span data-component-badge="mobile-control">—</span><span class="component-actions"><button class="component-button" type="button" data-component-restart="mobile-control">Restart chain</button><button class="component-button log" type="button" data-component-log="mobile-control">Logs</button></span></div>
+          </div>
+          <div class="component-toolbar"><span>Cold start after a NUC/PC reboot. Status checks never send motion commands.</span></div>
+          <pre class="component-log" id="component-log" hidden aria-live="polite"></pre>
+        </div>
+
+        <div class="cblock" aria-label="Pipeline issues">
+          <div class="cblock-head"><span class="eyebrow">Pipeline issues</span></div>
+          <div class="error-list" id="error-list"></div>
         </div>
       </aside>
-    </section>
+    </div>
 
-    <footer class="error-dock">
-      <div class="error-label">PIPELINE ISSUES</div>
-      <div class="error-list" id="error-list"></div>
-    </footer>
+    <details class="diag-drawer" aria-label="Diagnostics">
+      <summary>Diagnostics<span class="subtle" id="candidate-count">0 candidates</span></summary>
+      <div class="diag-grid">
+        <section class="section">
+          <h2>Bundle frames</h2>
+          <div class="runtime-grid">
+            <div class="runtime-metric"><span>Perception frame</span><strong id="perception-frame">—</strong></div>
+            <div class="runtime-metric"><span>Planning frame</span><strong id="planning-frame">—</strong></div>
+            <div class="runtime-metric"><span>Source stamp</span><strong id="source-stamp">—</strong></div>
+          </div>
+        </section>
+        <section class="section span-2">
+          <h2>Pipeline stages</h2>
+          <div class="stage-rail" id="stage-rail" aria-label="Pipeline stages"></div>
+        </section>
+        <section class="section">
+          <h2>Live runtime</h2>
+          <div class="runtime-grid" id="runtime-grid"></div>
+          <p class="runtime-note" id="runtime-note">Waiting for the subscribe-only ROS observer.</p>
+        </section>
+        <section class="section">
+          <h2>Safety evidence</h2>
+          <div class="safety-grid" id="safety-grid"></div>
+        </section>
+        <section class="section">
+          <h2>Frame gate</h2>
+          <div class="gate-box" id="calibration-gate"></div>
+        </section>
+        <section class="section span-2">
+          <h2>Approach telemetry</h2>
+          <div class="approach-readout">
+            <div class="approach-metric"><span>Camera 3D / elevation</span><strong id="approach-camera-range">—</strong></div>
+            <div class="approach-metric"><span>Planar / base 3D</span><strong id="approach-base-range">—</strong></div>
+            <div class="approach-metric"><span>Target height / arm 3D</span><strong id="approach-arm-range">—</strong></div>
+            <div class="approach-metric"><span>Body height / pitch target</span><strong id="approach-posture">—</strong></div>
+            <div class="approach-metric"><span>Posture feedback age</span><strong id="approach-feedback-age">—</strong></div>
+            <div class="approach-metric"><span>Optimizer phase / residual</span><strong id="approach-optimizer">—</strong></div>
+            <div class="approach-metric"><span>FOV / IK handoff</span><strong id="approach-handoff">—</strong></div>
+            <div class="approach-metric"><span>Range / bearing error</span><strong id="approach-errors">—</strong></div>
+            <div class="approach-metric"><span>Command vx / wz</span><strong id="approach-command">—</strong></div>
+            <div class="approach-metric"><span>Reactive view</span><strong id="approach-reactive">—</strong></div>
+            <div class="approach-metric wide"><span>SPORT transport / Euler</span><strong id="approach-sport-proof">—</strong></div>
+            <div class="approach-metric wide"><span>Posture execution proof</span><strong id="approach-posture-proof">CALCULATED — · GATED — · ACKED — · MEASURED —</strong></div>
+            <div class="approach-metric wide"><span>Arm execution proof</span><strong id="approach-arm-proof">CALCULATED — · GATED — · ACKED — · MEASURED —</strong></div>
+            <div class="approach-metric wide"><span>Fixed fixture guard</span><strong id="approach-fixed-guard">UNAVAILABLE · forwarding evidence —</strong></div>
+          </div>
+        </section>
+        <section class="section">
+          <h2>Trajectory optimization</h2>
+          <div id="trajectory-refinement-evidence"></div>
+        </section>
+        <section class="section">
+          <h2>Selected collision witness</h2>
+          <div id="collision-evidence"></div>
+        </section>
+        <section class="section span-2">
+          <h2>Candidate rejections</h2>
+          <details class="rejection-disclosure" id="rejection-disclosure" data-testid="rejection-disclosure">
+            <summary>
+              <span>Candidate rejections</span>
+              <span class="rejection-summary" id="rejection-summary">0 total</span>
+            </summary>
+            <div class="rejection-body">
+              <div class="rejection-controls">
+                <label>Stage
+                  <select id="rejection-stage-filter" data-testid="rejection-stage-filter" aria-label="Filter rejection stage"></select>
+                </label>
+                <label>Candidate
+                  <select id="rejection-candidate-filter" data-testid="rejection-candidate-filter" aria-label="Filter rejection candidate"></select>
+                </label>
+                <span class="rejection-visible-count" id="rejection-visible-count" aria-live="polite">0 shown</span>
+              </div>
+              <div class="rejection-scroll" id="rejection-table" data-testid="rejection-scroll"></div>
+            </div>
+          </details>
+        </section>
+      </div>
+    </details>
   </main>
 
   <div class="fatal" id="fatal" hidden>
