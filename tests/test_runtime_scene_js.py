@@ -931,5 +931,115 @@ console.log(JSON.stringify({{
     assert abs(result["coldCam"][2] - result["coldBase"][2]) < 6
 
 
+_COLD_LOAD_BUNDLE_JS = r"""
+const bundle = {{
+  schema: 'z_manip.debug_bundle.v1',
+  frames: {{ perception: 'camera', planning: 'piper_base_link' }},
+  visualization: {{
+    frame: 'piper_base_link', robot_overlay_allowed: true,
+    scene_cloud: {{ frame: 'piper_base_link', points_xyz_m: [[.2,.1,0],[.3,-.1,.02],[.25,0,.1]] }},
+    reference_axes: [{{ name: 'base', frame: 'piper_base_link', pose: [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]] }}]
+  }}
+}};
+const emptyLabel = ops => ops.filter(op => op[0] === 'fillText').some(op => op[1] === 'Waiting for scene data');
+const baseLabel = ops => ops.filter(op => op[0] === 'fillText').some(op => op[1] === 'base');
+"""
+
+
+def test_session_first_cold_load_frames_bundle_then_live():
+    # Operator regression (mid-task page reload): the FIRST data the scene sees
+    # is the session bundle — no live tick has arrived yet.  setBundle from the
+    # never-framed cold state must produce the first framing and draw, and a
+    # live entry afterwards must keep that framing (no empty state at any step).
+    result = _node(_live_harness(_COLD_LOAD_BUNDLE_JS + r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+operations.length = 0;
+const accepted = scene.setBundle(bundle);
+scene.flush();
+const framedFromBundle = scene.getState().framing;
+const bundleEmpty = emptyLabel(operations);
+const bundleDrewBase = baseLabel(operations);
+operations.length = 0;
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:false}});
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.flush();
+const framedLive = scene.getState().framing;
+const liveEmpty = emptyLabel(operations);
+const liveDrewBase = baseLabel(operations);
+console.log(JSON.stringify({{
+  accepted, framedFromBundle, bundleEmpty, bundleDrewBase, framedLive, liveEmpty, liveDrewBase
+}}));
+"""))
+
+    assert result["accepted"]["accepted"] is True
+    assert result["framedFromBundle"] is not None
+    assert result["framedFromBundle"]["source"] == "bundle_locked"
+    assert result["bundleEmpty"] is False
+    assert result["bundleDrewBase"] is True
+    # The bundle framing carries into live mode verbatim — still no empty state.
+    assert result["framedLive"] == result["framedFromBundle"]
+    assert result["liveEmpty"] is False
+    assert result["liveDrewBase"] is True
+
+
+def test_session_first_cold_load_frames_live_then_bundle():
+    # The mirrored arrival order, replaying the REAL boot sequence: drawScene
+    # first enters live mode with NO runtime data (gates closed, robot/pose
+    # cleared to null), which renders the cold empty state — the only moment it
+    # is allowed.  The session bundle then arrives and MUST frame and draw; a
+    # later live tick keeps the scene framed.
+    result = _node(_live_harness(_COLD_LOAD_BUNDLE_JS + r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+// Boot: applyLiveGeometry with state.runtime === null.
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:false, cloudExpected:false}});
+scene.setLiveRobot(null);
+scene.setLiveCameraPose(null);
+operations.length = 0;
+scene.render();
+const coldEmpty = emptyLabel(operations);
+// The session bundle arrives (ensureSessionScene hands it over on mode flip).
+operations.length = 0;
+const accepted = scene.setBundle(bundle);
+scene.flush();
+const framedFromBundle = scene.getState().framing;
+const bundleEmpty = emptyLabel(operations);
+const bundleDrewBase = baseLabel(operations);
+// A later live tick (feedback returns) keeps the scene framed.
+operations.length = 0;
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:false}});
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.flush();
+const liveEmpty = emptyLabel(operations);
+console.log(JSON.stringify({{
+  coldEmpty, accepted, framedFromBundle, bundleEmpty, bundleDrewBase, liveEmpty
+}}));
+"""))
+
+    assert result["coldEmpty"] is True
+    assert result["accepted"]["accepted"] is True
+    assert result["framedFromBundle"] is not None
+    assert result["bundleEmpty"] is False
+    assert result["bundleDrewBase"] is True
+    assert result["liveEmpty"] is False
+
+
+def test_dashboard_hands_bundle_to_scene_when_session_mode_engages_late():
+    # Orchestration half of the same regression: on a mid-task reload the boot
+    # order (loadBundle -> refreshSessionStatus -> refreshRuntime) resolves the
+    # geometry mode BEFORE taskContextActive flips true, so renderBundle skips
+    # its setBundle and no remaining path ever fed the renderer — the hero sat
+    # in the cold empty state forever while every other panel streamed.  The
+    # dashboard must hand the bundle over whenever session mode is effective but
+    # the module is not yet displaying session evidence, and must redraw on a
+    # task-context flip.
+    html = (ROOT / "web/debug_dashboard/index.html").read_text(encoding="utf-8")
+    assert "function ensureSessionScene" in html
+    # Definition plus BOTH per-tick session paths (syncGeometryView + drawScene).
+    assert html.count("ensureSessionScene(") >= 3
+    assert "if (contextWasActive !== contextActive) drawScene();" in html
+
+
 def test_javascript_syntax_is_valid():
     subprocess.run(["node", "--check", str(SCRIPT)], check=True)

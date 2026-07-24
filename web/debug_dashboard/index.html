@@ -1805,10 +1805,27 @@
         : lagging ? `LAGGING · ${worst} ms` : `LIVE · ${worst} ms`;
     }
 
+    // Session-first cold-load repair.  On a mid-task page reload the boot order
+    // is loadBundle -> refreshSessionStatus -> refreshRuntime, so renderBundle
+    // resolves the geometry mode BEFORE taskContextActive flips true and skips
+    // its setBundle; when the mode then settles on "session", no remaining path
+    // ever handed the bundle to the renderer — the hero sat in the cold empty
+    // state forever while every other panel streamed.  Whenever the session
+    // view is the effective mode but the module is not yet displaying session
+    // evidence, hand it the current bundle here so WHATEVER arrives first (live
+    // runtime tick or session bundle) produces the first framing.
+    function ensureSessionScene(scene) {
+      if (!scene || !state.bundle || typeof scene.setBundle !== "function") return;
+      const snapshot = typeof scene.getState === "function" ? scene.getState() : null;
+      if (snapshot && snapshot.live === false && snapshot.frame) return;
+      scene.setBundle(state.bundle);
+    }
+
     function syncGeometryView(runtime) {
       syncGeometryMode();
       if (state.geometryMode === "live") applyLiveGeometry();
       else {
+        ensureSessionScene(state.runtimeScene);
         applyRuntimeScene(runtime);
         // Re-anchor the live colored cloud on every runtime tick too, so the
         // world keeps sweeping with base motion even while the cloud endpoint
@@ -2135,6 +2152,7 @@
         scene.flush();
         return;
       }
+      ensureSessionScene(scene);
       scene.options.showAllCandidates = state.showAllCandidates;
       scene.setSelection({ candidateId: state.selectedCandidate, rejection: state.selectedRejection });
       applyRuntimeScene(state.runtime);
@@ -3519,6 +3537,11 @@
         renderImages();
         if (state.runtimeScene) state.runtimeScene.setBundle(null);
       }
+      // A task-context flip changes the EFFECTIVE geometry mode: re-resolve and
+      // redraw the hero immediately (via ensureSessionScene when session mode
+      // engages) instead of waiting for the next runtime tick — a mid-task page
+      // reload with the runtime observer offline would otherwise never frame.
+      if (contextWasActive !== contextActive) drawScene();
       renderHomeStatus(state.home);
       renderGraspStatus(state.grasp);
       renderApproachStatus(state.approach);
