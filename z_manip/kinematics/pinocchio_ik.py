@@ -14,7 +14,14 @@ from z_manip.planning_control import (
 )
 
 from .chain import KinematicChain
-from .robust_ik import IKConfig, IKFailure, IKSolution, RobustIKSolver, _halton
+from .robust_ik import (
+    IKConfig,
+    IKFailure,
+    IKSolution,
+    RobustIKSolver,
+    _halton,
+    control_point_delta,
+)
 
 
 class PinocchioUnavailable(RuntimeError):
@@ -173,9 +180,18 @@ class PinocchioIKSolver:
         base_world = self.data.oMf[self.base_frame_id]
         tip_world = self.data.oMf[self.tip_frame_id]
         desired_world = base_world * pin.SE3(goal[:3, :3], goal[:3, 3])
-        position_error = float(
-            np.linalg.norm(tip_world.translation - desired_world.translation),
-        )
+        # Position acceptance is measured at the configured tip-frame control
+        # point (the tool contact TCP when wired), so orientation leverage over
+        # the tool offset is bounded by the position gate.  A zero offset is
+        # exactly the historical tip-origin error.
+        offset = np.asarray(self.config.position_error_offset_tip_m, dtype=float)
+        position_error = float(np.linalg.norm(control_point_delta(
+            np.asarray(tip_world.translation, dtype=float),
+            np.asarray(tip_world.rotation, dtype=float),
+            np.asarray(desired_world.translation, dtype=float),
+            np.asarray(desired_world.rotation, dtype=float),
+            offset,
+        )))
         orientation_error = float(
             np.linalg.norm(
                 pin.log3(desired_world.rotation @ tip_world.rotation.T),

@@ -88,6 +88,12 @@ def test_deployment_config_resolves_robot_path_and_builds_typed_settings():
     assert config.ik.orientation_tolerance_rad == pytest.approx(0.06)
     assert config.ik.orientation_free_axis_tolerance_rad == pytest.approx(0.3490658504)
     assert tuple(config.ik.orientation_free_axis) == pytest.approx((0.0, 0.0, 1.0))
+    # Derived from tool_geometry (tip_approach_axis * contact_tcp_z_m): the IK
+    # position gate is enforced at the tool CONTACT point, so orientation
+    # leverage over the 116.675 mm tool offset is bounded by position_tolerance.
+    assert tuple(config.ik.position_error_offset_tip_m) == pytest.approx(
+        (0.0, 0.0, 0.116675),
+    )
     assert config.ik.continuation_timeout_s == pytest.approx(0.18)
     assert config.ik.continuation_seed_timeout_s == pytest.approx(0.08)
     assert config.ik.continuation_fallback_seeds == 2

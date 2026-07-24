@@ -44,6 +44,14 @@ class IKConfig:
     # historical isotropic geodesic gate exactly.
     orientation_free_axis_tolerance_rad: float = 0.0
     orientation_free_axis: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    # Control point (tip frame) at which the POSITION tolerance is enforced.
+    # The grasp contact TCP sits ``contact_tcp_z_m`` past the tip link, so a
+    # tip-frame orientation residual levers into contact-point translation the
+    # historical tip-position gate never saw (0.236 rad inside a loose gate put
+    # the PiPER fingers 27 mm off a verified live grasp, 2026-07-24).  With the
+    # offset wired to the tool contact point, an accepted solution bounds the
+    # finger placement itself.  Zero preserves the historical tip gate exactly.
+    position_error_offset_tip_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
         positive = (
@@ -81,6 +89,11 @@ class IKConfig:
             raise ValueError(
                 "orientation_free_axis must be a finite nonzero 3-vector",
             )
+        offset = np.asarray(self.position_error_offset_tip_m, dtype=float)
+        if offset.shape != (3,) or not np.all(np.isfinite(offset)):
+            raise ValueError(
+                "position_error_offset_tip_m must be a finite 3-vector",
+            )
 
 
 @dataclass(frozen=True)
@@ -96,6 +109,28 @@ class IKSolution:
 
 class IKFailure(RuntimeError):
     """No in-limit joint configuration met the Cartesian tolerances."""
+
+
+def control_point_delta(
+    actual_position: np.ndarray,
+    actual_rotation: np.ndarray,
+    goal_position: np.ndarray,
+    goal_rotation: np.ndarray,
+    offset: np.ndarray,
+) -> np.ndarray:
+    """Position error vector measured at a tip-frame control point.
+
+    With a zero ``offset`` this is exactly the historical tip-origin position
+    error.  With the offset at the tool contact point, a transverse orientation
+    residual contributes its full lever (``theta * |offset_perp|``) to the
+    measured error, while rotation *about* the offset direction contributes
+    nothing — matching the physics of a parallel jaw whose TCP lies along
+    tool-Z.  Shared by both IK backends so acceptance stays identical.
+    """
+
+    return (actual_position + actual_rotation @ offset) - (
+        goal_position + goal_rotation @ offset
+    )
 
 
 def _van_der_corput(index: int, base: int) -> float:
@@ -240,6 +275,7 @@ class RobustIKSolver:
             config.solve_timeout_s,
             "inverse kinematics solve budget",
         )
+        offset = np.asarray(config.position_error_offset_tip_m, dtype=float)
 
         def residual_for(seed_control: PlanningControl | None):
             def residual(joints: np.ndarray) -> np.ndarray:
@@ -248,7 +284,9 @@ class RobustIKSolver:
                 # the aggregate deadline through a shorter child control.
                 checkpoint(seed_control, "inverse kinematics numerical solve")
                 actual = self.chain.forward(joints)
-                position = (actual[:3, 3] - goal[:3, 3]) / config.position_scale_m
+                position = control_point_delta(
+                    actual[:3, 3], actual[:3, :3], goal[:3, 3], goal[:3, :3], offset,
+                ) / config.position_scale_m
                 orientation = rotation_log(goal[:3, :3] @ actual[:3, :3].T)
                 return np.concatenate((position, orientation / config.orientation_scale_rad))
 
@@ -314,7 +352,9 @@ class RobustIKSolver:
                     break
                 continue
             actual = self.chain.forward(result.x)
-            position_error = float(np.linalg.norm(actual[:3, 3] - goal[:3, 3]))
+            position_error = float(np.linalg.norm(control_point_delta(
+                actual[:3, 3], actual[:3, :3], goal[:3, 3], goal[:3, :3], offset,
+            )))
             orientation_error = float(
                 np.linalg.norm(rotation_log(goal[:3, :3] @ actual[:3, :3].T)),
             )
@@ -411,11 +451,14 @@ class RobustIKSolver:
         if np.any(reference < lower) or np.any(reference > upper):
             raise ValueError("current joints violate the kinematic chain limits")
         config = self.config
+        offset = np.asarray(config.position_error_offset_tip_m, dtype=float)
 
         def pose_errors(joints: np.ndarray) -> tuple[float, float]:
             actual = self.chain.forward(joints)
             return (
-                float(np.linalg.norm(actual[:3, 3] - goal[:3, 3])),
+                float(np.linalg.norm(control_point_delta(
+                    actual[:3, 3], actual[:3, :3], goal[:3, 3], goal[:3, :3], offset,
+                ))),
                 float(np.linalg.norm(
                     rotation_log(goal[:3, :3] @ actual[:3, :3].T),
                 )),
@@ -478,7 +521,9 @@ class RobustIKSolver:
         def residual(joints: np.ndarray, seed_control: PlanningControl) -> np.ndarray:
             checkpoint(seed_control, "Cartesian IK continuation numerical solve")
             actual = self.chain.forward(joints)
-            position = (actual[:3, 3] - goal[:3, 3]) / config.position_scale_m
+            position = control_point_delta(
+                actual[:3, 3], actual[:3, :3], goal[:3, 3], goal[:3, :3], offset,
+            ) / config.position_scale_m
             orientation = rotation_log(goal[:3, :3] @ actual[:3, :3].T)
             return np.concatenate(
                 (position, orientation / config.orientation_scale_rad),

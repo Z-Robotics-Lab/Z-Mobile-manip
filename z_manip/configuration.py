@@ -452,6 +452,19 @@ def load_stack_config(
             grasp=grasp_plan,
             collision=collision_model,
         )
+        ik_values = _mapping(values["ik"], "ik")
+        if "position_error_offset_tip_m" not in ik_values:
+            # Enforce the IK position tolerance at the tool CONTACT point, not
+            # the tip link: the TCP sits ``contact_tcp_z_m`` along the approach
+            # axis, so tip-frame orientation error levers into contact-point
+            # translation that a tip-origin gate never bounds.  Derived from
+            # the validated tool geometry so it cannot drift from the deployed
+            # gripper; an explicit config value still wins.
+            approach_axis = np.asarray(tool_geometry.tip_approach_axis, dtype=float)
+            ik_values["position_error_offset_tip_m"] = tuple(
+                float(component * tool_geometry.contact_tcp_z_m)
+                for component in approach_axis
+            )
         return StackConfig(
             schema_version=_SCHEMA_VERSION,
             robot=robot,
@@ -459,7 +472,7 @@ def load_stack_config(
             topics=TopicConfig(**_mapping(values["topics"], "topics")),
             visual_servo=visual_servo,
             approach=approach,
-            ik=IKConfig(**_mapping(values["ik"], "ik")),
+            ik=IKConfig(**ik_values),
             rrt=RRTConnectConfig(**_mapping(values["rrt"], "rrt")),
             standoff=ReachabilityStandoffConfig(
                 **_mapping(values["standoff"], "standoff"),

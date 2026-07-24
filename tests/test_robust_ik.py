@@ -521,3 +521,126 @@ def test_continuation_propagates_caller_deadline_from_numerical_solve(
             max_joint_step_rad=0.05,
             control=PlanningControl(deadline_s=0.10, monotonic_fn=clock),
         )
+
+
+# -- contact-point (control-point) position acceptance -----------------------
+#
+# The grasp contact TCP sits 116.675 mm past the tip link along tool-Z.  The
+# historical gate measured position error at the tip origin, so a transverse
+# orientation residual within its own tolerance could displace the FINGERS by
+# theta * 0.1167 (27 mm on a verified live grasp, 2026-07-24) without any gate
+# noticing.  ``position_error_offset_tip_m`` moves the position gate to the
+# contact point itself.
+
+_CONTACT_OFFSET = (0.0, 0.0, 0.116675)
+
+
+def _rotated_about_tip_axis(pose, axis, angle):
+    """Rotate ``pose`` about one of its own (tip-local) axes, keeping position."""
+
+    x, y, z = axis
+    skew = np.array(((0.0, -z, y), (z, 0.0, -x), (-y, x, 0.0)))
+    local = np.eye(3) + np.sin(angle) * skew + (1.0 - np.cos(angle)) * (skew @ skew)
+    rotated = np.asarray(pose, dtype=float).copy()
+    rotated[:3, :3] = rotated[:3, :3] @ local
+    return rotated
+
+
+def test_transverse_orientation_error_is_bounded_at_the_contact_point(piper_chain):
+    from z_manip.kinematics.robust_ik import control_point_delta
+
+    q0 = np.array([0.0, 0.43, -0.34, 0.0, 0.0, 0.0])
+    tip = piper_chain.forward(q0)
+    # 0.045 rad transverse tilt: tip position error stays exactly zero, but the
+    # contact point moves by 0.045 * 0.1167 = 5.3 mm > the 4 mm position gate.
+    goal = _rotated_about_tip_axis(tip, (1.0, 0.0, 0.0), 0.045)
+    offset = np.asarray(_CONTACT_OFFSET)
+    stale_contact_error = float(np.linalg.norm(control_point_delta(
+        tip[:3, 3], tip[:3, :3], goal[:3, 3], goal[:3, :3], offset,
+    )))
+    assert stale_contact_error > 0.004  # the unmoved joints now FAIL the gate
+
+    solver = RobustIKSolver(
+        piper_chain,
+        IKConfig(
+            position_tolerance_m=0.004,
+            orientation_tolerance_rad=0.06,
+            position_error_offset_tip_m=_CONTACT_OFFSET,
+            random_seeds=6,
+            max_iterations=200,
+        ),
+    )
+    try:
+        solution = solver.solve_continuation(goal, q0, max_joint_step_rad=0.25)
+    except IKFailure:
+        return  # rejecting outright also proves the gate holds
+    actual = piper_chain.forward(solution.joints)
+    contact_error = float(np.linalg.norm(control_point_delta(
+        actual[:3, 3], actual[:3, :3], goal[:3, 3], goal[:3, :3], offset,
+    )))
+    # Any accepted solution bounds the FINGER placement, not just the tip.
+    assert contact_error < 0.004
+    assert solution.position_error_m < 0.004
+    assert not np.allclose(solution.joints, q0, atol=1e-9)
+
+
+def test_roll_about_approach_axis_has_zero_contact_lever(piper_chain):
+    q0 = np.array([0.0, 0.43, -0.34, 0.0, 0.0, 0.0])
+    tip = piper_chain.forward(q0)
+    # Roll about tip-Z (the offset direction): the contact point does not move,
+    # so the current joints still pass the position gate exactly and the
+    # continuation fast path returns them untouched.
+    goal = _rotated_about_tip_axis(tip, (0.0, 0.0, 1.0), 0.05)
+    solver = RobustIKSolver(
+        piper_chain,
+        IKConfig(
+            position_tolerance_m=0.004,
+            orientation_tolerance_rad=0.06,
+            position_error_offset_tip_m=_CONTACT_OFFSET,
+        ),
+    )
+    solution = solver.solve_continuation(goal, q0, max_joint_step_rad=0.25)
+    assert np.allclose(solution.joints, q0)
+    assert solution.position_error_m < 1e-9
+    assert solution.iterations == 0
+
+
+def test_default_zero_offset_preserves_legacy_tip_acceptance(piper_chain):
+    q0 = np.array([0.0, 0.43, -0.34, 0.0, 0.0, 0.0])
+    tip = piper_chain.forward(q0)
+    goal = _rotated_about_tip_axis(tip, (1.0, 0.0, 0.0), 0.045)
+    # Without the offset (legacy default), the same transverse tilt keeps zero
+    # tip position error and is accepted immediately by the fast path.
+    solver = RobustIKSolver(
+        piper_chain,
+        IKConfig(position_tolerance_m=0.004, orientation_tolerance_rad=0.06),
+    )
+    solution = solver.solve_continuation(goal, q0, max_joint_step_rad=0.25)
+    assert np.allclose(solution.joints, q0)
+    assert solution.position_error_m < 1e-9
+
+
+def test_control_point_delta_matches_lever_arithmetic():
+    # Shared helper (used by BOTH the scipy and Pinocchio backends): transverse
+    # rotation contributes theta * |offset|, rotation about the offset axis
+    # contributes zero, and a zero offset reduces to the tip-origin error.
+    from z_manip.kinematics.robust_ik import control_point_delta
+
+    rng = np.random.default_rng(9)
+    position = rng.normal(size=3)
+    rotation = np.eye(3)
+    offset = np.asarray(_CONTACT_OFFSET)
+    theta = 0.2
+    transverse = _rotated_about_tip_axis(np.eye(4), (0.0, 1.0, 0.0), theta)[:3, :3]
+    lever = np.linalg.norm(control_point_delta(
+        position, rotation @ transverse, position, rotation, offset,
+    ))
+    assert lever == pytest.approx(2.0 * np.sin(theta / 2.0) * offset[2], rel=1e-9)
+    roll = _rotated_about_tip_axis(np.eye(4), (0.0, 0.0, 1.0), theta)[:3, :3]
+    assert np.linalg.norm(control_point_delta(
+        position, rotation @ roll, position, rotation, offset,
+    )) == pytest.approx(0.0, abs=1e-12)
+    assert np.linalg.norm(control_point_delta(
+        position + (0.001, 0.0, 0.0), rotation @ transverse, position, rotation,
+        np.zeros(3),
+    )) == pytest.approx(0.001, rel=1e-9)
