@@ -77,12 +77,17 @@ def test_deployment_config_resolves_robot_path_and_builds_typed_settings():
     assert config.work_pose.preferred_target_x_m == pytest.approx(0.56)
     assert config.work_pose.preferred_target_abs_y_m == pytest.approx(0.14)
     assert config.work_pose.max_base_translation_m == pytest.approx(1.5)
-    # Objects smaller than 30 mm are outside the current picking scope.  Keep
-    # a one-centimetre position gate while avoiding false IK rejection from
-    # camera/hand-eye/model residuals on the real arm.
-    assert config.ik.position_tolerance_m == pytest.approx(0.010)
+    # The contact TCP sits 116.675 mm past the tip link, so tip-frame
+    # orientation error levers into contact-point translation (0.349 rad let a
+    # verified 22-43 mm finger miss through on live grasps, 2026-07-24).  The
+    # transverse orientation gate is therefore tight; jaw ROLL about the
+    # approach axis displaces the TCP by zero and stays relaxed through the
+    # anisotropic free-axis gate (tip-Z), matching the grasp-symmetry family.
+    assert config.ik.position_tolerance_m == pytest.approx(0.006)
     assert config.ik.position_scale_m == pytest.approx(0.025)
-    assert config.ik.orientation_tolerance_rad == pytest.approx(0.3490658504)
+    assert config.ik.orientation_tolerance_rad == pytest.approx(0.06)
+    assert config.ik.orientation_free_axis_tolerance_rad == pytest.approx(0.3490658504)
+    assert tuple(config.ik.orientation_free_axis) == pytest.approx((0.0, 0.0, 1.0))
     assert config.ik.continuation_timeout_s == pytest.approx(0.18)
     assert config.ik.continuation_seed_timeout_s == pytest.approx(0.08)
     assert config.ik.continuation_fallback_seeds == 2

@@ -27,13 +27,16 @@ def _upright_half_cylinder(cx=0.5, cy=0.0, radius=0.030, z0=0.10, height=0.18,
     ])
 
 
-def _context(points, affordance=None):
+def _context(points, affordance=None, scene_points=None):
     return GraspContext(
         object_points=np.asarray(points, dtype=np.float32),
         bbox=None,
         source_frame="base_link",
         t_target_src=np.eye(4),
-        scene_points=None,
+        scene_points=(
+            None if scene_points is None
+            else np.asarray(scene_points, dtype=np.float32)
+        ),
         progress_cb=lambda _phase, _progress: None,
         affordance=affordance,
     )
@@ -279,3 +282,120 @@ def test_closing_axis_convention_survives_symmetry_expansion():
         # Approach axis is preserved; closing never swings toward vertical.
         assert np.allclose(member[:3, 2], grasp[:3, 2], atol=1e-6)
         assert _angle_to_vertical_deg(member[:3, 0]) > 60.0
+
+
+# -- small-object robustness (sparse single-view clouds) ---------------------
+
+
+def _rng_thin(points, keep, seed=7):
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(points), size=min(keep, len(points)), replace=False)
+    return np.asarray(points)[np.sort(indices)]
+
+
+def _small_box_cloud(half=(0.025, 0.018, 0.008), center=(0.47, -0.05, 0.0),
+                     per_edge=7, noise=0.0015, seed=3):
+    hx, hy, hz = half
+    cx, cy, cz = center
+    us = np.linspace(-1.0, 1.0, per_edge)
+    pts = []
+    for sign in (-1.0, 1.0):
+        pts += [(cx + sign * hx, cy + u * hy, cz + w * hz) for u in us for w in us]
+        pts += [(cx + u * hx, cy + sign * hy, cz + w * hz) for u in us for w in us]
+        pts += [(cx + u * hx, cy + w * hy, cz + sign * hz) for u in us for w in us]
+    rng = np.random.default_rng(seed)
+    return np.asarray(pts) + rng.normal(0.0, noise, (len(pts), 3))
+
+
+def _tcp_error_mm(candidates, true_center):
+    best = candidates.grasps[0, :3, 3]
+    return 1000.0 * float(np.linalg.norm(best - np.asarray(true_center)))
+
+
+def test_small_sparse_box_localizes_no_worse_than_obb_path():
+    # A charger-sized box (50 x 36 x 16 mm) at realistic sparse density with
+    # depth noise: the circle-completion path must never hijack it and push the
+    # TCP away — small boxes localize exactly as the plain OBB path does.
+    center = (0.47, -0.05, 0.0)
+    points = _rng_thin(_small_box_cloud(center=center), 260)
+    new = AntipodalGraspSource(max_candidates=32).generate(_context(points))
+    obb_only = AntipodalGraspSource(
+        max_candidates=32,
+        rotational_symmetry=False,
+    ).generate(_context(points))
+    assert _tcp_error_mm(new, center) <= _tcp_error_mm(obb_only, center) + 1.0
+    assert _tcp_error_mm(new, center) < 8.0
+
+
+def test_small_sparse_half_cylinder_localizes_no_worse_than_obb_path():
+    # A 32 mm-diameter bottle neck seen as a sparse front arc: the completion
+    # should help (or at worst match) the raw OBB mid-plane.
+    radius, cx, cy = 0.016, 0.47, -0.05
+    dense = _upright_half_cylinder(cx=cx, cy=cy, radius=radius, z0=-0.03,
+                                   height=0.06, n_angle=30, n_height=10)
+    rng = np.random.default_rng(11)
+    points = _rng_thin(dense + rng.normal(0.0, 0.001, dense.shape), 170)
+    axis_xy = np.array([cx, cy])
+
+    def horizontal_error_mm(candidates):
+        tcp = candidates.grasps[0, :3, 3]
+        return 1000.0 * float(np.hypot(tcp[0] - axis_xy[0], tcp[1] - axis_xy[1]))
+
+    new = AntipodalGraspSource(max_candidates=32).generate(_context(points))
+    obb_only = AntipodalGraspSource(
+        max_candidates=32,
+        rotational_symmetry=False,
+    ).generate(_context(points))
+    assert horizontal_error_mm(new) <= horizontal_error_mm(obb_only) + 1.0
+    assert horizontal_error_mm(new) < 8.0
+
+
+def test_shallow_arc_does_not_hallucinate_far_circle_center():
+    # A nearly flat curved patch: an unguarded algebraic circle fit recovers a
+    # huge radius whose centre lies far outside the object.  The hard floors
+    # (diameter band, centre-in-footprint) must reject the fit so the grasp
+    # point stays at the OBB mid-plane.
+    cx, cy, radius = 0.47, -0.05, 0.30  # 600 mm circle: locally almost flat
+    arc = np.linspace(-0.06, 0.06, 26)  # ~34 mm-wide shallow patch
+    zs = np.linspace(-0.05, 0.05, 12)
+    points = np.array([
+        [cx + radius * (np.cos(a) - 1.0), cy + radius * np.sin(a), z]
+        for a in arc for z in zs
+    ])
+    rng = np.random.default_rng(5)
+    points = points + rng.normal(0.0, 0.0008, points.shape)
+
+    new = AntipodalGraspSource(max_candidates=32).generate(_context(points))
+    obb_only = AntipodalGraspSource(
+        max_candidates=32,
+        rotational_symmetry=False,
+    ).generate(_context(points))
+    # Identical grasp point: the round path declined, OBB mid-plane won.
+    assert np.allclose(new.grasps[0, :3, 3], obb_only.grasps[0, :3, 3], atol=1e-6)
+
+
+def test_corridor_backfill_rescues_starved_candidate_set():
+    # A charger lying on a support surface: the support occupies almost every
+    # oblique finger corridor, which live starved the planner down to two
+    # candidates.  The backfill floor re-admits vetoed poses at strongly
+    # penalized scores; clean candidates always outrank them.
+    center = (0.47, -0.05, 0.012)
+    obj = _small_box_cloud(half=(0.025, 0.018, 0.008), center=center, noise=0.0005)
+    xs = np.linspace(-0.12, 0.12, 22)
+    support = np.array([
+        [center[0] + u, center[1] + v, 0.0] for u in xs for v in xs
+    ])
+    scene = np.vstack((obj, support))
+    source = AntipodalGraspSource(max_candidates=32)
+    starved = AntipodalGraspSource(
+        max_candidates=32,
+        corridor_backfill_min_candidates=0,
+    ).generate(_context(obj, scene_points=scene))
+    rescued = source.generate(_context(obj, scene_points=scene))
+    assert len(rescued.grasps) >= min(
+        source.corridor_backfill_min_candidates,
+        len(starved.grasps) + 1,
+    )
+    assert len(rescued.grasps) > len(starved.grasps)
+    # Penalized backfill never outranks a corridor-clean candidate.
+    assert np.max(rescued.scores) == pytest.approx(np.max(starved.scores), abs=1e-5)

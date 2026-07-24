@@ -71,8 +71,10 @@
     "max_pitch_rad": 0.2094395102
   },
   "ik": {
-    "position_tolerance_m": 0.01,
-    "orientation_tolerance_rad": 0.3490658504,
+    "position_tolerance_m": 0.006,
+    "orientation_tolerance_rad": 0.06,
+    "orientation_free_axis_tolerance_rad": 0.3490658504,
+    "orientation_free_axis": [0.0, 0.0, 1.0],
     "max_iterations": 220,
     "random_seeds": 14,
     "position_scale_m": 0.025,

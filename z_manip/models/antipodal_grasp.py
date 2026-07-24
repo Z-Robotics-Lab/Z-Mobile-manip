@@ -176,6 +176,8 @@ class AntipodalGraspSource:
         height_slabs: int = 7,
         height_offset_cap_m: float = 0.06,
         height_margin_weight: float = 0.5,
+        height_min_extent_m: float = 0.08,
+        corridor_backfill_min_candidates: int = 8,
     ) -> None:
         self.min_aperture_m = float(min_aperture_m)
         self.max_aperture_m = float(max_aperture_m)
@@ -217,6 +219,17 @@ class AntipodalGraspSource:
         self.height_slabs = max(1, int(height_slabs))
         self.height_offset_cap_m = max(0.0, float(height_offset_cap_m))
         self.height_margin_weight = max(0.0, float(height_margin_weight))
+        # Short objects offer no meaningful cross-section variation; searching
+        # a handful of noisy sparse slabs just makes the TCP jump run-to-run.
+        self.height_min_extent_m = max(0.0, float(height_min_extent_m))
+        # A small object on a support surface can have almost every oblique
+        # corridor occupied by the support itself; hard-vetoing down to one or
+        # two candidates starves downstream IK of alternatives.  Below this
+        # floor the blocked poses are appended back with a strong score penalty
+        # (downstream collision checking remains authoritative).  Zero disables.
+        self.corridor_backfill_min_candidates = max(
+            0, int(corridor_backfill_min_candidates)
+        )
 
     # -- public API -------------------------------------------------------
 
@@ -276,12 +289,14 @@ class AntipodalGraspSource:
         environment = self._environment_points(context.scene_points, obb)
         preferred = _preferred_approach(context.affordance)
 
+        blocked: list[_Candidate] = []
         candidates = self._build_candidates(
             graspable,
             environment=environment,
             preferred=preferred,
             grasp_center=grasp_center,
             enforce_corridor=True,
+            blocked_out=blocked,
         )
         if not candidates:
             # Every corridor was occupied (a fully surrounded object).  Keep the
@@ -294,6 +309,23 @@ class AntipodalGraspSource:
                 grasp_center=grasp_center,
                 enforce_corridor=False,
             )
+        elif len(candidates) < self.corridor_backfill_min_candidates and blocked:
+            # Partially surrounded object (e.g. sitting on its support): a
+            # couple of clean corridors is too thin a set for downstream IK.
+            # Re-admit the vetoed poses at strongly penalized scores so clean
+            # candidates always rank first; the planner's own swept-path
+            # collision check is the authority on whether any of them is safe.
+            blocked.sort(key=lambda candidate: -candidate.score)
+            shortfall = self.corridor_backfill_min_candidates - len(candidates)
+            candidates = list(candidates) + [
+                _Candidate(
+                    pose=candidate.pose,
+                    score=0.25 * candidate.score,
+                    width=candidate.width,
+                    approach=candidate.approach,
+                )
+                for candidate in blocked[:shortfall]
+            ]
         if not candidates:
             raise GraspGenerationError(
                 "graspable faces produced no valid 6-DoF poses"
@@ -396,6 +428,9 @@ class AntipodalGraspSource:
         self,
         uv: np.ndarray,
         max_horizontal_extent: float,
+        *,
+        center_reference: tuple[float, float],
+        diameter_band: tuple[float, float] = (0.6, 1.4),
     ) -> Optional[tuple[float, float, float]]:
         """Robustly fit a circle to one horizontal slab and gate its roundness.
 
@@ -403,6 +438,15 @@ class AntipodalGraspSource:
         then accepts the fit only when the inlier RMS is a small fraction of the
         radius AND the inliers wrap a wide angular arc.  A flat face or a box
         corner fails one of those, so boxes fall back to the OBB face path.
+
+        Sparse-cloud hard floors (small objects at range): a near-straight arc
+        makes an algebraic circle fit ill-conditioned — it can hallucinate a
+        huge radius whose centre sits far outside the object while still
+        passing a *relative* RMS gate.  The fit is therefore rejected unless it
+        keeps enough inliers, its diameter stays commensurate with the observed
+        OBB horizontal extent (``diameter_band``), and its centre lands near the
+        OBB centre (inside the observed footprint).  Any violation falls back
+        to the OBB mid-plane path.
         Returns ``(u_center, v_center, radius)`` or ``None``.
         """
 
@@ -420,9 +464,22 @@ class AntipodalGraspSource:
             if int(updated.sum()) < 12:
                 break
             inliers = updated
+        if int(inliers.sum()) < self.symmetry_min_slab_points:
+            return None
         r = np.hypot(uv[:, 0] - uc, uv[:, 1] - vc)
         rms = float(np.sqrt(np.mean((r[inliers] - radius) ** 2)))
-        if radius > 1.2 * max_horizontal_extent or 2.0 * radius <= self.min_aperture_m:
+        diameter = 2.0 * radius
+        if diameter <= self.min_aperture_m:
+            return None
+        low_band, high_band = diameter_band
+        if not (
+            low_band * max_horizontal_extent
+            <= diameter
+            <= high_band * max_horizontal_extent
+        ):
+            return None
+        centre_offset = math.hypot(uc - center_reference[0], vc - center_reference[1])
+        if centre_offset > 0.6 * max_horizontal_extent + 0.005:
             return None
         if rms / radius > self.symmetry_rms_ratio:
             return None
@@ -469,21 +526,36 @@ class AntipodalGraspSource:
             np.clip(0.5 * vertical_extent / max(1, self.height_slabs - 1), 0.015, 0.030)
         )
 
-        def fit_at(height: float, half: float) -> Optional[tuple[float, float, float]]:
+        obb_center_uv = (float(obb.center @ e1), float(obb.center @ e2))
+
+        def fit_at(
+            height: float,
+            half: float,
+            diameter_band: tuple[float, float],
+        ) -> Optional[tuple[float, float, float]]:
             mask = np.abs(heights - height) <= half
             slab = points[mask]
             if len(slab) < self.symmetry_min_slab_points:
                 return None
             uv = np.column_stack((slab @ e1, slab @ e2))
-            return self._fit_round_slab(uv, max_horizontal_extent)
+            return self._fit_round_slab(
+                uv,
+                max_horizontal_extent,
+                center_reference=obb_center_uv,
+                diameter_band=diameter_band,
+            )
 
-        reference = fit_at(mass_center_h, detect_half)
+        reference = fit_at(mass_center_h, detect_half, (0.6, 1.4))
         if reference is None:
             return None
 
         best_height = mass_center_h
         best_fit = reference
-        if self.height_search and self.height_slabs > 1:
+        if (
+            self.height_search
+            and self.height_slabs > 1
+            and vertical_extent >= self.height_min_extent_m
+        ):
             # Prefer a narrower graspable cross-section (more jaw margin) but
             # penalise straying from the vertical mass centre so the grasp stays
             # stable; both terms are in metres and the offset is capped at the
@@ -496,7 +568,10 @@ class AntipodalGraspSource:
                 offset = abs(float(height) - mass_center_h)
                 if offset > cap:
                     continue
-                fit = fit_at(float(height), eval_half)
+                # A validated round detection anchors the evaluation slabs, so
+                # a genuinely narrower neck (well under the body diameter) may
+                # pass; the centre-footprint and inlier floors still apply.
+                fit = fit_at(float(height), eval_half, (0.3, 1.4))
                 if fit is None:
                     continue
                 cost = 2.0 * fit[2] + self.height_margin_weight * offset
@@ -609,6 +684,7 @@ class AntipodalGraspSource:
         preferred: Optional[np.ndarray],
         grasp_center: np.ndarray,
         enforce_corridor: bool,
+        blocked_out: Optional[list["_Candidate"]] = None,
     ) -> list[_Candidate]:
         candidates: list[_Candidate] = []
         usable = max(self.graspable_extent_m - self.min_aperture_m, 1e-6)
@@ -632,7 +708,7 @@ class AntipodalGraspSource:
                 if approach is None:
                     continue
 
-                clearance, blocked = self._corridor_clearance(
+                clearance, corridor_blocked = self._corridor_clearance(
                     environment,
                     grasp_point=grasp_center,
                     approach=approach,
@@ -640,7 +716,7 @@ class AntipodalGraspSource:
                     binormal=binormal,
                     width=width,
                 )
-                if enforce_corridor and blocked:
+                if enforce_corridor and corridor_blocked and blocked_out is None:
                     continue
 
                 pose = np.eye(4)
@@ -662,14 +738,16 @@ class AntipodalGraspSource:
                     + preferred_score
                     + _W_DIVERSITY * math.cos(angle)
                 )
-                candidates.append(
-                    _Candidate(
-                        pose=pose,
-                        score=score,
-                        width=width,
-                        approach=approach,
-                    )
+                candidate = _Candidate(
+                    pose=pose,
+                    score=score,
+                    width=width,
+                    approach=approach,
                 )
+                if enforce_corridor and corridor_blocked:
+                    blocked_out.append(candidate)
+                else:
+                    candidates.append(candidate)
         return candidates
 
     def _environment_points(
