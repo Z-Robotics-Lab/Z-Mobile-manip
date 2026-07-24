@@ -107,6 +107,24 @@ class _OBB:
     axes: np.ndarray          # (3, 3) orthonormal principal axes as rows
     half_extent: np.ndarray   # (3,) robust half-extent along each principal axis
     full_extent: np.ndarray   # (3,) robust full extent along each principal axis
+    vertical_index: Optional[int] = None  # row of ``axes`` snapped to gravity, or None
+
+
+@dataclass(frozen=True)
+class _RoundSection:
+    """A recovered upright rotationally-symmetric cross-section (cylinder/bottle).
+
+    A single wrist view sees only the front arc of a round object; its raw OBB
+    axes therefore mislabel the front-to-back *radius* as a graspable width and
+    put the observed centre ~r in front of the true axis.  Fitting a circle to
+    the horizontal cross-section recovers the true axis centre and diameter and
+    lets the closing axis be any horizontal direction (the gripper picks the one
+    whose perpendicular approach is reachable).
+    """
+
+    center: np.ndarray        # (3,) true axis centre at the chosen grasp height
+    diameter: float           # true object diameter (jaw opening), not the arc depth
+    closing_axes: list["_ClosingAxis"]  # horizontal closing fan, all width == diameter
 
 
 @dataclass(frozen=True)
@@ -147,6 +165,17 @@ class AntipodalGraspSource:
         corridor_binormal_half_m: float = 0.045,
         corridor_closing_pad_m: float = 0.012,
         corridor_block_count: int = 4,
+        up_axis: Sequence[float] = (0.0, 0.0, 1.0),
+        gravity_snap_deg: float = 20.0,
+        rotational_symmetry: bool = True,
+        symmetry_closing_fan: int = 6,
+        symmetry_span_deg: float = 165.0,
+        symmetry_rms_ratio: float = 0.08,
+        symmetry_min_slab_points: int = 40,
+        height_search: bool = True,
+        height_slabs: int = 7,
+        height_offset_cap_m: float = 0.06,
+        height_margin_weight: float = 0.5,
     ) -> None:
         self.min_aperture_m = float(min_aperture_m)
         self.max_aperture_m = float(max_aperture_m)
@@ -171,6 +200,23 @@ class AntipodalGraspSource:
         self.corridor_binormal_half_m = max(1e-3, float(corridor_binormal_half_m))
         self.corridor_closing_pad_m = max(0.0, float(corridor_closing_pad_m))
         self.corridor_block_count = max(1, int(corridor_block_count))
+        # Gravity/upright prior.  The cloud is expressed in the arm base frame
+        # (``grasp_pipeline`` lifts every observation into it before calling a
+        # backend, and its lift direction is base +Z), so the default up axis is
+        # base +Z.  Tests and other frames may override it.
+        up = np.asarray(up_axis, dtype=np.float64)
+        up_unit = _normalize(up)
+        self.up_axis = up_unit if up_unit is not None else np.array([0.0, 0.0, 1.0])
+        self.gravity_snap_cos = math.cos(math.radians(max(0.0, float(gravity_snap_deg))))
+        self.rotational_symmetry = bool(rotational_symmetry)
+        self.symmetry_closing_fan = max(2, int(symmetry_closing_fan))
+        self.symmetry_span_cos_bins = max(1, int(round(float(symmetry_span_deg) / 10.0)))
+        self.symmetry_rms_ratio = max(1e-3, float(symmetry_rms_ratio))
+        self.symmetry_min_slab_points = max(12, int(symmetry_min_slab_points))
+        self.height_search = bool(height_search)
+        self.height_slabs = max(1, int(height_slabs))
+        self.height_offset_cap_m = max(0.0, float(height_offset_cap_m))
+        self.height_margin_weight = max(0.0, float(height_margin_weight))
 
     # -- public API -------------------------------------------------------
 
@@ -195,18 +241,36 @@ class AntipodalGraspSource:
             )
 
         context.progress_cb("closing_axes", 0.15)
-        closing_axes = self._candidate_closing_axes(points, obb)
-        graspable = [
-            candidate
-            for candidate in closing_axes
-            if self.min_aperture_m <= candidate.width <= self.graspable_extent_m
-        ]
+        # A single wrist view of a curved object exposes only its front arc, so
+        # the raw OBB mislabels the front-to-back radius as a graspable width and
+        # sits ~r in front of the true axis.  When the horizontal cross-section
+        # fits a circle, recover the true axis/diameter and let the closing axis
+        # be any horizontal direction; otherwise use the OBB faces (boxes).
+        grasp_center = obb.center
+        graspable: list[_ClosingAxis] = []
+        section = self._round_cross_section(points, obb)
+        if section is not None:
+            graspable = [
+                candidate
+                for candidate in section.closing_axes
+                if self.min_aperture_m <= candidate.width <= self.graspable_extent_m
+            ]
+            if graspable:
+                grasp_center = section.center
         if not graspable:
-            raise GraspGenerationError(
-                "no graspable face fits the gripper aperture with clearance; "
-                f"closing widths={[round(c.width, 3) for c in closing_axes]}, "
-                f"usable aperture={round(self.graspable_extent_m, 3)}"
-            )
+            closing_axes = self._candidate_closing_axes(points, obb)
+            graspable = [
+                candidate
+                for candidate in closing_axes
+                if self.min_aperture_m <= candidate.width <= self.graspable_extent_m
+            ]
+            grasp_center = obb.center
+            if not graspable:
+                raise GraspGenerationError(
+                    "no graspable face fits the gripper aperture with clearance; "
+                    f"closing widths={[round(c.width, 3) for c in closing_axes]}, "
+                    f"usable aperture={round(self.graspable_extent_m, 3)}"
+                )
 
         context.progress_cb("approach_corridors", 0.55)
         environment = self._environment_points(context.scene_points, obb)
@@ -214,9 +278,9 @@ class AntipodalGraspSource:
 
         candidates = self._build_candidates(
             graspable,
-            obb=obb,
             environment=environment,
             preferred=preferred,
+            grasp_center=grasp_center,
             enforce_corridor=True,
         )
         if not candidates:
@@ -225,9 +289,9 @@ class AntipodalGraspSource:
             # downstream IK/collision remains authoritative.
             candidates = self._build_candidates(
                 graspable,
-                obb=obb,
                 environment=environment,
                 preferred=preferred,
+                grasp_center=grasp_center,
                 enforce_corridor=False,
             )
         if not candidates:
@@ -240,7 +304,7 @@ class AntipodalGraspSource:
             candidates,
             frame=context.source_frame,
             num_raw=len(graspable) * self.approach_samples,
-            centroid=obb.center,
+            centroid=grasp_center,
         )
 
     # -- geometry ---------------------------------------------------------
@@ -249,6 +313,12 @@ class AntipodalGraspSource:
         median = np.median(points, axis=0)
         centred = points - median
         _, _, axes = np.linalg.svd(centred, full_matrices=False)
+        # Gravity/upright prior: PCA in-plane directions on a front-facing curved
+        # patch are noisy, so a principal axis near vertical arrives tilted and
+        # the gripper rotates off the graspable face.  Snap a near-vertical axis
+        # to exact vertical and re-orthonormalize the other two into the exact
+        # horizontal plane, so the two horizontal closing axes are level.
+        axes, vertical_index = self._snap_axes_to_gravity(axes)
         projected = centred @ axes.T
         # 1st/99th percentiles instead of raw min/max: FFS depth is clean but a
         # handful of stray points must not inflate a face width and reject an
@@ -269,7 +339,185 @@ class AntipodalGraspSource:
             axes=axes,
             half_extent=half_extent,
             full_extent=full_extent,
+            vertical_index=vertical_index,
         )
+
+    def _snap_axes_to_gravity(
+        self,
+        axes: np.ndarray,
+    ) -> tuple[np.ndarray, Optional[int]]:
+        """Snap a near-vertical principal axis to exact gravity, level the rest.
+
+        Returns the (possibly rewritten) orthonormal axis rows and the index of
+        the vertical axis, or ``None`` when no axis is within the snap cone (the
+        object is not upright — leave PCA untouched).
+        """
+
+        up = self.up_axis
+        axes = np.asarray(axes, dtype=np.float64)
+        dots = axes @ up
+        vertical_index = int(np.argmax(np.abs(dots)))
+        if abs(float(dots[vertical_index])) < self.gravity_snap_cos:
+            return axes, None
+        others = [i for i in range(3) if i != vertical_index]
+        # First horizontal axis: strip the vertical component from an existing
+        # in-plane axis so the level gripper keeps the observed orientation as
+        # much as possible; fall back to any horizontal direction if degenerate.
+        horiz0 = axes[others[0]] - float(axes[others[0]] @ up) * up
+        candidate = _normalize(horiz0)
+        if candidate is None:
+            candidate = _normalize(np.cross(up, axes[others[1]]))
+        if candidate is None:
+            reference = np.array([1.0, 0.0, 0.0])
+            if abs(float(up @ reference)) > 0.9:
+                reference = np.array([0.0, 1.0, 0.0])
+            candidate = _normalize(np.cross(up, reference))
+        assert candidate is not None
+        horiz1 = np.cross(up, candidate)
+        snapped = axes.copy()
+        snapped[vertical_index] = up * (1.0 if dots[vertical_index] >= 0.0 else -1.0)
+        snapped[others[0]] = candidate
+        snapped[others[1]] = horiz1
+        return snapped, vertical_index
+
+    # -- rotationally-symmetric (upright curved) completion ---------------
+
+    @staticmethod
+    def _fit_circle(uv: np.ndarray) -> tuple[float, float, float]:
+        """Algebraic (Kåsa) circle fit; returns ``(u_center, v_center, radius)``."""
+
+        design = np.column_stack((2.0 * uv[:, 0], 2.0 * uv[:, 1], np.ones(len(uv))))
+        rhs = (uv ** 2).sum(axis=1)
+        (uc, vc, c), *_ = np.linalg.lstsq(design, rhs, rcond=None)
+        radius = math.sqrt(max(c + uc * uc + vc * vc, 1e-12))
+        return float(uc), float(vc), float(radius)
+
+    def _fit_round_slab(
+        self,
+        uv: np.ndarray,
+        max_horizontal_extent: float,
+    ) -> Optional[tuple[float, float, float]]:
+        """Robustly fit a circle to one horizontal slab and gate its roundness.
+
+        Iteratively rejects inliers beyond 3*MAD (labels, holes, stray depth),
+        then accepts the fit only when the inlier RMS is a small fraction of the
+        radius AND the inliers wrap a wide angular arc.  A flat face or a box
+        corner fails one of those, so boxes fall back to the OBB face path.
+        Returns ``(u_center, v_center, radius)`` or ``None``.
+        """
+
+        if len(uv) < self.symmetry_min_slab_points:
+            return None
+        inliers = np.ones(len(uv), dtype=bool)
+        uc = vc = radius = 0.0
+        for _ in range(5):
+            uc, vc, radius = self._fit_circle(uv[inliers])
+            if radius <= 1e-6:
+                return None
+            r = np.hypot(uv[:, 0] - uc, uv[:, 1] - vc)
+            mad = float(np.median(np.abs(r[inliers] - np.median(r[inliers])))) + 1e-9
+            updated = np.abs(r - radius) < 3.0 * mad
+            if int(updated.sum()) < 12:
+                break
+            inliers = updated
+        r = np.hypot(uv[:, 0] - uc, uv[:, 1] - vc)
+        rms = float(np.sqrt(np.mean((r[inliers] - radius) ** 2)))
+        if radius > 1.2 * max_horizontal_extent or 2.0 * radius <= self.min_aperture_m:
+            return None
+        if rms / radius > self.symmetry_rms_ratio:
+            return None
+        # Angular coverage of the on-circle inliers: a box's near-circle points
+        # cluster at a few corners (narrow span); a real arc wraps continuously.
+        on_circle = np.abs(r - radius) < 0.15 * radius
+        angles = np.degrees(np.arctan2(uv[on_circle, 1] - vc, uv[on_circle, 0] - uc))
+        occupied = np.zeros(36, dtype=bool)
+        occupied[((angles % 360.0) // 10.0).astype(int)] = True
+        if int(occupied.sum()) < self.symmetry_span_cos_bins:
+            return None
+        return uc, vc, radius
+
+    def _round_cross_section(
+        self,
+        points: np.ndarray,
+        obb: _OBB,
+    ) -> Optional[_RoundSection]:
+        """Recover a true upright round cross-section, or ``None`` for non-round.
+
+        Fits circles to horizontal slabs along the vertical axis, confirms the
+        object is round at mid-height, then (optionally) picks the grasp height
+        whose cross-section leaves the most aperture margin while staying near
+        the vertical mass centre.  The closing axis is left free: a fan of
+        horizontal directions is returned, each with the true diameter, so the
+        downstream reachable approach dictates which diameter the jaw closes on.
+        """
+
+        if not self.rotational_symmetry or obb.vertical_index is None:
+            return None
+        up = self.up_axis
+        k = obb.vertical_index
+        horizontal = [obb.axes[i] for i in range(3) if i != k]
+        e1, e2 = horizontal[0], horizontal[1]
+        max_horizontal_extent = float(max(obb.full_extent[i] for i in range(3) if i != k))
+        heights = points @ up
+        mass_center_h = float(np.median(heights))
+        vertical_extent = float(obb.full_extent[k])
+        # A thick slab gives a robust roundness verdict at mid-height; a thinner
+        # slab resolves how the cross-section varies along the axis (neck vs
+        # body) for the grasp-height search.
+        detect_half = max(0.02, 0.25 * vertical_extent)
+        eval_half = float(
+            np.clip(0.5 * vertical_extent / max(1, self.height_slabs - 1), 0.015, 0.030)
+        )
+
+        def fit_at(height: float, half: float) -> Optional[tuple[float, float, float]]:
+            mask = np.abs(heights - height) <= half
+            slab = points[mask]
+            if len(slab) < self.symmetry_min_slab_points:
+                return None
+            uv = np.column_stack((slab @ e1, slab @ e2))
+            return self._fit_round_slab(uv, max_horizontal_extent)
+
+        reference = fit_at(mass_center_h, detect_half)
+        if reference is None:
+            return None
+
+        best_height = mass_center_h
+        best_fit = reference
+        if self.height_search and self.height_slabs > 1:
+            # Prefer a narrower graspable cross-section (more jaw margin) but
+            # penalise straying from the vertical mass centre so the grasp stays
+            # stable; both terms are in metres and the offset is capped at the
+            # smaller of the configured cap and half the object height.
+            cap = min(self.height_offset_cap_m, 0.5 * vertical_extent)
+            lo = float(np.quantile(heights, 0.10))
+            hi = float(np.quantile(heights, 0.90))
+            best_cost = 2.0 * reference[2]
+            for height in np.linspace(lo, hi, self.height_slabs):
+                offset = abs(float(height) - mass_center_h)
+                if offset > cap:
+                    continue
+                fit = fit_at(float(height), eval_half)
+                if fit is None:
+                    continue
+                cost = 2.0 * fit[2] + self.height_margin_weight * offset
+                if cost < best_cost:
+                    best_cost = cost
+                    best_height = float(height)
+                    best_fit = fit
+
+        uc, vc, radius = best_fit
+        center = uc * e1 + vc * e2 + best_height * up
+        diameter = 2.0 * radius
+        closing_axes: list[_ClosingAxis] = []
+        for index in range(self.symmetry_closing_fan):
+            angle = math.pi * index / self.symmetry_closing_fan
+            axis = _normalize(math.cos(angle) * e1 + math.sin(angle) * e2)
+            if axis is None:
+                continue
+            closing_axes.append(_ClosingAxis(axis=axis, width=diameter))
+        if not closing_axes:
+            return None
+        return _RoundSection(center=center, diameter=diameter, closing_axes=closing_axes)
 
     def _robust_extent_along(self, points: np.ndarray, obb: _OBB, axis: np.ndarray) -> float:
         projection = (points - obb.median) @ axis
@@ -357,9 +605,9 @@ class AntipodalGraspSource:
         self,
         graspable: Sequence[_ClosingAxis],
         *,
-        obb: _OBB,
         environment: Optional[np.ndarray],
         preferred: Optional[np.ndarray],
+        grasp_center: np.ndarray,
         enforce_corridor: bool,
     ) -> list[_Candidate]:
         candidates: list[_Candidate] = []
@@ -386,7 +634,7 @@ class AntipodalGraspSource:
 
                 clearance, blocked = self._corridor_clearance(
                     environment,
-                    grasp_point=obb.center,
+                    grasp_point=grasp_center,
                     approach=approach,
                     closing=closing,
                     binormal=binormal,
@@ -397,9 +645,10 @@ class AntipodalGraspSource:
 
                 pose = np.eye(4)
                 pose[:3, :3] = np.column_stack((closing, binormal, approach))
-                # Mid-plane fix: the grasp point is the OBB centre, not the
+                # The grasp point is the recovered object centre (round-section
+                # axis for curved objects, OBB mid-plane otherwise), never the
                 # observed near surface, so the jaw closes on the object centre.
-                pose[:3, 3] = obb.center
+                pose[:3, 3] = grasp_center
 
                 preferred_score = 0.0
                 if preferred is not None:

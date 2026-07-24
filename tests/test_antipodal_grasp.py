@@ -4,6 +4,27 @@ import pytest
 import z_manip.models.antipodal_grasp as antipodal_module
 from z_manip.models.antipodal_grasp import AntipodalGraspSource
 from z_manip.models.grasp_source import GraspContext, GraspGenerationError
+from z_manip.ik.symmetry import expand_symmetry
+
+_UP = np.array([0.0, 0.0, 1.0])
+
+
+def _angle_to_vertical_deg(vector):
+    unit = np.asarray(vector, dtype=float)
+    unit = unit / np.linalg.norm(unit)
+    return float(np.degrees(np.arccos(np.clip(abs(unit @ _UP), 0.0, 1.0))))
+
+
+def _upright_half_cylinder(cx=0.5, cy=0.0, radius=0.030, z0=0.10, height=0.18,
+                           n_angle=60, n_height=20):
+    """Front-only 180-degree arc of an upright cylinder (a single wrist view)."""
+
+    angles = np.linspace(-np.pi, 0.0, n_angle)  # front half, y <= cy
+    zs = np.linspace(z0, z0 + height, n_height)
+    return np.array([
+        [cx + radius * np.cos(a), cy + radius * np.sin(a), z]
+        for a in angles for z in zs
+    ])
 
 
 def _context(points, affordance=None):
@@ -148,3 +169,113 @@ def test_obb_fallback_keeps_small_cuboid_graspable_when_normals_are_one_sided(
     assert np.all(candidates.widths <= 0.068)
     assert np.min(candidates.widths) < 0.035
     assert np.allclose(candidates.centroid, np.median(points, axis=0), atol=0.005)
+
+
+# -- partial-view curved-object recovery (single wrist view) -----------------
+
+
+def test_half_cylinder_front_view_grasps_across_true_diameter():
+    # A single wrist view sees only the FRONT arc of a standing bottle.  The raw
+    # OBB would call the front-to-back radius a graspable width and sit ~r in
+    # front of the true axis; the circle completion must recover the true axis
+    # and close horizontally across the real diameter.
+    radius = 0.030
+    points = _upright_half_cylinder(cx=0.5, cy=0.0, radius=radius)
+    candidates = AntipodalGraspSource(max_candidates=32).generate(_context(points))
+
+    best_closing = candidates.grasps[0, :3, 0]
+    assert _angle_to_vertical_deg(best_closing) > 87.0  # horizontal within 3 deg
+    tcp = candidates.grasps[0, :3, 3]
+    # TCP lands on the true cylinder axis, not the observed front surface.
+    assert np.hypot(tcp[0] - 0.5, tcp[1] - 0.0) < 0.005
+    # Commanded width is the true diameter, within 10 percent.
+    assert abs(float(candidates.widths[0]) - 2.0 * radius) <= 0.10 * (2.0 * radius)
+    # Every closing axis is horizontal (all fan members are level).
+    assert np.all(np.abs(candidates.grasps[:, 2, 0]) < 0.06)
+
+
+def test_tilted_upright_object_snaps_closing_axis_to_gravity():
+    # An upright thin box tilted 12 deg: PCA yields a tilted vertical axis, so
+    # without the gravity prior the level jaw arrives rotated off the face.
+    half = np.array([0.014, 0.028, 0.09])
+    center = np.array([0.5, 0.0, 0.30])
+    tilt = np.radians(12.0)
+    # Tilt about Y so the narrow (x) closing axis genuinely leaves the horizontal
+    # plane; the vertical (z) axis stays inside the snap cone.
+    rot_y = np.array([
+        [np.cos(tilt), 0.0, np.sin(tilt)],
+        [0.0, 1.0, 0.0],
+        [-np.sin(tilt), 0.0, np.cos(tilt)],
+    ])
+    us = np.linspace(-1.0, 1.0, 9)
+    local = []
+    for sign in (-1.0, 1.0):
+        local += [(sign * half[0], u * half[1], w * half[2]) for u in us for w in us]
+        local += [(u * half[0], sign * half[1], w * half[2]) for u in us for w in us]
+        local += [(u * half[0], w * half[1], sign * half[2]) for u in us for w in us]
+    points = (np.asarray(local) @ rot_y.T) + center
+
+    snapped = AntipodalGraspSource(max_candidates=32).generate(_context(points))
+    assert _angle_to_vertical_deg(snapped.grasps[0, :3, 0]) > 87.0  # level jaw
+
+    # With the prior disabled the same cloud keeps the ~12 deg PCA tilt, proving
+    # the snap — not the geometry — leveled the closing axis.
+    unsnapped = AntipodalGraspSource(
+        max_candidates=32,
+        gravity_snap_deg=0.0,
+    ).generate(_context(points))
+    assert _angle_to_vertical_deg(unsnapped.grasps[0, :3, 0]) < 84.0
+
+
+def test_varying_cross_section_prefers_narrower_graspable_height():
+    # A fat body (D=72 mm) with a narrower neck (D=40 mm) above it: the grasp
+    # height should move up to the neck for aperture margin, staying within the
+    # stability cap of the mass centre.
+    cx, cy = 0.5, 0.0
+    points = []
+    for radius, z0, z1, n_height in ((0.036, 0.10, 0.20, 18), (0.020, 0.205, 0.265, 12)):
+        for a in np.linspace(-np.pi, 0.0, 50):
+            for z in np.linspace(z0, z1, n_height):
+                points.append([cx + radius * np.cos(a), cy + radius * np.sin(a), z])
+    points = np.asarray(points)
+    mass_center_z = float(np.median(points[:, 2]))
+
+    candidates = AntipodalGraspSource(max_candidates=32).generate(_context(points))
+    best = candidates.grasps[0]
+    # Grasp height rose toward the neck rather than staying at the fat body.
+    assert best[2, 3] > mass_center_z + 0.02
+    assert best[2, 3] >= 0.205
+    # And it closes across the narrow neck diameter, not the 72 mm body.
+    assert float(candidates.widths[0]) < 0.050
+    assert abs(float(candidates.widths[0]) - 0.040) <= 0.15 * 0.040
+    assert _angle_to_vertical_deg(best[:3, 0]) > 87.0
+
+
+def test_uniform_cylinder_grasp_height_stays_near_mass_center():
+    # The height-margin term must not move a uniform object off its centre.
+    points = _cylinder_cloud(radius=0.032, height=0.16)
+    candidates = AntipodalGraspSource(max_candidates=32).generate(_context(points))
+    mass_center_z = float(np.median(points[:, 2]))
+    assert abs(float(candidates.grasps[0, 2, 3]) - mass_center_z) < 0.02
+
+
+def test_closing_axis_convention_survives_symmetry_expansion():
+    # End-to-end convention pin: column 0 is the physical jaw-opening axis
+    # (tool-X per grasp_plan.tool_from_tip).  For an upright cylinder it must be
+    # horizontal, and NO approach-axis symmetry member may rotate it toward the
+    # object body (the observed "jaws parallel to the bottle" 90-degree failure).
+    points = _cylinder_cloud(radius=0.032, height=0.16)
+    candidates = AntipodalGraspSource(max_candidates=32).generate(_context(points))
+    grasp = candidates.grasps[0]
+
+    # Column order is (closing, binormal, approach); tool-Z (approach) is col 2.
+    assert _angle_to_vertical_deg(grasp[:3, 0]) > 87.0  # closing horizontal
+    rotation = grasp[:3, :3]
+    assert np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6)
+    assert np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6)
+
+    family = expand_symmetry(grasp, n_about_axis=4)
+    for member in family:
+        # Approach axis is preserved; closing never swings toward vertical.
+        assert np.allclose(member[:3, 2], grasp[:3, 2], atol=1e-6)
+        assert _angle_to_vertical_deg(member[:3, 0]) > 60.0
