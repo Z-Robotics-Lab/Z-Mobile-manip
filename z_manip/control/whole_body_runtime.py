@@ -152,12 +152,10 @@ class WholeBodyRuntimeController:
             # rearward/decreasing direction is bounded; the up/forward range is
             # unchanged.  The shared collision capsule config remains the
             # primary NUC protection; this is a defensive intent-layer stop.
-            # Floor at the home angle (0): the operator's reference is the
-            # initial pose, live tracking legitimately uses the [0, 9deg)
-            # band, and a floor above home would forbid re-entering it from
-            # above.  The floor never forces recovery motion (see the
-            # optimizer's bounds); the NUC capsule remains the real guard.
-            rear_lean_joint_index=1,
+            # Operator 2026-07-24: the rear hardware was physically
+            # relocated, so the joint-space rear-lean floor is disabled
+            # entirely; collision capsules are the only rear protection.
+            rear_lean_joint_index=None,
             rear_lean_floor_rad=0.0,
         )
         self.optimizer = WholeBodyShadowOptimizer(

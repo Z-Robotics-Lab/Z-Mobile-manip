@@ -920,3 +920,33 @@ def test_stale_capture_data_is_rejected_even_when_received_fresh():
     status = core.status() if hasattr(core, "status") else None
     # The rejection is visible for diagnosis.
     assert core._stale_data_rejections == 1
+
+
+def test_whole_body_branch_defers_to_the_loss_stair_and_capture_freshness():
+    """The whole-body branch must never override a loss-stair freeze.
+
+    Live 2026-07-24: during a 6s wifi stall the core reported tracking_hold
+    (frozen stale target) but the whole-body branch kept solving with the
+    retained multi-second-old target and rewrote the phase to
+    whole_body_approach -- the arm swung sinusoidally chasing its own motion.
+    The branch's exclusion set must contain every loss-stair phase and a
+    capture-age guard so stale data can only ever freeze, never steer.
+    """
+
+    import inspect
+    from pathlib import Path
+
+    source = Path(SERVO.__file__).read_text(encoding="utf-8")
+    marker = source.index("The loss stair MUST win over the whole-body branch")
+    window = source[marker:marker + 1400]
+    for phase in (
+        "tracking_hold",
+        "view_recovery",
+        "search_required",
+        "transform_unavailable",
+        "tracking_lost",
+        "waiting_target",
+    ):
+        assert f'"{phase}"' in window, phase
+    assert "max_target_capture_age_s" in window
+    assert "fallback.target_age_s" in window

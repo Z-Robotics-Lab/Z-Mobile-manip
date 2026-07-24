@@ -1813,10 +1813,25 @@ def _run_ros(args: argparse.Namespace) -> int:
                 geometry is None
                 or target is None
                 or self.tracking is not True
+                # The loss stair MUST win over the whole-body branch: when the
+                # core freezes on stale data (tracking_hold) or demands
+                # recovery, solving with the retained multi-second-old target
+                # kept the arm swinging through a 6s wifi stall (live
+                # 2026-07-24: raw_y swept +/-0.67m sinusoidally while the
+                # source stamp froze -- the arm was chasing its own motion).
                 or fallback.phase in {
                     "transform_unavailable", "tracking_lost", "reacquiring",
-                    "waiting_target", "posture_blocked",
+                    "waiting_target", "posture_blocked", "tracking_hold",
+                    "view_recovery", "search_required",
                 }
+                # Belt and braces: never solve on a target older than the
+                # capture-freshness budget, whatever phase the core reports.
+                or (
+                    fallback.target_age_s is not None
+                    and math.isfinite(fallback.target_age_s)
+                    and fallback.target_age_s
+                    > settings.max_target_capture_age_s
+                )
             ):
                 self.whole_body_handoff_settle_cycles = 0
                 return fallback
