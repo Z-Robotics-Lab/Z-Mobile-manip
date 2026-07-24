@@ -70,11 +70,35 @@ OPEN_APERTURE_M = 0.07
 MAX_PLANNED_GRASP_WIDTH_M = 0.062
 GRIPPER_CLOSE_STEPS = 8
 GRIPPER_CLOSE_INTERVAL_S = 0.20
+# Historic full ramp: OPEN_APERTURE_M -> ~0.026 m over 8 steps == ~5.5 mm of
+# aperture per 0.20 s step.  Distance-proportional step counts preserve that
+# exact maximum closing rate while a shorter remaining gap (after pre-close
+# staging) no longer pays the full 1.6 s ramp.
+GRIPPER_CLOSE_STEP_DISTANCE_M = 0.0055
+# Direct-grasp close staging: after the arm settles at the grasp pose, close
+# quickly to required_width + this clearance (3 mm per finger above the object
+# face, so contact is impossible), then run the slow evidence ramp only over
+# the remaining few millimetres.  The staging sweep happens at the settled
+# grasp pose over a sub-range of the exact aperture interval today's full slow
+# ramp already sweeps at that same pose, so it adds zero new swept volume; the
+# contact-speed profile below the clearance is unchanged.  Mid-descent staging
+# was deliberately rejected: the planner validates the descent corridor with
+# OPEN fingers plus a closed-finger audit of the final state only
+# (ros2/z_manip_task/z_manip_task/planning.py approach_path_valid), so a
+# narrower in-flight aperture is not corridor-covered evidence.
+GRIPPER_PRECLOSE_CLEARANCE_M = 0.006
 # Minimum measurable gripper motor load that proves an object is between the
-# fingers when the aperture shows no stall gap above the close target.  Must
-# sit above force-sensor noise and below the weakest real hold observed live
-# (0.114N on a plastic bottle, 2026-07-23).
-EMPTY_CLOSE_RESCUE_FORCE_N = 0.08
+# fingers when the aperture shows no stall gap above the close target.  Live
+# false positive (run mobile-handoff-grasp-1784868281926528476, 18.1mm
+# charger): an EMPTY gripper converged to 14.6mm against a 14.1mm command --
+# 0.5mm of servo scatter, no object -- while reporting -0.18N, so the former
+# 0.08N rescue read friction/current noise as a hold and the arm lifted air.
+# The force floor must sit comfortably above that empty-close noise reading.
+# Contact evidence therefore rests primarily on the stall gap: any real object
+# (even the soft 2026-07-23 bottle: aperture 57.8mm vs commanded 56.7mm,
+# -0.114N) blocks the jaws measurably ABOVE the commanded target, because the
+# command deliberately sits squeeze_margin (4mm) below the object width.
+EMPTY_CLOSE_RESCUE_FORCE_N = 0.30
 GRIPPER_POST_CLOSE_SETTLE_S = 0.50
 DEFAULT_SPEED_PERCENT = 5
 MAX_SPEED_PERCENT = 50
@@ -105,6 +129,13 @@ LIFT_STREAM_REFERENCE_SPEED_PERCENT = 15
 # (b) removes the stop-and-go halt at the pregrasp standoff (now a via).  The
 # reference speed is deliberately gentle so the tool creeps into contact.
 APPROACH_STREAM_REFERENCE_SPEED_PERCENT = 15
+# Transit streams from the artifact's retimed quintic for the same reason: the
+# stepped point-to-point loop decelerated PiPER to a full stop at EVERY raw
+# transit vertex and then dwelt >=3 feedback samples before the next target,
+# which read as visible stop-and-go segmentation in demo recordings.  All three
+# stream chains share one reference speed so the wall-time stretch factor is
+# identical across transit/approach/lift and no junction shows a rate step.
+TRANSIT_STREAM_REFERENCE_SPEED_PERCENT = 15
 # 0.30 s at the 50 Hz stream keeps the arm within a bounded 15-sample drift
 # on a non-realtime host; the previous 0.15 s tripped on ordinary scheduler
 # jitter and its failure path unloaded a holding arm.
@@ -306,15 +337,17 @@ def verify_nonempty_grasp(
         and feedback.aperture_m <= float(commanded_close_target_m) + 0.001
         and abs(feedback.force_n) < EMPTY_CLOSE_RESCUE_FORCE_N
     ):
-        # No stall gap above the commanded target AND no measurable motor
-        # load: nothing is between the fingers.  The gap test alone is no
-        # longer sufficient evidence of emptiness: with learned-stereo depth
-        # the planned width matches the true object width to ~1mm, so a soft
-        # object (plastic bottle) compresses to within the 1mm gap margin
-        # while clearly held (live 2026-07-23 17:50: aperture 57.8mm,
-        # target 56.7mm, force -0.114N, lift refused on a real grasp).  A
-        # firmware that reports zero force while holding still fails closed
-        # here, exactly as before.
+        # No stall gap above the commanded target AND no motor load clearly
+        # above empty-close noise: nothing is between the fingers.  The stall
+        # gap is the primary contact evidence -- the close command sits
+        # squeeze_margin (4mm) below the planned object width, so even the
+        # softest real hold observed live blocked the jaws 1.1mm above the
+        # command (2026-07-23 bottle: 57.8mm vs 56.7mm, -0.114N), while an
+        # EMPTY gripper converges within servo scatter (~0.5mm) of the
+        # command (run mobile-handoff-grasp-1784868281926528476: 14.6mm vs
+        # 14.1mm, -0.18N, then lifted air).  The force branch only rescues
+        # readings far above that observed noise; ambiguity reports empty so
+        # the pipeline retries legibly instead of lifting air.
         raise SafetyError(
             "gripper reached the empty close target without a contact gap "
             "or grasp force",
@@ -1265,6 +1298,32 @@ def enter_can_joint_control(
     )
 
 
+def verify_warm_can_control(robot: Any) -> None:
+    """Fault-gate a transport that established CAN-J control earlier in-process.
+
+    A warm stage boundary (full-grasp executor, consecutive stages on one open
+    connection) leaves the arm servo-holding the previous stage's verified
+    endpoint in CAN joint mode.  Re-running the cold enable/mode/hold handshake
+    there only inserts dwell (speed-1 hold ``move_j`` plus fresh-feedback
+    waits) between stages that read as stop-and-go.  Fault bits and the
+    reported control mode remain hard gates; any deviation fails closed and
+    the caller must use the full cold handshake instead.
+    """
+    message = robot.get_arm_status()
+    if message is None:
+        raise SafetyError("arm status feedback is unavailable")
+    status = getattr(message, "msg", None)
+    arm_status = int(getattr(status, "arm_status", 0xFF))
+    error_code = int(getattr(status, "err_code", 0xFFFF))
+    ctrl_mode = int(getattr(status, "ctrl_mode", -1))
+    if arm_status != 0 or error_code != 0 or ctrl_mode != 1:
+        raise SafetyError(
+            "warm stage handoff requires fault-free CAN joint control: "
+            f"arm_status={arm_status}, err_code=0x{error_code:04X}, "
+            f"ctrl_mode={ctrl_mode}",
+        )
+
+
 def _command_joint_target(
     robot: Any,
     target: np.ndarray,
@@ -1526,6 +1585,30 @@ def converge_to_measured_home(
     )
 
 
+def slow_close_step_count(
+    start_aperture_m: float,
+    target_aperture_m: float,
+    *,
+    step_distance_m: float = GRIPPER_CLOSE_STEP_DISTANCE_M,
+    max_steps: int = GRIPPER_CLOSE_STEPS,
+) -> int:
+    """Distance-proportional slow-close step count at the historic ramp rate.
+
+    The legacy ramp always spent ``GRIPPER_CLOSE_STEPS`` intervals regardless
+    of the remaining gap, so a pre-staged close still dwelt the full 1.6 s.
+    Scaling the count by distance keeps the identical worst-case aperture rate
+    (one ``step_distance_m`` per interval) and merely stops charging time for
+    distance that no longer exists.
+    """
+    start = float(start_aperture_m)
+    target = float(target_aperture_m)
+    if not math.isfinite(start) or not math.isfinite(target) or start < target:
+        raise SafetyError("slow close step count requires a decreasing aperture")
+    if not math.isfinite(step_distance_m) or step_distance_m <= 0.0 or max_steps < 2:
+        raise ValueError("slow close step sizing must be positive with >=2 steps")
+    return int(min(max_steps, max(2, math.ceil((start - target) / step_distance_m))))
+
+
 def command_slow_gripper_close(
     effector: Any,
     guard: CommandGuard,
@@ -1593,17 +1676,39 @@ def execute_stage(
     feedback_tolerance_rad: float = DEFAULT_FEEDBACK_TOLERANCE_RAD,
     gripper_force_n: float = 1.0,
     direct_approach: bool = True,
+    warm_start: bool = False,
+    timing_out: dict[str, object] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[np.ndarray, GripperFeedback | None]:
     """Execute exactly one stage; any post-command failure triggers e-stop.
 
-    ``direct_approach`` (default) streams the ``approach_close`` descent from the
-    artifact's retimed quintic as one continuous move into the exact grasp pose;
-    ``direct_approach=False`` restores the legacy stepped, stop-and-go approach.
+    ``direct_approach`` (default) streams the transit and ``approach_close``
+    descents from the artifact's retimed quintics as continuous moves (the
+    approach ends on the exact grasp pose); ``direct_approach=False`` restores
+    the legacy stepped, stop-and-go behavior everywhere.
+
+    ``warm_start`` (full-grasp executor only, consecutive stages on one open
+    connection) replaces the cold CAN enable/mode/hold handshake with a strict
+    fault/mode gate (:func:`verify_warm_can_control`) so stage boundaries stop
+    dwelling.  Standalone per-stage CLI invocations are always cold.
+
+    ``timing_out``, when provided, receives boundary-dwell instrumentation:
+    ``pre_motion_s`` (stage entry to first path command), ``motion_s`` and
+    ``post_motion_s`` (path end to stage return, e.g. the gripper close
+    phase), plus ``warm_start``.  Purely additive evidence for receipts.
     """
     guard = CommandGuard()
     gripper_result: GripperFeedback | None = None
+    entry_time = monotonic()
+
+    def _record(key: str, value: object) -> None:
+        if timing_out is not None:
+            timing_out[key] = (
+                round(float(value), 4) if isinstance(value, float) else value
+            )
+
+    _record("warm_start", bool(warm_start))
     try:
         _, initial_joint_stamp = wait_for_initial_arm_feedback(
             robot,
@@ -1641,6 +1746,8 @@ def execute_stage(
                 sleep=sleep,
             )
             transit_path = path
+            motion_started = monotonic()
+            _record("pre_motion_s", motion_started - entry_time)
             if artifact.requires_start_reconciliation:
                 execute_joint_path(
                     robot,
@@ -1654,26 +1761,70 @@ def execute_stage(
                     sleep=sleep,
                 )
                 transit_path = path[1:]
-            final_joints = execute_joint_path(
-                robot,
-                transit_path,
-                guard,
-                speed_percent=speed_percent,
-                segment_timeout_s=segment_timeout_s,
-                start_tolerance_rad=start_tolerance_rad,
-                feedback_tolerance_rad=feedback_tolerance_rad,
-                monotonic=monotonic,
-                sleep=sleep,
+            raw_transit = np.asarray(artifact.arrays["transit_raw"], dtype=float)
+            transit_has_motion = (
+                float(np.max(np.abs(raw_transit - raw_transit[0])))
+                > RESAMPLED_PATH_TOLERANCE_RAD
             )
+            if (
+                direct_approach
+                and not artifact.requires_start_reconciliation
+                and transit_has_motion
+            ):
+                # Stream the retimed transit exactly like the lift: one
+                # continuous chain instead of a point-to-point move + >=3
+                # settled-feedback samples at EVERY raw vertex, which was the
+                # dominant stop-and-go segmentation in demo recordings.  The
+                # dense trajectory is proven to ride the collision-checked raw
+                # transit polyline inside ``timed_stage_path``.
+                timed_transit, transit_times_s = timed_stage_path(artifact, "transit")
+                if (
+                    float(np.max(np.abs(timed_transit[0] - transit_path[0]))) > 1e-5
+                    or float(np.max(np.abs(timed_transit[-1] - transit_path[-1]))) > 1e-5
+                ):
+                    raise SafetyError(
+                        "timed transit path differs from authorized raw transit",
+                    )
+                final_joints = execute_timed_joint_path(
+                    robot,
+                    timed_transit,
+                    transit_times_s,
+                    guard,
+                    speed_percent=speed_percent,
+                    segment_timeout_s=segment_timeout_s,
+                    start_tolerance_rad=start_tolerance_rad,
+                    feedback_tolerance_rad=feedback_tolerance_rad,
+                    reference_speed_percent=TRANSIT_STREAM_REFERENCE_SPEED_PERCENT,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                )
+            else:
+                final_joints = execute_joint_path(
+                    robot,
+                    transit_path,
+                    guard,
+                    speed_percent=speed_percent,
+                    segment_timeout_s=segment_timeout_s,
+                    start_tolerance_rad=start_tolerance_rad,
+                    feedback_tolerance_rad=feedback_tolerance_rad,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                )
+            motion_ended = monotonic()
+            _record("motion_s", motion_ended - motion_started)
+            _record("post_motion_s", monotonic() - motion_ended)
             return final_joints, gripper_result
 
         if stage == "approach_close":
-            enter_can_joint_control(
-                robot,
-                guard,
-                monotonic=monotonic,
-                sleep=sleep,
-            )
+            if warm_start:
+                verify_warm_can_control(robot)
+            else:
+                enter_can_joint_control(
+                    robot,
+                    guard,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                )
             initial_gripper = normalize_gripper_feedback(effector.get_gripper_status())
             verify_gripper_safe_to_enable(initial_gripper)
             # A new pyAgxArm connection may expose a valid cached gripper
@@ -1694,6 +1845,8 @@ def execute_stage(
                 sleep=sleep,
             )
             verify_gripper_ready(open_feedback)
+            motion_started = monotonic()
+            _record("pre_motion_s", motion_started - entry_time)
             if direct_approach:
                 # Direct grasp: stream the retimed approach as one continuous
                 # descent into contact.  Unlike the stepped path, the streamer
@@ -1742,15 +1895,47 @@ def execute_stage(
             # failure must keep this pose torqued instead of electronic-stop
             # unloading the arm; path failures themselves still e-stop.
             guard.path_motion_started = False
+            motion_ended = monotonic()
+            _record("motion_s", motion_ended - motion_started)
             baseline = normalize_gripper_feedback(effector.get_gripper_status())
             verify_gripper_ready(baseline)
             target = close_target_m(artifact.required_width_m)
+            preclose_target = artifact.required_width_m + GRIPPER_PRECLOSE_CLEARANCE_M
+            if (
+                direct_approach
+                and baseline.aperture_m > preclose_target + 0.004
+                and preclose_target < OPEN_APERTURE_M - 0.005
+            ):
+                # Close staging at the settled grasp pose: sweep the
+                # contact-impossible part of the aperture range (open down to
+                # width + 6 mm clearance) at native gripper speed.  This is a
+                # sub-range of the exact sweep the full slow ramp already
+                # performed at this same pose, so no new swept volume; the
+                # slow evidence ramp below the clearance is unchanged.
+                guard.mark_before_command()
+                effector.move_gripper_m(value=preclose_target, force=gripper_force_n)
+                baseline = wait_for_gripper(
+                    effector,
+                    lambda sample: sample.aperture_m <= preclose_target + 0.002,
+                    after_timestamp=baseline.timestamp,
+                    timeout_s=3.0,
+                    static_accept_after_s=0.5,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                )
+                verify_gripper_ready(baseline)
+            close_steps = (
+                slow_close_step_count(baseline.aperture_m, target)
+                if direct_approach
+                else GRIPPER_CLOSE_STEPS
+            )
             command_slow_gripper_close(
                 effector,
                 guard,
                 start_aperture_m=baseline.aperture_m,
                 target_aperture_m=target,
                 force_n=gripper_force_n,
+                steps=close_steps,
                 sleep=sleep,
             )
             gripper_result = wait_for_gripper(
@@ -1775,15 +1960,19 @@ def execute_stage(
             # Hold the force-limited final aperture briefly before lift so a
             # newly contacted object can settle between both fingers.
             sleep(GRIPPER_POST_CLOSE_SETTLE_S)
+            _record("post_motion_s", monotonic() - motion_ended)
             return final_joints, gripper_result
 
         if stage == "lift":
-            enter_can_joint_control(
-                robot,
-                guard,
-                monotonic=monotonic,
-                sleep=sleep,
-            )
+            if warm_start:
+                verify_warm_can_control(robot)
+            else:
+                enter_can_joint_control(
+                    robot,
+                    guard,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                )
             baseline = normalize_gripper_feedback(effector.get_gripper_status())
             target = close_target_m(artifact.required_width_m)
             guard.mark_before_command()
@@ -1814,6 +2003,8 @@ def execute_stage(
                 or float(np.max(np.abs(timed_lift[-1] - path[-1]))) > 1e-5
             ):
                 raise SafetyError("timed lift path differs from authorized raw lift")
+            motion_started = monotonic()
+            _record("pre_motion_s", motion_started - entry_time)
             final_joints = execute_timed_joint_path(
                 robot,
                 timed_lift,
@@ -1827,6 +2018,8 @@ def execute_stage(
                 sleep=sleep,
             )
             guard.path_motion_started = False
+            motion_ended = monotonic()
+            _record("motion_s", motion_ended - motion_started)
             before_final_gripper = normalize_gripper_feedback(
                 effector.get_gripper_status(),
             ).timestamp
@@ -1851,6 +2044,7 @@ def execute_stage(
                 minimum_force_n=0.0,
                 commanded_close_target_m=close_target_m(artifact.required_width_m),
             )
+            _record("post_motion_s", monotonic() - motion_ended)
             return final_joints, gripper_result
         raise SafetyError(f"unsupported stage: {stage}")
     except BaseException:
@@ -1868,6 +2062,7 @@ def build_receipt(
     final_joints_rad: Sequence[float],
     gripper: GripperFeedback | None,
     approach_execution: str = "streamed",
+    stage_timing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a stage receipt only after all feedback gates have passed.
 
@@ -1875,6 +2070,10 @@ def build_receipt(
     (direct grasp, the default) or ``"stepped"`` (the legacy staged fallback).
     It is only meaningful for, and only recorded on, the ``approach_close``
     stage; the field is additive and never renames an existing receipt key.
+
+    ``stage_timing`` is the additive boundary-dwell instrumentation captured by
+    :func:`execute_stage` (``pre_motion_s``/``motion_s``/``post_motion_s``/
+    ``warm_start``) so smoothness improvements are measurable from receipts.
     """
     result: dict[str, Any] = {
         "schema": "z_manip.piper_stage_receipt.v1",
@@ -1894,6 +2093,8 @@ def build_receipt(
     }
     if stage == "approach_close":
         result["approach_execution"] = str(approach_execution)
+    if stage_timing is not None:
+        result["stage_timing"] = dict(stage_timing)
     if gripper is not None:
         result["gripper"] = {
             "aperture_m": gripper.aperture_m,
@@ -2094,6 +2295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             robot, effector = connect_real_arm(args.channel, args.firmware)
             started_ns = time.time_ns()
             direct_approach = not args.staged_approach_stop
+            stage_timing: dict[str, Any] = {}
             final_joints, gripper = execute_stage(
                 robot,
                 effector,
@@ -2104,6 +2306,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 segment_timeout_s=args.segment_timeout_s,
                 gripper_force_n=args.gripper_force_n,
                 direct_approach=direct_approach,
+                timing_out=stage_timing,
             )
             finished_ns = time.time_ns()
             receipt = build_receipt(
@@ -2115,6 +2318,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 final_joints_rad=final_joints,
                 gripper=gripper,
                 approach_execution="streamed" if direct_approach else "stepped",
+                stage_timing=stage_timing,
             )
             output = args.receipt_output or args.planning_report.with_name(
                 f"execution_{args.stage}_receipt.json",

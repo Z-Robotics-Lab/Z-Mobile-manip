@@ -600,10 +600,10 @@ def test_close_target_and_nonempty_verification_are_width_based():
             minimum_force_n=0.0,
             commanded_close_target_m=0.026,
         )
-    # A soft object compressed to the close target is HELD, not empty: the
-    # stall gap vanishes but the motor stays loaded (live 2026-07-23 bottle:
-    # aperture at target, force -0.114N, lift wrongly refused).
-    compressed_soft_hold = EXECUTOR.GripperFeedback(
+    # Weak force readings no longer rescue a vanished stall gap: the live
+    # empty-close false positive measured -0.18N with no object, so any
+    # sub-noise force at the commanded target must report EMPTY (fail-closed).
+    compressed_no_gap_weak_force = EXECUTOR.GripperFeedback(
         0.0265,
         -0.114,
         1.0,
@@ -612,11 +612,81 @@ def test_close_target_and_nonempty_verification_are_width_based():
         True,
         True,
     )
+    with pytest.raises(EXECUTOR.SafetyError, match="empty close target"):
+        EXECUTOR.verify_nonempty_grasp(
+            compressed_no_gap_weak_force,
+            0.03,
+            minimum_force_n=0.0,
+            commanded_close_target_m=0.026,
+        )
+    # A force clearly above the observed empty-close noise still rescues a
+    # soft object crushed all the way to the commanded width.
+    compressed_strong_force_hold = EXECUTOR.GripperFeedback(
+        0.0265,
+        -0.45,
+        1.0,
+        "width",
+        True,
+        True,
+        True,
+    )
     EXECUTOR.verify_nonempty_grasp(
-        compressed_soft_hold,
+        compressed_strong_force_hold,
         0.03,
         minimum_force_n=0.0,
         commanded_close_target_m=0.026,
+    )
+
+
+def test_nonempty_grasp_evidence_matches_recorded_receipts():
+    """Regression pinned to two live receipts.
+
+    Empty-lift false positive (run mobile-handoff-grasp-1784868281926528476):
+    18.1mm charger, commanded close 14.1mm, jaws converged to 14.6mm (0.5mm
+    servo scatter, BELOW the object width -- nothing between the fingers) at
+    -0.18N, yet the old 0.08N rescue recorded ``nonempty_verified: true`` and
+    the arm lifted air.  True hold (2026-07-23 soft bottle): commanded
+    56.7mm, jaws blocked at 57.8mm (1.1mm stall gap above the command) at
+    -0.114N.  The stall gap separates the two; the 0.18N empty reading proves
+    force at that magnitude is noise, not contact evidence.
+    """
+    charger_width_m = 0.0181
+    charger_commanded = EXECUTOR.close_target_m(charger_width_m)
+    assert charger_commanded == pytest.approx(0.0141)
+    empty_lift_false_positive = EXECUTOR.GripperFeedback(
+        0.0146,
+        -0.18,
+        1.0,
+        "width",
+        True,
+        True,
+        True,
+    )
+    with pytest.raises(EXECUTOR.SafetyError, match="empty close target"):
+        EXECUTOR.verify_nonempty_grasp(
+            empty_lift_false_positive,
+            charger_width_m,
+            minimum_force_n=0.0,
+            commanded_close_target_m=charger_commanded,
+        )
+
+    bottle_width_m = 0.0607
+    bottle_commanded = EXECUTOR.close_target_m(bottle_width_m)
+    assert bottle_commanded == pytest.approx(0.0567)
+    soft_bottle_true_hold = EXECUTOR.GripperFeedback(
+        0.0578,
+        -0.114,
+        1.0,
+        "width",
+        True,
+        True,
+        True,
+    )
+    EXECUTOR.verify_nonempty_grasp(
+        soft_bottle_true_hold,
+        bottle_width_m,
+        minimum_force_n=0.0,
+        commanded_close_target_m=bottle_commanded,
     )
 
 
@@ -1047,6 +1117,263 @@ def test_direct_approach_streams_exact_grasp_target_a_stepped_path_would_skip(tm
     np.testing.assert_allclose(streamed_final, q_grasp)
 
 
+def _artifact_with_dense_transit(tmp_path):
+    """Artifact whose dense transit has an interior sample the raw lacks."""
+    mid = (Q_START + Q_PRE) / 2.0
+    transit_raw = np.vstack((Q_START, Q_PRE))
+    transit_dense = np.vstack((Q_START, mid, Q_PRE))
+    approach = np.vstack((Q_PRE, Q_GRASP))
+    lift = np.vstack((Q_GRASP, Q_LIFT))
+    npz_path = tmp_path / "planned_grasp.npz"
+    np.savez_compressed(
+        npz_path,
+        transit=transit_dense,
+        transit_times_s=np.asarray((0.0, 0.02, 0.04)),
+        approach=approach,
+        approach_times_s=np.asarray((0.0, 0.02)),
+        lift=lift,
+        lift_times_s=np.asarray((0.0, 0.02)),
+        transit_raw=transit_raw,
+        approach_raw=approach,
+        lift_raw=lift,
+        current_joints=Q_START,
+        measured_joints=Q_START,
+    )
+    digest = _sha256(npz_path)
+    report = {
+        "read_only": True, "planning_only": True, "motion_commands_published": 0,
+        "plan_valid": True, "source_stamp_ns": time.time_ns(),
+        "current_joints_rad": Q_START.tolist(), "measured_joints_rad": Q_START.tolist(),
+        "planning_start_joints_rad": Q_START.tolist(),
+        "start_limit_projection_rad": np.zeros(6).tolist(),
+        "execution_start_requires_limit_reconciliation": False,
+        "raw_paths_collision_validated": True,
+        "transit_raw_waypoints": len(transit_raw),
+        "approach_raw_waypoints": len(approach),
+        "lift_raw_waypoints": len(lift),
+        "required_width_m": 0.03,
+        "planned_grasp_sha256": digest,
+    }
+    report_path = tmp_path / "planning_report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    return report_path, npz_path, mid
+
+
+def test_direct_pregrasp_streams_dense_transit_instead_of_stepping_raw(tmp_path):
+    report, archive, mid = _artifact_with_dense_transit(tmp_path)
+    artifact = load_artifact(report, archive)
+    path = EXECUTOR.validate_stage_context(artifact, "pregrasp", None)
+
+    streamed_events: list[tuple] = []
+    streamed_final, _ = EXECUTOR.execute_stage(
+        FakeRobot(Q_START, streamed_events),
+        FakeEffector(streamed_events),
+        artifact, "pregrasp", path,
+        direct_approach=True,
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    streamed_targets = [event[1] for event in streamed_events if event[0] == "move_j"]
+    # The dense interior sample is commanded: the transit is one continuous
+    # stream, not a point-to-point hop between raw vertices with settle dwells.
+    assert any(np.allclose(target, mid) for target in streamed_targets)
+    np.testing.assert_allclose(streamed_final, Q_PRE)
+
+    stepped_events: list[tuple] = []
+    stepped_final, _ = EXECUTOR.execute_stage(
+        FakeRobot(Q_START, stepped_events),
+        FakeEffector(stepped_events),
+        artifact, "pregrasp", path,
+        direct_approach=False,
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    stepped_targets = [event[1] for event in stepped_events if event[0] == "move_j"]
+    assert not any(np.allclose(target, mid) for target in stepped_targets)
+    np.testing.assert_allclose(stepped_final, Q_PRE)
+
+
+def test_warm_start_skips_cold_handshake_but_keeps_fault_gate(tmp_path):
+    report, archive, _ = make_artifact(tmp_path, start=Q_PRE, pregrasp=Q_PRE)
+    artifact = load_artifact(report, archive, stage="approach_close")
+    path = np.asarray(artifact.arrays["approach_raw"])
+
+    warm_events: list[tuple] = []
+    timing: dict[str, object] = {}
+    final, _ = EXECUTOR.execute_stage(
+        FakeRobot(Q_PRE, warm_events),
+        FakeEffector(warm_events, aperture_m=0.07, force_n=0.0),
+        artifact, "approach_close", path,
+        warm_start=True,
+        timing_out=timing,
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    names = [event[0] for event in warm_events]
+    # No cold CAN re-handshake: no mode request and no speed-1 hold move_j at
+    # the current pose; the first joint command is the streamed approach target.
+    assert ("mode", "j") not in warm_events
+    assert ("speed", 1) not in warm_events
+    first_move = [event[1] for event in warm_events if event[0] == "move_j"][0]
+    np.testing.assert_allclose(first_move, Q_GRASP)
+    np.testing.assert_allclose(final, Q_GRASP)
+    assert timing["warm_start"] is True
+    assert timing["pre_motion_s"] >= 0.0
+    assert timing["motion_s"] >= 0.0
+    assert timing["post_motion_s"] >= 0.0
+
+    class FaultedRobot(FakeRobot):
+        def get_arm_status(self):
+            message = super().get_arm_status()
+            message.msg.err_code = 0x21
+            return message
+
+    faulted_events: list[tuple] = []
+    # The fault gate fires before ANY command regardless of which check (stage
+    # entry status or the warm handoff gate) sees the fault first.
+    with pytest.raises(EXECUTOR.SafetyError, match="arm fault|warm stage handoff"):
+        EXECUTOR.execute_stage(
+            FaultedRobot(Q_PRE, faulted_events),
+            FakeEffector(faulted_events, aperture_m=0.07, force_n=0.0),
+            artifact, "approach_close", path,
+            warm_start=True,
+            monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+        )
+    assert not any(event[0] in ("move_j", "gripper") for event in faulted_events)
+
+
+def test_verify_warm_can_control_requires_can_joint_mode():
+    events: list[tuple] = []
+    robot = FakeRobot(Q_PRE, events)
+    EXECUTOR.verify_warm_can_control(robot)
+    robot.ctrl_mode = 0
+    with pytest.raises(EXECUTOR.SafetyError, match="ctrl_mode=0"):
+        EXECUTOR.verify_warm_can_control(robot)
+
+
+def test_direct_close_stages_preclose_then_short_ramp(tmp_path):
+    report, archive, _ = make_artifact(tmp_path, start=Q_PRE, pregrasp=Q_PRE)
+    artifact = load_artifact(report, archive, stage="approach_close")
+    path = np.asarray(artifact.arrays["approach_raw"])
+
+    direct_events: list[tuple] = []
+    EXECUTOR.execute_stage(
+        FakeRobot(Q_PRE, direct_events),
+        FakeEffector(direct_events, aperture_m=0.07, force_n=0.0),
+        artifact, "approach_close", path,
+        direct_approach=True,
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    move_count = len([e for e in direct_events if e[0] == "move_j"])
+    direct_gripper = [e[1] for e in direct_events if e[0] == "gripper"]
+    # open reassert, pre-close staging to width + 6mm, then a short ramp.
+    preclose = 0.03 + EXECUTOR.GRIPPER_PRECLOSE_CLEARANCE_M
+    assert direct_gripper[0] == pytest.approx(EXECUTOR.OPEN_APERTURE_M)
+    assert any(value == pytest.approx(preclose) for value in direct_gripper)
+    ramp = [value for value in direct_gripper if value < preclose - 1e-9]
+    # FakeEffector snaps to 0.029 after pre-close, so the remaining ramp is
+    # the 2-step minimum instead of the historic fixed 8 steps.
+    assert len(ramp) == 2
+    assert ramp[-1] == pytest.approx(0.026)
+
+    stepped_events: list[tuple] = []
+    EXECUTOR.execute_stage(
+        FakeRobot(Q_PRE, stepped_events),
+        FakeEffector(stepped_events, aperture_m=0.07, force_n=0.0),
+        artifact, "approach_close", path,
+        direct_approach=False,
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    stepped_gripper = [e[1] for e in stepped_events if e[0] == "gripper"]
+    # Legacy fallback: no staging command, full fixed 8-step ramp from open.
+    assert not any(value == pytest.approx(preclose) for value in stepped_gripper)
+    assert len(stepped_gripper) == 1 + EXECUTOR.GRIPPER_CLOSE_STEPS
+    assert move_count >= 1
+
+
+def test_slow_close_step_count_preserves_rate_and_bounds():
+    # Full-distance close keeps the historic 8 steps.
+    assert EXECUTOR.slow_close_step_count(0.07, 0.026) == 8
+    # A pre-staged 10mm gap at the same per-step rate needs only 2 steps.
+    assert EXECUTOR.slow_close_step_count(0.036, 0.026) == 2
+    # Never below the 2-step monotonic-ramp minimum.
+    assert EXECUTOR.slow_close_step_count(0.0265, 0.026) == 2
+    with pytest.raises(EXECUTOR.SafetyError):
+        EXECUTOR.slow_close_step_count(0.02, 0.026)
+
+
+def test_stage_receipt_records_timing_evidence(tmp_path):
+    report, archive, _ = make_artifact(tmp_path)
+    artifact = load_artifact(report, archive)
+    timing = {
+        "warm_start": False,
+        "pre_motion_s": 0.42,
+        "motion_s": 6.1,
+        "post_motion_s": 0.01,
+    }
+    receipt = EXECUTOR.build_receipt(
+        artifact=artifact, stage="pregrasp", prior=None,
+        started_unix_ns=1, finished_unix_ns=2, final_joints_rad=Q_PRE,
+        gripper=None, stage_timing=timing,
+    )
+    assert receipt["stage_timing"] == timing
+    bare = EXECUTOR.build_receipt(
+        artifact=artifact, stage="pregrasp", prior=None,
+        started_unix_ns=1, finished_unix_ns=2, final_joints_rad=Q_PRE,
+        gripper=None,
+    )
+    assert "stage_timing" not in bare
+
+
+def test_full_grasp_records_boundary_dwell_and_stage_timing(tmp_path):
+    """End-to-end fake run: warm boundaries + measurable dwell evidence."""
+    full_spec = importlib.util.spec_from_file_location(
+        "piper_full_grasp_executor_smoothness",
+        ROOT / "scripts" / "runtime" / "piper_full_grasp_executor.py",
+    )
+    assert full_spec is not None and full_spec.loader is not None
+    full = importlib.util.module_from_spec(full_spec)
+    full_spec.loader.exec_module(full)
+
+    report, archive, _ = _artifact_with_dense_transit(tmp_path)
+    artifact = load_artifact(report, archive)
+    events: list[tuple] = []
+    robot = FakeRobot(Q_START, events)
+    effector = FakeEffector(events, aperture_m=0.03, force_n=0.8)
+    receipt_dir = tmp_path / "receipts"
+
+    result = full.execute_full_grasp(
+        robot,
+        effector,
+        artifact,
+        receipt_dir=receipt_dir,
+        speed_percent=5,
+        segment_timeout_s=8.0,
+        gripper_force_n=1.0,
+        lift_hold_s=0.0,
+    )
+
+    assert result["success"] is True
+    dwell = result["boundary_dwell_s"]
+    assert set(dwell) == {"pregrasp_to_approach_s", "approach_to_lift_s"}
+    assert all(float(value) >= 0.0 for value in dwell.values())
+    for stage_name, warm in (
+        ("pregrasp", False),
+        ("approach_close", True),
+        ("lift", True),
+    ):
+        receipt = json.loads(
+            (receipt_dir / f"{stage_name}-receipt.json").read_text(encoding="utf-8"),
+        )
+        timing = receipt["stage_timing"]
+        assert timing["warm_start"] is warm
+        assert timing["pre_motion_s"] >= 0.0
+        assert timing["motion_s"] >= 0.0
+        assert timing["post_motion_s"] >= 0.0
+    approach_receipt = json.loads(
+        (receipt_dir / "approach_close-receipt.json").read_text(encoding="utf-8"),
+    )
+    assert approach_receipt["approach_execution"] == "streamed"
+    assert robot.estops == 0
+
+
 def test_lift_rechecks_nonempty_grasp_before_and_after_motion(tmp_path):
     report, archive, _ = make_artifact(tmp_path)
     artifact = load_artifact(report, archive, stage="lift")
@@ -1227,6 +1554,9 @@ def test_real_sdk_import_is_deferred_and_no_subprocess_transport_exists():
     # One explicit current-position hold before gripper motion plus the
     # collision-validated planned-path command site.
     assert source.count("robot.move_j(") == 2
-    assert source.count("effector.move_gripper_m(") == 6
+    # Seven authorized gripper command sites: pregrasp open, gripper-enable
+    # restore, approach re-open, direct-grasp pre-close staging, slow-close
+    # ramp, lift close re-assert, post-lift close re-assert.
+    assert source.count("effector.move_gripper_m(") == 7
     assert "robot.electronic_emergency_stop()" in source
     assert "--execute" in source and "--confirm" in source

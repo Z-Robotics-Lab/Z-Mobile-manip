@@ -85,6 +85,7 @@ def _receipt(
     gripper: stage_executor.GripperFeedback | None,
     receipt_dir: Path,
     approach_execution: str = "streamed",
+    stage_timing: dict[str, object] | None = None,
 ) -> stage_executor.PriorReceipt:
     document = stage_executor.build_receipt(
         artifact=artifact,
@@ -95,6 +96,7 @@ def _receipt(
         final_joints_rad=final_joints,
         gripper=gripper,
         approach_execution=approach_execution,
+        stage_timing=stage_timing,
     )
     path = receipt_dir / f"{stage}-receipt.json"
     stage_executor.atomic_write_json(path, document)
@@ -208,10 +210,18 @@ def _verify_holding_object(
         guard,
         force_n=gripper_force_n,
     )
+    # A dropped object leaves the fingers parked AT the commanded close width
+    # (they crushed through where the object should have been -- live run
+    # mobile-handoff-grasp-1784868281926528476), so the continuation applies
+    # the same stall-gap/force evidence rule as the lift stage instead of
+    # skipping it.  The commanded target is a pure function of the artifact's
+    # planned width; strictly additive evidence, fail-closed on ambiguity.
     stage_executor.verify_nonempty_grasp(
         feedback,
         artifact.required_width_m,
-        commanded_close_target_m=None,
+        commanded_close_target_m=stage_executor.close_target_m(
+            artifact.required_width_m,
+        ),
     )
 
 
@@ -247,6 +257,7 @@ def execute_full_grasp(
         None,
     )
     started = time.time_ns()
+    pregrasp_timing: dict[str, object] = {}
     final, gripper = stage_executor.execute_stage(
         robot,
         effector,
@@ -256,7 +267,10 @@ def execute_full_grasp(
         speed_percent=speed_percent,
         segment_timeout_s=segment_timeout_s,
         gripper_force_n=gripper_force_n,
+        direct_approach=direct_approach,
+        timing_out=pregrasp_timing,
     )
+    pregrasp_returned = time.monotonic()
     pregrasp_receipt = _receipt(
         artifact=artifact,
         stage="pregrasp",
@@ -265,6 +279,7 @@ def execute_full_grasp(
         final_joints=final,
         gripper=gripper,
         receipt_dir=receipt_dir,
+        stage_timing=pregrasp_timing,
     )
 
     approach_path = stage_executor.validate_stage_context(
@@ -273,6 +288,8 @@ def execute_full_grasp(
         pregrasp_receipt,
     )
     started = time.time_ns()
+    approach_timing: dict[str, object] = {}
+    approach_gap_s = time.monotonic() - pregrasp_returned
     final, gripper = stage_executor.execute_stage(
         robot,
         effector,
@@ -283,7 +300,12 @@ def execute_full_grasp(
         segment_timeout_s=segment_timeout_s,
         gripper_force_n=gripper_force_n,
         direct_approach=direct_approach,
+        # Same open connection, verified settled endpoint milliseconds ago:
+        # skip the cold CAN re-handshake dwell, keep the fault/mode gate.
+        warm_start=direct_approach,
+        timing_out=approach_timing,
     )
+    approach_returned = time.monotonic()
     approach_receipt = _receipt(
         artifact=artifact,
         stage="approach_close",
@@ -293,6 +315,7 @@ def execute_full_grasp(
         gripper=gripper,
         receipt_dir=receipt_dir,
         approach_execution="streamed" if direct_approach else "stepped",
+        stage_timing=approach_timing,
     )
 
     lift_path = stage_executor.validate_stage_context(
@@ -301,6 +324,8 @@ def execute_full_grasp(
         approach_receipt,
     )
     started = time.time_ns()
+    lift_timing: dict[str, object] = {}
+    lift_gap_s = time.monotonic() - approach_returned
     final, gripper = stage_executor.execute_stage(
         robot,
         effector,
@@ -310,6 +335,9 @@ def execute_full_grasp(
         speed_percent=speed_percent,
         segment_timeout_s=segment_timeout_s,
         gripper_force_n=gripper_force_n,
+        direct_approach=direct_approach,
+        warm_start=direct_approach,
+        timing_out=lift_timing,
     )
     lift_receipt = _receipt(
         artifact=artifact,
@@ -319,7 +347,21 @@ def execute_full_grasp(
         final_joints=final,
         gripper=gripper,
         receipt_dir=receipt_dir,
+        stage_timing=lift_timing,
     )
+    # Measurable boundary dwell: time from the previous stage's return to the
+    # next stage's first path command (receipt writes + validation + stage
+    # entry checks).  Additive evidence so smoothness work is quantifiable.
+    boundary_dwell_s = {
+        "pregrasp_to_approach_s": round(
+            approach_gap_s + float(approach_timing.get("pre_motion_s", 0.0) or 0.0),
+            4,
+        ),
+        "approach_to_lift_s": round(
+            lift_gap_s + float(lift_timing.get("pre_motion_s", 0.0) or 0.0),
+            4,
+        ),
+    }
     if lift_hold_s > 0.0:
         time.sleep(lift_hold_s)
 
@@ -396,6 +438,7 @@ def execute_full_grasp(
             "approach_close": str(approach_receipt.path),
             "lift": str(lift_receipt.path),
         },
+        "boundary_dwell_s": boundary_dwell_s,
         "finished_unix_ns": time.time_ns(),
     }
 
@@ -429,47 +472,60 @@ def execute_workflow_phase(
             )
         pregrasp_path = stage_executor.validate_stage_context(artifact, "pregrasp", None)
         started = time.time_ns()
+        pregrasp_timing: dict[str, object] = {}
         final, gripper = stage_executor.execute_stage(
             robot, effector, artifact, "pregrasp", pregrasp_path,
             speed_percent=speed_percent,
             segment_timeout_s=segment_timeout_s,
             gripper_force_n=gripper_force_n,
+            direct_approach=direct_approach,
+            timing_out=pregrasp_timing,
         )
         pregrasp_receipt = _receipt(
             artifact=artifact, stage="pregrasp", prior=None, started_ns=started,
             final_joints=final, gripper=gripper, receipt_dir=receipt_dir,
+            stage_timing=pregrasp_timing,
         )
         approach_path = stage_executor.validate_stage_context(
             artifact, "approach_close", pregrasp_receipt,
         )
         started = time.time_ns()
+        approach_timing: dict[str, object] = {}
         final, gripper = stage_executor.execute_stage(
             robot, effector, artifact, "approach_close", approach_path,
             speed_percent=speed_percent,
             segment_timeout_s=segment_timeout_s,
             gripper_force_n=gripper_force_n,
             direct_approach=direct_approach,
+            warm_start=direct_approach,
+            timing_out=approach_timing,
         )
         approach_receipt = _receipt(
             artifact=artifact, stage="approach_close", prior=pregrasp_receipt,
             started_ns=started, final_joints=final, gripper=gripper,
             receipt_dir=receipt_dir,
             approach_execution="streamed" if direct_approach else "stepped",
+            stage_timing=approach_timing,
         )
         lift_path = stage_executor.validate_stage_context(
             artifact, "lift", approach_receipt,
         )
         started = time.time_ns()
+        lift_timing: dict[str, object] = {}
         final, gripper = stage_executor.execute_stage(
             robot, effector, artifact, "lift", lift_path,
             speed_percent=speed_percent,
             segment_timeout_s=segment_timeout_s,
             gripper_force_n=gripper_force_n,
+            direct_approach=direct_approach,
+            warm_start=direct_approach,
+            timing_out=lift_timing,
         )
         _receipt(
             artifact=artifact, stage="lift", prior=approach_receipt,
             started_ns=started, final_joints=final, gripper=gripper,
             receipt_dir=receipt_dir,
+            stage_timing=lift_timing,
         )
         state = _workflow_state(
             receipt_dir, artifact=artifact, phase="holding_at_lift",

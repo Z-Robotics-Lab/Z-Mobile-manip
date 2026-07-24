@@ -5,9 +5,12 @@ backend and an optional joint-space planner into four explicit phases:
 
 ``approach -> pregrasp -> grasp -> lift``.
 
-Every phase is independently retimed, while the aggregate contract verifies
-that no hidden joint jump exists at a phase boundary.  A measured joint state
-can therefore replace any phase boundary and replan only the remaining suffix.
+In direct-approach mode (the default) every pre-contact phase is retimed as
+ONE velocity-continuous chain -- the standoffs are slow-down vias, not stops --
+while the aggregate contract still verifies that no hidden joint jump exists
+at a phase boundary.  A measured joint state can therefore replace any phase
+boundary and replan only the remaining suffix, and the staged fallback keeps
+the classic independently retimed rest-to-rest phases.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 import inspect
+import math
 from typing import Callable, Protocol, Sequence
 from uuid import uuid4
 
@@ -44,33 +48,6 @@ class SidePreference(str, Enum):
 
 
 _STAGE_ORDER = tuple(GraspStage)
-
-
-def _quintic_blend(u: float) -> float:
-    """Normalized rest-to-rest 5th-order smoothstep ``10u^3-15u^4+6u^5``.
-
-    ``s(0)=0``, ``s(1)=1`` with zero first and second derivative at both ends;
-    peak normalized velocity ``1.875`` and acceleration ``5.774`` at the middle.
-    """
-
-    return (u * u * u) * (10.0 + u * (-15.0 + 6.0 * u))
-
-
-def _inverse_quintic_blend(y: float) -> float:
-    """Return ``u in [0, 1]`` with ``_quintic_blend(u) == y`` (monotone)."""
-
-    if y <= 0.0:
-        return 0.0
-    if y >= 1.0:
-        return 1.0
-    low, high = 0.0, 1.0
-    for _ in range(64):
-        mid = 0.5 * (low + high)
-        if _quintic_blend(mid) < y:
-            low = mid
-        else:
-            high = mid
-    return 0.5 * (low + high)
 
 
 def _interpolate_arclength(path: np.ndarray, cumulative: np.ndarray, arclength: float) -> np.ndarray:
@@ -182,14 +159,16 @@ class StagedGraspRequest:
     lift_direction: tuple[float, float, float] = (0.0, 0.0, 1.0)
     side_preference: SidePreference = SidePreference.AUTO
     side_entry_offset_m: float = 0.0
-    # Direct-approach is the accuracy default: the pregrasp standoff becomes a
-    # velocity-continuous via inside one blended descent into contact, instead
-    # of a full stop before the final approach.  ``direct_approach=False`` keeps
-    # the classic per-stage rest-to-rest fallback.
+    # Direct-approach is the accuracy/smoothness default: both standoffs become
+    # velocity-continuous vias inside one blended transit-and-descent chain
+    # into contact, instead of full stops between stages.
+    # ``direct_approach=False`` keeps the classic per-stage rest-to-rest
+    # fallback.
     direct_approach: bool = True
-    # Peak descent speed multiplier applied to the blended pregrasp->grasp
-    # segment so the tool creeps into contact for accuracy.  The quintic already
-    # decelerates to zero exactly at the grasp pose; this caps the peak.
+    # Speed-cap multiplier for the descent arcs (pregrasp->grasp) of the
+    # blended chain so the tool creeps into contact for accuracy.  The profile
+    # already decelerates to zero exactly at the grasp pose; this caps the
+    # descent cruise.
     contact_speed_scale: float = 0.5
 
     def __post_init__(self) -> None:
@@ -440,105 +419,251 @@ class StagedGraspTrajectoryBuilder:
             self.time_config,
         )
 
-    def _retime_direct_pair(
+    def _retime_direct_chain(
         self,
-        pregrasp_path: np.ndarray,
-        grasp_path: np.ndarray,
-        *,
-        contact_speed_scale: float,
-    ) -> tuple[TimedJointTrajectory, TimedJointTrajectory]:
-        """Retime the pregrasp->grasp descent as ONE blended, sliced profile.
+        stage_paths: Sequence[np.ndarray],
+        speed_scales: Sequence[float],
+    ) -> list[TimedJointTrajectory] | None:
+        """Retime consecutive stage paths as ONE velocity-continuous chain.
 
-        The two collision-checked joint sub-paths are concatenated into a single
-        polyline whose shared standoff vertex becomes an interior *via* rather
-        than a stop.  A single rest-to-rest quintic in cumulative chord length
-        keeps a non-zero velocity through that via and decelerates smoothly to
-        zero exactly at the grasp contact; ``contact_speed_scale`` caps the peak
-        so the tool creeps into contact.  The dense samples are then sliced back
-        at the via into the pregrasp and grasp segment trajectories so the plan
-        keeps its four-stage structure (and its reverse-replay corridor) while
-        the flattened trajectory is one continuous velocity profile.
+        The collision-checked joint sub-paths are concatenated into a single
+        polyline whose shared stage vertices become interior *vias* rather
+        than stops.  A forward/backward path-velocity pass (TOPP-style)
+        produces one time profile that is at rest only at the chain ends:
 
-        The geometry is untouched: the samples ride the exact checked polyline
-        edges, so collision coverage is identical to the staged fallback.
+        * per-arc speed caps: transit at full scale, descent at the contact
+          scale, so the tool still creeps into contact;
+        * interior C0 corners get angle-tapered local speed caps -- a
+          slow-down, never a dwell -- because a corner crossed at speed asks
+          for a velocity-direction jump;
+        * the backward pass starts braking as early as the acceleration
+          limits require (e.g. a long transit brakes into a short
+          contact-speed descent well before the standoff), which no single
+          rest-to-rest quintic over the whole chain can express.
+
+        The dense samples are then sliced back at the vias into per-stage
+        trajectories, so the plan keeps its four-stage structure (and its
+        reverse-replay corridor) while the flattened trajectory is one
+        continuous velocity profile.  The geometry is untouched: samples ride
+        the exact checked polyline edges, so collision coverage is identical
+        to the staged fallback.  Returns ``None`` for degenerate chains; the
+        caller then falls back to per-stage rest-to-rest retiming.
         """
 
-        pregrasp = np.asarray(pregrasp_path, dtype=float)
-        grasp = np.asarray(grasp_path, dtype=float)
-        # Continuous polyline through the shared standoff via (dropped duplicate).
-        full = np.vstack((pregrasp, grasp[1:]))
-        via_index = len(pregrasp) - 1
+        paths = [np.asarray(path, dtype=float) for path in stage_paths]
+        scales = [float(scale) for scale in speed_scales]
+        if len(paths) < 2 or len(paths) != len(scales):
+            return None
+        full = paths[0]
+        via_indices: list[int] = []
+        for path in paths[1:]:
+            via_indices.append(len(full) - 1)
+            full = np.vstack((full, path[1:]))
         edges = np.diff(full, axis=0)
         edge_lengths = np.linalg.norm(edges, axis=1)
         cumulative = np.concatenate(([0.0], np.cumsum(edge_lengths)))
         total = float(cumulative[-1])
-        via_arclength = float(cumulative[via_index])
-        if (
-            total < 1e-9
-            or via_arclength <= 1e-9
-            or via_arclength >= total - 1e-9
-        ):
-            # Degenerate corridor (no real standoff separation): fall back to the
-            # conservative per-segment rest-to-rest retiming.
-            return self._retime(pregrasp), self._retime(grasp)
+        via_arcs = [float(cumulative[index]) for index in via_indices]
+        arc_bounds = np.asarray([0.0, *via_arcs, total])
+        if total < 1e-9 or np.any(np.diff(arc_bounds) <= 1e-9):
+            return None
 
         active = edge_lengths > 1e-12
         slope = np.zeros_like(edges)
         slope[active] = edges[active] / edge_lengths[active, None]
-        max_slope = np.max(np.abs(slope), axis=0)
-        # Peak speed of the single quintic over the whole descent is capped so no
-        # joint exceeds its (contact-scaled) velocity or its acceleration limit.
-        velocity = (
-            self.velocity_limits
-            * self.time_config.velocity_scale
-            * float(contact_speed_scale)
-        )
+        velocity = self.velocity_limits * self.time_config.velocity_scale
         acceleration = self.acceleration_limits * self.time_config.acceleration_scale
-        with np.errstate(divide="ignore", invalid="ignore"):
-            duration_velocity = float(np.max(1.875 * total * max_slope / velocity))
-            duration_acceleration = float(
-                np.max(np.sqrt(5.774 * total * max_slope / acceleration)),
-            )
-        duration = max(
-            self.time_config.min_segment_time_s,
-            duration_velocity,
-            duration_acceleration,
-        )
 
-        via_time = _inverse_quintic_blend(via_arclength / total) * duration
-        samples = max(2, int(np.ceil(duration / self.time_config.sample_period_s)) + 1)
-        grid = np.linspace(0.0, duration, samples)
-        # Guarantee the via is an exact sample so the slice endpoints land on the
-        # true standoff joints; drop any grid point that would collide with it.
-        keep = np.abs(grid - via_time) > 1e-6
-        times = np.sort(np.concatenate((grid[keep], (via_time,))))
-        positions = np.stack([
-            _interpolate_arclength(
-                full,
-                cumulative,
-                _quintic_blend(sample_time / duration) * total,
+        # Interior polyline corners.  The residual one-sample acceleration
+        # spike exactly AT a corner is a C0-geometry artifact, not a command
+        # the hardware must track instantaneously: targets are streamed at
+        # the sample period and the controller's internal generator smooths
+        # between them, exactly as the executor already streams C0 raw
+        # polylines today.  Corner-adjacent samples are therefore excluded
+        # from the discrete acceleration guard below; velocity is guarded
+        # everywhere and the corner speed itself is capped by angle.
+        corner_arcs: list[float] = []
+        corner_windows: list[float] = []
+        corner_fractions: list[float] = []
+        for vertex in range(1, len(full) - 1):
+            before = vertex - 1
+            if not active[before] or not active[vertex]:
+                continue
+            cosine = float(np.clip(
+                np.dot(slope[before], slope[vertex]), -1.0, 1.0,
+            ))
+            angle = math.acos(cosine)
+            if angle < math.radians(0.5):
+                continue
+            corner_arcs.append(float(cumulative[vertex]))
+            corner_windows.append(0.5 * float(min(
+                edge_lengths[before], edge_lengths[vertex],
+            )))
+            corner_fractions.append(
+                max(0.06, (1.0 - min(angle, math.pi) / math.pi) ** 3),
             )
-            for sample_time in times
+
+        # Arc-length nodes: dense grid plus every polyline vertex (so edge
+        # ownership never straddles a node) plus vias and corners.
+        grid = np.unique(np.concatenate((
+            np.linspace(0.0, total, 512),
+            cumulative,
+        )))
+        node_edge = np.clip(
+            np.searchsorted(cumulative, grid, side="right") - 1,
+            0,
+            len(edges) - 1,
+        )
+        interval_edge = node_edge[:-1]
+
+        def _arc_scale(arc: float) -> float:
+            index = int(np.clip(
+                np.searchsorted(arc_bounds, arc, side="right") - 1,
+                0,
+                len(scales) - 1,
+            ))
+            return scales[index]
+
+        interval_scale = np.asarray([
+            _arc_scale(0.5 * float(grid[i] + grid[i + 1]))
+            for i in range(len(grid) - 1)
+        ])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            per_edge_speed = np.where(
+                np.abs(slope) > 1e-12,
+                velocity / np.maximum(np.abs(slope), 1e-12),
+                np.inf,
+            ).min(axis=1)
+            per_edge_accel = np.where(
+                np.abs(slope) > 1e-12,
+                acceleration / np.maximum(np.abs(slope), 1e-12),
+                np.inf,
+            ).min(axis=1)
+        interval_speed_cap = interval_scale * per_edge_speed[interval_edge]
+        interval_accel = per_edge_accel[interval_edge]
+        if not np.all(np.isfinite(interval_speed_cap)):
+            return None
+
+        node_cap = np.empty_like(grid)
+        node_cap[0] = 0.0
+        node_cap[-1] = 0.0
+        node_cap[1:-1] = np.minimum(
+            interval_speed_cap[:-1],
+            interval_speed_cap[1:],
+        )
+        for corner, fraction in zip(corner_arcs, corner_fractions):
+            index = int(np.argmin(np.abs(grid - corner)))
+            if 0 < index < len(grid) - 1:
+                node_cap[index] = min(node_cap[index], node_cap[index] * fraction)
+
+        # Forward/backward reachability under the acceleration limits.
+        speeds = node_cap.copy()
+        deltas = np.diff(grid)
+        for i in range(len(grid) - 1):
+            reachable = math.sqrt(
+                speeds[i] ** 2 + 2.0 * float(interval_accel[i]) * float(deltas[i]),
+            )
+            speeds[i + 1] = min(speeds[i + 1], reachable)
+        for i in range(len(grid) - 2, -1, -1):
+            reachable = math.sqrt(
+                speeds[i + 1] ** 2 + 2.0 * float(interval_accel[i]) * float(deltas[i]),
+            )
+            speeds[i] = min(speeds[i], reachable)
+
+        # Integrate time along the arc (speed floored to keep the ends finite).
+        mean_speed = np.maximum(0.5 * (speeds[:-1] + speeds[1:]), 1e-4)
+        node_times = np.concatenate(([0.0], np.cumsum(deltas / mean_speed)))
+        duration = float(node_times[-1])
+        if not math.isfinite(duration) or duration <= 0.0:
+            return None
+
+        via_times = np.asarray([
+            float(np.interp(value, grid, node_times)) for value in via_arcs
+        ])
+        samples = max(
+            2,
+            int(np.ceil(duration / self.time_config.sample_period_s)) + 1,
+        )
+        base = np.linspace(0.0, duration, samples)
+        keep = np.min(
+            np.abs(base[:, None] - via_times[None, :]),
+            axis=1,
+        ) > 1e-6
+        times = np.sort(np.concatenate((base[keep], via_times)))
+        arc_positions = np.interp(times, node_times, grid)
+        positions = np.stack([
+            _interpolate_arclength(full, cumulative, value)
+            for value in arc_positions
         ])
 
-        boundary = int(np.searchsorted(times, via_time))
-        pregrasp_positions = positions[: boundary + 1].copy()
-        grasp_positions = positions[boundary:].copy()
-        # Pin the shared endpoints to the exact checked joints (kill float drift).
-        pregrasp_positions[0] = full[0]
-        pregrasp_positions[-1] = full[via_index]
-        grasp_positions[0] = full[via_index]
-        grasp_positions[-1] = full[-1]
-        return (
-            TimedJointTrajectory(
-                positions=pregrasp_positions,
-                times_s=times[: boundary + 1].copy(),
-            ),
-            TimedJointTrajectory(
-                positions=grasp_positions,
-                times_s=times[boundary:] - via_time,
-            ),
-        )
+        def _limit_ratio(
+            local_times: np.ndarray,
+            local_positions: np.ndarray,
+            local_arcs: np.ndarray,
+        ) -> float:
+            """Worst velocity/acceleration utilization of the sampled profile.
+
+            Velocity is guarded at every sample; the discrete acceleration is
+            guarded away from C0 corner vertices (see corner note above).
+            """
+            sample_deltas = np.diff(local_times)
+            velocities = np.diff(local_positions, axis=0) / sample_deltas[:, None]
+            worst = float(np.max(np.max(np.abs(velocities) / velocity, axis=1)))
+            if len(velocities) > 1:
+                midpoints = 0.5 * (local_times[:-1] + local_times[1:])
+                accelerations = (
+                    np.diff(velocities, axis=0) / np.diff(midpoints)[:, None]
+                )
+                acceleration_ratios = np.max(
+                    np.abs(accelerations) / acceleration, axis=1,
+                )
+                exclude = np.zeros(len(acceleration_ratios), dtype=bool)
+                sample_arcs = local_arcs[1:-1]
+                for corner, window in zip(corner_arcs, corner_windows):
+                    exclude |= np.abs(sample_arcs - corner) <= max(window, 1e-6)
+                for via in via_arcs:
+                    exclude |= np.abs(sample_arcs - via) <= 1e-6
+                acceleration_ratios = acceleration_ratios[~exclude]
+                if len(acceleration_ratios):
+                    worst = max(
+                        worst,
+                        math.sqrt(max(float(np.max(acceleration_ratios)), 0.0)),
+                    )
+            return worst
+
+        # Guarantee pass: discretization error can push a sample slightly
+        # over a limit; uniform time dilation by ``f`` scales velocity by 1/f
+        # and acceleration by 1/f^2 with the positions (the checked geometry)
+        # untouched.
+        factor = _limit_ratio(times, positions, arc_positions)
+        if factor > 1.001:
+            times = times * (factor * 1.02)
+            via_times = via_times * (factor * 1.02)
+
+        result: list[TimedJointTrajectory] = []
+        previous_index = 0
+        for arc, path in enumerate(paths):
+            if arc < len(via_times):
+                end_index = int(np.flatnonzero(
+                    np.isclose(times, via_times[arc], rtol=0.0, atol=1e-9),
+                )[0])
+            else:
+                end_index = len(times) - 1
+            segment_positions = positions[previous_index:end_index + 1].copy()
+            segment_times = (
+                times[previous_index:end_index + 1] - times[previous_index]
+            )
+            # Pin shared endpoints to the exact checked joints (no float drift).
+            segment_positions[0] = path[0]
+            segment_positions[-1] = path[-1]
+            if len(segment_positions) < 2:
+                return None
+            result.append(TimedJointTrajectory(
+                positions=segment_positions,
+                times_s=segment_times,
+            ))
+            previous_index = end_index
+        return result
 
     @staticmethod
     def _poses(request: StagedGraspRequest) -> dict[GraspStage, np.ndarray]:
@@ -592,22 +717,32 @@ class StagedGraspTrajectoryBuilder:
             stage_paths[stage] = (current, goal, path)
             current = goal
 
-        use_direct = (
-            request.direct_approach
-            and GraspStage.PREGRASP in stage_paths
-            and GraspStage.GRASP in stage_paths
-        )
+        # The blended chain covers every pre-contact stage present: transit
+        # (APPROACH) at full speed and the descent (PREGRASP + GRASP) at the
+        # contact scale, with the speed ramped down inside the transit tail.
+        # Both standoffs therefore become velocity-continuous vias; motion
+        # comes to rest only at the grasp contact (for the close) and after
+        # the lift.  LIFT stays a separate rest-to-rest segment because the
+        # gripper must close while the arm is stationary at the grasp pose.
+        chain_stages = [
+            stage
+            for stage in (GraspStage.APPROACH, GraspStage.PREGRASP, GraspStage.GRASP)
+            if stage in stage_paths
+        ]
+        chain_scales = {
+            GraspStage.APPROACH: 1.0,
+            GraspStage.PREGRASP: request.contact_speed_scale,
+            GraspStage.GRASP: request.contact_speed_scale,
+        }
         trajectories: dict[GraspStage, TimedJointTrajectory] = {}
-        if use_direct:
-            _, _, pregrasp_path = stage_paths[GraspStage.PREGRASP]
-            _, _, grasp_path = stage_paths[GraspStage.GRASP]
-            pregrasp_traj, grasp_traj = self._retime_direct_pair(
-                pregrasp_path,
-                grasp_path,
-                contact_speed_scale=request.contact_speed_scale,
+        if request.direct_approach and len(chain_stages) >= 2:
+            chained = self._retime_direct_chain(
+                [stage_paths[stage][2] for stage in chain_stages],
+                [chain_scales[stage] for stage in chain_stages],
             )
-            trajectories[GraspStage.PREGRASP] = pregrasp_traj
-            trajectories[GraspStage.GRASP] = grasp_traj
+            if chained is not None:
+                for stage, trajectory in zip(chain_stages, chained):
+                    trajectories[stage] = trajectory
         for stage, (_, _, path) in stage_paths.items():
             if stage not in trajectories:
                 trajectories[stage] = self._retime(path)
