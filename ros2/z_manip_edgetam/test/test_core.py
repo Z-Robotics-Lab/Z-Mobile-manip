@@ -1223,16 +1223,28 @@ def test_initialization_session_change_fails_closed() -> None:
     assert not client.active
 
 
-def test_sparse_target_depth_fails_closed_after_service_update() -> None:
+def test_sparse_target_depth_fails_closed_when_coasting_is_disabled() -> None:
+    # With the depth-dropout coast window disabled (max_tracking_coast_frames=0)
+    # a sparse-depth frame reverts to the legacy contract: it fails closed on
+    # the first frame instead of bridging the transient depth hole.
     client = FakeClient()
-    subject = tracker(client, min_points=4)
+    subject = FailClosedTracker(
+        client,
+        min_depth_m=0.1,
+        max_depth_m=3.0,
+        min_points=4,
+        max_points=100,
+        max_tracking_coast_frames=0,
+        session_id_factory=lambda: 'test-session',
+    )
     initialize(subject)
     depth = np.zeros((5, 6), dtype=np.float32)
     depth[1, 1] = 1.0
 
-    with pytest.raises(TrackerFailure, match='sparse'):
+    with pytest.raises(TrackerFailure, match='coasted beyond') as error:
         subject.update(frame(11, depth=depth))
 
+    assert error.value.reason_code == 'tracking_coast_exhausted'
     assert client.update_calls == [1]
     assert not subject.active
     assert not client.active
@@ -1423,3 +1435,160 @@ def test_invalid_coast_window_is_rejected(bad: object) -> None:
             min_points=2,
             max_tracking_coast_frames=bad,
         )
+
+
+def _square_mask(box: tuple[int, int, int, int]) -> np.ndarray:
+    """Build one 32x32 solid mask block for depth-dropout coast tests."""
+    mask = np.zeros((32, 32), dtype=bool)
+    x1, y1, x2, y2 = box
+    mask[y1:y2, x1:x2] = True
+    return mask
+
+
+def _empty_depth() -> np.ndarray:
+    """Return a 32x32 depth image with no valid returns (a total dropout)."""
+    return np.zeros((32, 32), dtype=np.float32)
+
+
+def _depth_coast_tracker(
+    masks: list[np.ndarray],
+    *,
+    max_coast: int = 32,
+) -> tuple[FailClosedTracker, MaskSequenceClient]:
+    client = MaskSequenceClient(masks)
+    subject = FailClosedTracker(
+        client,
+        min_depth_m=0.1,
+        max_depth_m=3.0,
+        min_points=2,
+        max_points=1_000,
+        max_tracking_coast_frames=max_coast,
+        session_id_factory=lambda: 'test-session',
+    )
+    subject.initialize(
+        stamp_ns=10,
+        image_jpeg=JPEG,
+        width=32,
+        height=32,
+        bbox_xyxy=_mask_bbox(masks[0]),
+        label='airpods',
+    )
+    return subject, client
+
+
+def test_empty_target_depth_reports_a_typed_reason_code() -> None:
+    with pytest.raises(TrackerFailure, match='target depth is sparse') as error:
+        project_mask_depth_geometry(
+            np.ones((2, 2), dtype=bool),
+            np.zeros((2, 2), dtype=np.float32),
+            CameraIntrinsics(2.0, 2.0, 1.0, 1.0),
+            min_depth_m=0.1,
+            max_depth_m=3.0,
+            min_points=2,
+            max_points=10,
+        )
+    assert error.value.reason_code == 'target_depth_sparse'
+
+
+def test_sparse_dominant_depth_cluster_reports_a_typed_reason_code() -> None:
+    # Two separate one-pixel components, each below the point minimum, so the
+    # dominant-cluster branch raises rather than the whole-mask branch.
+    mask = np.zeros((4, 6), dtype=bool)
+    mask[1, 1:3] = True
+    mask[2, 4:6] = True
+    with pytest.raises(TrackerFailure, match='dominant target depth cluster') as error:
+        project_mask_depth_geometry(
+            mask,
+            np.ones((4, 6), dtype=np.float32),
+            CameraIntrinsics(4.0, 4.0, 2.0, 1.5),
+            min_depth_m=0.1,
+            max_depth_m=3.0,
+            min_points=3,
+            max_points=10,
+        )
+    assert error.value.reason_code == 'target_depth_sparse'
+
+
+def test_transient_depth_dropout_coasts_and_relocks_without_reset() -> None:
+    """A dark-surface depth hole under a locked mask must not tear the track."""
+    locked = _square_mask((8, 8, 16, 16))
+    subject, client = _depth_coast_tracker([locked, locked, locked, locked])
+
+    published = subject.update(sized_frame(1_000_000_010, width=32, height=32))
+    coasted = subject.update(
+        sized_frame(2_000_000_010, width=32, height=32, depth=_empty_depth()),
+    )
+    relocked = subject.update(sized_frame(3_000_000_010, width=32, height=32))
+
+    assert published is not None and relocked is not None
+    # The empty-depth frame produced no observation but kept the identity.
+    assert coasted is None
+    assert subject.active
+    assert client.reset_calls == 0
+    assert published.track_id == relocked.track_id
+    # The service timeline advanced in strict lockstep across the depth coast.
+    assert client.update_calls == [1, 2, 3]
+
+
+def test_depth_dropout_coast_leaves_validated_anchor_untouched() -> None:
+    locked = _square_mask((8, 8, 16, 16))
+    subject, _client = _depth_coast_tracker([locked, locked, locked])
+    subject.update(sized_frame(1_000_000_010, width=32, height=32))
+    anchor_before = subject._last_mask.copy()
+    centroid_before = subject._last_centroid.copy()
+    validated_before = subject._last_validated_stamp_ns
+
+    coasted = subject.update(
+        sized_frame(2_000_000_010, width=32, height=32, depth=_empty_depth()),
+    )
+
+    assert coasted is None
+    assert subject.active
+    # No depth means no new 3-D evidence: anchor, centroid, and validated stamp
+    # are frozen exactly like a service coast; only the timeline advances.
+    assert np.array_equal(subject._last_mask, anchor_before)
+    assert np.array_equal(subject._last_centroid, centroid_before)
+    assert subject._last_validated_stamp_ns == validated_before
+    assert subject._last_stamp_ns == 2_000_000_010
+
+
+def test_persistent_depth_dropout_fails_closed_after_coast_window() -> None:
+    locked = _square_mask((8, 8, 16, 16))
+    subject, client = _depth_coast_tracker(
+        [locked, locked, locked, locked, locked],
+        max_coast=2,
+    )
+    subject.update(sized_frame(1_000_000_010, width=32, height=32))
+    assert subject.update(
+        sized_frame(2_000_000_010, width=32, height=32, depth=_empty_depth()),
+    ) is None
+    assert subject.update(
+        sized_frame(3_000_000_010, width=32, height=32, depth=_empty_depth()),
+    ) is None
+
+    with pytest.raises(TrackerFailure, match='coasted beyond') as error:
+        subject.update(
+            sized_frame(4_000_000_010, width=32, height=32, depth=_empty_depth()),
+        )
+
+    assert error.value.reason_code == 'tracking_coast_exhausted'
+    assert not subject.active
+    assert client.reset_calls >= 1
+
+
+def test_sparse_depth_under_a_drifted_mask_is_never_coasted() -> None:
+    """A disjoint mask jump with sparse depth is genuine loss, not a coast."""
+    locked = _square_mask((8, 8, 16, 16))
+    drifted = _square_mask((20, 20, 28, 28))
+    subject, client = _depth_coast_tracker([locked, locked, drifted])
+    subject.update(sized_frame(1_000_000_010, width=32, height=32))
+
+    with pytest.raises(TrackerFailure):
+        subject.update(
+            sized_frame(2_000_000_010, width=32, height=32, depth=_empty_depth()),
+        )
+
+    # The mask lost overlap with its anchor, so the hard-continuity gate blocks
+    # the coast and the identity fails closed instead of hallucinating a track.
+    assert not subject.active
+    assert client.reset_calls >= 1

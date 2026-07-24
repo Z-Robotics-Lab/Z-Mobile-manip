@@ -22,9 +22,12 @@ def test_target_and_scene_clouds_project_the_same_filtered_rgbd_frame():
     scene_projection = (
         "project_scene_depth(\n            observation.mask,\n            frame.depth_m,"
     )
+    # The target projection runs inside a depth-dropout coast guard (a try
+    # block), so it is nested one level deeper, but it still consumes the same
+    # exact-stamp filtered ``frame.depth_m`` as the scene projection.
     target_projection = (
         "project_mask_depth_geometry(\n"
-        "                current_mask,\n                frame.depth_m,"
+        "                    current_mask,\n                    frame.depth_m,"
     )
     assert scene_projection in node
     assert target_projection in core

@@ -1116,6 +1116,7 @@ def project_mask_depth_geometry(
     if rows.size < min_points:
         raise TrackerFailure(
             f'target depth is sparse: {rows.size} valid points, need {min_points}',
+            reason_code='target_depth_sparse',
         )
     selected = _dominant_depth_component(
         valid,
@@ -1128,6 +1129,7 @@ def project_mask_depth_geometry(
         raise TrackerFailure(
             'dominant target depth cluster is sparse: '
             f'{selected_rows.size} valid points, need {min_points}',
+            reason_code='target_depth_sparse',
         )
     rejected = valid & ~selected
     rejected_rows, rejected_cols = np.nonzero(rejected)
@@ -1637,17 +1639,33 @@ class FailClosedTracker:
                         mask_diagnostics,
                     )
                     return None
-            projection = project_mask_depth_geometry(
-                current_mask,
-                frame.depth_m,
-                frame.intrinsics,
-                min_depth_m=self._min_depth_m,
-                max_depth_m=self._max_depth_m,
-                min_points=self._min_points,
-                max_points=self._max_points,
-                cluster_max_depth_jump_m=self._cluster_max_depth_jump_m,
-                cluster_max_depth_jump_ratio=self._cluster_max_depth_jump_ratio,
-            )
+            try:
+                projection = project_mask_depth_geometry(
+                    current_mask,
+                    frame.depth_m,
+                    frame.intrinsics,
+                    min_depth_m=self._min_depth_m,
+                    max_depth_m=self._max_depth_m,
+                    min_points=self._min_points,
+                    max_points=self._max_points,
+                    cluster_max_depth_jump_m=self._cluster_max_depth_jump_m,
+                    cluster_max_depth_jump_ratio=self._cluster_max_depth_jump_ratio,
+                )
+            except TrackerFailure as error:
+                if self._depth_dropout_is_recoverable(error, continuity_metrics):
+                    # EdgeTAM still holds a spatially continuous mask, but the
+                    # depth under it is transiently sparse this frame: a dark or
+                    # low-texture surface drops D435/FFS returns, or the holding
+                    # hand briefly occludes the target.  Coast on the last
+                    # depth-validated anchor instead of destroying the identity
+                    # and forcing a VLM re-grounding.  The bounded coast window
+                    # still fails closed if the dropout persists, and a drifted
+                    # or jumped mask fails the hard-continuity gate inside the
+                    # guard and is never coasted, so genuine loss is preserved.
+                    self._register_coast()
+                    self._commit_service_update(frame.stamp_ns)
+                    return None
+                raise
             points = projection.points_xyz
             pixels = projection.pixels_uv
             centroid = np.median(points, axis=0)
@@ -1821,6 +1839,33 @@ class FailClosedTracker:
                 f'({self._coast_streak} > {self._max_tracking_coast_frames} frames)',
                 reason_code='tracking_coast_exhausted',
             )
+
+    def _depth_dropout_is_recoverable(
+        self,
+        error: TrackerFailure,
+        metrics: dict[str, float] | None,
+    ) -> bool:
+        """Return whether a sparse-depth frame may coast on the last anchor.
+
+        Only a transient depth dropout under an otherwise locked mask qualifies.
+        The failure must be the typed ``target_depth_sparse`` case (a structural
+        projection error keeps its default reason and stays terminal); no
+        contained-collapse recovery may already be in progress; and the current
+        mask must still pass the hard mask-continuity gate against the validated
+        anchor.  A drifted, jumped, or rescaled mask fails that gate and is
+        never coasted, so genuine target loss is still reported.  This mirrors
+        the depth-free RGB-replay acquisition bar, which also relocks on hard
+        continuity alone.
+        """
+        if getattr(error, 'reason_code', '') != 'target_depth_sparse':
+            return False
+        if self._pending_mask_anomaly or metrics is None:
+            return False
+        try:
+            self._reject_hard_mask_discontinuity(metrics)
+        except TrackerFailure:
+            return False
+        return True
 
     def _validate_coast(
         self,
