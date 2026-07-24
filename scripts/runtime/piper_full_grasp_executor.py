@@ -84,6 +84,7 @@ def _receipt(
     final_joints: np.ndarray,
     gripper: stage_executor.GripperFeedback | None,
     receipt_dir: Path,
+    approach_execution: str = "streamed",
 ) -> stage_executor.PriorReceipt:
     document = stage_executor.build_receipt(
         artifact=artifact,
@@ -93,6 +94,7 @@ def _receipt(
         finished_unix_ns=time.time_ns(),
         final_joints_rad=final_joints,
         gripper=gripper,
+        approach_execution=approach_execution,
     )
     path = receipt_dir / f"{stage}-receipt.json"
     stage_executor.atomic_write_json(path, document)
@@ -225,6 +227,7 @@ def execute_full_grasp(
     lift_hold_s: float,
     executor_start: tuple[int, int] | None = None,
     planning_session_id: str = "",
+    direct_approach: bool = True,
 ) -> dict[str, object]:
     """Run the complete pick, visible lift, place-back and checked return."""
 
@@ -279,6 +282,7 @@ def execute_full_grasp(
         speed_percent=speed_percent,
         segment_timeout_s=segment_timeout_s,
         gripper_force_n=gripper_force_n,
+        direct_approach=direct_approach,
     )
     approach_receipt = _receipt(
         artifact=artifact,
@@ -288,6 +292,7 @@ def execute_full_grasp(
         final_joints=final,
         gripper=gripper,
         receipt_dir=receipt_dir,
+        approach_execution="streamed" if direct_approach else "stepped",
     )
 
     lift_path = stage_executor.validate_stage_context(
@@ -408,6 +413,7 @@ def execute_workflow_phase(
     segment_timeout_s: float,
     gripper_force_n: float,
     executor_start: tuple[int, int] | None = None,
+    direct_approach: bool = True,
 ) -> dict[str, object]:
     """Execute one durable pick/hold/return/place-back workflow transition."""
     if workflow_phase == "pick-hold":
@@ -442,11 +448,13 @@ def execute_workflow_phase(
             speed_percent=speed_percent,
             segment_timeout_s=segment_timeout_s,
             gripper_force_n=gripper_force_n,
+            direct_approach=direct_approach,
         )
         approach_receipt = _receipt(
             artifact=artifact, stage="approach_close", prior=pregrasp_receipt,
             started_ns=started, final_joints=final, gripper=gripper,
             receipt_dir=receipt_dir,
+            approach_execution="streamed" if direct_approach else "stepped",
         )
         lift_path = stage_executor.validate_stage_context(
             artifact, "lift", approach_receipt,
@@ -600,6 +608,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workflow-phase", choices=WORKFLOW_PHASES, default="full")
     parser.add_argument("--prior-receipt-dir", type=Path)
     parser.add_argument("--planning-session-id")
+    parser.add_argument(
+        "--staged-approach-stop",
+        action="store_true",
+        help=(
+            "legacy fallback: halt at the pregrasp standoff and step the grasp "
+            "descent instead of streaming directly into contact (the accurate "
+            "default)"
+        ),
+    )
     return parser
 
 
@@ -667,6 +684,7 @@ def main() -> int:
             # boundary: the CAN transport has opened, but no stage command has
             # yet been emitted.
             executor_start = (time.time_ns(), time.monotonic_ns())
+            direct_approach = not args.staged_approach_stop
             if args.workflow_phase == "full":
                 result = execute_full_grasp(
                     robot, effector, artifact, receipt_dir=args.receipt_dir,
@@ -676,6 +694,7 @@ def main() -> int:
                     lift_hold_s=args.lift_hold_s,
                     executor_start=executor_start,
                     planning_session_id=args.planning_session_id or "",
+                    direct_approach=direct_approach,
                 )
             else:
                 result = execute_workflow_phase(
@@ -687,6 +706,7 @@ def main() -> int:
                     segment_timeout_s=args.segment_timeout_s,
                     gripper_force_n=args.gripper_force_n,
                     executor_start=executor_start,
+                    direct_approach=direct_approach,
                 )
             print(json.dumps(result, indent=2))
             return 0

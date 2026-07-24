@@ -95,6 +95,16 @@ EXECUTION_MAX_COALESCED_SEGMENT_RAD = math.radians(180.0)
 # at every vertex).  Fifteen percent is the speed at which the recorded timing
 # was first validated; lower requested speeds stretch, never compress, it.
 LIFT_STREAM_REFERENCE_SPEED_PERCENT = 15
+# Direct grasp streams the approach->contact descent from the SAME retimed
+# quintic the artifact already carries, exactly like the lift, instead of
+# stepping raw IK vertices point-to-point.  Streaming (a) commands the final
+# grasp target unconditionally so the tool is driven onto the exact planned
+# contact pose -- the stepped path skips a final waypoint already within the
+# feedback tolerance, which stops the tool up to that tolerance short of the
+# grasp and closes the gripper there ("slightly off / barely missing") -- and
+# (b) removes the stop-and-go halt at the pregrasp standoff (now a via).  The
+# reference speed is deliberately gentle so the tool creeps into contact.
+APPROACH_STREAM_REFERENCE_SPEED_PERCENT = 15
 # 0.30 s at the 50 Hz stream keeps the arm within a bounded 15-sample drift
 # on a non-realtime host; the previous 0.15 s tripped on ordinary scheduler
 # jitter and its failure path unloaded a holding arm.
@@ -1582,10 +1592,16 @@ def execute_stage(
     start_tolerance_rad: float = DEFAULT_START_TOLERANCE_RAD,
     feedback_tolerance_rad: float = DEFAULT_FEEDBACK_TOLERANCE_RAD,
     gripper_force_n: float = 1.0,
+    direct_approach: bool = True,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[np.ndarray, GripperFeedback | None]:
-    """Execute exactly one stage; any post-command failure triggers e-stop."""
+    """Execute exactly one stage; any post-command failure triggers e-stop.
+
+    ``direct_approach`` (default) streams the ``approach_close`` descent from the
+    artifact's retimed quintic as one continuous move into the exact grasp pose;
+    ``direct_approach=False`` restores the legacy stepped, stop-and-go approach.
+    """
     guard = CommandGuard()
     gripper_result: GripperFeedback | None = None
     try:
@@ -1678,17 +1694,50 @@ def execute_stage(
                 sleep=sleep,
             )
             verify_gripper_ready(open_feedback)
-            final_joints = execute_joint_path(
-                robot,
-                path,
-                guard,
-                speed_percent=speed_percent,
-                segment_timeout_s=segment_timeout_s,
-                start_tolerance_rad=start_tolerance_rad,
-                feedback_tolerance_rad=feedback_tolerance_rad,
-                monotonic=monotonic,
-                sleep=sleep,
-            )
+            if direct_approach:
+                # Direct grasp: stream the retimed approach as one continuous
+                # descent into contact.  Unlike the stepped path, the streamer
+                # commands the FINAL grasp target unconditionally, so the tool
+                # is driven onto the exact planned contact pose instead of
+                # settling up to one feedback tolerance short of it (the stepped
+                # path skips a final waypoint already within tolerance and the
+                # gripper would then close at that short pose).  The pregrasp
+                # standoff is a via, not a halt, and the quintic decelerates
+                # into contact.  The dense trajectory is proven to ride the same
+                # collision-checked raw polyline inside ``timed_stage_path``.
+                timed_approach, approach_times_s = timed_stage_path(artifact, "approach")
+                if (
+                    float(np.max(np.abs(timed_approach[0] - path[0]))) > 1e-5
+                    or float(np.max(np.abs(timed_approach[-1] - path[-1]))) > 1e-5
+                ):
+                    raise SafetyError(
+                        "timed approach path differs from authorized raw approach",
+                    )
+                final_joints = execute_timed_joint_path(
+                    robot,
+                    timed_approach,
+                    approach_times_s,
+                    guard,
+                    speed_percent=speed_percent,
+                    segment_timeout_s=segment_timeout_s,
+                    start_tolerance_rad=start_tolerance_rad,
+                    feedback_tolerance_rad=feedback_tolerance_rad,
+                    reference_speed_percent=APPROACH_STREAM_REFERENCE_SPEED_PERCENT,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                )
+            else:
+                final_joints = execute_joint_path(
+                    robot,
+                    path,
+                    guard,
+                    speed_percent=speed_percent,
+                    segment_timeout_s=segment_timeout_s,
+                    start_tolerance_rad=start_tolerance_rad,
+                    feedback_tolerance_rad=feedback_tolerance_rad,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                )
             # The checked joint path completed.  A subsequent gripper-status
             # failure must keep this pose torqued instead of electronic-stop
             # unloading the arm; path failures themselves still e-stop.
@@ -1818,8 +1867,15 @@ def build_receipt(
     finished_unix_ns: int,
     final_joints_rad: Sequence[float],
     gripper: GripperFeedback | None,
+    approach_execution: str = "streamed",
 ) -> dict[str, Any]:
-    """Build a stage receipt only after all feedback gates have passed."""
+    """Build a stage receipt only after all feedback gates have passed.
+
+    ``approach_execution`` attests which grasp-descent mode ran: ``"streamed"``
+    (direct grasp, the default) or ``"stepped"`` (the legacy staged fallback).
+    It is only meaningful for, and only recorded on, the ``approach_close``
+    stage; the field is additive and never renames an existing receipt key.
+    """
     result: dict[str, Any] = {
         "schema": "z_manip.piper_stage_receipt.v1",
         "stage": stage,
@@ -1836,6 +1892,8 @@ def build_receipt(
             artifact.requires_start_reconciliation and stage == "pregrasp"
         ),
     }
+    if stage == "approach_close":
+        result["approach_execution"] = str(approach_execution)
     if gripper is not None:
         result["gripper"] = {
             "aperture_m": gripper.aperture_m,
@@ -1941,6 +1999,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--firmware", choices=("default", "v183", "v188", "v189"), default="v188")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm", help="exact artifact-bound token printed by dry run")
+    parser.add_argument(
+        "--staged-approach-stop",
+        action="store_true",
+        help=(
+            "legacy fallback: stop at the pregrasp standoff and step the "
+            "approach_close descent instead of streaming it directly into "
+            "contact (the accurate default)"
+        ),
+    )
     return parser
 
 
@@ -2026,6 +2093,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             robot, effector = connect_real_arm(args.channel, args.firmware)
             started_ns = time.time_ns()
+            direct_approach = not args.staged_approach_stop
             final_joints, gripper = execute_stage(
                 robot,
                 effector,
@@ -2035,6 +2103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 speed_percent=args.speed_percent,
                 segment_timeout_s=args.segment_timeout_s,
                 gripper_force_n=args.gripper_force_n,
+                direct_approach=direct_approach,
             )
             finished_ns = time.time_ns()
             receipt = build_receipt(
@@ -2045,6 +2114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 finished_unix_ns=finished_ns,
                 final_joints_rad=final_joints,
                 gripper=gripper,
+                approach_execution="streamed" if direct_approach else "stepped",
             )
             output = args.receipt_output or args.planning_report.with_name(
                 f"execution_{args.stage}_receipt.json",

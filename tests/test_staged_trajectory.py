@@ -159,3 +159,154 @@ def test_builder_uses_pinocchio_reduced_model_velocity_limit_shape():
     )
 
     assert np.allclose(builder.velocity_limits, 0.6)
+
+
+def _segment_final_speed(segment) -> float:
+    positions = segment.trajectory.positions
+    times = segment.trajectory.times_s
+    step = float(times[-1] - times[-2])
+    return float(np.max(np.abs(positions[-1] - positions[-2])) / step)
+
+
+def _segment_speeds(segment) -> np.ndarray:
+    positions = segment.trajectory.positions
+    times = segment.trajectory.times_s
+    return np.max(np.abs(np.diff(positions, axis=0)), axis=1) / np.diff(times)
+
+
+def _direct_request(**overrides) -> StagedGraspRequest:
+    base = dict(
+        current_joints=np.zeros(6),
+        target=_target(),
+        pregrasp_offset_m=0.08,
+        approach_clearance_m=0.05,
+        lift_distance_m=0.09,
+    )
+    base.update(overrides)
+    return StagedGraspRequest(**base)
+
+
+def test_direct_approach_is_the_default_and_is_recorded_on_the_plan():
+    plan = _builder(_MidpointPlanner()).build(_direct_request())
+
+    assert plan.direct_approach is True
+    assert plan.contact_speed_scale == 0.5
+    # The four-stage structure and suffix contract are preserved.
+    assert tuple(segment.stage for segment in plan.segments) == tuple(GraspStage)
+    for previous, following in zip(plan.segments, plan.segments[1:]):
+        assert np.allclose(previous.goal_joints, following.start_joints)
+
+
+def test_direct_approach_passes_the_standoff_via_without_halting():
+    builder = _builder(_MidpointPlanner())
+    direct = builder.build(_direct_request(direct_approach=True))
+    staged = builder.build(_direct_request(direct_approach=False))
+
+    # The pregrasp segment ends AT the standoff.  Direct mode keeps a real
+    # velocity through that via; the staged fallback stops dead there.
+    direct_via_speed = _segment_final_speed(direct.segment(GraspStage.PREGRASP))
+    staged_via_speed = _segment_final_speed(staged.segment(GraspStage.PREGRASP))
+    assert direct_via_speed > 0.05
+    assert staged_via_speed < 1e-3
+    assert direct_via_speed > 20.0 * staged_via_speed
+
+
+def test_direct_approach_speed_profile_slows_into_contact():
+    plan = _builder(_MidpointPlanner()).build(_direct_request(contact_speed_scale=0.4))
+
+    grasp = plan.segment(GraspStage.GRASP)
+    speeds = _segment_speeds(grasp)
+    quarter = max(1, len(speeds) // 4)
+    # The blended descent decelerates as it reaches contact: the final quarter
+    # of the grasp segment is slower than its opening quarter, and it ends at
+    # (near) rest exactly at the grasp pose.
+    assert np.max(speeds[-quarter:]) < np.max(speeds[:quarter])
+    assert _segment_final_speed(grasp) < 0.05
+    # Peak descent speed honours the contact speed cap (0.8 vel * 0.7 scale * 0.4).
+    assert np.max(speeds) <= 0.8 * 0.7 * 0.4 * 1.01
+
+
+def test_direct_approach_flattened_profile_is_velocity_continuous_and_bounded():
+    plan = _builder(_MidpointPlanner()).build(_direct_request(contact_speed_scale=0.6))
+    flattened = plan.flattened()
+
+    assert np.all(np.diff(flattened.times_s) > 0.0)
+    velocity = np.diff(flattened.positions, axis=0) / np.diff(flattened.times_s)[:, None]
+    # No stage anywhere exceeds the base velocity envelope.
+    assert np.max(np.abs(velocity)) <= 0.8 * 0.7 * 1.01
+
+
+def test_direct_approach_preserves_the_reverse_replay_corridor():
+    builder = _builder(_MidpointPlanner())
+    direct = builder.build(_direct_request(direct_approach=True))
+    staged = builder.build(_direct_request(direct_approach=False))
+
+    # Same IK / joint paths: the geometry (standoff corners) is untouched, only
+    # the timing changed.  A reverse joint replay therefore visits the exact
+    # same standoffs whether the plan was blended or staged.
+    for stage in GraspStage:
+        assert np.allclose(
+            direct.segment(stage).goal_joints,
+            staged.segment(stage).goal_joints,
+        )
+        assert np.allclose(
+            direct.segment(stage).start_joints,
+            staged.segment(stage).start_joints,
+        )
+
+    standoffs = [direct.segment(stage).goal_joints for stage in GraspStage]
+    forward = direct.flattened().positions
+    reverse = forward[::-1]
+    for corner in standoffs:
+        assert np.min(np.max(np.abs(forward - corner), axis=1)) < 1e-6
+        assert np.min(np.max(np.abs(reverse - corner), axis=1)) < 1e-6
+
+
+def test_direct_approach_segments_start_and_end_on_exact_checked_joints():
+    plan = _builder(_MidpointPlanner()).build(_direct_request())
+
+    pregrasp = plan.segment(GraspStage.PREGRASP)
+    grasp = plan.segment(GraspStage.GRASP)
+    # The shared standoff via is an exact endpoint of both blended slices.
+    assert np.allclose(pregrasp.trajectory.positions[-1], pregrasp.goal_joints)
+    assert np.allclose(grasp.trajectory.positions[0], grasp.start_joints)
+    assert np.allclose(pregrasp.goal_joints, grasp.start_joints)
+    # The grasp slice terminates exactly at the contact pose joints.
+    assert np.allclose(grasp.trajectory.positions[-1], grasp.goal_joints)
+
+
+def test_direct_approach_replan_from_grasp_falls_back_to_single_descent():
+    builder = _builder(_MidpointPlanner())
+    initial = builder.build(_direct_request(), plan_id="p0")
+
+    measured = initial.segment(GraspStage.PREGRASP).goal_joints + 0.01
+    replanned = builder.replan_remaining(
+        initial,
+        measured,
+        from_stage=GraspStage.GRASP,
+    )
+
+    # Direct mode is propagated across the rolling replan.
+    assert replanned.direct_approach is True
+    assert replanned.contact_speed_scale == initial.contact_speed_scale
+    assert tuple(s.stage for s in replanned.segments) == (GraspStage.GRASP, GraspStage.LIFT)
+    # A lone grasp descent still decelerates to rest at contact.
+    assert _segment_final_speed(replanned.segment(GraspStage.GRASP)) < 0.05
+
+
+def test_direct_approach_can_be_disabled_for_the_staged_fallback():
+    plan = _builder(_MidpointPlanner()).build(_direct_request(direct_approach=False))
+
+    assert plan.direct_approach is False
+    # Every stage stops at rest at its own boundary (classic staged behaviour).
+    for stage in (GraspStage.APPROACH, GraspStage.PREGRASP, GraspStage.GRASP):
+        assert _segment_final_speed(plan.segment(stage)) < 1e-3
+
+
+def test_contact_speed_scale_is_validated():
+    import pytest
+
+    with pytest.raises(ValueError, match="contact speed scale"):
+        _direct_request(contact_speed_scale=0.0)
+    with pytest.raises(ValueError, match="contact speed scale"):
+        _direct_request(contact_speed_scale=1.5)

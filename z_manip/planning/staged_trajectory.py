@@ -46,6 +46,47 @@ class SidePreference(str, Enum):
 _STAGE_ORDER = tuple(GraspStage)
 
 
+def _quintic_blend(u: float) -> float:
+    """Normalized rest-to-rest 5th-order smoothstep ``10u^3-15u^4+6u^5``.
+
+    ``s(0)=0``, ``s(1)=1`` with zero first and second derivative at both ends;
+    peak normalized velocity ``1.875`` and acceleration ``5.774`` at the middle.
+    """
+
+    return (u * u * u) * (10.0 + u * (-15.0 + 6.0 * u))
+
+
+def _inverse_quintic_blend(y: float) -> float:
+    """Return ``u in [0, 1]`` with ``_quintic_blend(u) == y`` (monotone)."""
+
+    if y <= 0.0:
+        return 0.0
+    if y >= 1.0:
+        return 1.0
+    low, high = 0.0, 1.0
+    for _ in range(64):
+        mid = 0.5 * (low + high)
+        if _quintic_blend(mid) < y:
+            low = mid
+        else:
+            high = mid
+    return 0.5 * (low + high)
+
+
+def _interpolate_arclength(path: np.ndarray, cumulative: np.ndarray, arclength: float) -> np.ndarray:
+    """Sample a joint polyline at a cumulative chord length (rides the edges)."""
+
+    total = float(cumulative[-1])
+    clamped = min(max(arclength, 0.0), total)
+    index = int(np.searchsorted(cumulative, clamped, side="right") - 1)
+    index = min(max(index, 0), len(path) - 2)
+    span = float(cumulative[index + 1] - cumulative[index])
+    if span <= 1e-12:
+        return np.array(path[index], dtype=float, copy=True)
+    fraction = (clamped - float(cumulative[index])) / span
+    return path[index] + fraction * (path[index + 1] - path[index])
+
+
 def _readonly_vector(value: object, label: str, dof: int | None = None) -> np.ndarray:
     vector = np.array(value, dtype=float, copy=True)
     expected = (dof,) if dof is not None else None
@@ -141,6 +182,15 @@ class StagedGraspRequest:
     lift_direction: tuple[float, float, float] = (0.0, 0.0, 1.0)
     side_preference: SidePreference = SidePreference.AUTO
     side_entry_offset_m: float = 0.0
+    # Direct-approach is the accuracy default: the pregrasp standoff becomes a
+    # velocity-continuous via inside one blended descent into contact, instead
+    # of a full stop before the final approach.  ``direct_approach=False`` keeps
+    # the classic per-stage rest-to-rest fallback.
+    direct_approach: bool = True
+    # Peak descent speed multiplier applied to the blended pregrasp->grasp
+    # segment so the tool creeps into contact for accuracy.  The quintic already
+    # decelerates to zero exactly at the grasp pose; this caps the peak.
+    contact_speed_scale: float = 0.5
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -149,6 +199,7 @@ class StagedGraspRequest:
             _readonly_vector(self.current_joints, "current joints"),
         )
         object.__setattr__(self, "side_preference", SidePreference(self.side_preference))
+        object.__setattr__(self, "direct_approach", bool(self.direct_approach))
         positive = (
             self.pregrasp_offset_m,
             self.approach_clearance_m,
@@ -156,6 +207,8 @@ class StagedGraspRequest:
         )
         if any(not np.isfinite(value) or value <= 0.0 for value in positive):
             raise ValueError("pregrasp, approach, and lift distances must be positive")
+        if not np.isfinite(self.contact_speed_scale) or not 0.0 < self.contact_speed_scale <= 1.0:
+            raise ValueError("contact speed scale must be within (0, 1]")
         if not np.isfinite(self.side_entry_offset_m) or self.side_entry_offset_m < 0.0:
             raise ValueError("side entry offset must be finite and non-negative")
         direction = np.asarray(self.lift_direction, dtype=float)
@@ -216,6 +269,11 @@ class StagedGraspTrajectory:
     lift_distance_m: float = 0.10
     lift_direction: tuple[float, float, float] = (0.0, 0.0, 1.0)
     side_entry_offset_m: float = 0.0
+    # Records which approach mode produced this plan so the executor receipt /
+    # trace can attest it: ``True`` == one blended pregrasp->grasp descent,
+    # ``False`` == the legacy discrete pregrasp stop.
+    direct_approach: bool = True
+    contact_speed_scale: float = 0.5
     schema: str = "z_manip.staged_grasp_trajectory.v1"
 
     def __post_init__(self) -> None:
@@ -382,6 +440,106 @@ class StagedGraspTrajectoryBuilder:
             self.time_config,
         )
 
+    def _retime_direct_pair(
+        self,
+        pregrasp_path: np.ndarray,
+        grasp_path: np.ndarray,
+        *,
+        contact_speed_scale: float,
+    ) -> tuple[TimedJointTrajectory, TimedJointTrajectory]:
+        """Retime the pregrasp->grasp descent as ONE blended, sliced profile.
+
+        The two collision-checked joint sub-paths are concatenated into a single
+        polyline whose shared standoff vertex becomes an interior *via* rather
+        than a stop.  A single rest-to-rest quintic in cumulative chord length
+        keeps a non-zero velocity through that via and decelerates smoothly to
+        zero exactly at the grasp contact; ``contact_speed_scale`` caps the peak
+        so the tool creeps into contact.  The dense samples are then sliced back
+        at the via into the pregrasp and grasp segment trajectories so the plan
+        keeps its four-stage structure (and its reverse-replay corridor) while
+        the flattened trajectory is one continuous velocity profile.
+
+        The geometry is untouched: the samples ride the exact checked polyline
+        edges, so collision coverage is identical to the staged fallback.
+        """
+
+        pregrasp = np.asarray(pregrasp_path, dtype=float)
+        grasp = np.asarray(grasp_path, dtype=float)
+        # Continuous polyline through the shared standoff via (dropped duplicate).
+        full = np.vstack((pregrasp, grasp[1:]))
+        via_index = len(pregrasp) - 1
+        edges = np.diff(full, axis=0)
+        edge_lengths = np.linalg.norm(edges, axis=1)
+        cumulative = np.concatenate(([0.0], np.cumsum(edge_lengths)))
+        total = float(cumulative[-1])
+        via_arclength = float(cumulative[via_index])
+        if (
+            total < 1e-9
+            or via_arclength <= 1e-9
+            or via_arclength >= total - 1e-9
+        ):
+            # Degenerate corridor (no real standoff separation): fall back to the
+            # conservative per-segment rest-to-rest retiming.
+            return self._retime(pregrasp), self._retime(grasp)
+
+        active = edge_lengths > 1e-12
+        slope = np.zeros_like(edges)
+        slope[active] = edges[active] / edge_lengths[active, None]
+        max_slope = np.max(np.abs(slope), axis=0)
+        # Peak speed of the single quintic over the whole descent is capped so no
+        # joint exceeds its (contact-scaled) velocity or its acceleration limit.
+        velocity = (
+            self.velocity_limits
+            * self.time_config.velocity_scale
+            * float(contact_speed_scale)
+        )
+        acceleration = self.acceleration_limits * self.time_config.acceleration_scale
+        with np.errstate(divide="ignore", invalid="ignore"):
+            duration_velocity = float(np.max(1.875 * total * max_slope / velocity))
+            duration_acceleration = float(
+                np.max(np.sqrt(5.774 * total * max_slope / acceleration)),
+            )
+        duration = max(
+            self.time_config.min_segment_time_s,
+            duration_velocity,
+            duration_acceleration,
+        )
+
+        via_time = _inverse_quintic_blend(via_arclength / total) * duration
+        samples = max(2, int(np.ceil(duration / self.time_config.sample_period_s)) + 1)
+        grid = np.linspace(0.0, duration, samples)
+        # Guarantee the via is an exact sample so the slice endpoints land on the
+        # true standoff joints; drop any grid point that would collide with it.
+        keep = np.abs(grid - via_time) > 1e-6
+        times = np.sort(np.concatenate((grid[keep], (via_time,))))
+        positions = np.stack([
+            _interpolate_arclength(
+                full,
+                cumulative,
+                _quintic_blend(sample_time / duration) * total,
+            )
+            for sample_time in times
+        ])
+
+        boundary = int(np.searchsorted(times, via_time))
+        pregrasp_positions = positions[: boundary + 1].copy()
+        grasp_positions = positions[boundary:].copy()
+        # Pin the shared endpoints to the exact checked joints (kill float drift).
+        pregrasp_positions[0] = full[0]
+        pregrasp_positions[-1] = full[via_index]
+        grasp_positions[0] = full[via_index]
+        grasp_positions[-1] = full[-1]
+        return (
+            TimedJointTrajectory(
+                positions=pregrasp_positions,
+                times_s=times[: boundary + 1].copy(),
+            ),
+            TimedJointTrajectory(
+                positions=grasp_positions,
+                times_s=times[boundary:] - via_time,
+            ),
+        )
+
     @staticmethod
     def _poses(request: StagedGraspRequest) -> dict[GraspStage, np.ndarray]:
         grasp = np.array(request.target.grasp_pose, copy=True)
@@ -423,20 +581,47 @@ class StagedGraspTrajectoryBuilder:
         selected = GraspStage(start_stage)
         start_index = _STAGE_ORDER.index(selected)
         poses = self._poses(request)
-        segments: list[GraspTrajectorySegment] = []
+        # First resolve every stage's collision-checked joint path, then retime.
+        # Splitting the two phases lets the direct-approach mode fuse the
+        # pregrasp and grasp descents into one blended, velocity-continuous
+        # profile without duplicating IK or path planning.
+        stage_paths: dict[GraspStage, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         for stage in _STAGE_ORDER[start_index:]:
             goal = self._solve(poses[stage], current)
             path = self._path(current, goal)
-            segments.append(
-                GraspTrajectorySegment(
-                    stage=stage,
-                    target_pose=poses[stage],
-                    start_joints=current,
-                    goal_joints=goal,
-                    trajectory=self._retime(path),
-                ),
-            )
+            stage_paths[stage] = (current, goal, path)
             current = goal
+
+        use_direct = (
+            request.direct_approach
+            and GraspStage.PREGRASP in stage_paths
+            and GraspStage.GRASP in stage_paths
+        )
+        trajectories: dict[GraspStage, TimedJointTrajectory] = {}
+        if use_direct:
+            _, _, pregrasp_path = stage_paths[GraspStage.PREGRASP]
+            _, _, grasp_path = stage_paths[GraspStage.GRASP]
+            pregrasp_traj, grasp_traj = self._retime_direct_pair(
+                pregrasp_path,
+                grasp_path,
+                contact_speed_scale=request.contact_speed_scale,
+            )
+            trajectories[GraspStage.PREGRASP] = pregrasp_traj
+            trajectories[GraspStage.GRASP] = grasp_traj
+        for stage, (_, _, path) in stage_paths.items():
+            if stage not in trajectories:
+                trajectories[stage] = self._retime(path)
+
+        segments: list[GraspTrajectorySegment] = [
+            GraspTrajectorySegment(
+                stage=stage,
+                target_pose=poses[stage],
+                start_joints=start_joints,
+                goal_joints=goal_joints,
+                trajectory=trajectories[stage],
+            )
+            for stage, (start_joints, goal_joints, _) in stage_paths.items()
+        ]
         return StagedGraspTrajectory(
             plan_id=plan_id or uuid4().hex,
             revision=int(revision),
@@ -449,6 +634,8 @@ class StagedGraspTrajectoryBuilder:
             lift_distance_m=request.lift_distance_m,
             lift_direction=request.lift_direction,
             side_entry_offset_m=request.side_entry_offset_m,
+            direct_approach=request.direct_approach,
+            contact_speed_scale=request.contact_speed_scale,
         )
 
     def replan_remaining(
@@ -463,6 +650,8 @@ class StagedGraspTrajectoryBuilder:
         lift_distance_m: float | None = None,
         lift_direction: tuple[float, float, float] | None = None,
         side_entry_offset_m: float | None = None,
+        direct_approach: bool | None = None,
+        contact_speed_scale: float | None = None,
     ) -> StagedGraspTrajectory:
         """Replace a remaining suffix from a fresh measured joint boundary."""
 
@@ -495,6 +684,16 @@ class StagedGraspTrajectoryBuilder:
                 previous.side_entry_offset_m
                 if side_entry_offset_m is None
                 else side_entry_offset_m
+            ),
+            direct_approach=(
+                previous.direct_approach
+                if direct_approach is None
+                else direct_approach
+            ),
+            contact_speed_scale=(
+                previous.contact_speed_scale
+                if contact_speed_scale is None
+                else contact_speed_scale
             ),
         )
         return self.build(

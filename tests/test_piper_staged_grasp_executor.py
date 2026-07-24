@@ -927,6 +927,126 @@ def test_approach_moves_then_closes_to_width_based_target(tmp_path):
     assert robot.estops == 0
 
 
+def test_approach_close_receipt_records_streamed_by_default_and_stepped_fallback(tmp_path):
+    report, archive, _ = make_artifact(tmp_path, start=Q_PRE, pregrasp=Q_PRE)
+    artifact = load_artifact(report, archive, stage="approach_close")
+
+    streamed = EXECUTOR.build_receipt(
+        artifact=artifact, stage="approach_close", prior=None,
+        started_unix_ns=1, finished_unix_ns=2, final_joints_rad=Q_GRASP, gripper=None,
+    )
+    stepped = EXECUTOR.build_receipt(
+        artifact=artifact, stage="approach_close", prior=None,
+        started_unix_ns=1, finished_unix_ns=2, final_joints_rad=Q_GRASP, gripper=None,
+        approach_execution="stepped",
+    )
+    pregrasp = EXECUTOR.build_receipt(
+        artifact=artifact, stage="pregrasp", prior=None,
+        started_unix_ns=1, finished_unix_ns=2, final_joints_rad=Q_GRASP, gripper=None,
+    )
+
+    assert streamed["approach_execution"] == "streamed"
+    assert stepped["approach_execution"] == "stepped"
+    # The additive attestation only appears on the grasp-descent stage.
+    assert "approach_execution" not in pregrasp
+
+
+def test_staged_approach_stop_fallback_still_steps_and_closes(tmp_path):
+    report, archive, _ = make_artifact(tmp_path, start=Q_PRE, pregrasp=Q_PRE)
+    artifact = load_artifact(report, archive, stage="approach_close")
+    path = np.asarray(artifact.arrays["approach_raw"])
+    events: list[tuple] = []
+    robot = FakeRobot(Q_PRE, events)
+    effector = FakeEffector(events, aperture_m=0.07, force_n=0.0)
+    clock = FakeClock()
+
+    final, feedback = EXECUTOR.execute_stage(
+        robot,
+        effector,
+        artifact,
+        "approach_close",
+        path,
+        direct_approach=False,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    names = [event[0] for event in events]
+    assert names.index("move_j") < names.index("gripper")
+    np.testing.assert_allclose(final, Q_GRASP)
+    assert feedback.force_n >= 0.2
+    assert robot.estops == 0
+
+
+def test_direct_approach_streams_exact_grasp_target_a_stepped_path_would_skip(tmp_path):
+    # The final grasp target sits within one feedback tolerance of the prior
+    # waypoint.  The legacy stepped path skips commanding it (stopping the tool
+    # short and closing there); the streamed direct approach drives the tool
+    # onto the exact planned contact pose.
+    q_pre = Q_PRE
+    q_grasp = Q_GRASP
+    q_near = q_grasp + np.asarray((0.008, -0.006, 0.005, 0.0, 0.0, 0.0))
+    assert float(np.max(np.abs(q_near - q_grasp))) < EXECUTOR.DEFAULT_FEEDBACK_TOLERANCE_RAD
+
+    transit = np.vstack((Q_START, q_pre))
+    approach = np.vstack((q_pre, q_near, q_grasp))
+    lift = np.vstack((q_grasp, Q_LIFT))
+    npz_path = tmp_path / "planned_grasp.npz"
+    np.savez_compressed(
+        npz_path,
+        transit=transit, transit_times_s=np.asarray((0.0, 1.0)),
+        approach=approach, approach_times_s=np.asarray((0.0, 1.0, 2.0)),
+        lift=lift, lift_times_s=np.asarray((0.0, 1.0)),
+        transit_raw=transit, approach_raw=approach, lift_raw=lift,
+        current_joints=Q_START, measured_joints=Q_START,
+    )
+    digest = _sha256(npz_path)
+    report = {
+        "read_only": True, "planning_only": True, "motion_commands_published": 0,
+        "plan_valid": True, "source_stamp_ns": time.time_ns(),
+        "current_joints_rad": Q_START.tolist(), "measured_joints_rad": Q_START.tolist(),
+        "planning_start_joints_rad": Q_START.tolist(),
+        "start_limit_projection_rad": np.zeros(6).tolist(),
+        "execution_start_requires_limit_reconciliation": False,
+        "raw_paths_collision_validated": True,
+        "transit_raw_waypoints": len(transit),
+        "approach_raw_waypoints": len(approach),
+        "lift_raw_waypoints": len(lift),
+        "required_width_m": 0.03,
+        "planned_grasp_sha256": digest,
+    }
+    report_path = tmp_path / "planning_report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    artifact = load_artifact(report_path, npz_path, stage="approach_close")
+    path = np.asarray(artifact.arrays["approach_raw"])
+
+    stepped_events: list[tuple] = []
+    stepped_robot = FakeRobot(q_pre, stepped_events)
+    stepped_final, _ = EXECUTOR.execute_stage(
+        stepped_robot,
+        FakeEffector(stepped_events, aperture_m=0.07, force_n=0.0),
+        artifact, "approach_close", path,
+        direct_approach=False,
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    stepped_targets = [event[1] for event in stepped_events if event[0] == "move_j"]
+    assert not any(np.allclose(target, q_grasp) for target in stepped_targets)
+    np.testing.assert_allclose(stepped_final, q_near)
+
+    streamed_events: list[tuple] = []
+    streamed_robot = FakeRobot(q_pre, streamed_events)
+    streamed_final, _ = EXECUTOR.execute_stage(
+        streamed_robot,
+        FakeEffector(streamed_events, aperture_m=0.07, force_n=0.0),
+        artifact, "approach_close", path,
+        direct_approach=True,
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    streamed_targets = [event[1] for event in streamed_events if event[0] == "move_j"]
+    assert any(np.allclose(target, q_grasp) for target in streamed_targets)
+    np.testing.assert_allclose(streamed_final, q_grasp)
+
+
 def test_lift_rechecks_nonempty_grasp_before_and_after_motion(tmp_path):
     report, archive, _ = make_artifact(tmp_path)
     artifact = load_artifact(report, archive, stage="lift")
