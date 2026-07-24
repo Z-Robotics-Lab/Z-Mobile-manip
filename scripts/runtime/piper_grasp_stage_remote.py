@@ -31,6 +31,27 @@ REMOTE_ROOT = "/home/yusenzlabnuc/z-manip-runtime/grasp-actions"
 STAGE_MAX_AGE_S = {"pregrasp": 30.0, "approach_close": 180.0, "lift": 180.0}
 
 
+def _mux_options() -> list[str]:
+    """SSH connection-multiplexing options shared by every ssh/scp call.
+
+    Each stage makes five short ssh/scp calls (mkdir, upload, the executor
+    call, the receipt fetch, cleanup) and a grasp drives three stages as
+    separate processes.  Over the WiFi link to the NUC a cold SSH handshake
+    costs ~0.40s while a multiplexed call costs ~0.01-0.03s; reusing one
+    persisted master across every call -- and across the successive stage
+    processes -- collapses that tax to a single connect per grasp.  Shares the
+    dedicated ``grasp`` control path used by ``piper_full_grasp_remote`` and
+    mirrors the perception path; transport only, no remote command or
+    fail-closed gate changes.
+    """
+
+    return [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=60",
+        "-o", f"ControlPath={NUC_KEY.parent / 'z-manip-grasp-%C'}",
+    ]
+
+
 class RemoteStageError(RuntimeError):
     """The fixed remote stage failed before producing a verified receipt."""
 
@@ -105,13 +126,16 @@ def execute_remote_stage(
 
     action_id = f"{time.time_ns()}-{secrets.token_hex(5)}"
     remote_dir = f"{REMOTE_ROOT}/{action_id}"
+    mux = _mux_options()
     ssh_base = [
         "ssh", "-i", str(NUC_KEY), "-o", "BatchMode=yes",
-        "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5", NUC_HOST,
+        "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5",
+        *mux, NUC_HOST,
     ]
     scp_base = [
         "scp", "-q", "-i", str(NUC_KEY), "-o", "BatchMode=yes",
         "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5",
+        *mux,
     ]
     mkdir = _run([*ssh_base, f"mkdir -p {shlex.quote(remote_dir)}"], timeout=10.0, capture=True)
     if mkdir.returncode != 0:

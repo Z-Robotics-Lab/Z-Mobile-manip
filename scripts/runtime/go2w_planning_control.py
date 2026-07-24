@@ -104,6 +104,13 @@ MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 2.0
 # This changes detection latency only; the source epoch, six-joint, freshness,
 # read-only, zero-command, and downstream limit gates remain unchanged.
 MOBILE_HANDOFF_JOINT_READY_POLL_S = 0.01
+# Poll interval for the pre-approach passive-joint-freshness gate
+# (_wait_for_joint_feedback).  The passive observer publishes at ~20 Hz and the
+# freshness bound is 1 s, so the previous 0.5 s poll added up to ~0.5 s of pure
+# idle-wait before the visual approach could start even once fresh joints had
+# arrived.  0.1 s still reads a small local JSON well under the data cadence and
+# only shortens detection latency; the freshness/epoch gates are unchanged.
+APPROACH_JOINT_FEEDBACK_POLL_S = 0.1
 MOBILE_HANDOFF_CAPTURE_MAX_SKEW_S = 1.0
 MAX_HANDOFF_EVIDENCE_BYTES = 512 * 1024
 # Default dwell at Home while holding the object between the carry-home and
@@ -1765,7 +1772,7 @@ class DepthServoRunner:
                     "Waiting for passive joint feedback before starting the "
                     "visual approach."
                 )
-            time.sleep(0.5)
+            time.sleep(APPROACH_JOINT_FEEDBACK_POLL_S)
         return "cancelled while waiting for passive joint feedback"
 
     def _supervise(self, mode: str, acquire_target: bool) -> None:
@@ -4026,6 +4033,27 @@ def _runtime_handler(
     """Add fixed-path runtime, camera, and read-only session endpoints."""
 
     class RuntimeDashboardHandler(base_handler):
+        def handle_one_request(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            # The dashboard status pollers hit /api/*/status about once a second
+            # and routinely drop the socket while the server is still writing --
+            # on a page reload, navigation, or tab close.  socketserver turns the
+            # resulting BrokenPipe/ConnectionReset into an unhandled-exception
+            # stack trace per disconnect (~150 traces in a two-hour 2026-07-24
+            # workbench window, every one a benign client hangup).  Swallow only
+            # those two connection-teardown errors, mark the connection closed,
+            # and leave a single concise line so genuine handler faults still
+            # surface with their full traceback.
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError) as error:
+                self.close_connection = True
+                try:
+                    self.log_message(
+                        "client closed connection mid-response: %s", error,
+                    )
+                except Exception:  # pragma: no cover - logging must never raise
+                    pass
+
         def _interactive_error(
             self,
             code: str,
@@ -5571,6 +5599,15 @@ def _make_nuc_base_lock_emit(
     """
 
     log = logger or (lambda _message: None)
+    # Reuse the same persisted SSH master the read-only perception path opens
+    # (FixedReadOnlyBackend._ssh_prefix uses this exact ControlPath).  The lock
+    # is emitted at grasp start, immediately after an approach that has been
+    # driving repeated perception SSH round trips, so the master is warm and the
+    # cold ~0.40s handshake -- which stalled to a 6s ConnectTimeout twice in the
+    # 2026-07-24 workbench journal, leaving the base unlocked and stepping during
+    # the grasp -- is skipped.  This transport is fail-open (a miss never blocks
+    # the grasp), so sharing the perception path is safe.
+    control_path = Path(nuc_key).expanduser().parent / "z-manip-%C"
 
     def emit(command: dict[str, Any]) -> go2w_base_lock.BaseLockAck:
         arguments = [
@@ -5579,6 +5616,9 @@ def _make_nuc_base_lock_emit(
             "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes",
             "-o", "ConnectTimeout=5",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=60",
+            "-o", f"ControlPath={control_path}",
             nuc_host,
             publisher,
             "--lock", "1" if command.get("lock") else "0",

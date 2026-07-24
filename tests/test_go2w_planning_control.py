@@ -4087,3 +4087,95 @@ def test_grasp_status_base_lock_defaults_to_unlocked_without_owner(tmp_path):
     # No base_lock attribute installed (offline / no live service).
     field = runner.status()["base_lock"]
     assert field == {"state": "unlocked", "since_s": None, "source": None}
+
+
+def test_base_lock_transport_reuses_the_perception_control_master(tmp_path, monkeypatch):
+    # The base-lock emit runs at grasp start, right after an approach that has
+    # been driving repeated perception SSH round trips, so it must reuse the same
+    # persisted master (the z-manip-%C control path the read-only perception path
+    # opens) rather than re-pay a cold WiFi handshake that stalled to a 6s
+    # ConnectTimeout twice in the 2026-07-24 workbench journal.
+    key = tmp_path / "id_ed25519_codex_nuc"
+    key.write_text("k", encoding="utf-8")
+    recorded: dict[str, list[str]] = {}
+
+    def fake_run(arguments, **kwargs):
+        recorded["arguments"] = [str(part) for part in arguments]
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=json.dumps({"delivered": True, "nuc_state": "locked"}) + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(CONTROL.subprocess, "run", fake_run)
+    emit = CONTROL._make_nuc_base_lock_emit(nuc_host="user@nuc", nuc_key=str(key))
+    ack = emit({"lock": True, "source": "test", "seq": 1, "lease_s": 120.0})
+
+    assert ack.delivered is True
+    args = recorded["arguments"]
+    assert args[0] == "ssh"
+    assert "ControlMaster=auto" in args
+    assert "ControlPersist=60" in args
+    control_path = next(
+        part.split("=", 1)[1] for part in args if part.startswith("ControlPath=")
+    )
+    assert control_path == str(key.parent / "z-manip-%C")
+
+
+def test_dashboard_handler_swallows_benign_client_disconnect(tmp_path, monkeypatch):
+    runtime_path = tmp_path / "runtime.json"
+    runtime_path.write_text(
+        json.dumps(_runtime_state(time.time_ns())), encoding="utf-8",
+    )
+
+    class FakeControl:
+        def status(self):
+            return {"available": True, "running": False, "state": "idle"}
+
+        def start(self):
+            return {"started": True}
+
+    server = CONTROL.create_server(
+        _bundle(tmp_path / "debug_bundle.json"),
+        port=0,
+        index_path=HTML,
+        control_backend=FakeControl(),
+        runtime_state=runtime_path,
+    )
+    try:
+        handler_cls = server.RequestHandlerClass
+        base = next(
+            cls
+            for cls in handler_cls.__mro__[1:]
+            if "handle_one_request" in cls.__dict__
+        )
+        handler = handler_cls.__new__(handler_cls)
+        handler.close_connection = False
+        logged: list[str] = []
+        handler.log_message = lambda fmt, *args: logged.append(fmt % args)
+
+        calls = {"n": 0}
+
+        def disconnect(_self):
+            calls["n"] += 1
+            raise BrokenPipeError(32, "Broken pipe")
+
+        monkeypatch.setattr(base, "handle_one_request", disconnect)
+
+        # Benign client hangup: swallowed, connection marked closed, one line.
+        handler.handle_one_request()
+        assert calls["n"] == 1
+        assert handler.close_connection is True
+        assert logged and "mid-response" in logged[0]
+
+        # A genuine handler fault must still propagate with its traceback.
+        def real_fault(_self):
+            raise ValueError("boom")
+
+        monkeypatch.setattr(base, "handle_one_request", real_fault)
+        handler.close_connection = False
+        with pytest.raises(ValueError):
+            handler.handle_one_request()
+    finally:
+        server.server_close()

@@ -25,6 +25,31 @@ NUC_KEY = Path(os.environ.get(
 REMOTE_ROOT = "/home/yusenzlabnuc/z-manip-runtime/full-grasp-actions"
 
 
+def _mux_options() -> list[str]:
+    """SSH connection-multiplexing options shared by every ssh/scp call.
+
+    This wrapper makes ~6-10 short ssh/scp calls per leg (mkdir, upload,
+    optional prior upload, the executor call, the receipt probe/fetch retries,
+    and cleanup), and a place-back cycle drives three back-to-back leg
+    processes.  Over the WiFi link to the NUC a cold SSH handshake costs
+    ~0.40s while a call multiplexed onto a persisted master costs ~0.01-0.03s.
+    Reusing one authenticated master across every call -- and persisting it
+    (``ControlPersist``) across the successive leg processes -- collapses that
+    per-handshake tax to a single connect per grasp.  This mirrors the
+    perception path (``FixedReadOnlyBackend._ssh_prefix``) and the wrist-search
+    launcher; a dedicated ``grasp`` control path keeps a wedged motion
+    connection from ever poisoning the perception transport.  Transport only:
+    the remote command, every receipt, and every fail-closed gate are
+    unchanged.
+    """
+
+    return [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=60",
+        "-o", f"ControlPath={NUC_KEY.parent / 'z-manip-grasp-%C'}",
+    ]
+
+
 def run(arguments: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         arguments,
@@ -86,13 +111,16 @@ def main() -> int:
         action_id = f"{time.time_ns()}-{secrets.token_hex(5)}"
         remote_dir = f"{REMOTE_ROOT}/{action_id}"
         remote_receipts = f"{remote_dir}/receipts"
+        mux = _mux_options()
         ssh = [
             "ssh", "-i", str(NUC_KEY), "-o", "BatchMode=yes",
-            "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5", NUC_HOST,
+            "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5",
+            *mux, NUC_HOST,
         ]
         scp = [
             "scp", "-q", "-p", "-i", str(NUC_KEY), "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5",
+            *mux,
         ]
         created = run([*ssh, f"mkdir -p {shlex.quote(remote_dir)}"], timeout=10.0)
         if created.returncode != 0:

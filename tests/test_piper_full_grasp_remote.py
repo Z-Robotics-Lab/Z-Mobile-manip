@@ -45,8 +45,11 @@ class FakeRuns:
         self.execute_raises_timeout = execute_raises_timeout
         self.fetch_attempts = 0
         self.remote_deleted = False
+        self.calls: list[list[str]] = []
 
     def __call__(self, arguments, *, timeout):
+        self.calls.append([str(part) for part in arguments])
+
         def done(rc, out=""):
             return subprocess.CompletedProcess(arguments, rc, stdout=out, stderr=None)
 
@@ -156,3 +159,37 @@ def test_execute_timeout_before_probe_preserves_remote(tmp_path, monkeypatch):
     )
     assert _invoke(tmp_path, monkeypatch, fake) == 2
     assert fake.remote_deleted is False
+
+
+def test_every_ssh_and_scp_call_reuses_one_control_master(tmp_path, monkeypatch):
+    # Over the WiFi link to the NUC a cold SSH handshake costs ~0.40s, so the
+    # ~6-10 ssh/scp calls this wrapper makes per leg (and the three back-to-back
+    # leg processes of a place-back cycle) must multiplex over one persisted
+    # master.  Every ssh/scp invocation has to carry the multiplexing options
+    # against a stable dedicated grasp control path; a bare call would re-pay the
+    # handshake and defeat the persisted socket.
+    fake = FakeRuns(
+        executor_rc=0,
+        probe_rcs=(0,),
+        fetch_rc=0,
+        receipt_dir=tmp_path / "receipts",
+    )
+    assert _invoke(tmp_path, monkeypatch, fake) == 0
+
+    transport_calls = [
+        call for call in fake.calls if call and call[0] in ("ssh", "scp")
+    ]
+    assert transport_calls, "wrapper made no ssh/scp calls"
+    control_paths = set()
+    for call in transport_calls:
+        assert "ControlMaster=auto" in call
+        assert "ControlPersist=60" in call
+        control_path = next(
+            part.split("=", 1)[1]
+            for part in call
+            if part.startswith("ControlPath=")
+        )
+        assert control_path.endswith("z-manip-grasp-%C")
+        control_paths.add(control_path)
+    # One shared socket path for the whole grasp -- not a per-call path.
+    assert len(control_paths) == 1
