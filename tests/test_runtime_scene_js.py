@@ -528,9 +528,11 @@ console.log(JSON.stringify({{again, kept, reset, cleared}}));
     assert result["again"]["live"] is True
     assert result["kept"] == 4
     assert result["reset"]["live"] is True
-    # Toggling the calibration gate rebuilds the model, so the cloud is dropped
-    # until the next observer frame arrives (never silently retained cross-gate).
-    assert result["cleared"] == 0
+    # A gate drop (hand-eye vanishing with the suspended feedback service during
+    # a grasp) is a HOLD, not a teardown: the previously fused cloud — verified
+    # when it entered the model — stays frozen on stage.  The closed gate only
+    # blocks NEW unverified data from being fused (see the locked test above).
+    assert result["cleared"] == 4
 
 
 def test_live_colored_cloud_is_fail_soft_without_a_document():
@@ -808,6 +810,125 @@ console.log(JSON.stringify({{
 
     assert result["coldEmpty"] is True
     assert result["warmEmpty"] is False
+
+
+def test_mid_session_new_bundle_preserves_camera_and_colored_cloud():
+    # Close-range handoff replans create FRESH bundles while the operator is
+    # already viewing session evidence — typically at the exact moment the
+    # hand-eye gate is DOWN (the transform vanishes with the suspended feedback
+    # service mid-grasp).  A session -> session bundle swap must keep the
+    # operator's virtual camera (orbit + framing) verbatim AND keep the live
+    # colored cloud on stage: the held cloud was verified when it was fused, so
+    # only a genuine frame mismatch may withhold it.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+scene.setLiveCameraPose(cameraPose);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+// The operator has orbited away from the defaults.
+scene.orbit.yaw = 1.11; scene.orbit.zoom = 2.2; scene.orbit.panY = -25;
+scene.flush();
+const liveState = scene.getState();
+const mkBundle = id => ({{
+  schema: 'z_manip.debug_bundle.v1',
+  frames: {{ perception: 'camera', planning: 'piper_base_link' }},
+  visualization: {{
+    frame: 'piper_base_link', robot_overlay_allowed: true,
+    scene_cloud: {{ frame: 'piper_base_link', points_xyz_m: [[.2,.1,0],[.3 + id * .01,-.1,.02]] }},
+    reference_axes: [{{ name: 'base', frame: 'piper_base_link', pose: [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]] }}]
+  }}
+}});
+// Grasp begins: feedback suspended, both caller gates drop BEFORE the session
+// activates — the state every mid-grasp bundle is born into.
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:false, cloudExpected:false}});
+const acceptedA = scene.setBundle(mkBundle(1));
+scene.flush();
+const sessionA = scene.getState();
+operations.length = 0;
+// Mid-session replan: a brand-new bundle arrives while session evidence is up.
+const acceptedB = scene.setBundle(mkBundle(2));
+scene.flush();
+const sessionB = scene.getState();
+const drewCloudAfterReplan = operations.some(op => op[0] === 'drawImage');
+console.log(JSON.stringify({{
+  liveState, acceptedA, sessionA, acceptedB, sessionB, drewCloudAfterReplan
+}}));
+"""))
+
+    assert result["acceptedA"]["accepted"] is True
+    assert result["acceptedB"]["accepted"] is True
+    # Virtual camera bit-identical across live -> session -> new mid-session
+    # bundle: orbit and framing never re-fit, never snap.
+    assert result["sessionA"]["orbit"] == result["liveState"]["orbit"]
+    assert result["sessionB"]["orbit"] == result["liveState"]["orbit"]
+    assert result["sessionA"]["framing"] == result["liveState"]["framing"]
+    assert result["sessionB"]["framing"] == result["liveState"]["framing"]
+    # The colored cloud survives both session entries despite the closed gate,
+    # and is actually composited after the replan.
+    assert result["sessionA"]["counts"]["coloredCloudPoints"] == 4
+    assert result["sessionB"]["counts"]["coloredCloudPoints"] == 4
+    assert result["drewCloudAfterReplan"] is True
+
+
+def test_session_view_orientation_is_bit_identical_to_live_view():
+    # One canonical orientation, ever: the session/bundle view renders in the
+    # SAME world orientation as the live view.  Projecting the same fixed world
+    # point (the camera reference 0.4 m straight above the base) in live mode
+    # and then in session mode must land on IDENTICAL raster positions — same
+    # orbit, same framing, same Z-up basis.  A cold-start session (page loaded
+    # mid-task, never live) must use the same canonical basis and default orbit.
+    result = _node(_live_harness(r"""
+const upPose = [[1,0,0,0],[0,1,0,0],[0,0,1,.4],[0,0,0,1]];
+const bundle = {{
+  schema: 'z_manip.debug_bundle.v1',
+  frames: {{ perception: 'camera', planning: 'piper_base_link' }},
+  visualization: {{
+    frame: 'piper_base_link', robot_overlay_allowed: true,
+    scene_cloud: {{ frame: 'piper_base_link', points_xyz_m: [[.2,.1,0],[.3,-.1,.02]] }},
+    reference_axes: [
+      {{ name: 'base', frame: 'piper_base_link', pose: [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]] }},
+      {{ name: 'camera', frame: 'piper_base_link', pose: upPose }}
+    ]
+  }}
+}};
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:false}});
+scene.setLiveCameraPose(upPose);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.flush();
+const findLabel = (ops, text) => ops.filter(op => op[0] === 'fillText').find(op => op[1] === text);
+const liveBase = findLabel(operations, 'base');
+const liveCam = findLabel(operations, 'camera pose');
+operations.length = 0;
+scene.setBundle(bundle);
+scene.flush();
+const sesBase = findLabel(operations, 'base');
+const sesCam = findLabel(operations, 'camera pose');
+// Cold start straight into session evidence (operator reloads mid-task).
+operations.length = 0;
+const scene2 = window.ZManipScene.create(new Canvas(), {{autoResize:false,interactive:false,reducedMotion:true}});
+scene2.setBundle(bundle);
+scene2.flush();
+const coldBase = findLabel(operations, 'base');
+const coldCam = findLabel(operations, 'camera pose');
+console.log(JSON.stringify({{
+  liveBase, liveCam, sesBase, sesCam, coldBase, coldCam,
+  liveOrbit: scene.getState().orbit, coldOrbit: scene2.getState().orbit
+}}));
+"""))
+
+    # Live -> session in one scene: identical raster positions for the same
+    # world points (fillText payload is [text, x, y]).
+    assert result["sesBase"][2:] == result["liveBase"][2:]
+    assert result["sesCam"][2:] == result["liveCam"][2:]
+    # Cold-start session uses the SAME canonical Z-up basis and default orbit as
+    # live: the +z camera renders straight above the base, horizontally aligned.
+    assert result["coldOrbit"] == result["liveOrbit"]
+    assert result["coldCam"][3] < result["coldBase"][3] - 20
+    assert abs(result["coldCam"][2] - result["coldBase"][2]) < 6
 
 
 def test_javascript_syntax_is_valid():

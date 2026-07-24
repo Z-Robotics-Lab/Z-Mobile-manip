@@ -45,12 +45,13 @@
     Object.freeze([0, 0, 1, 0]),
     Object.freeze([0, 0, 0, 1]),
   ]);
-  // Default virtual-camera framing.  The live view stands the operator behind
-  // the robot and slightly elevated (base frame is Z-up; the projection remap in
-  // _worldToView keeps the arm's up axis upright).  The session/bundle view keeps
-  // the original angle so recorded evidence renders exactly as before.
+  // The ONE canonical virtual-camera orbit, shared by the live view and the
+  // session/bundle view: standing behind the robot and slightly elevated (base
+  // frame is Z-up; the projection remap in _worldToView keeps the arm's up axis
+  // upright).  There is deliberately no per-mode default — a mode or phase
+  // switch must never reorient the hero, so both views start here and only the
+  // operator's own orbit input (or "Reset view") ever changes it.
   const LIVE_ORBIT = Object.freeze({ yaw: -0.8, pitch: -0.38, zoom: 1, panX: 0, panY: 0 });
-  const SESSION_ORBIT = Object.freeze({ yaw: -0.72, pitch: -0.46, zoom: 1, panX: 0, panY: 0 });
   // Live auto-fit tuning.  The colored cloud can span a whole room, so the fit
   // ignores cloud points past LIVE_WORK_RADIUS_M of the base, clamps the span so
   // the arm never shrinks below LIVE_ARM_MIN_FRAC of the view, and biases the
@@ -159,7 +160,7 @@
       // hero is never blanked mid-demo.  It stays null until the FIRST real
       // framing is computed, so the cold-start empty state is preserved.
       this._lastFraming = null;
-      this.orbit = Object.assign({}, SESSION_ORBIT);
+      this.orbit = Object.assign({}, LIVE_ORBIT);
       this._drag = null;
       this._listeners = [];
       this._observer = null;
@@ -169,10 +170,11 @@
       // colored cloud is rasterized into an offscreen buffer and composited
       // under the vector overlays so 15-20k points never stall the page.
       this.live = false;
-      // View-orientation flag decoupled from `live`: the Z-up projection remap
-      // persists across a live -> session switch of the SAME world frame so the
-      // operator's viewpoint never flips when a session becomes active.
-      this._zUp = false;
+      // Canonical world basis: the Z-up projection remap applies to EVERY view
+      // (live and session/bundle alike — all scene data is authored in the Z-up
+      // robot base frame) and is never flipped, so mode/phase/bundle switches
+      // can never reorient the world under the operator.
+      this._zUp = true;
       this._liveFramingLocked = false;
       this._liveCloudExpected = false;
       // Camera->base anchor pose for the live colored cloud.  The cloud is
@@ -460,15 +462,16 @@
 
     setBundle(bundle) {
       if (this._destroyed) return { accepted: false, diagnostics: this.getDiagnostics() };
-      // View continuity capture.  When the incoming session bundle is authored
-      // in the SAME world frame the operator is already viewing, the live
-      // colored cloud keeps rendering under the session overlays and the
-      // virtual camera (orbit is never touched here; framing + Z-up remap are
-      // carried below) is preserved so activating a session never jumps the
-      // viewpoint.  A different frame falls back to the original cold-load
-      // behavior: no carried cloud, plain projection, one locked re-fit.
+      // View continuity capture.  The operator's virtual camera (orbit is never
+      // touched here; framing + the canonical Z-up basis are carried below)
+      // survives EVERY bundle transition — live -> session, session -> new
+      // mid-session bundle (close-range handoff replans), and even a bundle in a
+      // MISMATCHED frame: the camera is kept anyway and only what is drawn
+      // changes.  The live colored cloud keeps rendering under the session
+      // overlays whenever the world frame matches (the frame gate below is the
+      // only thing that can withhold it — never a hand-eye flap, whose held
+      // cloud is last-VERIFIED fusion).
       const previousFrame = this.displayFrame;
-      const carryZUp = this._zUp;
       const carryCloudExpected = this._liveCloudExpected;
       const carryCloud = this.model.coloredCloud;
       const carryCloudPose = this._cloudPose;
@@ -476,7 +479,6 @@
       // Leaving live mode keeps the live robot setter gated while session
       // evidence is displayed.
       this.live = false;
-      this._zUp = false;
       this._liveFramingLocked = false;
       this._liveCloudExpected = false;
       this._cloudPose = null;
@@ -490,6 +492,16 @@
       this.displayFrame = normalizeFrame(visualization && visualization.frame);
       if (!this.displayFrame) {
         this._diagnose("MISSING_DISPLAY_FRAME", "visualization.frame is required", "visualization.frame");
+        // Clearing session evidence (setBundle(null) at task end) is a display
+        // transition, not a data fault: hold the operator's camera and the last
+        // fused colored cloud so the hero never flashes empty between the
+        // session ending and the next live tick repopulating the scene.
+        this._framing = carryFraming;
+        this._liveCloudExpected = carryCloudExpected;
+        if (carryCloud) {
+          this.model.coloredCloud = carryCloud;
+          this._cloudPose = carryCloudPose;
+        }
         this.render();
         return { accepted: false, frame: null, diagnostics: this.getDiagnostics() };
       }
@@ -540,25 +552,27 @@
         this._defaultWitness(this.bundle, this._selection.candidateId),
         "planning.rejections.collision_witness",
       );
-      // Same-frame continuity: keep the live colored cloud (only when the
-      // hand-eye gate allowed it in the previous view — camera-frame points are
-      // still never co-drawn on the base grid) and keep the Z-up remap so the
-      // projection basis does not flip under the operator.
+      // Same-frame continuity: keep the live colored cloud + anchor.  The carry
+      // is deliberately independent of the hand-eye gate's CURRENT state — a
+      // held cloud was verified when it was fused (unverified data never enters
+      // the model), and mid-grasp bundles arrive exactly while the gate is
+      // transiently down because the passive feedback service is suspended.
+      // Only a genuine frame mismatch withholds it: a cloud anchored in another
+      // world frame is never co-drawn on this bundle's base grid.
       const continuity = previousFrame !== null && previousFrame === this.displayFrame;
       if (continuity) {
-        this._zUp = carryZUp;
         this._liveCloudExpected = carryCloudExpected;
-        if (carryCloudExpected && carryCloud) {
+        if (carryCloud) {
           this.model.coloredCloud = carryCloud;
           this._cloudPose = carryCloudPose;
         }
       }
-      // Lock auto-framing to the recorded planning bundle. Live depth clouds
-      // contain edge noise and outliers; fitting the virtual camera to every
-      // runtime update makes a stationary robot appear to shake.  Under
-      // same-frame continuity the operator's existing framing is kept verbatim:
-      // "Reset view" is the only recenter.
-      this._framing = continuity && carryFraming ? carryFraming : this._fitLockedFraming();
+      // The operator's framing (virtual camera) is carried VERBATIM whenever one
+      // exists — same frame or not, live or session — so no bundle transition
+      // can recenter, rezoom, or reorient the hero.  The locked fit runs only on
+      // a true cold start into session evidence; live depth clouds contain edge
+      // noise and outliers, and "Reset view" is the only recenter.
+      this._framing = carryFraming || this._fitLockedFraming();
       this.render();
       return {
         accepted: true,
@@ -671,40 +685,33 @@
       // Live -> live on the SAME world frame with only the gates changing: this
       // is a staleness / gate flap during a running grasp (the passive joint
       // feedback service is suspended BY DESIGN while the arm executor owns the
-      // CAN bus, so a stale skeleton mid-motion is the NORMAL state of every
-      // grasp, not a fault).  HOLD the last-known kinematic chain, cloud anchor,
-      // framing and virtual camera instead of tearing the scene down to an empty
-      // model — a frozen skeleton lagging the real arm is accepted, and the plan
-      // ghost conveys intended motion.  The ONLY geometry a gate change may
-      // remove is the colored cloud when the hand-eye safety gate drops
-      // (cloudExpected -> false): a camera-frame cloud must never be co-drawn on
-      // the base grid.  Updates resume seamlessly on the next fresh feed.
+      // CAN bus, so a stale skeleton — and the hand-eye transform vanishing with
+      // it — is the NORMAL state of every grasp, not a fault).  HOLD the
+      // last-known kinematic chain, colored cloud, anchor, framing and virtual
+      // camera instead of tearing the scene down — a frozen scene lagging the
+      // real arm is accepted, and the plan ghost conveys intended motion.  The
+      // held cloud is last-VERIFIED fusion frozen at its verified anchor; the
+      // closed gate only blocks NEW unverified data from being fused (enforced
+      // in setLiveColoredCloud).  Updates resume seamlessly on fresh feed.
       if (this.live && normalizeFrame(this.displayFrame) === frame) {
         this.model.overlayAllowed = overlayAllowed;
         this._liveCloudExpected = cloudExpected;
-        if (!cloudExpected && this.model.coloredCloud) {
-          this.model.coloredCloud = null;
-          this._cloudPose = null;
-        }
         this._scheduleRender();
         return { accepted: true, frame, overlayAllowed, cloudExpected, live: true };
       }
-      const wasLive = this.live;
-      // Session -> live continuity: returning to the live view of the SAME
-      // world frame keeps the operator's camera (orbit + framing) and, when the
-      // hand-eye gate allowed it on both sides, the colored cloud — so toggling
-      // the geometry view never jumps the scene.  Gate toggles while already
-      // live keep the original rebuild semantics.
-      const continuity = !wasLive
-        && normalizeFrame(this.displayFrame) === frame
-        && this._framing !== null;
-      const carryFraming = continuity ? this._framing : null;
-      const carryCloud = continuity && cloudExpected && this._liveCloudExpected
-        ? this.model.coloredCloud
-        : null;
+      // Rebuild (session -> live, or a frame change).  The operator's camera
+      // (orbit untouched + framing carried verbatim) survives EVERY re-entry —
+      // even a frame change keeps the camera and only changes what is drawn.
+      // The colored cloud carries whenever the world frame is unchanged (a
+      // cleared displayFrame of null counts: the held cloud was fused under this
+      // same frame chain); a genuine frame mismatch withholds it so a cloud
+      // anchored in another frame is never co-drawn on this base grid.
+      const sameFrame = this.displayFrame === null
+        || normalizeFrame(this.displayFrame) === frame;
+      const carryFraming = this._framing;
+      const carryCloud = sameFrame ? this.model.coloredCloud : null;
       const carryCloudPose = carryCloud ? this._cloudPose : null;
       this.live = true;
-      this._zUp = true;
       this.bundle = null;
       this.diagnostics = [];
       this._diagnosticKeys.clear();
@@ -721,10 +728,6 @@
       this._cloudPose = carryCloudPose;
       this._framing = carryFraming;
       this._liveFramingLocked = carryFraming !== null;
-      // Snap to the standing-behind default only when first entering live mode
-      // (no continuity view to keep) so operator orbit/zoom persists across data
-      // refreshes, gate toggles, and session round-trips.
-      if (!wasLive && !continuity) this.orbit = Object.assign({}, LIVE_ORBIT);
       this._scheduleRender();
       return { accepted: true, frame, overlayAllowed, cloudExpected, live: true };
     }
@@ -779,8 +782,11 @@
         && xyz && typeof xyz.length === "number" && xyz.length >= total * 3
         && rgb && typeof rgb.length === "number" && rgb.length >= total * 3;
       if (!usable) {
-        const changed = this.model.coloredCloud !== null;
-        this.model.coloredCloud = null;
+        // HOLD, never clear: an unusable push (fresh unverified data, or a
+        // null while the feed pauses) leaves the previously fused cloud — which
+        // was verified when it entered the model — frozen at its last anchor.
+        // The gate withholds only the NEW data; continuity always wins so the
+        // colored cloud survives every phase of the grasp lifecycle.
         if (total > 0 && !this._liveCloudExpected) {
           this._diagnose(
             "CLOUD_FUSION_LOCKED",
@@ -788,13 +794,27 @@
             "live.coloredCloud",
           );
         }
-        if (changed) this._scheduleRender();
-        return 0;
+        return this.model.coloredCloud ? this.model.coloredCloud.count : 0;
       }
       this.model.coloredCloud = { xyz, rgb, count: total };
       this._ensureLiveFraming();
       this._scheduleRender();
       return total;
+    }
+
+    setLiveCloudGate(value) {
+      // Session-mode counterpart of enterLiveMode's cloudExpected option.
+      // While SESSION evidence is displayed the live entry point is never
+      // re-run, so a bundle born mid-grasp (hand-eye transiently down while the
+      // feedback service is suspended) would otherwise leave the hard fusion
+      // gate closed for the whole session and freeze the cloud even after
+      // verification returns.  The caller re-arms (or closes) the gate here as
+      // the measured hand-eye verification comes and goes; closing it never
+      // clears the held cloud — it only blocks NEW unverified data (see
+      // setLiveColoredCloud).  Live mode ignores this: enterLiveMode owns it.
+      if (this._destroyed || this.live) return this._liveCloudExpected;
+      this._liveCloudExpected = value === true;
+      return this._liveCloudExpected;
     }
 
     _ensureLiveFraming() {
@@ -1114,7 +1134,9 @@
     }
 
     resetView() {
-      this.orbit = Object.assign({}, this.live || this._zUp ? LIVE_ORBIT : SESSION_ORBIT);
+      // One canonical orbit for every mode: resetting in session view lands on
+      // the exact same orientation as resetting in live view.
+      this.orbit = Object.assign({}, LIVE_ORBIT);
       if (this.live) {
         this._liveFramingLocked = false;
         this._framing = null;
@@ -1135,10 +1157,11 @@
       let y = value[1] - center[1];
       let z = value[2] - center[2];
       if (this._zUp) {
-        // The turntable projection is Y-up, but the live base frame is Z-up.
+        // The turntable projection is Y-up, but the robot base frame is Z-up.
         // Remap robot(x, y, z) -> render(x, z, -y) so the robot's up axis renders
         // straight up and the floor (base z=0 plane) reads as horizontal ground.
-        // _zUp (not `live`) so the basis survives a same-frame session switch.
+        // _zUp is the canonical always-on basis shared by live AND session views
+        // so no mode/phase/bundle switch can ever flip the world orientation.
         const ry = z;
         const rz = -y;
         y = ry;

@@ -1638,13 +1638,12 @@
       const context = ensureLiveMode();
       if (!context) return;
       const cloud = state.liveColoredCloud;
-      // Only a verified, base-transformed cloud is fed to the shared scene.  When
-      // the hand-eye transform is not verified the cloud is withheld here (and the
-      // module drops it too), and stays visible only in the left color-cloud tile.
-      if (!context.verified || !cloud || !cloud.count) {
-        context.scene.setLiveColoredCloud(null, null, 0);
-        return;
-      }
+      // Only a verified, base-transformed cloud is fed to the shared scene.
+      // HOLD, never clear: while hand-eye verification pauses (the transform
+      // vanishes with the suspended feedback service during every grasp) or no
+      // fresh frame exists, skip the push — the module keeps the frozen
+      // last-verified cloud on stage so the hero never loses color mid-phase.
+      if (!context.verified || !cloud || !cloud.count) return;
       // The scene composes camera->base at DRAW time from the freshest pose, so
       // the raw camera-frame cloud is passed with the CURRENT hand-eye pose and
       // a moving base sweeps the whole environment, not just the tracked target.
@@ -1667,10 +1666,16 @@
       const cloud = state.liveColoredCloud;
       const sessionFrame = state.bundle?.visualization?.frame;
       const frameMatch = Boolean(sessionFrame) && liveBaseFrame(runtime) === sessionFrame;
-      if (!verified || !frameMatch || !cloud || !cloud.count) {
-        scene.setLiveColoredCloud(null, null, 0);
-        return;
-      }
+      // Keep the module's hard fusion gate tracking CURRENT verification: a
+      // bundle born mid-grasp carries a closed gate (hand-eye down while the
+      // feedback service is suspended), and without this re-arm fresh verified
+      // clouds would stay locked out for the rest of the session.
+      if (typeof scene.setLiveCloudGate === "function") scene.setLiveCloudGate(verified && frameMatch);
+      // HOLD, never clear: no fresh verified same-frame cloud -> skip the push;
+      // the module keeps the frozen last-verified cloud so session sub-phases
+      // (planning / handoff replans / grasp) never fall back to the white mask
+      // points as the primary cloud.
+      if (!verified || !frameMatch || !cloud || !cloud.count) return;
       // Raw camera-frame cloud + CURRENT pose: the module re-anchors at draw
       // time (updating only its cloud anchor in session mode — the recorded
       // bundle's capture-time camera frustum stays untouched).
@@ -1746,8 +1751,10 @@
       if (!chip) return;
       const runtime = state.runtime;
       const held = (state.runtimeScene?.getState?.().counts?.actualLinks || 0) > 0;
-      const holding = state.geometryMode === "live"
-        && runtime?.status === "live"
+      // Mode-independent: the SESSION view's live-joint overlay freezes on the
+      // same stale-feedback condition as the live skeleton, so the chip reports
+      // the hold in both views — one continuous scene, one consistent signal.
+      const holding = runtime?.status === "live"
         && !liveSkeletonAvailable(runtime)
         && held;
       chip.hidden = !holding;
