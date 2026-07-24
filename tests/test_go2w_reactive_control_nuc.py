@@ -409,3 +409,69 @@ def test_pc_relay_allows_only_known_ai_w_epoch_to_negotiate_euler():
     status["capabilities"]["euler_state"] = "UNKNOWN"
     status["transport"]["motion_mode"]["robot_code"] = 3203
     assert not bridge.euler_negotiation_is_allowed(status)
+
+
+# ---------------------------------------------------------------------------
+# Base body-posture lock integration (source-level; the live module cannot be
+# imported without rclpy/unitree, matching this file's existing convention).
+# ---------------------------------------------------------------------------
+
+INSTALL = ROOT / "scripts/runtime/install_go2w_reactive_runtime.sh"
+BASE_LOCK_PUBLISH = ROOT / "scripts/runtime/go2w_base_lock_publish.py"
+BASE_LOCK_PUBLISH_SH = ROOT / "scripts/runtime/go2w_base_lock_publish.sh"
+
+
+def test_live_node_subscribes_to_the_base_lock_command_channel():
+    source = SOURCE.read_text(encoding="utf-8")
+    # The command reuses the existing /go2w/* control channel, not a new one.
+    assert "BASE_LOCK_COMMAND_TOPIC = go2w_base_lock.BASE_LOCK_COMMAND_TOPIC" in source
+    assert "self.create_subscription(String, BASE_LOCK_COMMAND_TOPIC, self._base_lock_command, qos)" in source
+    assert "self._base_lock = BaseLockLatch()" in source
+
+
+def test_base_lock_rejects_cmd_vel_as_defense_in_depth():
+    source = SOURCE.read_text(encoding="utf-8")
+    # Both the live transport gate and the shadow observer refuse motion while
+    # the base is locked -- on top of the static SPORT stance.
+    assert "if self._stop_latched or self._base_lock.locked():" in source
+    # Full Stop and base lock are independent latches, so the live cmd_vel gate
+    # must check both.
+    assert source.count("self._base_lock.locked()") >= 2
+
+
+def test_base_lock_status_is_published_and_watchdog_is_polled():
+    source = SOURCE.read_text(encoding="utf-8")
+    assert '"base_lock": self._base_lock.status_field(),' in source
+    # The 10 Hz status timer also expires the lease if the PC stops heartbeating.
+    assert 'self._base_lock.poll() == "watchdog_expired"' in source
+    assert '_on_base_lock_released(reason="watchdog_expired")' in source
+
+
+def test_base_lock_engages_stopmove_then_capability_probed_stand():
+    source = SOURCE.read_text(encoding="utf-8")
+    assert 'BASE_LOCK_STANCE_CMD = "StandUp"' in source
+    assert 'BASE_LOCK_RELEASE_CMD = "BalanceStand"' in source
+    # Zero velocity first, then probe the joint-lock stand capability.
+    assert 'await self._request_sport("StopMove", {})' in source
+    assert "stance_id = SPORT_CMD.get(BASE_LOCK_STANCE_CMD)" in source
+    # A wheeled service that answers 3203 falls back to StopMove-hold and
+    # records the residual balance micro-motion instead of failing.
+    assert "code == RPC_ERR_SERVER_API_NOT_IMPL" in source
+    assert "note_stance(" in source
+    assert "residual balance micro-motion" in source
+    # Release restores a movable stance so the base is never stranded locked.
+    assert "release_id = SPORT_CMD.get(BASE_LOCK_RELEASE_CMD)" in source
+
+
+def test_install_script_deploys_the_base_lock_runtime_to_the_nuc():
+    install = INSTALL.read_text(encoding="utf-8")
+    assert BASE_LOCK_PUBLISH.is_file()
+    assert BASE_LOCK_PUBLISH_SH.is_file()
+    for name in (
+        "go2w_base_lock.py",
+        "go2w_base_lock_publish.py",
+        "go2w_base_lock_publish.sh",
+    ):
+        assert name in install, f"install script must scp {name} to the NUC"
+    # The publisher wrapper must be made executable on the NUC.
+    assert 'go2w_base_lock_publish.sh"' in install

@@ -17,6 +17,9 @@ SCP=(scp -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5)
 "${SCP[@]}" \
   "$SCRIPT_DIR/go2w_reactive_control_nuc.py" \
   "$SCRIPT_DIR/go2w_reactive_control_nuc.sh" \
+  "$SCRIPT_DIR/go2w_base_lock.py" \
+  "$SCRIPT_DIR/go2w_base_lock_publish.py" \
+  "$SCRIPT_DIR/go2w_base_lock_publish.sh" \
   "$SCRIPT_DIR/piper_reactive_view_executor.py" \
   "$SCRIPT_DIR/piper_reactive_view_executor.sh" \
   "$SCRIPT_DIR/piper_staged_grasp_executor.py" \
@@ -51,6 +54,8 @@ SCP=(scp -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5)
   chmod 0755 \
     "$HOME/.local/lib/z-mobile-manip/go2w_reactive_control_nuc.sh" \
     "$HOME/.local/lib/z-mobile-manip/go2w_reactive_control_nuc.py" \
+    "$HOME/.local/lib/z-mobile-manip/go2w_base_lock_publish.sh" \
+    "$HOME/.local/lib/z-mobile-manip/go2w_base_lock_publish.py" \
     "$HOME/.local/lib/z-mobile-manip/piper_reactive_view_executor.sh" \
     "$HOME/.local/lib/z-mobile-manip/piper_reactive_view_executor.py"
   systemctl --user daemon-reload

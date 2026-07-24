@@ -3534,3 +3534,174 @@ def test_monitor_holds_search_through_the_acquisition_grace_window(tmp_path):
     assert search.calls >= 1
     # The sweep must not have started inside the grace window.
     assert search.first_call_s - started_s >= 0.9
+
+
+# ---------------------------------------------------------------------------
+# Base body-posture lock: the servo->grasp handoff worker owns the lock and
+# releases it on every exit path.
+# ---------------------------------------------------------------------------
+
+class _FakeBaseLock:
+    """Records lock/unlock calls in order; optionally raises to prove fail-open."""
+
+    def __init__(self, *, raise_on_lock=False):
+        self.calls = []
+        self._raise_on_lock = raise_on_lock
+
+    def request_lock(self, source, *, base_stopped, now=None):
+        self.calls.append(("lock", source, base_stopped))
+        if self._raise_on_lock:
+            raise RuntimeError("simulated lock transport failure")
+        return "locked"
+
+    def request_unlock(self, source, *, now=None):
+        self.calls.append(("unlock", source))
+        return "unlocked"
+
+    def status_field(self, now=None):
+        return {"state": "locked", "since_s": 1.0, "source": "mobile_handoff_grasp"}
+
+
+def _handoff_runner(tmp_path, *, base_lock, execute, sessions, extra_status=None):
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir(exist_ok=True)
+    runner.session_service = sessions
+    runner.base_lock = base_lock
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+    if extra_status:
+        runner._status.update(extra_status)
+    runner._planning_artifacts = lambda attempt: (
+        tmp_path / "planning_report.json",
+        tmp_path / "planned_grasp.npz",
+    )
+
+    class FreshJoints:
+        def current_joint_snapshot(self, *, not_before_unix_ns):
+            return True, "fresh", {
+                "sequence": 1,
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            }
+
+    runner.home_verifier = FreshJoints()
+    runner._validate_mobile_handoff_capture_evidence = lambda **_kwargs: {"validated": True}
+    runner._run_full = execute
+    return runner
+
+
+class _HandoffSessions:
+    def __init__(self):
+        self.events = []
+
+    def clear_current_context(self):
+        self.events.append("clear")
+
+    def start_perception(self, target):
+        self.events.append(("perception", target))
+        return {"status": "succeeded", "session_id": "20260722-120010"}
+
+    def start_planning(self):
+        self.events.append("planning")
+        return {"status": "succeeded", "session_id": "20260722-120011"}
+
+
+def test_mobile_handoff_locks_base_before_executor_and_unlocks_after_home(tmp_path):
+    base_lock = _FakeBaseLock()
+    sessions = _HandoffSessions()
+    order = []
+
+    def execute(**kwargs):
+        order.append("execute")
+        return _executor_start_evidence()
+
+    runner = _handoff_runner(tmp_path, base_lock=base_lock, execute=execute, sessions=sessions)
+    runner._run_mobile_handoff("floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000)
+
+    # Lock is requested exactly once, proving the base is stopped (never during
+    # servo), and unlock is requested exactly once on the success path.
+    assert base_lock.calls[0] == ("lock", "mobile_handoff_grasp", True)
+    assert base_lock.calls[-1] == ("unlock", "mobile_handoff_grasp")
+    assert [c[0] for c in base_lock.calls] == ["lock", "unlock"]
+    # The lock was engaged before the staged executor ran and released after.
+    assert order == ["execute"]
+    status = runner.status()
+    assert status["outcome"] == "passed"
+    assert status["phase"] == "returned_home"
+    # The dashboard status stream carries the lock state.
+    assert status["base_lock"]["state"] == "locked"
+
+
+def test_mobile_handoff_unlocks_base_on_exception(tmp_path):
+    base_lock = _FakeBaseLock()
+    sessions = _HandoffSessions()
+
+    def execute(**_kwargs):
+        raise RuntimeError("executor stopped between close and lift")
+
+    runner = _handoff_runner(tmp_path, base_lock=base_lock, execute=execute, sessions=sessions)
+    runner._run_mobile_handoff("floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000)
+
+    assert base_lock.calls[0][0] == "lock"
+    assert base_lock.calls[-1] == ("unlock", "mobile_handoff_grasp")
+    assert runner.status()["outcome"] == "blocked"
+
+
+def test_mobile_handoff_unlocks_base_on_need_base_approach(tmp_path):
+    base_lock = _FakeBaseLock()
+
+    class NeedApproachSessions(_HandoffSessions):
+        def start_planning(self):
+            self.events.append("planning")
+            return {
+                "status": "blocked",
+                "error": {"code": "NEED_BASE_APPROACH", "message": "out of reach"},
+            }
+
+    def execute(**_kwargs):  # must never run on this path
+        raise AssertionError("executor ran despite NEED_BASE_APPROACH")
+
+    runner = _handoff_runner(
+        tmp_path, base_lock=base_lock, execute=execute, sessions=NeedApproachSessions(),
+    )
+    runner._run_mobile_handoff("floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000)
+
+    # The arm never moved and the base must be freed so it can re-approach.
+    assert base_lock.calls[0][0] == "lock"
+    assert base_lock.calls[-1] == ("unlock", "mobile_handoff_grasp")
+    assert runner.status()["phase"] == "needs_base_approach"
+
+
+def test_mobile_handoff_survives_lock_transport_failure(tmp_path):
+    # A raising lock transport must not brick the grasp (lock is an accuracy
+    # improvement, not a safety gate).
+    base_lock = _FakeBaseLock(raise_on_lock=True)
+    sessions = _HandoffSessions()
+
+    def execute(**_kwargs):
+        return _executor_start_evidence()
+
+    runner = _handoff_runner(tmp_path, base_lock=base_lock, execute=execute, sessions=sessions)
+    runner._run_mobile_handoff("floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000)
+
+    # Lock attempt was made and failed; unlock still runs; the grasp completes.
+    assert base_lock.calls[0][0] == "lock"
+    assert base_lock.calls[-1] == ("unlock", "mobile_handoff_grasp")
+    assert runner.status()["outcome"] == "passed"
+
+
+def test_grasp_status_base_lock_defaults_to_unlocked_without_owner(tmp_path):
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner._lock = threading.Lock()
+    runner._status = {"revision": 0, "running": False, "phase": "idle", "outcome": None}
+    # No base_lock attribute installed (offline / no live service).
+    field = runner.status()["base_lock"]
+    assert field == {"state": "unlocked", "since_s": None, "source": None}

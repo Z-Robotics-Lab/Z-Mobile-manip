@@ -35,15 +35,30 @@ from std_srvs.srv import Trigger
 from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
 from unitree_webrtc_ros.unitree_control import UnitreeControlNode
 
+import go2w_base_lock
+from go2w_base_lock import BaseLockLatch
+
 POSTURE_COMMAND_TOPIC = "/go2w/posture_cmd"
 POSTURE_CANCEL_TOPIC = "/go2w/posture_cancel"
 FULL_STOP_TOPIC = "/go2w/full_stop"
 CONTROL_RESET_TOPIC = "/go2w/control_reset"
 POSTURE_STATE_TOPIC = "/go2w/posture_state"
+BASE_LOCK_COMMAND_TOPIC = go2w_base_lock.BASE_LOCK_COMMAND_TOPIC
 STATUS_SCHEMA = "z_manip.go2w_posture_status.v1"
 LIVE_ACK = "I_UNDERSTAND_GO2W_WILL_MOVE"
 RPC_ERR_SERVER_API_NOT_IMPL = 3203
 MOTION_SWITCHER_CHECK_MODE_API_ID = 1001
+# Base-lock stance choice.  ``StandUp`` is Go2's joint-locked fixed stand: the
+# legs hold a commanded pose and the active balance controller stops issuing
+# the stepping micro-corrections that shake the arm during a grasp.
+# ``BalanceStand`` is the active-balancing stand used to restore normal
+# locomotion-ready behavior on release.  Both are capability-probed against the
+# active motion service exactly like Euler -- a wheeled ``ai-w`` service that
+# answers 3203 (RPC_ERR_SERVER_API_NOT_IMPL) means a true joint-lock stand is
+# unavailable, and the latch falls back to StopMove-hold + cmd_vel rejection
+# with the residual balance micro-motion recorded in the status block.
+BASE_LOCK_STANCE_CMD = "StandUp"
+BASE_LOCK_RELEASE_CMD = "BalanceStand"
 
 
 def _status_code(response: Any) -> int | None:
@@ -214,6 +229,12 @@ class _StatusNode(Node):
         )
         self._last_code: int | None = None
         self._stop_latched = False
+        # Base-lock latch: an independent, self-expiring lock that holds the
+        # base in its stillest stance during a grasp.  It is deliberately NOT
+        # the same primitive as Full Stop -- Full Stop is an emergency latch
+        # that flushes queues, while the base lock is a quiet-stance request
+        # that composes with normal command flow.  Both reject cmd_vel.
+        self._base_lock = BaseLockLatch()
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
@@ -224,6 +245,7 @@ class _StatusNode(Node):
         self.create_subscription(Empty, POSTURE_CANCEL_TOPIC, self._full_stop, qos)
         self.create_subscription(Empty, FULL_STOP_TOPIC, self._full_stop, qos)
         self.create_subscription(Empty, CONTROL_RESET_TOPIC, self._control_reset, qos)
+        self.create_subscription(String, BASE_LOCK_COMMAND_TOPIC, self._base_lock_command, qos)
         self.create_timer(0.10, self._publish_status)
 
     def _validate_posture(self, message: TwistStamped) -> tuple[float, float, float, float]:
@@ -350,6 +372,7 @@ class _StatusNode(Node):
                 "posture" if self._phase in {"commanding", "settling"} else "none"
             ),
             "stop_latched": self._stop_latched,
+            "base_lock": self._base_lock.status_field(),
             "detail": self._detail,
             "body_height": {
                 "current_m": current_height,
@@ -444,9 +467,47 @@ class _StatusNode(Node):
         }
 
     def _publish_status(self) -> None:
+        # Drive the base-lock watchdog on the same 10 Hz cadence.  If the PC
+        # owner stopped renewing the lease (process death / dropped session),
+        # the latch auto-unlocks here and the live subclass restores a
+        # movable stance so the base can never be stranded locked.
+        if self._base_lock.poll() == "watchdog_expired":
+            self.get_logger().warning(
+                "base-lock watchdog expired without an unlock; auto-releasing "
+                "the base stance lock"
+            )
+            self._on_base_lock_released(reason="watchdog_expired")
         message = String()
         message.data = json.dumps(self._status_document(), separators=(",", ":"), allow_nan=False)
         self._posture_pub.publish(message)
+
+    def _base_lock_command(self, message: String) -> None:
+        """Fold one PC-owned lock/unlock command into the latch.
+
+        Malformed or duplicate commands are no-ops (the latch returns
+        ``"ignored"``).  A fresh lock or unlock drives the matching stance hook;
+        the live subclass overrides the hooks with real SPORT calls, while the
+        shadow node only records the state for observability.
+        """
+        try:
+            document = json.loads(message.data)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return
+        event = self._base_lock.apply(document)
+        if event == "locked":
+            self._on_base_lock_engaged(
+                source=str(document.get("source", "unknown")),
+            )
+        elif event == "unlocked":
+            self._on_base_lock_released(reason="unlock_command")
+
+    def _on_base_lock_engaged(self, *, source: str) -> None:
+        """Hook: base lock just latched.  Shadow records; live locks stance."""
+        self._detail = f"base lock engaged by {source!r} (shadow: no transport)"
+
+    def _on_base_lock_released(self, *, reason: str) -> None:
+        """Hook: base lock just released.  Shadow records; live restores stance."""
+        self._detail = f"base lock released ({reason}) (shadow: no transport)"
 
 
 class ShadowReactiveControlNode(_StatusNode):
@@ -460,7 +521,7 @@ class ShadowReactiveControlNode(_StatusNode):
         self.get_logger().warning("SHADOW ONLY: no Unitree WebRTC connection was opened")
 
     def _shadow_move(self, message: TwistStamped) -> None:
-        if self._stop_latched:
+        if self._stop_latched or self._base_lock.locked():
             return
         self._phase = "shadow"
         self._detail = "shadow: Move observed but not transmitted"
@@ -642,7 +703,12 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             return
 
     def cmd_vel_callback(self, message: TwistStamped) -> None:
-        if self._stop_latched:
+        # Defense in depth: even though the base lock engages a static SPORT
+        # stance, reject every velocity command while locked so a stray Move
+        # (or a cmd_vel_guard bypass) can never re-trigger stepping under the
+        # arm.  This is the last producer before the WebRTC transport, so the
+        # gate here is closer to the robot than cmd_vel_guard itself.
+        if self._stop_latched or self._base_lock.locked():
             return
         UnitreeControlNode.cmd_vel_callback(self, message)
 
@@ -957,6 +1023,78 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
         self._stop_latched = False
         self._phase = "idle"
         self._detail = "Full Stop latch released against fresh quiet feedback"
+
+    def _on_base_lock_engaged(self, *, source: str) -> None:
+        """Latch the base into its stillest stance for the grasp window."""
+        self._detail = f"base lock engaged by {source!r}; holding still stance for grasp"
+        if not self.conn or not self.loop:
+            self._base_lock.note_stance(
+                supported=False, residual="WebRTC transport is not ready",
+            )
+            return
+        asyncio.run_coroutine_threadsafe(self._engage_base_lock_stance(), self.loop)
+
+    async def _engage_base_lock_stance(self) -> None:
+        """Zero base velocity, then probe the joint-lock stand capability."""
+        try:
+            # Immediately zero any residual base velocity through the shared
+            # SPORT request lock.  cmd_vel is already rejected while locked, so
+            # nothing competes for the next request slot.
+            await self._request_sport("StopMove", {})
+            stance_id = SPORT_CMD.get(BASE_LOCK_STANCE_CMD)
+            if stance_id is None:
+                self._base_lock.note_stance(
+                    supported=False,
+                    residual=(
+                        f"{BASE_LOCK_STANCE_CMD} api id is unavailable on this "
+                        "connector; StopMove-hold + cmd_vel rejection only"
+                    ),
+                )
+                return
+            code = _status_code(await self._request_sport_api_response(stance_id, {}))
+            if code == 0:
+                self._base_lock.note_stance(supported=True, residual=None)
+            elif code == RPC_ERR_SERVER_API_NOT_IMPL:
+                self._base_lock.note_stance(
+                    supported=False,
+                    residual=(
+                        f"{BASE_LOCK_STANCE_CMD} returned 3203 "
+                        "(RPC_ERR_SERVER_API_NOT_IMPL) on the active motion "
+                        "service; StopMove-hold + cmd_vel rejection only, "
+                        "residual balance micro-motion is possible"
+                    ),
+                )
+            else:
+                self._base_lock.note_stance(
+                    supported=False,
+                    residual=f"{BASE_LOCK_STANCE_CMD} returned code {code}; StopMove-hold only",
+                )
+        except Exception as error:  # noqa: BLE001 - lock is best-effort, never fatal
+            self._base_lock.note_stance(
+                supported=False,
+                residual=f"stance lock request failed: {type(error).__name__}: {error}",
+            )
+
+    def _on_base_lock_released(self, *, reason: str) -> None:
+        """Restore a movable stance so the base is never stranded locked."""
+        self._detail = f"base lock released ({reason}); restoring movable stance"
+        if not self.conn or not self.loop:
+            return
+        asyncio.run_coroutine_threadsafe(self._release_base_lock_stance(), self.loop)
+
+    async def _release_base_lock_stance(self) -> None:
+        try:
+            release_id = SPORT_CMD.get(BASE_LOCK_RELEASE_CMD)
+            if release_id is not None:
+                # Return to the active balance stand so the servo's next Move
+                # can drive the base again.  If BalanceStand is unavailable on
+                # this service, the next cmd_vel Move re-engages locomotion on
+                # its own, so a failure here is only logged.
+                await self._request_sport_api_response(release_id, {})
+        except Exception as error:  # noqa: BLE001
+            self.get_logger().warning(
+                f"base-lock release stance restore failed: {error}"
+            )
 
 
 def _parse_args(args: list[str] | None) -> tuple[argparse.Namespace, list[str]]:

@@ -32,6 +32,7 @@ import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+import go2w_base_lock
 import go2w_debug_ui
 import go2w_interactive_sessions
 import go2w_reactive_supervision
@@ -2105,6 +2106,7 @@ class PiperGraspRunner:
         session_run_root: Path,
         home_runner: PiperHomeRunner,
         home_verifier: MeasuredHomeVerifier | None = None,
+        base_lock: Any | None = None,
     ) -> None:
         self.script = script.expanduser().resolve()
         if not self.script.is_file():
@@ -2119,6 +2121,12 @@ class PiperGraspRunner:
         self.session_run_root = session_run_root.expanduser().resolve()
         self.home_runner = home_runner
         self.home_verifier = home_verifier
+        # Single owner of the Go2W base body-posture lock.  Only the
+        # servo->grasp handoff worker (:meth:`_run_mobile_handoff`) drives it,
+        # and every exit path releases it.  ``None`` disables the feature
+        # (offline/direct callers and existing tests), so the pipeline behaves
+        # exactly as before when no NUC live service is available.
+        self.base_lock = base_lock
         self._lock = threading.Lock()
         self._workflow_path = self.receipt_root / "workflow.json"
         self._workflow: dict[str, Any] = {
@@ -2213,7 +2221,22 @@ class PiperGraspRunner:
                 "holding_object": False,
                 "at_home": True,
             })
-            return {**self._status, "workflow": dict(workflow)}
+            return {
+                **self._status,
+                "workflow": dict(workflow),
+                "base_lock": self._base_lock_status_field(),
+            }
+
+    def _base_lock_status_field(self) -> dict[str, Any]:
+        """Expose the base-lock state for the dashboard status stream.
+
+        Always present (defaults to unlocked) so the UI can render it whether or
+        not a NUC live service / lock owner is wired.
+        """
+        controller = getattr(self, "base_lock", None)
+        if controller is None:
+            return {"state": "unlocked", "since_s": None, "source": None}
+        return controller.status_field()
 
     def _update(self, **values: Any) -> None:
         with self._lock:
@@ -2958,6 +2981,15 @@ class PiperGraspRunner:
             "host_monotonic_clock_domain": "pc_planning_control_process",
         }
         timings: dict[str, float] = {}
+        # Lock the Go2W body posture for the whole grasp window.  The depth
+        # servo has already latched zero base velocity at ``base_stopped_*``
+        # (this worker only runs after that stop), so ``base_stopped=True`` is
+        # the truthful never-lock-during-servo guard.  Locking here -- before
+        # the post-stop joint capture, planning, and the staged executor --
+        # stops the balance stepping that both shakes the arm during the grasp
+        # and corrupts the measured close-range joints.  The lock is released
+        # in the ``finally`` on every exit path.
+        self._request_base_lock()
         try:
             self.log_path.write_text(
                 "Starting mobile handoff grasp from the measured close-range arm pose; "
@@ -3230,6 +3262,32 @@ class PiperGraspRunner:
                     f"{self.status().get('phase')}: {error}"
                 ),
             )
+        finally:
+            # Release on every exit -- success (arm returned Home), recoverable
+            # NEED_BASE_APPROACH (arm never moved; the base must be free to
+            # re-approach next), and failure/exception/abort (the base must be
+            # free for Home recovery).  Keeping the base locked on any of these
+            # paths is exactly the serialized/deadlocked lock state the design
+            # must avoid; the NUC watchdog is only the last-resort backstop.
+            self._release_base_lock()
+
+    def _request_base_lock(self) -> None:
+        controller = getattr(self, "base_lock", None)
+        if controller is None:
+            return
+        try:
+            controller.request_lock("mobile_handoff_grasp", base_stopped=True)
+        except Exception:  # noqa: BLE001 - lock is best-effort, never fatal
+            pass
+
+    def _release_base_lock(self) -> None:
+        controller = getattr(self, "base_lock", None)
+        if controller is None:
+            return
+        try:
+            controller.request_unlock("mobile_handoff_grasp")
+        except Exception:  # noqa: BLE001 - unlock must never mask a grasp result
+            pass
 
     def _wait_mobile_handoff_joints(
         self,
@@ -5089,6 +5147,84 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Remote path where install_go2w_reactive_runtime.sh places the NUC-local
+# base-lock publisher wrapper.  ``~`` is expanded by the remote shell.
+NUC_BASE_LOCK_PUBLISHER = "~/.local/lib/z-mobile-manip/go2w_base_lock_publish.sh"
+
+
+def _make_nuc_base_lock_emit(
+    *,
+    nuc_host: str,
+    nuc_key: str,
+    publisher: str = NUC_BASE_LOCK_PUBLISHER,
+    timeout_s: float = 6.0,
+    logger: Callable[[str], None] | None = None,
+) -> Callable[[dict[str, Any]], go2w_base_lock.BaseLockAck]:
+    """Build the base-lock transport: SSH + NUC-local ``/go2w/base_lock`` publish.
+
+    The workstation host runs FastDDS while the live service subscribes on the
+    NUC's Domain-20 CycloneDDS graph, so publishing cross-host is unreliable.
+    Instead the command is published *on the NUC* (co-located with the
+    subscriber) by the installed helper, which echoes the live service's
+    resulting base-lock state back as JSON for the acknowledgement.  Every
+    failure returns an undelivered ack -- the grasp is never blocked on it.
+    """
+
+    log = logger or (lambda _message: None)
+
+    def emit(command: dict[str, Any]) -> go2w_base_lock.BaseLockAck:
+        arguments = [
+            "ssh",
+            "-i", str(nuc_key),
+            "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=5",
+            nuc_host,
+            publisher,
+            "--lock", "1" if command.get("lock") else "0",
+            "--source", str(command.get("source", "orchestrator")),
+            "--seq", str(int(command.get("seq", 0))),
+            "--lease-s", repr(float(command.get("lease_s", go2w_base_lock.DEFAULT_LOCK_LEASE_S))),
+        ]
+        try:
+            completed = subprocess.run(
+                arguments,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_s,
+                check=False,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            log(f"base-lock transport SSH failed: {error}")
+            return go2w_base_lock.BaseLockAck(delivered=False, nuc_state=None)
+        if completed.returncode != 0:
+            log(
+                "base-lock transport SSH exited "
+                f"{completed.returncode}: {completed.stderr.strip()[:200]}"
+            )
+            return go2w_base_lock.BaseLockAck(delivered=False, nuc_state=None)
+        for line in reversed(completed.stdout.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                document = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            nuc_state = document.get("nuc_state")
+            return go2w_base_lock.BaseLockAck(
+                delivered=bool(document.get("delivered")),
+                nuc_state=nuc_state if nuc_state in ("locked", "unlocked") else None,
+            )
+        return go2w_base_lock.BaseLockAck(delivered=False, nuc_state=None)
+
+    return emit
+
+
 def main() -> int:
     args = _arguments()
     run_root = args.run_root.expanduser().resolve()
@@ -5107,6 +5243,23 @@ def main() -> int:
     if args.grasp_script is not None:
         if home_runner is None:
             raise ValueError("--grasp-script requires --home-script")
+        # Base-lock owner: reuses the existing PC->NUC control path (SSH to the
+        # NUC + a co-located publish onto the live service's /go2w/base_lock
+        # channel).  Constructed unconditionally; if the NUC key is absent the
+        # transport simply reports undelivered and the grasp proceeds unlocked.
+        nuc_host = os.environ.get("GO2W_NUC_HOST", "yusenzlabnuc@192.168.3.8")
+        nuc_key = os.environ.get(
+            "GO2W_NUC_SSH_KEY",
+            str(Path.home() / ".ssh" / "id_ed25519_codex_nuc"),
+        )
+        base_lock = go2w_base_lock.BaseLockController(
+            emit=_make_nuc_base_lock_emit(
+                nuc_host=nuc_host,
+                nuc_key=nuc_key,
+                logger=lambda message: print(message, flush=True),
+            ),
+            logger=lambda message: print(message, flush=True),
+        )
         grasp_runner = PiperGraspRunner(
             args.grasp_script,
             run_root / "piper-grasp.log",
@@ -5118,6 +5271,7 @@ def main() -> int:
                 args.runtime_state,
                 home_runner.script.parents[2] / "configs" / "piper_home.json",
             ),
+            base_lock=base_lock,
         )
         def clear_home_context() -> None:
             interactive_service.clear_current_context()
