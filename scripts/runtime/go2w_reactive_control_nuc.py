@@ -774,6 +774,39 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
             result.message = f"{command_name} failed: {type(error).__name__}: {error}"
         return result
 
+    def _restart_drain_on_owner_loop(self, coro: Any) -> bool:
+        """Re-arm a drain coroutine on the owning WebRTC loop, teardown-safe.
+
+        The asyncio loop runs on the ``_connection_worker`` daemon thread
+        (``run_forever``); the rclpy executor runs on the main thread.  A
+        drain's ``finally`` normally runs on the loop thread, where the previous
+        ``asyncio.create_task`` restart found a running loop.  At process
+        shutdown the loop is stopped and closed, so the still-pending drain task
+        is closed/garbage-collected and its ``finally`` runs *off* the loop
+        under ``GeneratorExit``.  There ``asyncio.create_task`` calls
+        ``events.get_running_loop()`` and raises ``RuntimeError: no running
+        event loop`` while leaving the freshly created coroutine un-awaited --
+        the crash-loop observed in the NUC journal.
+
+        ``run_coroutine_threadsafe`` targets the owning loop explicitly and is
+        safe from any thread, including the loop thread itself (it just
+        schedules the coroutine for the next iteration).  When the loop is gone
+        we drop the restart and ``close`` the coroutine so nothing is left
+        un-awaited; the caller then releases its pump/active flag so a later
+        command re-arms the drain cleanly.  Returns ``True`` iff the coroutine
+        was handed to the loop.
+        """
+        loop = self.loop
+        if loop is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(coro, loop)
+                return True
+            except RuntimeError:
+                # Lost a race with loop teardown between is_running() and submit.
+                pass
+        coro.close()
+        return False
+
     async def _drain_move_commands(self) -> None:
         """Override upstream pump so Move shares the SPORT request lock."""
         try:
@@ -837,8 +870,14 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 restart = self._pending_move is not None and not self._stop_latched
                 if restart:
                     self._move_pump_running = True
-            if restart:
-                asyncio.create_task(self._drain_move_commands())
+            if restart and not self._restart_drain_on_owner_loop(
+                self._drain_move_commands()
+            ):
+                # Owner loop is gone (shutdown/teardown): release the pump flag
+                # so a later cmd_vel re-arms cleanly instead of wedging the pump
+                # in a "running" state.  The latest _pending_move is preserved.
+                with self._move_lock:
+                    self._move_pump_running = False
 
     def _posture_command(self, message: TwistStamped) -> None:
         try:
@@ -979,8 +1018,14 @@ class ReactiveUnitreeControlNode(UnitreeControlNode, _StatusNode):
                 )
                 if restart:
                     self._posture_active = True
-            if restart:
-                asyncio.create_task(self._drain_posture())
+            if restart and not self._restart_drain_on_owner_loop(
+                self._drain_posture()
+            ):
+                # Owner loop is gone (shutdown/teardown): release the active
+                # flag so a later posture command re-arms cleanly.  The latest
+                # _pending_posture is preserved.
+                with self._posture_lock:
+                    self._posture_active = False
 
     def _full_stop(self, _message: Empty) -> None:
         self._stop_latched = True

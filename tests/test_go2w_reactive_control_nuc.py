@@ -2,6 +2,7 @@ import importlib.util
 import ast
 import json
 import math
+import types
 from pathlib import Path
 
 import pytest
@@ -475,3 +476,119 @@ def test_install_script_deploys_the_base_lock_runtime_to_the_nuc():
         assert name in install, f"install script must scp {name} to the NUC"
     # The publisher wrapper must be made executable on the NUC.
     assert 'go2w_base_lock_publish.sh"' in install
+
+
+# ---------------------------------------------------------------------------
+# Move/posture pump restart is teardown-safe.  The asyncio loop runs on the
+# UnitreeControlNode connection-worker thread (run_forever) while the rclpy
+# executor runs on the main thread.  A drain's finally normally runs on the
+# loop thread, but at process shutdown the still-pending drain task is
+# closed/GC'd and its finally runs OFF the loop under GeneratorExit -- where
+# the old ``asyncio.create_task`` restart raised ``RuntimeError: no running
+# event loop`` and left the coroutine un-awaited (the ~94-hit NUC crash-loop).
+# ---------------------------------------------------------------------------
+
+
+class _FakeAsyncio:
+    """Stand-in for the ``asyncio`` name inside the extracted restart helper."""
+
+    def __init__(self, *, raise_runtime: bool = False):
+        self.calls = []
+        self._raise_runtime = raise_runtime
+
+    def run_coroutine_threadsafe(self, coro, loop):
+        self.calls.append((coro, loop))
+        if self._raise_runtime:
+            raise RuntimeError("Event loop is closed")
+        return "concurrent-future"
+
+
+class _FakeCoro:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeLoop:
+    def __init__(self, running: bool):
+        self._running = running
+
+    def is_running(self) -> bool:
+        return self._running
+
+
+def _load_restart_drain(asyncio_module):
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    selected = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_restart_drain_on_owner_loop"
+    ]
+    assert selected, "the teardown-safe drain-restart helper must exist"
+    namespace = {"asyncio": asyncio_module, "Any": object}
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"),
+        namespace,
+    )
+    return namespace["_restart_drain_on_owner_loop"]
+
+
+def test_drain_restart_is_teardown_safe_and_never_leaks_a_coroutine():
+    # 1. No owning loop yet (or torn down to None): give up, close the coro so
+    #    it is never left un-awaited, and never touch run_coroutine_threadsafe.
+    fake = _FakeAsyncio()
+    restart = _load_restart_drain(fake)
+    coro = _FakeCoro()
+    assert restart(types.SimpleNamespace(loop=None), coro) is False
+    assert coro.closed
+    assert fake.calls == []
+
+    # 2. Loop present but NOT running -- exactly the shutdown/teardown context
+    #    where the old asyncio.create_task raised "no running event loop".
+    fake = _FakeAsyncio()
+    restart = _load_restart_drain(fake)
+    coro = _FakeCoro()
+    assert restart(types.SimpleNamespace(loop=_FakeLoop(running=False)), coro) is False
+    assert coro.closed
+    assert fake.calls == []
+
+    # 3. Running loop: hand the coroutine to run_coroutine_threadsafe on the
+    #    owning loop (safe from any thread) and do NOT close it.
+    fake = _FakeAsyncio()
+    restart = _load_restart_drain(fake)
+    coro = _FakeCoro()
+    loop = _FakeLoop(running=True)
+    assert restart(types.SimpleNamespace(loop=loop), coro) is True
+    assert not coro.closed
+    assert fake.calls == [(coro, loop)]
+
+    # 4. Race: loop reported running but was torn down before submit -- swallow
+    #    the RuntimeError and close the coro so nothing is left un-awaited.
+    fake = _FakeAsyncio(raise_runtime=True)
+    restart = _load_restart_drain(fake)
+    coro = _FakeCoro()
+    assert restart(types.SimpleNamespace(loop=_FakeLoop(running=True)), coro) is False
+    assert coro.closed
+
+
+def test_drain_pumps_do_not_restart_with_bare_create_task():
+    source = SOURCE.read_text(encoding="utf-8")
+    # The teardown-unsafe restart must be gone from BOTH the Move and posture
+    # pumps: bare create_task requires a running loop on the *calling* thread,
+    # which is false when the finally runs off-loop during shutdown.
+    assert "asyncio.create_task(self._drain_move_commands())" not in source
+    assert "asyncio.create_task(self._drain_posture())" not in source
+    assert "asyncio.create_task(" not in source  # no bare create_task anywhere
+    # Both pumps re-arm through the teardown-safe owner-loop helper.
+    assert "def _restart_drain_on_owner_loop(self" in source
+    assert source.count("self._restart_drain_on_owner_loop(") == 2
+    assert "asyncio.run_coroutine_threadsafe(coro, loop)" in source
+    assert "loop is not None and loop.is_running()" in source
+    # Single-owner + latest-value semantics preserved: on give-up the pending
+    # command is NOT cleared and only the pump/active flag is released so a
+    # later cmd_vel / posture command re-arms cleanly.
+    assert "self._move_pump_running = False" in source
+    assert "self._posture_active = False" in source

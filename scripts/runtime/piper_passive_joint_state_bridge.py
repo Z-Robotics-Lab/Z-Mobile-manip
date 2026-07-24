@@ -135,7 +135,23 @@ def run(interface: str, topic: str, publish_hz: float, snapshot_span_s: float) -
             message.header.frame_id = "piper_base_link"
             message.name = list(JOINT_NAMES)
             message.position = [float(value) for value in positions]
-            publisher.publish(message)
+            if not rclpy.ok():
+                break
+            try:
+                publisher.publish(message)
+            except Exception:  # noqa: BLE001
+                # A systemd stop/restart can tear the rcl context down between
+                # the rclpy.ok() gate above and this publish, invalidating the
+                # publisher mid-iteration (RCLError "publisher's context is
+                # invalid", at publisher.c:423).  That is a normal shutdown
+                # race, not a CAN/TX fault: leave the receive loop cleanly so
+                # the process exits 0 instead of crash-looping through systemd.
+                # A still-valid context means a genuine, unexpected fault --
+                # re-raise it (matching the TX-counter fail-loud policy) rather
+                # than hiding it.
+                if rclpy.ok():
+                    raise
+                break
             next_publish = now + publish_period
     finally:
         if channel is not None:
