@@ -106,6 +106,16 @@ MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 2.0
 MOBILE_HANDOFF_JOINT_READY_POLL_S = 0.01
 MOBILE_HANDOFF_CAPTURE_MAX_SKEW_S = 1.0
 MAX_HANDOFF_EVIDENCE_BYTES = 512 * 1024
+# Default dwell at Home while holding the object between the carry-home and
+# place-back legs of the mobile pick->hold->place-back cycle.  The dwell is a
+# pure orchestrator wait between the return-home-holding and place-back
+# executor invocations: the PiPER holds its last commanded joints and gripper
+# force across the gap (exactly the held state the stationary Return-Home-
+# Holding -> Place-Back buttons already rely on when an operator waits between
+# presses), so no executor-side hold knob is needed.  Bounded so that a
+# mistaken large value can never strand a held object for minutes.
+MOBILE_HANDOFF_HOLD_SECONDS = 2.0
+MOBILE_HANDOFF_MAX_HOLD_SECONDS = 10.0
 MAX_CAMERA_FUTURE_S = 0.25
 MAX_INTERACTIVE_REQUEST_BYTES = 512
 MAX_INTERACTIVE_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -1131,6 +1141,8 @@ class DepthServoRunner:
             "auto_handoff": False,
             "operator_present": False,
             "speed_percent": 5,
+            "place_back": True,
+            "hold_seconds": MOBILE_HANDOFF_HOLD_SECONDS,
             "reacquisition_attempts": 0,
             "last_reacquisition": None,
             "failure": None,
@@ -1262,6 +1274,8 @@ class DepthServoRunner:
         auto_handoff: bool = False,
         operator_present: bool = False,
         speed_percent: int = 5,
+        place_back: bool = True,
+        hold_seconds: float = MOBILE_HANDOFF_HOLD_SECONDS,
     ) -> dict[str, Any]:
         if mode not in {"shadow", "live"}:
             return {
@@ -1275,6 +1289,25 @@ class DepthServoRunner:
                 "error": {"code": "INVALID_SPEED", "message": "speed_percent must be 1..50"},
                 "approach": self.status(),
             }
+        # place_back defaults TRUE (the operator's requested pick -> carry-home
+        # -> hold -> place-back demo cycle); only an explicit False keeps the
+        # plain grasp-and-home behaviour.
+        place_back = place_back is not False
+        if (
+            isinstance(hold_seconds, bool)
+            or not isinstance(hold_seconds, (int, float))
+            or not math.isfinite(float(hold_seconds))
+            or not 0.0 <= float(hold_seconds) <= MOBILE_HANDOFF_MAX_HOLD_SECONDS
+        ):
+            return {
+                "started": False,
+                "error": {
+                    "code": "INVALID_HOLD_SECONDS",
+                    "message": f"hold_seconds must be 0..{MOBILE_HANDOFF_MAX_HOLD_SECONDS:g}",
+                },
+                "approach": self.status(),
+            }
+        hold_seconds = float(hold_seconds)
         if target is not None:
             try:
                 target = validate_target_description(target)
@@ -1334,6 +1367,8 @@ class DepthServoRunner:
                 "auto_handoff": bool(auto_handoff),
                 "operator_present": bool(operator_present),
                 "speed_percent": speed_percent,
+                "place_back": place_back,
+                "hold_seconds": hold_seconds,
                 "reacquisition_attempts": 0,
                 "last_reacquisition": None,
                 "failure": None,
@@ -1462,6 +1497,10 @@ class DepthServoRunner:
         with self._lock:
             auto_handoff = self._workflow.get("auto_handoff") is True
             speed = int(self._workflow.get("speed_percent", 5))
+            place_back = self._workflow.get("place_back", True) is not False
+            hold_seconds = float(
+                self._workflow.get("hold_seconds", MOBILE_HANDOFF_HOLD_SECONDS),
+            )
         session_state = (
             self._session_service.status()
             if self._session_service is not None
@@ -1482,6 +1521,8 @@ class DepthServoRunner:
                 superseded_perception_session_id=superseded_session_id,
                 base_stopped_unix_ns=base_stopped_unix_ns,
                 base_stopped_monotonic_ns=base_stopped_monotonic_ns,
+                place_back=place_back,
+                hold_seconds=hold_seconds,
             )
             if result.get("started"):
                 self._set_workflow(
@@ -2320,6 +2361,8 @@ class PiperGraspRunner:
         superseded_perception_session_id: str | None = None,
         base_stopped_unix_ns: int,
         base_stopped_monotonic_ns: int,
+        place_back: bool = True,
+        hold_seconds: float = MOBILE_HANDOFF_HOLD_SECONDS,
     ) -> dict[str, Any]:
         """Capture, plan, and execute from the measured close-range arm pose.
 
@@ -2330,6 +2373,14 @@ class PiperGraspRunner:
         perception context, captures a new synchronized RGB-D/joint bundle at
         the stopped-base handoff, plans from those measured joints, and then
         invokes the same immutable receipt-bound executor as a normal grasp.
+
+        When ``place_back`` is true (the operator's default demo cycle), a
+        verified grasp is carried Home along the reverse of the just-executed
+        path while holding, dwells ``hold_seconds`` at Home, and is then placed
+        back at its original grasp pose by replaying that path forward before
+        the arm retreats Home -- one continuous sequence with no operator
+        intervention between legs.  ``place_back=False`` keeps the plain
+        grasp-and-home behaviour.
         """
 
         try:
@@ -2414,6 +2465,14 @@ class PiperGraspRunner:
                     "the current measured arm/view pose."
                 ),
             })
+        place_back = place_back is not False
+        if (
+            isinstance(hold_seconds, bool)
+            or not isinstance(hold_seconds, (int, float))
+            or not math.isfinite(float(hold_seconds))
+        ):
+            hold_seconds = MOBILE_HANDOFF_HOLD_SECONDS
+        hold_seconds = max(0.0, min(float(hold_seconds), MOBILE_HANDOFF_MAX_HOLD_SECONDS))
         worker = threading.Thread(
             target=self._run_mobile_handoff,
             args=(
@@ -2422,6 +2481,8 @@ class PiperGraspRunner:
                 superseded_perception_session_id,
                 base_stopped_unix_ns,
                 base_stopped_monotonic_ns,
+                place_back,
+                hold_seconds,
             ),
             name="z-manip-piper-mobile-handoff-grasp",
             daemon=True,
@@ -2769,6 +2830,293 @@ class PiperGraspRunner:
             raise RuntimeError(f"full grasp stopped safely; inspect {wrapper_log}")
         return start_receipt
 
+    def _run_workflow_leg(
+        self,
+        *,
+        workflow_phase: str,
+        report: Path,
+        archive: Path,
+        receipt_dir: Path,
+        speed_percent: int,
+        planning_session_id: str,
+        prior_receipt_dir: Path | None,
+    ) -> dict[str, Any]:
+        """Run one held-object workflow leg on the NUC and validate its evidence.
+
+        Drives the immutable receipt-bound full-grasp wrapper with an explicit
+        ``--workflow-phase`` (and ``--prior-receipt-dir`` for the holding
+        continuations) -- exactly the CLI the stationary Pick & Hold ->
+        Return-Home-Holding -> Place-Back buttons already use.  It validates the
+        transport-open evidence (identity-bound to this plan) and the phase's
+        ``workflow-state.json`` completion receipt, and preserves a per-leg
+        wrapper log next to the receipt directory for operator forensics.  On a
+        stop after the object is held it raises a legible held-object error
+        instead of advancing; the caller keeps the held-object workflow state so
+        the existing recovery buttons can finish or unwind the leg.
+        """
+
+        planning_session_id = validate_session_id(planning_session_id)
+        expected_report_sha256 = hashlib.sha256(report.read_bytes()).hexdigest()
+        expected_archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+        expected_artifact_id = self._artifact_id(report, archive)
+        arguments = [
+            str(self.script),
+            "--planning-report", str(report),
+            "--planned-grasp", str(archive),
+            "--receipt-dir", str(receipt_dir),
+            "--speed-percent", str(speed_percent),
+            "--workflow-phase", workflow_phase,
+            "--planning-session-id", planning_session_id,
+        ]
+        if prior_receipt_dir is not None:
+            arguments.extend(("--prior-receipt-dir", str(prior_receipt_dir)))
+        # Per-leg wrapper stdout is forensic evidence: keep it next to the leg's
+        # receipt directory so a later leg cannot truncate the output needed to
+        # diagnose a stop while an object was held.
+        wrapper_log = receipt_dir.parent / f"{receipt_dir.name}.wrapper.log"
+        receipt_dir.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("a", encoding="utf-8") as log:
+            log.write(f"Mobile {workflow_phase} leg wrapper output: {wrapper_log}\n")
+        with wrapper_log.open("w", encoding="utf-8") as log:
+            completed = subprocess.run(
+                arguments,
+                cwd=self.script.parents[2],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+                shell=False,
+                timeout=480.0,
+            )
+        start_receipt_path = receipt_dir / "executor-start-receipt.json"
+        if start_receipt_path.is_symlink() or not start_receipt_path.is_file():
+            raise RuntimeError(
+                f"mobile {workflow_phase} leg produced no executor-start evidence "
+                "-- the CAN transport may never have opened, or the receipt fetch "
+                "failed (remote evidence is preserved in that case); wrapper exit "
+                f"{completed.returncode}; inspect {wrapper_log}",
+            )
+        start_receipt = self._validate_executor_start_receipt(
+            start_receipt_path,
+            expected_artifact_id=expected_artifact_id,
+            expected_planning_report_sha256=expected_report_sha256,
+            expected_planned_grasp_sha256=expected_archive_sha256,
+            expected_planning_session_id=planning_session_id,
+        )
+        if completed.returncode != 0 or not (receipt_dir / "workflow-state.json").is_file():
+            # After the close (pick-hold past approach) and for every holding
+            # continuation the object may still be in the gripper.  Surface that
+            # explicitly and never advance -- the executor already holds torque
+            # on a safe stop rather than dropping the load.
+            object_may_be_held = (
+                workflow_phase != "pick-hold"
+                or (receipt_dir / "approach_close-receipt.json").is_file()
+            )
+            held_note = (
+                " -- the object may still be HELD in the gripper; recover with "
+                "Place Back or Return Home Holding and do not start a new grasp"
+                if object_may_be_held
+                else ""
+            )
+            raise RuntimeError(
+                f"mobile {workflow_phase} leg stopped safely{held_note}; wrapper "
+                f"exit {completed.returncode}; inspect {wrapper_log}",
+            )
+        return start_receipt
+
+    @staticmethod
+    def _write_hold_receipt(
+        *,
+        action_dir: Path,
+        requested_hold_s: float,
+        actual_hold_s: float,
+        hold_started_unix_ns: int,
+        hold_finished_unix_ns: int,
+    ) -> Path:
+        """Persist evidence for the pure-dwell hold leg (no NUC involvement)."""
+        action_dir.mkdir(parents=True, exist_ok=True)
+        document = {
+            "schema": "z_manip.mobile_handoff_hold_receipt.v1",
+            "event": "held_at_home_dwell",
+            "at_home": True,
+            "holding_object": True,
+            "requested_hold_s": round(float(requested_hold_s), 6),
+            "actual_hold_s": round(float(actual_hold_s), 6),
+            "hold_started_unix_ns": int(hold_started_unix_ns),
+            "hold_finished_unix_ns": int(hold_finished_unix_ns),
+        }
+        path = action_dir / "hold-receipt.json"
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+        return path
+
+    def _hold_at_home(
+        self,
+        *,
+        action_dir: Path,
+        hold_seconds: float,
+        lifecycle: dict[str, Any],
+        timings: dict[str, float],
+    ) -> None:
+        """Dwell at Home while holding the object, then record the hold receipt.
+
+        A pure orchestrator wait: the arm holds its last commanded joints and
+        gripper force (the same held state the stationary Return-Home-Holding ->
+        Place-Back gap relies on) so no executor invocation is needed here.
+        """
+        hold_seconds = max(0.0, min(float(hold_seconds), MOBILE_HANDOFF_MAX_HOLD_SECONDS))
+        hold_started_unix_ns = time.time_ns()
+        hold_started = time.monotonic()
+        lifecycle["hold_started_unix_ns"] = hold_started_unix_ns
+        if hold_seconds > 0.0:
+            time.sleep(hold_seconds)
+        actual_hold_s = round(time.monotonic() - hold_started, 6)
+        hold_finished_unix_ns = time.time_ns()
+        lifecycle["hold_finished_unix_ns"] = hold_finished_unix_ns
+        lifecycle["hold_requested_s"] = round(float(hold_seconds), 6)
+        timings["handoff_hold_at_home"] = actual_hold_s
+        self._write_hold_receipt(
+            action_dir=action_dir,
+            requested_hold_s=hold_seconds,
+            actual_hold_s=actual_hold_s,
+            hold_started_unix_ns=hold_started_unix_ns,
+            hold_finished_unix_ns=hold_finished_unix_ns,
+        )
+
+    def _run_mobile_place_back_cycle(
+        self,
+        *,
+        report: Path,
+        archive: Path,
+        action_dir: Path,
+        speed_percent: int,
+        planning_session_id: str,
+        artifact_id: str,
+        hold_seconds: float,
+        lifecycle: dict[str, Any],
+        timings: dict[str, float],
+    ) -> dict[str, Any]:
+        """Carry the freshly grasped object Home, hold, then place it back.
+
+        Reuses the executor's durable pick-hold / return-home-holding /
+        place-back workflow phases (the object stays held across all three)
+        exactly as the stationary buttons do, but driven from the mobile
+        handoff's fresh close-range plan with an automatic Home dwell between
+        the carry-Home and place-back legs.  The shared grasp-workflow state is
+        advanced after every leg so that a mid-cycle stop hands a still-HELD
+        object to the existing Place Back / Return Home Holding recovery
+        buttons instead of dropping or stranding it.  Returns the pick-hold
+        leg's transport-open receipt (the grasp's first-motion evidence) for the
+        handoff lifecycle document.
+        """
+
+        # -- Leg 1: pick & hold (transit -> approach -> close -> lift) --------
+        pick_hold_dir = action_dir / "pick-hold"
+        leg_started = time.monotonic()
+        executor_start = self._run_workflow_leg(
+            workflow_phase="pick-hold",
+            report=report,
+            archive=archive,
+            receipt_dir=pick_hold_dir,
+            speed_percent=speed_percent,
+            planning_session_id=planning_session_id,
+            prior_receipt_dir=None,
+        )
+        timings["handoff_pick_hold"] = round(time.monotonic() - leg_started, 6)
+        lifecycle["pick_hold_finished_unix_ns"] = time.time_ns()
+        with self._lock:
+            self._set_workflow(
+                phase="holding_at_lift",
+                artifact_id=artifact_id,
+                planning_session_id=planning_session_id,
+                holding_object=True,
+                at_home=False,
+                receipt_dir=str(pick_hold_dir),
+                planning_report=str(report),
+                planned_grasp=str(archive),
+            )
+
+        # -- Leg 2: carry Home holding (reverse corridor, gripper closed) -----
+        self._update(
+            phase="handoff_carry_home",
+            handoff_lifecycle=dict(lifecycle),
+            timings_s=dict(timings),
+            message=(
+                "Object grasped and lifted; carrying it Home along the reverse "
+                "of the checked path while holding."
+            ),
+        )
+        return_home_dir = action_dir / "return-home-holding"
+        leg_started = time.monotonic()
+        self._run_workflow_leg(
+            workflow_phase="return-home-holding",
+            report=report,
+            archive=archive,
+            receipt_dir=return_home_dir,
+            speed_percent=speed_percent,
+            planning_session_id=planning_session_id,
+            prior_receipt_dir=pick_hold_dir,
+        )
+        timings["handoff_carry_home"] = round(time.monotonic() - leg_started, 6)
+        lifecycle["carry_home_finished_unix_ns"] = time.time_ns()
+        with self._lock:
+            self._set_workflow(
+                phase="holding_at_home",
+                holding_object=True,
+                at_home=True,
+                receipt_dir=str(return_home_dir),
+            )
+
+        # -- Leg 3: hold at Home (pure orchestrator dwell) --------------------
+        self._update(
+            phase="handoff_hold_at_home",
+            handoff_lifecycle=dict(lifecycle),
+            timings_s=dict(timings),
+            message=(
+                f"At Home holding the object; dwelling {hold_seconds:g}s before "
+                "placing it back."
+            ),
+        )
+        self._hold_at_home(
+            action_dir=action_dir,
+            hold_seconds=hold_seconds,
+            lifecycle=lifecycle,
+            timings=timings,
+        )
+
+        # -- Leg 4: place back (forward corridor -> release -> retreat Home) --
+        self._update(
+            phase="handoff_place_back",
+            handoff_lifecycle=dict(lifecycle),
+            timings_s=dict(timings),
+            message=(
+                "Replaying the original path forward to place the object back at "
+                "its grasp pose, then retreating Home."
+            ),
+        )
+        place_back_dir = action_dir / "place-back"
+        leg_started = time.monotonic()
+        self._run_workflow_leg(
+            workflow_phase="place-back",
+            report=report,
+            archive=archive,
+            receipt_dir=place_back_dir,
+            speed_percent=speed_percent,
+            planning_session_id=planning_session_id,
+            prior_receipt_dir=return_home_dir,
+        )
+        timings["handoff_place_back"] = round(time.monotonic() - leg_started, 6)
+        lifecycle["place_back_finished_unix_ns"] = time.time_ns()
+        with self._lock:
+            self._set_workflow(
+                phase="placed_back_at_home",
+                holding_object=False,
+                at_home=True,
+                receipt_dir=str(place_back_dir),
+            )
+        return executor_start
+
     @classmethod
     def _validate_executor_start_receipt(
         cls,
@@ -2964,6 +3312,8 @@ class PiperGraspRunner:
         superseded_perception_session_id: str | None,
         base_stopped_unix_ns: int,
         base_stopped_monotonic_ns: int | None = None,
+        place_back: bool = True,
+        hold_seconds: float = MOBILE_HANDOFF_HOLD_SECONDS,
     ) -> None:
         """Run a fresh close-range transaction without commanding Home first."""
 
@@ -3175,23 +3525,56 @@ class PiperGraspRunner:
                 return
             report, archive = self._planning_artifacts(planning)
             planning_session_id = validate_session_id(planning.get("session_id"))
-            self._update(
-                phase="handoff_execute",
-                planning_session_id=planning_session_id,
-                handoff_lifecycle=dict(lifecycle),
-                timings_s=dict(timings),
-                message=(
-                    f"Executing the fresh close-range receipt-bound plan at "
-                    f"{speed_percent}%."
-                ),
-            )
-            executor_start = self._run_full(
-                report=report,
-                archive=archive,
-                receipt_dir=action_dir,
-                speed_percent=speed_percent,
-                planning_session_id=planning_session_id,
-            )
+            if place_back:
+                self._update(
+                    phase="handoff_pick_hold",
+                    planning_session_id=planning_session_id,
+                    handoff_lifecycle=dict(lifecycle),
+                    timings_s=dict(timings),
+                    message=(
+                        f"Executing the fresh close-range plan as one continuous "
+                        f"pick, carry-Home, hold {hold_seconds:g}s, and place-back "
+                        f"cycle at {speed_percent}%."
+                    ),
+                )
+                executor_start = self._run_mobile_place_back_cycle(
+                    report=report,
+                    archive=archive,
+                    action_dir=action_dir,
+                    speed_percent=speed_percent,
+                    planning_session_id=planning_session_id,
+                    artifact_id=self._artifact_id(report, archive),
+                    hold_seconds=hold_seconds,
+                    lifecycle=lifecycle,
+                    timings=timings,
+                )
+                success_message = (
+                    "Fresh mobile-handoff grasp executed; object carried Home, "
+                    f"held {hold_seconds:g}s, placed back at its original grasp "
+                    "pose, and arm returned Home."
+                )
+            else:
+                self._update(
+                    phase="handoff_execute",
+                    planning_session_id=planning_session_id,
+                    handoff_lifecycle=dict(lifecycle),
+                    timings_s=dict(timings),
+                    message=(
+                        f"Executing the fresh close-range receipt-bound plan at "
+                        f"{speed_percent}%."
+                    ),
+                )
+                executor_start = self._run_full(
+                    report=report,
+                    archive=archive,
+                    receipt_dir=action_dir,
+                    speed_percent=speed_percent,
+                    planning_session_id=planning_session_id,
+                )
+                success_message = (
+                    "Fresh mobile-handoff grasp executed; object placed back "
+                    "and arm returned Home."
+                )
             lifecycle.update({
                 "executor_transport_started_unix_ns": executor_start[
                     "executor_started_unix_ns"
@@ -3215,10 +3598,7 @@ class PiperGraspRunner:
                 receipt_dir=str(action_dir),
                 handoff_lifecycle=dict(lifecycle),
                 timings_s=dict(timings),
-                message=(
-                    "Fresh mobile-handoff grasp executed; object placed back "
-                    "and arm returned Home."
-                ),
+                message=success_message,
             )
         except Exception as error:  # pragma: no cover - hardware boundary
             start_receipt_path = action_dir / "executor-start-receipt.json"
@@ -3780,7 +4160,8 @@ def _runtime_handler(
             ) else set()
             if action == APPROACH_START_ACTION:
                 valid_fields = "mode" in document and set(document).issubset({
-                    "mode", "target", "acquire_target", "auto_handoff", "operator_present", "speed_percent",
+                    "mode", "target", "acquire_target", "auto_handoff",
+                    "operator_present", "speed_percent", "place_back", "hold_seconds",
                 })
             elif action in (GRASP_ACTION, PICK_HOLD_ACTION):
                 valid_fields = "target" in document and set(document).issubset(
@@ -3800,7 +4181,7 @@ def _runtime_handler(
                 elif action in (GRASP_ACTION, PICK_HOLD_ACTION):
                     field_message = "grasp accepts a required target and an optional speed_percent"
                 elif action == APPROACH_START_ACTION:
-                    field_message = "approach requires mode and accepts target, acquire_target, auto_handoff, operator_present, and speed_percent"
+                    field_message = "approach requires mode and accepts target, acquire_target, auto_handoff, operator_present, speed_percent, place_back, and hold_seconds"
                 elif optional:
                     field_message = f"{action} accepts only an optional speed_percent"
                 else:
@@ -3828,11 +4209,25 @@ def _runtime_handler(
                 )
                 return None
             if action == APPROACH_START_ACTION:
-                for field in ("acquire_target", "auto_handoff", "operator_present"):
+                for field in ("acquire_target", "auto_handoff", "operator_present", "place_back"):
                     if field in document and not isinstance(document[field], bool):
                         self._interactive_error(
                             "INVALID_APPROACH_OPTION",
                             f"{field} must be boolean",
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return None
+                if "hold_seconds" in document:
+                    hold = document["hold_seconds"]
+                    if (
+                        isinstance(hold, bool)
+                        or not isinstance(hold, (int, float))
+                        or not math.isfinite(float(hold))
+                        or not 0.0 <= float(hold) <= MOBILE_HANDOFF_MAX_HOLD_SECONDS
+                    ):
+                        self._interactive_error(
+                            "INVALID_HOLD_SECONDS",
+                            f"hold_seconds must be a number from 0 to {MOBILE_HANDOFF_MAX_HOLD_SECONDS:g}",
                             status=HTTPStatus.BAD_REQUEST,
                         )
                         return None
@@ -4121,6 +4516,11 @@ def _runtime_handler(
                 auto_handoff=document.get("auto_handoff") is True,
                 operator_present=document.get("operator_present") is True,
                 speed_percent=int(document.get("speed_percent", 5)),
+                # place_back defaults TRUE (the operator's pick -> hold ->
+                # place-back demo cycle); only an explicit False opts out to the
+                # plain grasp-and-home behaviour.
+                place_back=document.get("place_back", True) is not False,
+                hold_seconds=document.get("hold_seconds", MOBILE_HANDOFF_HOLD_SECONDS),
             )
             self._json(
                 result,

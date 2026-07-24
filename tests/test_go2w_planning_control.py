@@ -239,6 +239,8 @@ class _FakeGraspRunner:
         self.superseded_perception_session_id = None
         self.base_stopped_unix_ns = None
         self.base_stopped_monotonic_ns = None
+        self.place_back = None
+        self.hold_seconds = None
 
     def status(self):
         return {
@@ -266,6 +268,8 @@ class _FakeGraspRunner:
         superseded_perception_session_id=None,
         base_stopped_unix_ns=None,
         base_stopped_monotonic_ns=None,
+        place_back=True,
+        hold_seconds=2.0,
     ):
         self.mobile_handoff_starts += 1
         self.starts += 1
@@ -274,6 +278,8 @@ class _FakeGraspRunner:
         self.superseded_perception_session_id = superseded_perception_session_id
         self.base_stopped_unix_ns = base_stopped_unix_ns
         self.base_stopped_monotonic_ns = base_stopped_monotonic_ns
+        self.place_back = place_back
+        self.hold_seconds = hold_seconds
         if self.running:
             return {"started": False, "grasp": self.status()}
         self.running = True
@@ -794,6 +800,10 @@ def test_depth_servo_api_has_separate_shadow_live_and_stop_actions(tmp_path):
             "auto_handoff": False,
             "operator_present": False,
             "speed_percent": 5,
+            # place_back defaults TRUE (operator's pick -> hold -> place-back
+            # demo cycle); hold-at-Home dwell defaults to 2.0s.
+            "place_back": True,
+            "hold_seconds": 2.0,
         }
 
         connection.request(
@@ -863,7 +873,57 @@ def test_depth_servo_api_accepts_server_owned_automatic_workflow(tmp_path):
             "auto_handoff": True,
             "operator_present": True,
             "speed_percent": 20,
+            "place_back": True,
+            "hold_seconds": 2.0,
         }
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_depth_servo_api_forwards_place_back_opt_out_and_custom_hold(tmp_path):
+    class FakeControl:
+        def status(self):
+            return {"available": True, "running": False, "state": "idle"}
+
+    approach = _FakeApproachRunner()
+    server = CONTROL.create_server(
+        _bundle(tmp_path / "debug_bundle.json"),
+        port=0,
+        index_path=HTML,
+        control_backend=FakeControl(),
+        runtime_state=None,
+        interactive_service=_FakeInteractiveService(),
+        grasp_runner=_FakeGraspRunner(),
+        approach_runner=approach,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    try:
+        payload = json.dumps({
+            "mode": "live",
+            "target": "charger",
+            "acquire_target": True,
+            "auto_handoff": True,
+            "place_back": False,
+            "hold_seconds": 3.5,
+        }).encode()
+        connection.request(
+            "POST",
+            "/api/approach/start",
+            body=payload,
+            headers=_interactive_headers(port, "approach-start"),
+        )
+        response = connection.getresponse()
+        assert response.status == 202
+        response.read()
+        # Explicit opt-out and a custom Home dwell are parsed and forwarded.
+        assert approach.options["place_back"] is False
+        assert approach.options["hold_seconds"] == 3.5
     finally:
         connection.close()
         server.shutdown()
@@ -1041,6 +1101,60 @@ def test_depth_servo_handoff_phases_stop_base_before_fresh_grasp(tmp_path):
         assert runner._process.poll() is not None
         assert isinstance(grasp.base_stopped_monotonic_ns, int)
         assert runner.status()["workflow"]["phase"] == "grasp_preparing"
+        # The demo cycle is on by default: the handoff forwards place_back=True
+        # and the default 2.0s Home dwell to the grasp runner.
+        assert grasp.place_back is True
+        assert grasp.hold_seconds == 2.0
+
+
+def test_depth_servo_handoff_forwards_place_back_opt_out_and_hold_config(tmp_path):
+    phase_dir = tmp_path / "handoff_ready"
+    phase_dir.mkdir()
+    grasp = _FakeGraspRunner()
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(phase_dir / "servo.py", "handoff_ready"),
+        phase_dir / "status.json",
+        phase_dir / "servo.log",
+        session_service=_FakeInteractiveService(),
+        grasp_runner=grasp,
+    )
+
+    result = runner.start(
+        "live",
+        target="charger",
+        auto_handoff=True,
+        speed_percent=12,
+        place_back=False,
+        hold_seconds=3.5,
+    )
+    deadline = time.monotonic() + 3.0
+    while grasp.starts == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert result["started"] is True
+    assert grasp.mobile_handoff_starts == 1
+    # The server-owned opt-out and custom Home dwell reach the grasp runner.
+    assert grasp.place_back is False
+    assert grasp.hold_seconds == 3.5
+
+
+def test_depth_servo_start_rejects_out_of_range_hold_seconds(tmp_path):
+    grasp = _FakeGraspRunner()
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "handoff_ready"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=_FakeInteractiveService(),
+        grasp_runner=grasp,
+    )
+
+    for bad in (99.0, -1.0, "soon", True):
+        result = runner.start(
+            "live", target="charger", auto_handoff=True, hold_seconds=bad,
+        )
+        assert result["started"] is False
+        assert result["error"]["code"] == "INVALID_HOLD_SECONDS"
+    assert grasp.mobile_handoff_starts == 0
 
 
 def test_depth_servo_supervisor_accepts_structured_handoff_evidence(tmp_path):
@@ -1877,11 +1991,14 @@ def test_mobile_handoff_invalidates_old_capture_and_plans_from_fresh_session(tmp
     runner._run_full = execute
     # No home_runner/_wait_home is installed: a call to either would fail the
     # test and prove that the handoff discarded the current arm/view pose.
+    # place_back=False exercises the plain grasp-and-home opt-out path so this
+    # capture/planning test drives the single _run_full executor call.
     runner._run_mobile_handoff(
         "floor bottle",
         9,
         "20260722-115900",
         1_800_000_000_000_000_000,
+        place_back=False,
     )
 
     assert events[0] == "clear"
@@ -2025,6 +2142,7 @@ def test_mobile_handoff_overlaps_joint_wait_with_fresh_perception(tmp_path):
         5,
         "20260722-120029",
         1_800_000_000_000_000_000,
+        place_back=False,
     )
 
     status = runner.status()
@@ -3453,6 +3571,7 @@ def test_mobile_handoff_recaptures_once_when_passive_window_straddles_stop(tmp_p
         9,
         "20260723-115900",
         1_800_000_000_000_000_000,
+        place_back=False,
     )
 
     assert events.count(("perception", 1)) == 1
@@ -3624,7 +3743,10 @@ def test_mobile_handoff_locks_base_before_executor_and_unlocks_after_home(tmp_pa
         return _executor_start_evidence()
 
     runner = _handoff_runner(tmp_path, base_lock=base_lock, execute=execute, sessions=sessions)
-    runner._run_mobile_handoff("floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000)
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=False,
+    )
 
     # Lock is requested exactly once, proving the base is stopped (never during
     # servo), and unlock is requested exactly once on the success path.
@@ -3690,12 +3812,272 @@ def test_mobile_handoff_survives_lock_transport_failure(tmp_path):
         return _executor_start_evidence()
 
     runner = _handoff_runner(tmp_path, base_lock=base_lock, execute=execute, sessions=sessions)
-    runner._run_mobile_handoff("floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000)
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=False,
+    )
 
     # Lock attempt was made and failed; unlock still runs; the grasp completes.
     assert base_lock.calls[0][0] == "lock"
     assert base_lock.calls[-1] == ("unlock", "mobile_handoff_grasp")
     assert runner.status()["outcome"] == "passed"
+
+
+def _place_back_runner(tmp_path, *, base_lock=None, sessions=None, leg=None):
+    """A mobile-handoff runner wired for the pick -> hold -> place-back cycle.
+
+    The workflow-state file and grasp-workflow dict are installed so the cycle
+    can advance the shared held-object state, and ``_run_workflow_leg`` is
+    stubbed so no NUC subprocess is spawned.  ``_run_full`` is booby-trapped:
+    the place-back cycle must never fall through to the plain full-grasp path.
+    """
+    runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.log_path = tmp_path / "grasp.log"
+    runner.receipt_root = tmp_path / "receipts"
+    runner.receipt_root.mkdir(exist_ok=True)
+    runner.session_service = sessions if sessions is not None else _HandoffSessions()
+    runner.base_lock = base_lock
+    runner._lock = threading.Lock()
+    runner._status = {
+        "revision": 0,
+        "running": True,
+        "phase": "handoff_settle",
+        "outcome": None,
+    }
+    runner._workflow_path = runner.receipt_root / "workflow.json"
+    runner._workflow = {
+        "phase": "ready_at_home",
+        "artifact_id": None,
+        "planning_session_id": None,
+        "holding_object": False,
+        "at_home": True,
+        "receipt_dir": None,
+        "planning_report": None,
+        "planned_grasp": None,
+    }
+    report = tmp_path / "planning_report.json"
+    archive = tmp_path / "planned_grasp.npz"
+    report.write_text("{}", encoding="utf-8")
+    archive.write_bytes(b"npz-bytes")
+    runner._planning_artifacts = lambda attempt: (report, archive)
+
+    class FreshJoints:
+        def current_joint_snapshot(self, *, not_before_unix_ns):
+            return True, "fresh", {
+                "sequence": 1,
+                "source_timestamp_ns": not_before_unix_ns + 1,
+                "joint_positions_rad": [0.0] * 6,
+                "read_only": True,
+            }
+
+    runner.home_verifier = FreshJoints()
+    runner._validate_mobile_handoff_capture_evidence = lambda **_kwargs: {"validated": True}
+    if leg is not None:
+        runner._run_workflow_leg = leg
+    runner._run_full = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("place_back cycle must not fall through to _run_full"),
+    )
+    return runner
+
+
+def _recording_leg(record, *, fail_phase=None):
+    def leg(
+        *,
+        workflow_phase,
+        report,
+        archive,
+        receipt_dir,
+        speed_percent,
+        planning_session_id,
+        prior_receipt_dir,
+    ):
+        record.append((
+            workflow_phase,
+            None if prior_receipt_dir is None else Path(prior_receipt_dir).name,
+            Path(receipt_dir).name,
+        ))
+        if fail_phase is not None and workflow_phase == fail_phase:
+            raise RuntimeError(
+                f"mobile {workflow_phase} leg stopped safely -- the object may "
+                "still be HELD in the gripper; recover with Place Back or Return "
+                "Home Holding and do not start a new grasp",
+            )
+        return _executor_start_evidence()
+
+    return leg
+
+
+def test_mobile_handoff_place_back_runs_pick_carry_hold_place_in_order(tmp_path):
+    record = []
+    sessions = _HandoffSessions()
+    runner = _place_back_runner(tmp_path, sessions=sessions, leg=_recording_leg(record))
+
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=0.0,
+    )
+
+    # The three held-object legs run in order, each consuming the previous
+    # leg's receipt directory: pick-hold (no prior) -> return-home-holding
+    # (prior=pick-hold) -> place-back (prior=return-home-holding).
+    assert [r[0] for r in record] == ["pick-hold", "return-home-holding", "place-back"]
+    assert record[0][1] is None
+    assert record[1][1] == "pick-hold"
+    assert record[2][1] == "return-home-holding"
+    # A hold-leg receipt documents the dwell between carry-home and place-back.
+    action_dirs = list(runner.receipt_root.glob("mobile-handoff-grasp-*"))
+    assert len(action_dirs) == 1
+    hold_receipt = json.loads((action_dirs[0] / "hold-receipt.json").read_text())
+    assert hold_receipt["schema"] == "z_manip.mobile_handoff_hold_receipt.v1"
+    assert hold_receipt["holding_object"] is True
+    assert hold_receipt["at_home"] is True
+    # The cycle finishes released, Home, and ready for the next handoff.
+    status = runner.status()
+    assert status["outcome"] == "passed"
+    assert status["phase"] == "returned_home"
+    assert "carried Home" in status["message"] and "placed back" in status["message"]
+    assert runner._workflow["phase"] == "placed_back_at_home"
+    assert runner._workflow["holding_object"] is False
+    assert runner._workflow["at_home"] is True
+    # Final Home + context clear happened exactly once at the end.
+    assert sessions.events[-1] == "clear"
+
+
+def test_mobile_handoff_place_back_hold_duration_is_honored(tmp_path, monkeypatch):
+    record = []
+    slept = []
+    monkeypatch.setattr(CONTROL.time, "sleep", lambda seconds: slept.append(seconds))
+    runner = _place_back_runner(tmp_path, leg=_recording_leg(record))
+
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=2.0,
+    )
+
+    # The hold dwell is a single 2.0s wait, taken between carry-home and
+    # place-back (after two legs, before the third).
+    assert slept == [2.0]
+    action_dir = next(iter(runner.receipt_root.glob("mobile-handoff-grasp-*")))
+    hold_receipt = json.loads((action_dir / "hold-receipt.json").read_text())
+    assert hold_receipt["requested_hold_s"] == 2.0
+    status = runner.status()
+    assert status["outcome"] == "passed"
+    assert status["timings_s"]["handoff_hold_at_home"] >= 0.0
+    # The place-back leg only runs after the hold receipt exists.
+    assert [r[0] for r in record] == ["pick-hold", "return-home-holding", "place-back"]
+
+
+def test_mobile_handoff_place_back_default_speed_two_honored_end_to_end(tmp_path):
+    record = []
+    speeds = []
+
+    def leg(*, speed_percent, **kwargs):
+        speeds.append(speed_percent)
+        return _recording_leg(record)(speed_percent=speed_percent, **kwargs)
+
+    runner = _place_back_runner(tmp_path, leg=leg)
+    runner._run_mobile_handoff(
+        "floor bottle", 7, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=0.0,
+    )
+    # Every leg inherits the handoff speed, not a per-leg default.
+    assert speeds == [7, 7, 7]
+
+
+def test_mobile_handoff_place_back_failure_mid_carry_keeps_held_object(tmp_path):
+    record = []
+    base_lock = _FakeBaseLock()
+    runner = _place_back_runner(
+        tmp_path,
+        base_lock=base_lock,
+        leg=_recording_leg(record, fail_phase="return-home-holding"),
+    )
+
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=0.0,
+    )
+
+    # The carry-home leg failed after the object was grasped and lifted.  The
+    # place-back leg must NOT run (never blindly release), and the shared
+    # workflow must reflect a still-HELD object at the lift so the existing
+    # Place Back / Return Home Holding recovery buttons can finish it.
+    assert [r[0] for r in record] == ["pick-hold", "return-home-holding"]
+    assert runner._workflow["phase"] == "holding_at_lift"
+    assert runner._workflow["holding_object"] is True
+    assert runner._workflow["at_home"] is False
+    assert Path(runner._workflow["receipt_dir"]).name == "pick-hold"
+    status = runner.status()
+    assert status["outcome"] == "blocked"
+    assert "HELD" in status["message"]
+    # The base lock is still released on the failure exit path.
+    assert base_lock.calls[0][0] == "lock"
+    assert base_lock.calls[-1] == ("unlock", "mobile_handoff_grasp")
+
+
+def test_mobile_handoff_place_back_holds_base_lock_across_every_leg(tmp_path):
+    timeline = []
+
+    class _TimelineLock:
+        def request_lock(self, source, *, base_stopped, now=None):
+            timeline.append(("lock", source, base_stopped))
+            return "locked"
+
+        def request_unlock(self, source, *, now=None):
+            timeline.append(("unlock", source))
+            return "unlocked"
+
+        def status_field(self, now=None):
+            return {"state": "locked", "since_s": 1.0, "source": "mobile_handoff_grasp"}
+
+    def leg(*, workflow_phase, **_kwargs):
+        timeline.append(("leg", workflow_phase))
+        return _executor_start_evidence()
+
+    runner = _place_back_runner(tmp_path, base_lock=_TimelineLock(), leg=leg)
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=0.0,
+    )
+
+    # A single lock brackets all three held-object legs (never re-locked per
+    # leg, never unlocked between them), and a single unlock fires after the
+    # last leg -- the lock/heartbeat lease spans the whole extended cycle.
+    assert timeline == [
+        ("lock", "mobile_handoff_grasp", True),
+        ("leg", "pick-hold"),
+        ("leg", "return-home-holding"),
+        ("leg", "place-back"),
+        ("unlock", "mobile_handoff_grasp"),
+    ]
+
+
+def test_mobile_handoff_opt_out_uses_plain_full_grasp_not_the_cycle(tmp_path):
+    calls = {"full": 0, "leg": 0}
+    runner = _place_back_runner(tmp_path, leg=None)
+
+    def full(**_kwargs):
+        calls["full"] += 1
+        return _executor_start_evidence()
+
+    def leg(**_kwargs):
+        calls["leg"] += 1
+        return _executor_start_evidence()
+
+    runner._run_full = full
+    runner._run_workflow_leg = leg
+
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=False,
+    )
+
+    # The opt-out path drives one plain full grasp and never enters the cycle;
+    # the shared held-object workflow is left untouched.
+    assert calls == {"full": 1, "leg": 0}
+    assert runner._workflow["phase"] == "ready_at_home"
+    assert runner._workflow["holding_object"] is False
+    assert runner.status()["phase"] == "returned_home"
 
 
 def test_grasp_status_base_lock_defaults_to_unlocked_without_owner(tmp_path):
