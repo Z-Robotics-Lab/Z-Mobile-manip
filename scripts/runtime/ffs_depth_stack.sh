@@ -17,6 +17,25 @@ set -euo pipefail
 # FALLBACK: set depth_topic back to /camera/aligned_depth_to_color/image_raw,
 # rebuild + restart perception, then `ffs_depth_stack.sh down` -- the raw D435
 # aligned-depth path is untouched by this stack.
+#
+# DEPTH NOISE FILTER (runs in the relay, one pass upstream of every consumer --
+# EdgeTAM depth, grasp scene_points, UI cloud, collision).  Vectorised cv2/numpy
+# on the uint16 mm depth image, ~3.3 ms/frame at 640x480 (edge 1.8 + speckle 1.2
+# + median 1.0).  Core lives in scripts/runtime/ffs_depth_filter.py (pure funcs,
+# bind-mounted next to the relay), so a change is `down`+`up`, never a rebuild.
+# Toggle stages/params via env (defaults in parens); restore RAW depth with
+# FFS_FILTER=0 (single switch, no rebuild):
+#   FFS_FILTER                    master on/off                      (1)
+#   FFS_FILTER_EDGE               flying-pixel/edge-bleed gradient   (1)
+#   FFS_FILTER_EDGE_MAX_GRAD_MM   3x3 depth-jump threshold, mm       (120)
+#   FFS_FILTER_SPECKLE            free-space speck removal           (1)
+#   FFS_FILTER_SPECKLE_MAX_SIZE   filterSpeckles maxSpeckleSize, px  (50)
+#   FFS_FILTER_SPECKLE_MAX_DIFF_MM filterSpeckles maxDiff, mm        (24)
+#   FFS_FILTER_MEDIAN             banding/ripple median              (1)
+#   FFS_FILTER_MEDIAN_KSIZE       median aperture (3 or 5)           (5)
+#   FFS_FILTER_TEMPORAL           per-pixel motion-gated EMA         (0, OFF)
+#   FFS_FILTER_TEMPORAL_ALPHA     EMA weight on current frame        (0.5)
+#   FFS_FILTER_TEMPORAL_CHANGE_MM per-pixel reset threshold, mm      (40)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="${Z_MANIP_FFS_IMAGE:-ffs:infer}"
@@ -87,9 +106,21 @@ start_relay() {
     -e FFS_IR1_TOPIC=/nuc/camera/ffs_ir_pair/infra1/compressed \
     -e FFS_IR2_TOPIC=/nuc/camera/ffs_ir_pair/infra2/compressed \
     -e "FFS_MAX_FPS=${Z_MANIP_FFS_MAX_FPS:-10}" \
+    -e "FFS_FILTER=${FFS_FILTER:-1}" \
+    -e "FFS_FILTER_EDGE=${FFS_FILTER_EDGE:-1}" \
+    -e "FFS_FILTER_EDGE_MAX_GRAD_MM=${FFS_FILTER_EDGE_MAX_GRAD_MM:-120}" \
+    -e "FFS_FILTER_SPECKLE=${FFS_FILTER_SPECKLE:-1}" \
+    -e "FFS_FILTER_SPECKLE_MAX_SIZE=${FFS_FILTER_SPECKLE_MAX_SIZE:-50}" \
+    -e "FFS_FILTER_SPECKLE_MAX_DIFF_MM=${FFS_FILTER_SPECKLE_MAX_DIFF_MM:-24}" \
+    -e "FFS_FILTER_MEDIAN=${FFS_FILTER_MEDIAN:-1}" \
+    -e "FFS_FILTER_MEDIAN_KSIZE=${FFS_FILTER_MEDIAN_KSIZE:-5}" \
+    -e "FFS_FILTER_TEMPORAL=${FFS_FILTER_TEMPORAL:-0}" \
+    -e "FFS_FILTER_TEMPORAL_ALPHA=${FFS_FILTER_TEMPORAL_ALPHA:-0.5}" \
+    -e "FFS_FILTER_TEMPORAL_CHANGE_MM=${FFS_FILTER_TEMPORAL_CHANGE_MM:-40}" \
     -v "$DDS_CONFIG:/config/cyclonedds.xml:ro" \
     -v "$CALIB:/config/ffs_calibration.json:ro" \
     -v "$ROOT_DIR/scripts/runtime/ffs_depth_relay.py:/usr/local/bin/z-manip-ffs-depth-relay:ro" \
+    -v "$ROOT_DIR/scripts/runtime/ffs_depth_filter.py:/usr/local/bin/ffs_depth_filter.py:ro" \
     "$RUNTIME_IMAGE" python3 /usr/local/bin/z-manip-ffs-depth-relay >/dev/null
   echo "FFS relay started."
 }

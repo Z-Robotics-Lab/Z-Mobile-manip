@@ -27,14 +27,23 @@ whatever the GPU sustains (measured and logged every 10 s).
 import base64
 import json
 import os
+import sys
 import threading
 import time
 import urllib.request
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+
+# Lightweight depth-image noise filter (pure numpy/cv2, no ROS/torch).  Mounted
+# next to this script inside the relay container (see ffs_depth_stack.sh) and
+# alongside it in the repo, so the import resolves both in-container and on-host
+# for tests.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ffs_depth_filter import FilterConfig, filter_depth  # noqa: E402
 
 SERVICE_URL = os.environ.get('FFS_SERVICE_URL', 'http://127.0.0.1:8773')
 CALIB_PATH = os.environ.get('FFS_CALIB', '/config/ffs_calibration.json')
@@ -76,6 +85,16 @@ class FfsDepthRelay(Node):
         self._received = 0
         self._bytes_in = 0
         self._lat_ms = []
+        # Depth noise filter: applied here (the single publisher upstream of
+        # every consumer) so one pass benefits EdgeTAM depth, grasp scene
+        # points, the UI cloud and collision checking.  Disable at runtime with
+        # FFS_FILTER=0 (restart, no rebuild -- relay + filter are bind-mounted).
+        self._filter_cfg = FilterConfig.from_env()
+        self._filter_prev = None
+        self._filter_removed = 0
+        self.get_logger().info(
+            f'depth filter: enabled={self._filter_cfg.enabled} '
+            f'stages={self._filter_cfg.active_stages()}')
 
         self._pub = self.create_publisher(Image, OUT_TOPIC,
                                           qos_profile_sensor_data)
@@ -174,6 +193,13 @@ class FfsDepthRelay(Node):
             if len(raw) != self.W * self.H * 2:
                 self.get_logger().error('bad depth payload size; dropping')
                 continue
+            if self._filter_cfg.enabled:
+                depth = np.frombuffer(raw, dtype=np.uint16).reshape(self.H, self.W)
+                depth, report = filter_depth(depth, self._filter_cfg,
+                                             self._filter_prev)
+                self._filter_prev = depth
+                self._filter_removed += report['removed']
+                raw = np.ascontiguousarray(depth).tobytes()
             msg = Image()
             msg.header.stamp.sec = stamp // 10**9
             msg.header.stamp.nanosec = stamp % 10**9
@@ -191,12 +217,17 @@ class FfsDepthRelay(Node):
     def _report(self):
         lat = self._lat_ms[-100:]
         p50 = sorted(lat)[len(lat) // 2] if lat else float('nan')
+        filt = ''
+        if self._filter_cfg.enabled and self._published:
+            filt = f' filt_drop~{self._filter_removed / self._published:.0f}px/frame'
         self.get_logger().info(
             f'pairs_in={self._received} published={self._published} '
             f'rate~{self._published / max(1e-9, 10.0):.1f}fps '
-            f'rt_p50={p50:.0f}ms wifi_in={self._bytes_in / 10.0 / 1e6:.2f}MB/s')
+            f'rt_p50={p50:.0f}ms wifi_in={self._bytes_in / 10.0 / 1e6:.2f}MB/s'
+            f'{filt}')
         self._published = 0
         self._bytes_in = 0
+        self._filter_removed = 0
         if len(self._lat_ms) > 400:
             self._lat_ms = self._lat_ms[-100:]
 
