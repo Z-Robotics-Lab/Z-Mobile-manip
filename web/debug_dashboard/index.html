@@ -202,6 +202,7 @@
       font: 600 8px var(--mono); letter-spacing: .06em; text-transform: uppercase;
       font-variant-numeric: tabular-nums; pointer-events: auto;
     }
+    .camera-state[hidden] { display: none; }
     .camera-state.live, .camera-state.fresh { border-color: var(--ok-dim); color: var(--ok); background: rgba(63, 181, 103, .07); }
     .camera-state.tracked { border-color: var(--info); color: var(--info); background: rgba(106, 147, 224, .08); }
     .camera-state.stale { border-color: var(--warn-dim); color: var(--warn); }
@@ -1584,8 +1585,11 @@
       };
     }
 
-    // Rotate + translate the camera-frame cloud into the verified base frame in
-    // one pass over the shared typed arrays (no per-point allocation).
+    // Rotate + translate a camera-frame cloud into the verified base frame in
+    // one pass over the shared typed arrays (no per-point allocation).  The
+    // shared scene now composes camera->base at DRAW time from the current
+    // pose (see setLiveCameraPose), so this helper is retained as the reference
+    // implementation of that transform rather than being on the hot path.
     function transformCloudToBase(xyz, count, matrix) {
       const out = new Float32Array(count * 3);
       const m00 = matrix[0][0], m01 = matrix[0][1], m02 = matrix[0][2], m03 = matrix[0][3];
@@ -1619,7 +1623,7 @@
 
     function applyLiveColoredCloud(parsed) {
       if (parsed) state.liveColoredCloud = parsed;
-      if (state.geometryMode !== "live") return;
+      if (state.geometryMode !== "live") { applySessionColoredCloud(); return; }
       const context = ensureLiveMode();
       if (!context) return;
       const cloud = state.liveColoredCloud;
@@ -1630,8 +1634,37 @@
         context.scene.setLiveColoredCloud(null, null, 0);
         return;
       }
-      const base = transformCloudToBase(cloud.xyz, cloud.count, context.kt.arm_base_from_camera);
-      context.scene.setLiveColoredCloud(base, cloud.rgb, cloud.count);
+      // The scene composes camera->base at DRAW time from the freshest pose, so
+      // the raw camera-frame cloud is passed with the CURRENT hand-eye pose and
+      // a moving base sweeps the whole environment, not just the tracked target.
+      context.scene.setLiveCameraPose(context.kt.arm_base_from_camera);
+      context.scene.setLiveColoredCloud(cloud.xyz, cloud.rgb, cloud.count);
+    }
+
+    // Session continuity: while SESSION evidence is displayed, the live colored
+    // cloud keeps refreshing underneath the session overlays — but only when the
+    // measured hand-eye transform is verified AND the live base frame equals the
+    // session bundle's display frame, so a differently-framed cloud is never
+    // co-drawn on session geometry.  ensureLiveMode is deliberately NOT called
+    // here: the scene stays in session mode and the module gate (carried by
+    // setBundle continuity) still has final say.
+    function applySessionColoredCloud() {
+      const scene = state.runtimeScene;
+      if (!scene || typeof scene.setLiveColoredCloud !== "function") return;
+      const runtime = state.runtime;
+      const verified = liveCalibrationVerified(runtime);
+      const cloud = state.liveColoredCloud;
+      const sessionFrame = state.bundle?.visualization?.frame;
+      const frameMatch = Boolean(sessionFrame) && liveBaseFrame(runtime) === sessionFrame;
+      if (!verified || !frameMatch || !cloud || !cloud.count) {
+        scene.setLiveColoredCloud(null, null, 0);
+        return;
+      }
+      // Raw camera-frame cloud + CURRENT pose: the module re-anchors at draw
+      // time (updating only its cloud anchor in session mode — the recorded
+      // bundle's capture-time camera frustum stays untouched).
+      scene.setLiveCameraPose(runtime.kinematic_transforms.arm_base_from_camera);
+      scene.setLiveColoredCloud(cloud.xyz, cloud.rgb, cloud.count);
     }
 
     function applyLiveGeometry() {
@@ -1724,7 +1757,13 @@
     function syncGeometryView(runtime) {
       syncGeometryMode();
       if (state.geometryMode === "live") applyLiveGeometry();
-      else applyRuntimeScene(runtime);
+      else {
+        applyRuntimeScene(runtime);
+        // Re-anchor the live colored cloud on every runtime tick too, so the
+        // world keeps sweeping with base motion even while the cloud endpoint
+        // is answering 304 (no new frame) between captures.
+        applySessionColoredCloud();
+      }
     }
 
     function renderTrajectoryStrip() {

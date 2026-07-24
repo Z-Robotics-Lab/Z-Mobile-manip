@@ -163,8 +163,17 @@
       // colored cloud is rasterized into an offscreen buffer and composited
       // under the vector overlays so 15-20k points never stall the page.
       this.live = false;
+      // View-orientation flag decoupled from `live`: the Z-up projection remap
+      // persists across a live -> session switch of the SAME world frame so the
+      // operator's viewpoint never flips when a session becomes active.
+      this._zUp = false;
       this._liveFramingLocked = false;
       this._liveCloudExpected = false;
+      // Camera->base anchor pose for the live colored cloud.  The cloud is
+      // stored in CAMERA frame and composed with this pose at DRAW time, so
+      // every rendered frame re-anchors the world with the CURRENT pose (a
+      // moving base sweeps the whole environment, not just the tracked target).
+      this._cloudPose = null;
       this._cloudCanvas = null;
       this._cloudCtx = null;
       this._cloudImage = null;
@@ -445,12 +454,26 @@
 
     setBundle(bundle) {
       if (this._destroyed) return { accepted: false, diagnostics: this.getDiagnostics() };
-      // A recorded bundle is authored in the session frame and rendered with the
-      // plain (non-remapped) projection.  Leaving live mode here guarantees the
-      // Z-up remap and live framing never leak into the session/plan view.
+      // View continuity capture.  When the incoming session bundle is authored
+      // in the SAME world frame the operator is already viewing, the live
+      // colored cloud keeps rendering under the session overlays and the
+      // virtual camera (orbit is never touched here; framing + Z-up remap are
+      // carried below) is preserved so activating a session never jumps the
+      // viewpoint.  A different frame falls back to the original cold-load
+      // behavior: no carried cloud, plain projection, one locked re-fit.
+      const previousFrame = this.displayFrame;
+      const carryZUp = this._zUp;
+      const carryCloudExpected = this._liveCloudExpected;
+      const carryCloud = this.model.coloredCloud;
+      const carryCloudPose = this._cloudPose;
+      const carryFraming = this._framing;
+      // Leaving live mode keeps the live robot setter gated while session
+      // evidence is displayed.
       this.live = false;
+      this._zUp = false;
       this._liveFramingLocked = false;
       this._liveCloudExpected = false;
+      this._cloudPose = null;
       this.diagnostics = [];
       this._diagnosticKeys.clear();
       this.bundle = bundle && typeof bundle === "object" ? bundle : null;
@@ -511,10 +534,25 @@
         this._defaultWitness(this.bundle, this._selection.candidateId),
         "planning.rejections.collision_witness",
       );
+      // Same-frame continuity: keep the live colored cloud (only when the
+      // hand-eye gate allowed it in the previous view — camera-frame points are
+      // still never co-drawn on the base grid) and keep the Z-up remap so the
+      // projection basis does not flip under the operator.
+      const continuity = previousFrame !== null && previousFrame === this.displayFrame;
+      if (continuity) {
+        this._zUp = carryZUp;
+        this._liveCloudExpected = carryCloudExpected;
+        if (carryCloudExpected && carryCloud) {
+          this.model.coloredCloud = carryCloud;
+          this._cloudPose = carryCloudPose;
+        }
+      }
       // Lock auto-framing to the recorded planning bundle. Live depth clouds
       // contain edge noise and outliers; fitting the virtual camera to every
-      // runtime update makes a stationary robot appear to shake.
-      this._framing = this._fitLockedFraming();
+      // runtime update makes a stationary robot appear to shake.  Under
+      // same-frame continuity the operator's existing framing is kept verbatim:
+      // "Reset view" is the only recenter.
+      this._framing = continuity && carryFraming ? carryFraming : this._fitLockedFraming();
       this.render();
       return {
         accepted: true,
@@ -625,7 +663,21 @@
         return { accepted: true, frame, overlayAllowed, cloudExpected, live: true };
       }
       const wasLive = this.live;
+      // Session -> live continuity: returning to the live view of the SAME
+      // world frame keeps the operator's camera (orbit + framing) and, when the
+      // hand-eye gate allowed it on both sides, the colored cloud — so toggling
+      // the geometry view never jumps the scene.  Gate toggles while already
+      // live keep the original rebuild semantics.
+      const continuity = !wasLive
+        && normalizeFrame(this.displayFrame) === frame
+        && this._framing !== null;
+      const carryFraming = continuity ? this._framing : null;
+      const carryCloud = continuity && cloudExpected && this._liveCloudExpected
+        ? this.model.coloredCloud
+        : null;
+      const carryCloudPose = carryCloud ? this._cloudPose : null;
       this.live = true;
+      this._zUp = true;
       this.bundle = null;
       this.diagnostics = [];
       this._diagnosticKeys.clear();
@@ -638,11 +690,14 @@
       // The display frame is the base frame origin, so the floor grid and base
       // axes anchor at identity; the Z-up projection remap renders them upright.
       this.model.basePose = IDENTITY.map(row => row.slice());
-      this._framing = null;
-      this._liveFramingLocked = false;
-      // Snap to the standing-behind default only when first entering live mode so
-      // operator orbit/zoom persists across data refreshes and gate toggles.
-      if (!wasLive) this.orbit = Object.assign({}, LIVE_ORBIT);
+      if (carryCloud) this.model.coloredCloud = carryCloud;
+      this._cloudPose = carryCloudPose;
+      this._framing = carryFraming;
+      this._liveFramingLocked = carryFraming !== null;
+      // Snap to the standing-behind default only when first entering live mode
+      // (no continuity view to keep) so operator orbit/zoom persists across data
+      // refreshes, gate toggles, and session round-trips.
+      if (!wasLive && !continuity) this.orbit = Object.assign({}, LIVE_ORBIT);
       this._scheduleRender();
       return { accepted: true, frame, overlayAllowed, cloudExpected, live: true };
     }
@@ -664,20 +719,28 @@
     }
 
     setLiveCameraPose(value) {
-      if (this._destroyed || !this.live) return false;
+      // Live mode updates the drawn frustum AND the cloud anchor pose; under
+      // session continuity (_liveCloudExpected carried by setBundle) only the
+      // cloud anchor updates, so the recorded bundle's capture-time camera
+      // frustum is never overwritten while the live cloud keeps re-anchoring.
+      if (this._destroyed || (!this.live && !this._liveCloudExpected)) return false;
       const matrix = value === null ? null : pose(value);
       if (value !== null && !matrix) {
         this._diagnose("INVALID_POSE", "live camera pose is not a finite transform", "live.cameraPose");
         return false;
       }
-      this.model.cameraPose = matrix;
+      this._cloudPose = matrix;
+      if (this.live) this.model.cameraPose = matrix;
       this._ensureLiveFraming();
       this._scheduleRender();
       return Boolean(matrix);
     }
 
     setLiveColoredCloud(xyz, rgb, count) {
-      if (this._destroyed || !this.live) return 0;
+      // Accepted in live mode, and also while SESSION evidence is displayed
+      // under same-frame continuity (_liveCloudExpected carried by setBundle),
+      // so the live colored cloud keeps refreshing beneath session overlays.
+      if (this._destroyed || (!this.live && !this._liveCloudExpected)) return 0;
       const total = Number.isInteger(count) && count > 0 ? count : 0;
       // Hard gate: a colored cloud only enters the shared base scene when the
       // hand-eye transform is verified (cloudExpected).  Camera-frame points must
@@ -769,10 +832,14 @@
       if (this.model.cameraPose) anchors.push(origin(this.model.cameraPose));
       const step = Math.max(1, Math.floor(cloud.count / 1500));
       const near = [];
+      // The stored cloud is camera-frame; apply the current anchor pose so the
+      // work-radius filter and the fit operate in base-frame coordinates.
+      const anchor = this._cloudPose;
       for (let index = 0; index < cloud.count; index += step) {
         const base = index * 3;
-        const value = [cloud.xyz[base], cloud.xyz[base + 1], cloud.xyz[base + 2]];
+        let value = [cloud.xyz[base], cloud.xyz[base + 1], cloud.xyz[base + 2]];
         if (!value.every(finite)) continue;
+        if (anchor) value = transformPoint(anchor, value);
         if (Math.hypot(value[0], value[1], value[2]) <= LIVE_WORK_RADIUS_M) near.push(value);
       }
       for (const value of this._robustCloudPoints(near)) anchors.push(value);
@@ -851,13 +918,27 @@
       const xyz = cloud.xyz;
       const rgb = cloud.rgb;
       const count = cloud.count;
-      const liveUp = this.live;
+      const liveUp = this._zUp;
       const size = Math.max(1, Math.round(ratio * 1.5));
+      // Draw-time re-anchor: the cloud is stored in CAMERA frame; compose the
+      // CURRENT camera->base pose here (not a capture-time snapshot) so base
+      // motion sweeps the whole environment coherently.  A null pose means the
+      // caller supplied base-frame points already (identity).
+      const anchor = this._cloudPose;
+      const a00 = anchor ? anchor[0][0] : 1, a01 = anchor ? anchor[0][1] : 0,
+        a02 = anchor ? anchor[0][2] : 0, a03 = anchor ? anchor[0][3] : 0;
+      const a10 = anchor ? anchor[1][0] : 0, a11 = anchor ? anchor[1][1] : 1,
+        a12 = anchor ? anchor[1][2] : 0, a13 = anchor ? anchor[1][3] : 0;
+      const a20 = anchor ? anchor[2][0] : 0, a21 = anchor ? anchor[2][1] : 0,
+        a22 = anchor ? anchor[2][2] : 1, a23 = anchor ? anchor[2][3] : 0;
       for (let index = 0; index < count; index += 1) {
         const base = index * 3;
-        let wx = xyz[base] - cx;
-        let wy = xyz[base + 1] - cy;
-        let wz = xyz[base + 2] - cz;
+        const px = xyz[base];
+        const py = xyz[base + 1];
+        const pz = xyz[base + 2];
+        let wx = a00 * px + a01 * py + a02 * pz + a03 - cx;
+        let wy = a10 * px + a11 * py + a12 * pz + a13 - cy;
+        let wz = a20 * px + a21 * py + a22 * pz + a23 - cz;
         if (liveUp) {
           // Match the Z-up remap applied to the vector overlays in _worldToView
           // so the cloud shares one frame with the arm skeleton and floor grid.
@@ -1006,11 +1087,15 @@
     }
 
     resetView() {
-      this.orbit = Object.assign({}, this.live ? LIVE_ORBIT : SESSION_ORBIT);
+      this.orbit = Object.assign({}, this.live || this._zUp ? LIVE_ORBIT : SESSION_ORBIT);
       if (this.live) {
         this._liveFramingLocked = false;
         this._framing = null;
         this._ensureLiveFraming();
+      } else if (this.bundle) {
+        // "Reset view" is the ONLY recenter: session mode re-fits to the
+        // recorded evidence here, never automatically on mode/frame changes.
+        this._framing = this._fitLockedFraming();
       }
       this._scheduleRender();
       return this;
@@ -1022,10 +1107,11 @@
       let x = value[0] - center[0];
       let y = value[1] - center[1];
       let z = value[2] - center[2];
-      if (this.live) {
+      if (this._zUp) {
         // The turntable projection is Y-up, but the live base frame is Z-up.
         // Remap robot(x, y, z) -> render(x, z, -y) so the robot's up axis renders
         // straight up and the floor (base z=0 plane) reads as horizontal ground.
+        // _zUp (not `live`) so the basis survives a same-frame session switch.
         const ry = z;
         const rz = -y;
         y = ry;
@@ -1236,9 +1322,14 @@
       for (const value of this.model.scene) values.push({ value, target: false });
       for (const value of this.model.target) values.push({ value, target: true });
       values.sort((left, right) => project(left.value).z - project(right.value).z);
+      // Bundle scene points are a capture-time snapshot (no base odometry is
+      // available to counter-transform them).  When the live colored cloud is
+      // also on stage it carries the current world, so the snapshot points are
+      // clearly de-emphasized rather than competing with it.
+      const snapshotAlpha = this.model.coloredCloud && this.model.coloredCloud.count ? 0.16 : 0.44;
       for (const item of values) {
         const screen = project(item.value);
-        context.globalAlpha = item.target ? 0.9 : 0.44;
+        context.globalAlpha = item.target ? 0.9 : snapshotAlpha;
         this._circle(
           screen,
           item.target ? 1.8 : 1.1,
@@ -1489,6 +1580,7 @@
       this.bundle = null;
       this.model = this._emptyModel();
       this._framing = null;
+      this._cloudPose = null;
       this._cloudCanvas = null;
       this._cloudCtx = null;
       this._cloudImage = null;

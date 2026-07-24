@@ -611,5 +611,133 @@ console.log(JSON.stringify({{framing}}));
     assert 0.4 <= framing["span"] < 1.5
 
 
+def test_session_bundle_keeps_live_colored_cloud_and_camera_without_refit():
+    # Operator regression: activating a planning/grasp session while the live
+    # view is up must (a) keep drawing the live colored cloud under the session
+    # overlays, (b) keep accepting live cloud refreshes, and (c) never move the
+    # operator's camera — orbit, framing, and the Z-up projection basis all
+    # survive live -> session -> live for a same-frame bundle.  "Reset view"
+    # remains the only recenter.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+scene.setLiveCameraPose(cameraPose);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+// The operator has orbited/zoomed/panned away from the defaults.
+scene.orbit.yaw = 1.23; scene.orbit.zoom = 2.5; scene.orbit.panX = 40;
+const liveState = scene.getState();
+const bundle = {{
+  schema: 'z_manip.debug_bundle.v1',
+  frames: {{ perception: 'camera', planning: 'piper_base_link' }},
+  visualization: {{
+    frame: 'piper_base_link', robot_overlay_allowed: true,
+    scene_cloud: {{ frame: 'piper_base_link', points_xyz_m: [[.2,.1,0],[.3,-.1,.02]] }},
+    target_cloud: {{ frame: 'piper_base_link', points_xyz_m: [[.32,.03,.21]] }},
+    reference_axes: [{{ name: 'base', frame: 'piper_base_link', pose: [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]] }}]
+  }}
+}};
+operations.length = 0;
+const accepted = scene.setBundle(bundle);
+scene.flush();
+const sessionState = scene.getState();
+const drewCloudInSession = operations.some(op => op[0] === 'drawImage');
+// Live cloud refreshes keep flowing while the session is displayed.
+const refreshed = scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+const backState = scene.getState();
+console.log(JSON.stringify({{
+  liveState, accepted, sessionState, drewCloudInSession, refreshed, backState,
+  diagnostics: scene.getDiagnostics().map(item => item.code)
+}}));
+"""))
+
+    assert result["accepted"]["accepted"] is True
+    assert result["accepted"]["frame"] == "piper_base_link"
+    assert result["sessionState"]["live"] is False
+    # (a) the live colored cloud persists and is composited in session mode.
+    assert result["sessionState"]["counts"]["coloredCloudPoints"] == 4
+    assert result["drewCloudInSession"] is True
+    # (b) live refreshes are still accepted while session evidence is shown.
+    assert result["refreshed"] == 4
+    # (c) no viewpoint jump in either direction: orbit and framing are carried
+    # verbatim (framing source stays "live" — no bundle_locked re-fit).
+    assert result["sessionState"]["orbit"] == result["liveState"]["orbit"]
+    assert result["sessionState"]["framing"] == result["liveState"]["framing"]
+    assert result["backState"]["orbit"] == result["liveState"]["orbit"]
+    assert result["backState"]["framing"] == result["liveState"]["framing"]
+    assert result["backState"]["counts"]["coloredCloudPoints"] == 4
+
+
+def test_live_colored_cloud_re_anchors_from_current_camera_pose_at_draw_time():
+    # Operator regression (base approach): the environment cloud must sweep with
+    # base motion, not stay glued to the arm.  The module stores the CAMERA-frame
+    # cloud and composes the camera->base pose at DRAW time, so feeding two
+    # successive camera poses re-projects the SAME untouched cloud arrays to
+    # different pixels — with the locked virtual camera (framing) unchanged,
+    # proving it is a draw-time re-anchor and not a view re-fit.  The anchor
+    # keeps updating while SESSION evidence is displayed (continuity), where it
+    # must not overwrite the bundle's capture-time camera frustum.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.setLiveCameraPose(cameraPose);
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.flush();
+const framingA = scene.getState().framing;
+const pixelA = scene._cloudU32.findIndex(v => v !== 0);
+// The base advances: the hand-eye chain reports a new camera pose while the
+// stored cloud arrays are untouched.
+const poseB = cameraPose.map(row => row.slice());
+poseB[0][3] += 0.12;
+scene.setLiveCameraPose(poseB);
+scene.flush();
+const framingB = scene.getState().framing;
+const pixelB = scene._cloudU32.findIndex(v => v !== 0);
+// Session mode keeps re-anchoring the cloud but not the recorded frustum.
+const bundle = {{
+  schema: 'z_manip.debug_bundle.v1',
+  frames: {{ perception: 'camera', planning: 'piper_base_link' }},
+  visualization: {{
+    frame: 'piper_base_link', robot_overlay_allowed: true,
+    scene_cloud: {{ frame: 'piper_base_link', points_xyz_m: [[.2,.1,0],[.3,-.1,.02]] }},
+    reference_axes: [
+      {{ name: 'base', frame: 'piper_base_link', pose: [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]] }},
+      {{ name: 'camera', frame: 'piper_base_link', pose: cameraPose }}
+    ]
+  }}
+}};
+scene.setBundle(bundle);
+const poseC = cameraPose.map(row => row.slice());
+poseC[0][3] += 0.24;
+const sessionPoseAccepted = scene.setLiveCameraPose(poseC);
+scene.flush();
+const pixelC = scene._cloudU32.findIndex(v => v !== 0);
+const sessionState = scene.getState();
+const frustumUntouched = scene.model.cameraPose === null
+  || scene.model.cameraPose[0][3] === cameraPose[0][3];
+console.log(JSON.stringify({{
+  framingA, framingB, pixelA, pixelB, pixelC,
+  sessionPoseAccepted, sessionState, frustumUntouched
+}}));
+"""))
+
+    assert result["pixelA"] >= 0
+    assert result["pixelB"] >= 0
+    assert result["pixelC"] >= 0
+    # Same cloud arrays, new pose, unchanged virtual camera => new pixels.
+    assert result["framingA"] == result["framingB"]
+    assert result["pixelA"] != result["pixelB"]
+    # The anchor keeps moving while session evidence is displayed...
+    assert result["sessionPoseAccepted"] is True
+    assert result["pixelB"] != result["pixelC"]
+    assert result["sessionState"]["counts"]["coloredCloudPoints"] == 4
+    # ...without overwriting the bundle's capture-time camera frustum.
+    assert result["frustumUntouched"] is True
+
+
 def test_javascript_syntax_is_valid():
     subprocess.run(["node", "--check", str(SCRIPT)], check=True)
