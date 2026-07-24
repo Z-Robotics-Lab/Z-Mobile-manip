@@ -492,14 +492,25 @@ def test_geometry_view_defaults_to_live_fusion_with_session_toggle():
     assert "function livebaseframe" in lowered
     assert "cloudexpected: verified" in lowered
     assert "overlayallowed: skeleton" in lowered
-    assert "scene.setliverobot(skeleton ? liverobotoverlay(runtime, frame) : null)" in lowered
+    # Stale joint feedback during a grasp is a HOLD, not a teardown: fresh feed
+    # pushes the new chain, a held state skips the clearing setLiveRobot(null), and
+    # only a true cold/offline state (no skeleton ever shown) clears to null.
+    assert "const feedbackhold = !skeletonfresh && held" in lowered
+    assert "scene.setliverobot(liverobotoverlay(runtime, frame))" in lowered
+    assert "scene.setliverobot(null)" in lowered
     # When hand-eye is not verified the cloud is withheld from the shared scene
     # (it stays in the left tile) and the banner says so honestly.
     assert "!context.verified || !cloud || !cloud.count" in lowered
     assert "hand-eye unverified" in lowered
     assert "colored cloud fusion locked" in lowered
-    assert "arm skeleton is live forward kinematics" in lowered
     assert "function updatecalibrationlock" in lowered
+    # The old top-center "JOINT FEEDBACK STALE ... locked" banner is demoted to a
+    # quiet amber chip in the hero toolbar so a normal grasp never reads as a
+    # failure in recordings.
+    assert "joint feedback stale" not in lowered
+    assert 'data-testid="geometry-feedback-hold"' in lowered
+    assert "feedback hold" in lowered
+    assert "function renderfeedbackhold" in lowered
 
     # Per-layer freshness badge consistent with the other live tiles.
     assert "function rendergeometryfreshness" in lowered

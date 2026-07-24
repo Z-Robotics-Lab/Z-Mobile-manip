@@ -637,6 +637,7 @@
             <span class="subtle" id="view-frame">frame: —</span>
             <span class="camera-state live" id="geometry-view-mode" data-testid="geometry-view-mode" aria-live="polite">LIVE</span>
             <span class="camera-state live" id="geometry-live-state" data-testid="geometry-live-state" aria-live="polite" title="Live geometry freshness">LIVE</span>
+            <span class="camera-state stale" id="geometry-feedback-hold" data-testid="geometry-feedback-hold" aria-live="polite" title="Passive joint feedback is suspended while the arm executor owns the CAN bus — showing the last-known kinematic chain" hidden>FEEDBACK HOLD</span>
             <button class="tool-button" type="button" id="geometry-view-toggle" data-testid="geometry-view-toggle" hidden>Show session</button>
             <select class="candidate-picker" id="candidate-selector" data-testid="candidate-selector" aria-label="Select grasp candidate"></select>
             <label class="candidate-toggle"><input type="checkbox" id="show-all-candidates">all</label>
@@ -1611,14 +1612,24 @@
       const runtime = state.runtime;
       const verified = liveCalibrationVerified(runtime);
       const kt = runtime?.kinematic_transforms;
-      const skeleton = liveSkeletonAvailable(runtime);
+      const skeletonFresh = liveSkeletonAvailable(runtime);
+      // Passive joint feedback is suspended BY DESIGN while a grasp executor owns
+      // the CAN bus, so a stale skeleton mid-motion is the NORMAL state of every
+      // grasp, not a fault.  Once the module already holds a rendered skeleton,
+      // a stale tick is a HOLD: latch overlayAllowed so enterLiveMode keeps the
+      // frozen chain (rather than tearing the model down), and report the hold so
+      // the caller skips the clearing setLiveRobot(null).  Only a true cold start
+      // (no skeleton ever shown this page load) leaves the gate closed.
+      const held = (scene.getState?.().counts?.actualLinks || 0) > 0;
+      const feedbackHold = !skeletonFresh && held;
+      const skeleton = skeletonFresh || feedbackHold;
       // Always render in the base frame.  The skeleton (forward kinematics) is
-      // allowed whenever link frames are fresh; the colored cloud and wrist
-      // frustum stay locked until the hand-eye transform verifies, so a camera
-      // frame cloud is never placed on the base grid.
+      // allowed whenever link frames are fresh (or held); the colored cloud and
+      // wrist frustum stay locked until the hand-eye transform verifies, so a
+      // camera frame cloud is never placed on the base grid.
       const frame = liveBaseFrame(runtime);
       scene.enterLiveMode({ frame, overlayAllowed: skeleton, cloudExpected: verified });
-      return { scene, verified, kt, runtime, frame, skeleton };
+      return { scene, verified, kt, runtime, frame, skeletonFresh, feedbackHold };
     }
 
     function applyLiveColoredCloud(parsed) {
@@ -1670,13 +1681,26 @@
     function applyLiveGeometry() {
       const context = ensureLiveMode();
       if (!context) return;
-      const { scene, verified, kt, runtime, frame, skeleton } = context;
+      const { scene, verified, kt, runtime, frame, skeletonFresh, feedbackHold } = context;
       // Arm skeleton: live forward kinematics in the base frame whenever the
       // observer publishes fresh link frames, independent of the hand-eye gate.
-      scene.setLiveRobot(skeleton ? liveRobotOverlay(runtime, frame) : null);
+      // Stale feedback after a scene has rendered is a HOLD — never push a
+      // clearing null, so the frozen chain keeps drawing until fresh joints
+      // return.  Only a genuine cold/offline state (no skeleton ever shown)
+      // clears to null.
+      if (skeletonFresh) {
+        scene.setLiveRobot(liveRobotOverlay(runtime, frame));
+      } else if (!feedbackHold) {
+        scene.setLiveRobot(null);
+      }
       // Wrist-camera frustum + colored cloud fusion: gated on the measured
-      // hand-eye transform.
-      scene.setLiveCameraPose(verified ? kt.arm_base_from_camera : null);
+      // hand-eye transform.  During a hold, keep the last frustum pose instead of
+      // clearing it so the whole scene freezes together.
+      if (verified) {
+        scene.setLiveCameraPose(kt.arm_base_from_camera);
+      } else if (!feedbackHold) {
+        scene.setLiveCameraPose(null);
+      }
       applyLiveColoredCloud(null);
     }
 
@@ -1709,6 +1733,24 @@
       }
       updateCalibrationLock();
       renderGeometryFreshness();
+      renderFeedbackHold();
+    }
+
+    // Quiet amber chip in the hero toolbar shown while joint feedback is stale
+    // but the last-known kinematic chain is being held on screen.  It replaces
+    // the old top-center stale-feedback lock banner, which read as a failure in
+    // recordings even though a held (frozen) skeleton is the normal state of
+    // every grasp while the passive feedback service is suspended by design.
+    function renderFeedbackHold() {
+      const chip = byId("geometry-feedback-hold");
+      if (!chip) return;
+      const runtime = state.runtime;
+      const held = (state.runtimeScene?.getState?.().counts?.actualLinks || 0) > 0;
+      const holding = state.geometryMode === "live"
+        && runtime?.status === "live"
+        && !liveSkeletonAvailable(runtime)
+        && held;
+      chip.hidden = !holding;
     }
 
     function updateCalibrationLock() {
@@ -1719,11 +1761,13 @@
         lock.hidden = verified;
         if (state.runtime?.status !== "live") {
           lock.textContent = "LIVE OBSERVER OFFLINE — base geometry locked · waiting for the subscribe-only runtime observer";
-        } else if (liveSkeletonAvailable(state.runtime)) {
-          // Skeleton is honest base FK; only the camera-derived fusion is locked.
-          lock.textContent = "HAND-EYE UNVERIFIED — colored cloud fusion locked (cloud stays camera-frame in the left tile) · arm skeleton is live forward kinematics";
         } else {
-          lock.textContent = "JOINT FEEDBACK STALE — arm skeleton and cloud fusion locked · waiting for fresh /piper/state";
+          // Hand-eye fusion lock only.  This is independent of joint-feedback
+          // freshness: the arm skeleton is honest base FK and keeps rendering
+          // (frozen at its last pose while feedback is suspended during a grasp),
+          // so we never demote it to a locked banner here.  Stale joint feedback
+          // is a HOLD, surfaced by the quiet FEEDBACK HOLD chip — not this lock.
+          lock.textContent = "HAND-EYE UNVERIFIED — colored cloud fusion locked · cloud stays camera-frame in the left tile";
         }
       } else {
         lock.hidden = state.calibrationValid;

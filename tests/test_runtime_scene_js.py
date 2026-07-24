@@ -739,5 +739,76 @@ console.log(JSON.stringify({{
     assert result["frustumUntouched"] is True
 
 
+def test_stale_feedback_tick_holds_skeleton_and_cloud_without_blanking():
+    # Operator regression (grasp money shot): while a grasp executes, the arm
+    # executor owns the CAN bus and the NUC passive-feedback service is suspended
+    # BY DESIGN, so /piper/state joint feedback goes stale on EVERY grasp.  A
+    # stale tick must FREEZE the last-known kinematic chain + colored cloud and
+    # keep rendering everything — never blank the hero.  Even a downgraded overlay
+    # gate (skeleton "unavailable") holds the frozen chain instead of tearing the
+    # model down to an empty scene; only the hand-eye safety gate (cloudExpected)
+    # may drop the colored cloud, and here it stays verified so the cloud holds.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+scene.setLiveCameraPose(cameraPose);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.flush();
+const rendered = scene.getState();
+operations.length = 0;
+// Grasp begins: joint feedback stale.  The overlay gate is downgraded, yet the
+// module must HOLD the frozen skeleton, colored cloud, anchor and framing.
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:false, cloudExpected:true}});
+scene.flush();
+const held = scene.getState();
+const labels = operations.filter(op => op[0] === 'fillText').map(op => op[1]);
+const drewCloud = operations.some(op => op[0] === 'drawImage');
+console.log(JSON.stringify({{ rendered, held, labels, drewCloud }}));
+"""))
+
+    assert result["rendered"]["counts"]["actualLinks"] == 3
+    assert result["rendered"]["counts"]["coloredCloudPoints"] == 4
+    # Skeleton + cloud are HELD across the stale tick — nothing cleared.
+    assert result["held"]["counts"]["actualLinks"] == 3
+    assert result["held"]["counts"]["coloredCloudPoints"] == 4
+    # Virtual camera held verbatim: no re-fit, no null framing, no empty state.
+    assert result["held"]["framing"] == result["rendered"]["framing"]
+    assert result["held"]["framing"]["source"] == "live"
+    assert "Waiting for scene data" not in result["labels"]
+    # Skeleton + cloud are still actually drawn during the hold.
+    assert "base" in result["labels"]
+    assert result["drewCloud"] is True
+
+
+def test_empty_state_only_on_cold_start_never_after_first_geometry():
+    # The full-screen empty state is allowed ONLY on a true cold start (no scene
+    # data ever received this page load).  Once any geometry has been framed, a
+    # later null-framing tick holds the last-known view instead of blanking.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+// Cold start: nothing has ever been received -> the empty state is allowed.
+operations.length = 0;
+scene.render();
+const coldLabels = operations.filter(op => op[0] === 'fillText').map(op => op[1]);
+// First geometry arrives; from now on the empty state must never return.
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:false}});
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.flush();
+operations.length = 0;
+scene.render();
+const warmLabels = operations.filter(op => op[0] === 'fillText').map(op => op[1]);
+console.log(JSON.stringify({{
+  coldEmpty: coldLabels.includes('Waiting for scene data'),
+  warmEmpty: warmLabels.includes('Waiting for scene data')
+}}));
+"""))
+
+    assert result["coldEmpty"] is True
+    assert result["warmEmpty"] is False
+
+
 def test_javascript_syntax_is_valid():
     subprocess.run(["node", "--check", str(SCRIPT)], check=True)

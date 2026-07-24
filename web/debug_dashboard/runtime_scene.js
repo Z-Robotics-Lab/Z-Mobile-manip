@@ -153,6 +153,12 @@
       this._renderCount = 0;
       this._selection = { candidateId: null, rejection: null };
       this._framing = null;
+      // Sticky last-known-good framing.  A rebuild (session clear, live gate
+      // flap, stale-feedback tick) can transiently null `_framing`; this keeps
+      // the virtual camera the operator was already using so an already-rendered
+      // hero is never blanked mid-demo.  It stays null until the FIRST real
+      // framing is computed, so the cold-start empty state is preserved.
+      this._lastFraming = null;
       this.orbit = Object.assign({}, SESSION_ORBIT);
       this._drag = null;
       this._listeners = [];
@@ -660,6 +666,27 @@
         && this.model.overlayAllowed === overlayAllowed
         && this._liveCloudExpected === cloudExpected
       ) {
+        return { accepted: true, frame, overlayAllowed, cloudExpected, live: true };
+      }
+      // Live -> live on the SAME world frame with only the gates changing: this
+      // is a staleness / gate flap during a running grasp (the passive joint
+      // feedback service is suspended BY DESIGN while the arm executor owns the
+      // CAN bus, so a stale skeleton mid-motion is the NORMAL state of every
+      // grasp, not a fault).  HOLD the last-known kinematic chain, cloud anchor,
+      // framing and virtual camera instead of tearing the scene down to an empty
+      // model — a frozen skeleton lagging the real arm is accepted, and the plan
+      // ghost conveys intended motion.  The ONLY geometry a gate change may
+      // remove is the colored cloud when the hand-eye safety gate drops
+      // (cloudExpected -> false): a camera-frame cloud must never be co-drawn on
+      // the base grid.  Updates resume seamlessly on the next fresh feed.
+      if (this.live && normalizeFrame(this.displayFrame) === frame) {
+        this.model.overlayAllowed = overlayAllowed;
+        this._liveCloudExpected = cloudExpected;
+        if (!cloudExpected && this.model.coloredCloud) {
+          this.model.coloredCloud = null;
+          this._cloudPose = null;
+        }
+        this._scheduleRender();
         return { accepted: true, frame, overlayAllowed, cloudExpected, live: true };
       }
       const wasLive = this.live;
@@ -1209,8 +1236,14 @@
     }
 
     _viewTransform() {
-      const framing = this._framing || this._fitLockedFraming();
+      // Fall back to the last-known-good framing so a transient rebuild never
+      // drops the whole scene to the cold-start empty state: once ANY geometry
+      // has been framed this page load, the hero holds that virtual camera
+      // instead of blanking.  `_lastFraming` is null only before the very first
+      // frame, which is the sole moment the empty state is allowed to show.
+      const framing = this._framing || this._fitLockedFraming() || this._lastFraming;
       if (!framing) return null;
+      this._lastFraming = framing;
       const center = framing.center;
       const span = framing.span;
       const scale = Math.min(this._viewport.width, this._viewport.height) * 0.80 / span;
@@ -1497,10 +1530,14 @@
         }
         const view = this._viewTransform();
         if (!view) {
+          // Cold start only: no geometry has ever been framed this page load
+          // (`_lastFraming` is still null).  A transient staleness or gate flap
+          // after a scene has rendered can never reach here — it holds the last
+          // framing above — so this reads as a calm "waiting", not a failure.
           context.fillStyle = "#8fa0a8";
           context.font = "12px ui-monospace, monospace";
           context.textAlign = "center";
-          context.fillText("No frame-consistent scene geometry", width * 0.5, height * 0.5);
+          context.fillText("Waiting for scene data", width * 0.5, height * 0.5);
         } else {
           const project = view.project;
           const pixelScale = Math.min(width, height) * 0.68 / view.span;
@@ -1580,6 +1617,7 @@
       this.bundle = null;
       this.model = this._emptyModel();
       this._framing = null;
+      this._lastFraming = null;
       this._cloudPose = null;
       this._cloudCanvas = null;
       this._cloudCtx = null;
