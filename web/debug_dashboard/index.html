@@ -300,8 +300,8 @@
     /* Buttons — quiet by default, one white primary */
     .btn {
       appearance: none; border: 1px solid var(--btn-border); border-radius: var(--radius-sm);
-      background: transparent; color: var(--text); padding: 7px 10px; min-height: 32px;
-      font: 500 12px var(--sans); letter-spacing: .01em; cursor: pointer; white-space: nowrap;
+      background: transparent; color: var(--text); padding: 9px 12px; min-height: 40px;
+      font: 500 13px var(--sans); letter-spacing: .01em; cursor: pointer; white-space: nowrap;
       display: inline-flex; align-items: center; justify-content: center; gap: 6px;
       transition: border-color .12s ease, background .12s ease, color .12s ease, transform .12s ease, box-shadow .12s ease;
     }
@@ -316,9 +316,23 @@
     .btn.primary:disabled { background: #1c1c1c; border-color: #242424; color: #5a5a5a; opacity: 1; }
     .btn.danger { color: var(--err); border-color: var(--err-dim); }
     .btn.danger:hover:not(:disabled), .btn.danger:focus-visible:not(:disabled) { background: var(--err); border-color: var(--err); color: #0a0a0a; }
-    .btn.small { min-height: 28px; padding: 5px 8px; font-size: 11px; }
+    .btn.small { min-height: 30px; padding: 5px 8px; font-size: 11px; }
     .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
     .btn-grid.one { grid-template-columns: 1fr; }
+    /* Hero rows: the primary find->grasp action and the Home action span the
+       full grid so they are unmissable; siblings share the row below. */
+    .btn-grid:has(#approach-auto) { grid-template-columns: 1fr 1fr 1fr; }
+    #approach-auto { grid-column: 1 / -1; min-height: 48px; font-size: 14px; }
+    #session-go-home {
+      grid-column: 1 / -1; min-height: 48px; font-size: 14px; font-weight: 600;
+      background: var(--elev); border-color: var(--line-3);
+    }
+    #session-go-home:hover:not(:disabled) { background: #1d1d1d; border-color: #3a3a3a; }
+    #session-go-home::before {
+      /* CSS-drawn house glyph (offline page: no SVG-namespace data URIs) */
+      content: ""; width: 13px; height: 13px; flex: 0 0 auto; background: currentColor;
+      clip-path: polygon(50% 0, 100% 42%, 88% 42%, 88% 100%, 60% 100%, 60% 62%, 40% 62%, 40% 100%, 12% 100%, 12% 42%, 0 42%);
+    }
 
     .target-row { display: grid; gap: 6px; }
     .target-input {
