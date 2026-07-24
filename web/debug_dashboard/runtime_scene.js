@@ -1156,20 +1156,28 @@
       if (!base) return;
       const extent = 0.6;
       const spacing = 0.1;
-      for (let index = -6; index <= 6; index += 1) {
+      const steps = 6;
+      for (let index = -steps; index <= steps; index += 1) {
         const offset = index * spacing;
-        const alpha = index === 0 ? "#333333" : this.options.grid;
+        // Fade grid lines with distance from the origin so the plane recedes
+        // instead of reading as a flat uniform mesh.
+        const t = Math.abs(index) / steps;
+        const fade = (0.34 * (1 - t) + 0.05).toFixed(3);
+        const color = index === 0
+          ? "rgba(126, 138, 146, 0.42)"
+          : `rgba(132, 144, 154, ${fade})`;
+        const width = index === 0 ? 1.3 : 0.7;
         this._line(
           project(transformPoint(base, [-extent, offset, 0])),
           project(transformPoint(base, [extent, offset, 0])),
-          alpha,
-          index === 0 ? 1.4 : 0.7,
+          color,
+          width,
         );
         this._line(
           project(transformPoint(base, [offset, -extent, 0])),
           project(transformPoint(base, [offset, extent, 0])),
-          alpha,
-          index === 0 ? 1.4 : 0.7,
+          color,
+          width,
         );
       }
     }
@@ -1187,9 +1195,12 @@
         this._line(screen, project(endpoint), AXIS_COLORS[axis], width || 1.6);
       }
       if (label) {
-        context.fillStyle = "#d6e0e5";
-        context.font = "10px ui-monospace, monospace";
-        context.fillText(label, screen.x + 6, screen.y - 6);
+        context.font = "600 11px ui-monospace, monospace";
+        // Halo so the frame label stays legible over cloud points or grid.
+        context.fillStyle = "rgba(6, 6, 6, 0.85)";
+        context.fillText(label, screen.x + 8, screen.y - 6);
+        context.fillStyle = "#c8d2d7";
+        context.fillText(label, screen.x + 7, screen.y - 7);
       }
     }
 
@@ -1377,6 +1388,22 @@
         context.clearRect(0, 0, width, height);
         context.fillStyle = this.options.background;
         context.fillRect(0, 0, width, height);
+        // Ambient stage glow near the ground plane so the hero reads as a lit
+        // volume rather than dead black.  Purely cosmetic; drawn once per frame
+        // and skipped whenever a real CanvasGradient is unavailable.
+        if (typeof context.createRadialGradient === "function") {
+          const gx = width * 0.5;
+          const gy = height * 0.60;
+          const gr = Math.max(width, height) * 0.78;
+          const glow = context.createRadialGradient(gx, gy, 0, gx, gy, gr);
+          if (glow && typeof glow.addColorStop === "function") {
+            glow.addColorStop(0, "rgba(150, 170, 190, 0.055)");
+            glow.addColorStop(0.45, "rgba(120, 140, 165, 0.02)");
+            glow.addColorStop(1, "rgba(0, 0, 0, 0)");
+            context.fillStyle = glow;
+            context.fillRect(0, 0, width, height);
+          }
+        }
         const view = this._viewTransform();
         if (!view) {
           context.fillStyle = "#8fa0a8";

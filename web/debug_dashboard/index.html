@@ -8,16 +8,22 @@
     :root {
       color-scheme: dark;
       --bg: #0a0a0a;
-      --panel: #0f0f0f;
-      --panel-2: #131313;
+      --panel: #101010;
+      --panel-top: #141414;
+      --panel-2: #141414;
       --elev: #171717;
-      --line: #1f1f1f;
+      --line: #222222;
       --line-2: #2a2a2a;
       --line-3: #383838;
       --text: #ededed;
       --muted: #a1a1a1;
+      --head: #8f8f8f;
+      --icon: #8a8a8a;
       --dim: #6b6b6b;
       --faint: #454545;
+      --btn-border: #262626;
+      --btn-hover: #1a1a1a;
+      --hairline: rgba(255, 255, 255, .035);
       --ok: #3fb567;
       --ok-dim: #2c7a48;
       --warn: #d6a53c;
@@ -43,21 +49,39 @@
     body {
       margin: 0;
       background: var(--bg);
+      /* Barely-there page vignette so panels sit on a lit stage, not dead black. */
+      background-image:
+        radial-gradient(130% 90% at 50% -8%, rgba(150, 165, 185, .05), transparent 46%),
+        radial-gradient(120% 120% at 50% 120%, rgba(0, 0, 0, .45), transparent 55%);
+      background-attachment: fixed;
       color: var(--text);
       font-family: var(--sans);
       font-size: 13px;
       line-height: 1.45;
+      font-variant-numeric: tabular-nums;
       -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
     button, select, input { font: inherit; color: inherit; }
 
     /* Micro section label shared across panels */
     .eyebrow {
-      color: var(--dim);
+      color: var(--head);
       font: 600 var(--micro)/1 var(--sans);
-      letter-spacing: .12em;
+      letter-spacing: .08em;
       text-transform: uppercase;
     }
+
+    /* Inline stroke icons for section headers — the one thing that removes the
+       "too plain" flatness without adding colour. Self-contained, no assets. */
+    .hdr-icon {
+      flex: 0 0 auto; width: 14px; height: 14px; color: var(--icon);
+      stroke: currentColor; fill: none;
+      stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+    }
+
+    /* Soft breathing pulse for genuinely-live status dots (CSS only, no flicker). */
+    @keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 
     /* ---------- App shell: header + workspace + diagnostics drawer ---------- */
     .shell {
@@ -75,9 +99,10 @@
       gap: 18px;
       padding: 8px 14px;
       border: 1px solid var(--line);
-      background: var(--panel);
+      background: linear-gradient(180deg, var(--panel-top), var(--panel) 62%);
       border-radius: var(--radius);
       min-height: 46px;
+      box-shadow: inset 0 1px 0 var(--hairline), 0 1px 2px rgba(0, 0, 0, .35);
     }
     .brand { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
     .brand h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
@@ -89,7 +114,8 @@
       color: var(--dim); font: 600 10px var(--sans); letter-spacing: .06em; text-transform: uppercase; white-space: nowrap;
     }
     .runtime-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-    .runtime-badge.live { color: var(--ok); border-color: var(--ok-dim); }
+    .runtime-badge.live { color: var(--ok); border-color: var(--ok-dim); background: rgba(63, 181, 103, .06); }
+    .runtime-badge.live::before { box-shadow: 0 0 6px rgba(63, 181, 103, .5); animation: live-pulse 2s ease-in-out infinite; }
     .runtime-badge.stale { color: var(--warn); border-color: var(--warn-dim); }
     .runtime-badge.offline { color: var(--dim); border-color: var(--line-2); }
 
@@ -123,12 +149,14 @@
       background: var(--panel);
       border-radius: var(--radius);
       overflow: hidden;
+      box-shadow: inset 0 1px 0 var(--hairline), 0 1px 2px rgba(0, 0, 0, .3);
     }
     .panel-title {
       display: flex; align-items: center; gap: 8px;
       padding: 9px 12px; border-bottom: 1px solid var(--line);
-      color: var(--dim); font: 600 var(--micro)/1 var(--sans);
-      letter-spacing: .12em; text-transform: uppercase; flex: 0 0 auto;
+      background: linear-gradient(180deg, rgba(255, 255, 255, .012), transparent);
+      color: var(--head); font: 600 var(--micro)/1 var(--sans);
+      letter-spacing: .08em; text-transform: uppercase; flex: 0 0 auto;
     }
     .panel-title .subtle { margin-left: auto; color: var(--faint); font: 10px var(--mono); letter-spacing: 0; text-transform: none; }
 
@@ -139,7 +167,10 @@
     .image-frame {
       position: relative; min-height: 0;
       border: 1px solid var(--line); background: #060606; border-radius: var(--radius-sm); overflow: hidden;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .02);
+      transition: border-color .12s ease;
     }
+    .image-frame:hover { border-color: var(--line-3); }
     .image-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
     .image-frame img[hidden], .empty-image[hidden] { display: none; }
     .image-frame.live-camera { flex: 1 1 0; min-height: 118px; }
@@ -151,8 +182,9 @@
       display: flex; align-items: center; justify-content: space-between; gap: 6px; pointer-events: none;
     }
     .image-label {
-      padding: 2px 6px; background: rgba(10, 10, 10, .82); border: 1px solid var(--line-2); border-radius: 4px;
-      font: 9px var(--sans); letter-spacing: .04em; color: var(--muted); pointer-events: auto;
+      padding: 2px 7px; background: rgba(8, 8, 8, .8); border: 1px solid var(--line-2); border-radius: 4px;
+      font: 600 9px var(--sans); letter-spacing: .05em; color: var(--muted); pointer-events: auto;
+      backdrop-filter: blur(3px);
     }
     .image-frame-actions { display: inline-flex; align-items: center; gap: 4px; pointer-events: auto; }
     .image-reorder-button {
@@ -164,16 +196,36 @@
 
     /* Small status pills — the one place color carries meaning */
     .camera-state {
-      padding: 2px 6px; border: 1px solid var(--line-2); border-radius: 999px;
-      background: rgba(10, 10, 10, .82); color: var(--dim);
-      font: 600 8px var(--sans); letter-spacing: .07em; text-transform: uppercase; pointer-events: auto;
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 7px; border: 1px solid var(--line-2); border-radius: 999px;
+      background: rgba(8, 8, 8, .82); color: var(--dim);
+      font: 600 8px var(--mono); letter-spacing: .06em; text-transform: uppercase;
+      font-variant-numeric: tabular-nums; pointer-events: auto;
     }
-    .camera-state.live, .camera-state.fresh { border-color: var(--ok-dim); color: var(--ok); }
-    .camera-state.tracked { border-color: var(--info); color: var(--info); }
+    .camera-state.live, .camera-state.fresh { border-color: var(--ok-dim); color: var(--ok); background: rgba(63, 181, 103, .07); }
+    .camera-state.tracked { border-color: var(--info); color: var(--info); background: rgba(106, 147, 224, .08); }
     .camera-state.stale { border-color: var(--warn-dim); color: var(--warn); }
     .camera-state.offline, .camera-state.invalid { border-color: var(--line-2); color: var(--dim); }
+    /* Leading status dot; breathes only when the source is genuinely fresh. */
+    .camera-state.live::before, .camera-state.fresh::before, .camera-state.tracked::before,
+    .camera-state.stale::before {
+      content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: 0 0 auto;
+    }
+    .camera-state.live::before, .camera-state.fresh::before { animation: live-pulse 2s ease-in-out infinite; }
 
-    .empty-image { position: absolute; inset: 0; display: grid; place-items: center; padding: 10px; text-align: center; color: var(--dim); font: 10px var(--mono); }
+    .empty-image {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 9px; padding: 12px;
+      text-align: center; color: var(--dim); font: 10px var(--mono);
+    }
+    /* Framed "no image" glyph so an unavailable tile reads as intentional, not bare. */
+    .empty-image::before {
+      content: ""; width: 28px; height: 22px; flex: 0 0 auto; opacity: .5;
+      border: 1.5px solid var(--faint); border-radius: 4px;
+      background:
+        radial-gradient(circle at 34% 38%, var(--faint) 0 2px, transparent 2.5px),
+        linear-gradient(150deg, transparent 52%, var(--faint) 52%, var(--faint) 62%, transparent 62%);
+    }
 
     .cloud-canvas { width: 100%; height: 100%; display: block; background: #060606; cursor: grab; touch-action: none; }
     .cloud-canvas.dragging { cursor: grabbing; }
@@ -197,12 +249,23 @@
     .canvas-wrap { position: relative; flex: 1 1 auto; min-height: 0; background: #0a0a0a; overflow: hidden; }
     #scene-canvas { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
     #scene-canvas.dragging { cursor: grabbing; }
-    .canvas-hud {
-      position: absolute; left: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 10px;
-      color: var(--dim); font: 10px var(--mono); pointer-events: none;
+    /* Soft inset vignette layered over the canvas so the stage has depth at the edges. */
+    .canvas-wrap::after {
+      content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+      box-shadow: inset 0 0 90px 8px rgba(0, 0, 0, .5);
+      background: radial-gradient(125% 100% at 50% 40%, transparent 58%, rgba(0, 0, 0, .28));
     }
-    .legend { display: inline-flex; align-items: center; gap: 5px; }
-    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .canvas-hud {
+      position: absolute; left: 12px; bottom: 12px; z-index: 2; display: flex; flex-wrap: wrap; gap: 6px;
+      color: var(--dim); font: 9px var(--mono); pointer-events: none;
+    }
+    .legend {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px;
+      background: rgba(10, 10, 10, .58); backdrop-filter: blur(4px); letter-spacing: .02em;
+    }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 4px currentColor; }
+    .calibration-lock { z-index: 3; }
 
     .calibration-lock {
       position: absolute; top: 12px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 24px);
@@ -226,26 +289,33 @@
 
     /* ---------- Right: control strip ---------- */
     .controls { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; gap: 10px; }
-    .cblock { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); padding: 10px; display: grid; gap: 8px; }
+    .cblock {
+      border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); padding: 10px; display: grid; gap: 8px;
+      box-shadow: inset 0 1px 0 var(--hairline), 0 1px 2px rgba(0, 0, 0, .3);
+    }
     .cblock-head { display: flex; align-items: center; gap: 8px; }
     .cblock-head .eyebrow { flex: 0 0 auto; }
     .cblock-head .hint { margin-left: auto; color: var(--faint); font: 9px var(--mono); }
 
     /* Buttons — quiet by default, one white primary */
     .btn {
-      appearance: none; border: 1px solid var(--line-2); border-radius: var(--radius-sm);
+      appearance: none; border: 1px solid var(--btn-border); border-radius: var(--radius-sm);
       background: transparent; color: var(--text); padding: 7px 10px; min-height: 32px;
       font: 500 12px var(--sans); letter-spacing: .01em; cursor: pointer; white-space: nowrap;
       display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-      transition: border-color .14s ease, background .14s ease, color .14s ease;
+      transition: border-color .12s ease, background .12s ease, color .12s ease, transform .12s ease, box-shadow .12s ease;
     }
-    .btn:hover:not(:disabled), .btn:focus-visible:not(:disabled) { border-color: var(--line-3); background: var(--elev); outline: none; }
-    .btn:disabled { color: var(--faint); border-color: var(--line); cursor: not-allowed; }
+    .btn:hover:not(:disabled), .btn:focus-visible:not(:disabled) { border-color: var(--line-3); background: var(--btn-hover); outline: none; }
+    .btn:active:not(:disabled) { transform: translateY(1px); background: #151515; }
+    .btn:disabled { opacity: .4; border-color: var(--btn-border); cursor: not-allowed; }
     .btn.primary { background: var(--text); border-color: var(--text); color: #0a0a0a; font-weight: 600; }
-    .btn.primary:hover:not(:disabled), .btn.primary:focus-visible:not(:disabled) { background: #fff; border-color: #fff; }
-    .btn.primary:disabled { background: #2a2a2a; border-color: #2a2a2a; color: var(--faint); }
+    .btn.primary:hover:not(:disabled), .btn.primary:focus-visible:not(:disabled) {
+      background: #fff; border-color: #fff; transform: translateY(-1px); box-shadow: 0 3px 12px rgba(0, 0, 0, .45);
+    }
+    .btn.primary:active:not(:disabled) { transform: translateY(0); box-shadow: none; }
+    .btn.primary:disabled { background: #1c1c1c; border-color: #242424; color: #5a5a5a; opacity: 1; }
     .btn.danger { color: var(--err); border-color: var(--err-dim); }
-    .btn.danger:hover:not(:disabled), .btn.danger:focus-visible:not(:disabled) { background: rgba(122, 52, 56, .18); border-color: var(--err); }
+    .btn.danger:hover:not(:disabled), .btn.danger:focus-visible:not(:disabled) { background: var(--err); border-color: var(--err); color: #0a0a0a; }
     .btn.small { min-height: 28px; padding: 5px 8px; font-size: 11px; }
     .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
     .btn-grid.one { grid-template-columns: 1fr; }
@@ -278,15 +348,33 @@
     .approach-metric span { display: block; color: var(--dim); font: 8px var(--sans); letter-spacing: .06em; text-transform: uppercase; }
     .approach-metric strong { display: block; margin-top: 2px; color: var(--text); font: 10px var(--mono); overflow-wrap: anywhere; }
 
-    /* Phase breadcrumb */
-    .approach-progress { display: flex; flex-wrap: wrap; gap: 4px; }
+    /* Phase breadcrumb — a real stepper: nodes joined by 1px connectors. */
+    .approach-progress { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 0; }
     .approach-phase {
-      border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--dim);
-      background: var(--panel-2); font: 600 8px var(--sans); letter-spacing: .05em; text-transform: uppercase; white-space: nowrap;
+      position: relative; display: inline-flex; align-items: center; gap: 5px;
+      padding: 2px 3px; color: var(--faint); white-space: nowrap;
+      font: 600 8px var(--sans); letter-spacing: .05em; text-transform: uppercase;
+      transition: color .15s ease;
     }
-    .approach-phase.active { border-color: var(--warn-dim); color: var(--warn); background: rgba(124, 99, 38, .15); }
-    .approach-phase.complete { border-color: var(--ok-dim); color: var(--ok); }
-    .approach-phase.blocked { border-color: var(--err-dim); color: var(--err); }
+    /* node */
+    .approach-phase::before {
+      content: ""; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box;
+      border: 1.5px solid var(--faint); background: transparent; flex: 0 0 auto;
+      transition: background .15s ease, border-color .15s ease, box-shadow .15s ease;
+    }
+    /* connector to the next node */
+    .approach-phase::after {
+      content: ""; width: 9px; height: 1px; margin-left: 3px; background: var(--line-2); flex: 0 0 auto;
+      transition: background .15s ease;
+    }
+    .approach-phase:last-child::after { display: none; }
+    .approach-phase.complete { color: var(--muted); }
+    .approach-phase.complete::before { background: var(--ok); border-color: var(--ok); }
+    .approach-phase.complete::after { background: var(--ok-dim); }
+    .approach-phase.active { color: var(--text); }
+    .approach-phase.active::before { background: #fff; border-color: #fff; box-shadow: 0 0 0 3px rgba(255, 255, 255, .12); }
+    .approach-phase.blocked { color: var(--err); }
+    .approach-phase.blocked::before { background: var(--err); border-color: var(--err); }
 
     /* Service health rows — dot + name + status, actions revealed on hover */
     .component-list { display: grid; gap: 1px; }
@@ -299,7 +387,7 @@
     [data-component-badge] { display: none; }
     .component-state { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--dim); font: 9px var(--mono); white-space: nowrap; overflow: hidden; }
     .component-state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
-    .component-state.healthy::before { background: var(--ok); }
+    .component-state.healthy::before { background: var(--ok); box-shadow: 0 0 5px rgba(63, 181, 103, .5); animation: live-pulse 2s ease-in-out infinite; }
     .component-state.degraded::before { background: var(--warn); }
     .component-state.offline::before { background: var(--err); }
     .component-state.degraded { color: var(--warn); }
@@ -337,9 +425,11 @@
     /* ---------- Diagnostics drawer (collapsed by default) ---------- */
     .diag-drawer { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); overflow: hidden; }
     .diag-drawer > summary {
-      list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; padding: 9px 14px;
-      color: var(--dim); font: 600 var(--micro) var(--sans); letter-spacing: .12em; text-transform: uppercase;
+      list-style: none; cursor: pointer; display: flex; align-items: center; gap: 9px; padding: 9px 14px;
+      color: var(--head); font: 600 var(--micro) var(--sans); letter-spacing: .08em; text-transform: uppercase;
+      transition: color .12s ease;
     }
+    .diag-drawer > summary:hover { color: var(--text); }
     .diag-drawer > summary::-webkit-details-marker { display: none; }
     .diag-drawer > summary::before { content: "▸"; color: var(--faint); transition: transform .15s ease; }
     .diag-drawer[open] > summary::before { transform: rotate(90deg); }
@@ -350,7 +440,7 @@
       max-height: 52vh; overflow: auto;
     }
     .section { min-width: 0; }
-    .section h2 { margin: 0 0 8px; color: var(--dim); font: 600 var(--micro) var(--sans); letter-spacing: .1em; text-transform: uppercase; }
+    .section h2 { margin: 0 0 8px; color: var(--head); font: 600 var(--micro) var(--sans); letter-spacing: .08em; text-transform: uppercase; }
     .section.span-2 { grid-column: span 2; }
 
     .stage-rail { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -478,7 +568,7 @@
     <div class="workspace">
       <!-- LEFT: perception feed -->
       <section class="panel" aria-label="Perception feed">
-        <div class="panel-title"><span>Perception feed</span><span class="subtle">live + tracking</span></div>
+        <div class="panel-title"><svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg><span>Perception feed</span><span class="subtle">live + tracking</span></div>
         <div class="image-stack" id="image-stack">
           <div class="image-frame live-camera" data-testid="live-camera-frame" data-feed-key="live_camera">
             <div class="image-frame-toolbar">
@@ -526,6 +616,7 @@
       <!-- CENTER: geometry / scene (hero) -->
       <section class="panel viewport-panel" aria-label="Geometry scene view">
         <div class="panel-title">
+          <svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
           <span>Geometry / scene</span>
           <div class="viewport-toolbar">
             <span class="subtle" id="view-frame">frame: —</span>
@@ -559,14 +650,14 @@
       <!-- RIGHT: control strip -->
       <aside class="controls" aria-label="Robot controls">
         <div class="cblock">
-          <div class="cblock-head"><span class="eyebrow">Target object</span></div>
+          <div class="cblock-head"><svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg><span class="eyebrow">Target object</span></div>
           <div class="target-row">
             <input class="target-input" id="perception-target" type="text" maxlength="160" autocomplete="off" spellcheck="false" placeholder="e.g. white block with red port" aria-label="Current target object description">
           </div>
         </div>
 
         <div class="cblock" aria-label="Mobile find to grasp controls">
-          <div class="cblock-head"><span class="eyebrow">Mobile find → grasp</span></div>
+          <div class="cblock-head"><svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="22" y1="12" x2="18" y2="12"/><line x1="6" y1="12" x2="2" y2="12"/><line x1="12" y1="6" x2="12" y2="2"/><line x1="12" y1="22" x2="12" y2="18"/></svg><span class="eyebrow">Mobile find → grasp</span></div>
           <div class="approach-progress" id="approach-progress" aria-label="Mobile grasp workflow progress">
             <span class="approach-phase" data-approach-phase="detect">Detect</span>
             <span class="approach-phase" data-approach-phase="search">Search</span>
@@ -593,6 +684,7 @@
 
         <div class="cblock" aria-label="Pipeline steps">
           <div class="cblock-head">
+            <svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
             <span class="eyebrow">Pipeline steps</span>
             <label class="speed-control" for="motion-speed">Speed
               <input class="speed-input" id="motion-speed" type="number" min="1" max="50" step="1" value="5" inputmode="numeric" aria-describedby="motion-speed-note">%
@@ -625,6 +717,7 @@
 
         <div class="cblock" aria-label="Robot service health">
           <div class="cblock-head">
+            <svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
             <span class="eyebrow">Service health</span>
             <button class="component-button" id="component-bringup" type="button">Bring up stack</button>
           </div>
@@ -647,14 +740,14 @@
         </div>
 
         <div class="cblock" aria-label="Pipeline issues">
-          <div class="cblock-head"><span class="eyebrow">Pipeline issues</span></div>
+          <div class="cblock-head"><svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span class="eyebrow">Pipeline issues</span></div>
           <div class="error-list" id="error-list"></div>
         </div>
       </aside>
     </div>
 
     <details class="diag-drawer" aria-label="Diagnostics">
-      <summary>Diagnostics<span class="subtle" id="candidate-count">0 candidates</span></summary>
+      <summary><svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Diagnostics<span class="subtle" id="candidate-count">0 candidates</span></summary>
       <div class="diag-grid">
         <section class="section">
           <h2>Bundle frames</h2>
