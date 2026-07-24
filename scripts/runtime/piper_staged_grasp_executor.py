@@ -114,6 +114,16 @@ RESAMPLED_PATH_TOLERANCE_RAD = 1e-5
 MAX_START_RECONCILIATION_RAD = 0.006
 PROJECTION_MATCH_TOLERANCE_RAD = math.radians(0.01)
 JOINT_LIMIT_TOLERANCE_RAD = 1e-5
+# Bounded low-speed convergence from a checked-corridor endpoint to the
+# calibrated software Home.  These mirror the standalone Home action exactly as
+# the operator's Home wrapper invokes it (piper_home_recovery.py with
+# --max-recovery-deg 20 --max-step-deg 5): a checked path leaves the arm at its
+# recorded planning-start pose, and the final short hop to calibrated Home must
+# never sweep a large unplanned joint-space chord.  Deltas beyond the envelope
+# fail closed so the caller can stop safely at the corridor endpoint instead;
+# the step cap keeps every segment inside PiPER's controller deadband budget.
+MEASURED_HOME_MAX_CONVERGENCE_RAD = math.radians(20.0)
+MEASURED_HOME_MAX_STEP_RAD = math.radians(5.0)
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -1438,6 +1448,71 @@ def execute_timed_joint_path(
         tolerance_rad=feedback_tolerance_rad,
         monotonic=monotonic,
         sleep=sleep,
+    )
+
+
+def load_software_home(path: Path) -> np.ndarray:
+    """Load and validate a captured PiPER software Home pose.
+
+    Mirrors the standalone Home action's loader so the calibrated Home reached
+    by a checked-corridor recovery is the exact same evidence-bound pose the
+    dedicated Home action would drive to.
+    """
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or document.get("schema") != "z_manip.piper_software_home.v1":
+        raise SafetyError("invalid PiPER software Home schema")
+    if document.get("capture_zero_can_tx_verified") is not True:
+        raise SafetyError("software Home was not captured with zero CAN TX evidence")
+    radians = _finite_vector(document.get("joint_radians"), "software Home joints")
+    degrees = _finite_vector(document.get("joint_degrees"), "software Home degrees")
+    if float(np.max(np.abs(np.degrees(radians) - degrees))) > 1e-3:
+        raise SafetyError("software Home degree/radian values disagree")
+    low = JOINT_LIMITS_RAD[:, 0]
+    high = JOINT_LIMITS_RAD[:, 1]
+    if np.any(radians < low) or np.any(radians > high):
+        raise SafetyError("software Home lies outside PiPER joint limits")
+    return radians
+
+
+def converge_to_measured_home(
+    robot: Any,
+    current: np.ndarray,
+    home: np.ndarray,
+    guard: CommandGuard,
+    *,
+    speed_percent: int,
+    segment_timeout_s: float = 12.0,
+    max_convergence_rad: float = MEASURED_HOME_MAX_CONVERGENCE_RAD,
+    max_step_rad: float = MEASURED_HOME_MAX_STEP_RAD,
+) -> np.ndarray:
+    """Bounded low-speed linear convergence from a checked endpoint to Home.
+
+    This is the exact recovery motion the standalone Home action uses: it
+    never sweeps a large unplanned chord (a delta beyond the envelope fails
+    closed so the caller can stop safely at the checked-corridor endpoint) and
+    it steps the interpolation so every segment stays inside PiPER's controller
+    deadband.  Reusing this from the reverse-home recovery lets a single Home
+    request finish at calibrated Home instead of stranding the arm at its
+    recorded planning-start pose.
+    """
+    current = _finite_vector(current, "convergence start")
+    home = _finite_vector(home, "measured Home")
+    delta = float(np.max(np.abs(home - current)))
+    if delta > max_convergence_rad:
+        raise SafetyError(
+            f"measured Home delta {math.degrees(delta):.3f}deg exceeds "
+            f"{math.degrees(max_convergence_rad):.3f}deg convergence envelope",
+        )
+    steps = max(1, int(math.ceil(delta / max_step_rad)))
+    path = np.linspace(current, home, steps + 1)
+    return execute_joint_path(
+        robot,
+        path,
+        guard,
+        speed_percent=speed_percent,
+        segment_timeout_s=segment_timeout_s,
+        start_tolerance_rad=DEFAULT_START_TOLERANCE_RAD,
+        feedback_tolerance_rad=DEFAULT_FEEDBACK_TOLERANCE_RAD,
     )
 
 
