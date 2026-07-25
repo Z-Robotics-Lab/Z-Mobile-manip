@@ -366,3 +366,23 @@ def test_tracking_response_never_indexes_the_whole_silhouette(monkeypatch) -> No
     assert response["status"] == "tracking"
     assert response["bbox_xyxy"] == [0, 0, 8, 8]
     assert 2 not in indexed_dimensions
+
+
+def test_service_and_client_coco_rle_encoders_agree_byte_for_byte() -> None:
+    # The protocol encoder is duplicated because the service container carries
+    # no z_manip dependency. Pin the copies to each other so they cannot drift.
+    from z_manip.perception.edgetam_service_client import encode_coco_rle as client_encode
+
+    rng = np.random.default_rng(20260725)
+    cases = [
+        np.zeros((5, 7), dtype=bool),
+        np.ones((5, 7), dtype=bool),
+        np.array([[True]], dtype=bool),
+        np.array([[False]], dtype=bool),
+    ]
+    for _ in range(40):
+        shape = (int(rng.integers(1, 9)), int(rng.integers(1, 9)))
+        cases.append(rng.integers(0, 2, size=shape).astype(bool))
+
+    for mask in cases:
+        assert server.encode_coco_rle(mask) == client_encode(mask)

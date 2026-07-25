@@ -141,22 +141,23 @@ def encode_coco_rle(mask: object) -> dict[str, object]:
     if array.ndim != 2 or array.shape[0] < 1 or array.shape[1] < 1:
         raise ValueError("mask must be a non-empty 2-D array")
     flat = array.reshape(-1, order="F")
-    counts: list[int] = []
-    current = False
-    run = 0
-    for pixel in flat:
-        value = bool(pixel)
-        if value == current:
-            run += 1
-        else:
-            counts.append(run)
-            current = value
-            run = 1
-    counts.append(run)
+    # Vectorized run-length encoding.  This is byte-for-byte equivalent to the
+    # per-pixel loop it replaces -- and to the service-side encoder in
+    # docker/edgetam_service/server.py, which tests/test_edgetam_service_server
+    # pins it against -- but costs no Python iteration per image pixel.
+    changes = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+    boundaries = np.concatenate(
+        (np.array([0], dtype=np.int64), changes, np.array([flat.size], dtype=np.int64)),
+    )
+    counts = np.diff(boundaries).tolist()
+    # COCO RLE counts always begin with a background (False) run; prepend a
+    # zero-length run when the first pixel is foreground.
+    if bool(flat[0]):
+        counts = [0] + counts
     return {
         "encoding": "coco_rle",
         "size": [int(array.shape[0]), int(array.shape[1])],
-        "counts": counts,
+        "counts": [int(count) for count in counts],
     }
 
 

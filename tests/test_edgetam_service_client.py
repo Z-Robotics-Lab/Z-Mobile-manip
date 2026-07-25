@@ -450,3 +450,67 @@ def test_tracked_frame_parse_never_indexes_the_whole_silhouette(monkeypatch):
 
     assert updated.bbox_xyxy == expected_bbox
     assert 2 not in indexed_dimensions
+
+
+def _reference_coco_rle(mask):
+    """Original per-pixel RLE, kept here as the equivalence oracle."""
+    flat = np.asarray(mask, dtype=bool).reshape(-1, order="F")
+    counts = []
+    current = False
+    run = 0
+    for pixel in flat:
+        value = bool(pixel)
+        if value == current:
+            run += 1
+        else:
+            counts.append(run)
+            current = value
+            run = 1
+    counts.append(run)
+    return counts
+
+
+def _rle_equivalence_cases():
+    rng = np.random.default_rng(20260725)
+    cases = [
+        np.zeros((5, 7), dtype=bool),
+        np.ones((5, 7), dtype=bool),
+        np.array([[True]], dtype=bool),
+        np.array([[False]], dtype=bool),
+    ]
+    leading = np.zeros((4, 6), dtype=bool)
+    leading[0, 0] = True
+    cases.append(leading)
+    for _ in range(40):
+        shape = (int(rng.integers(1, 9)), int(rng.integers(1, 9)))
+        cases.append(rng.integers(0, 2, size=shape).astype(bool))
+    return cases
+
+
+def test_vectorized_coco_rle_matches_the_per_pixel_reference():
+    for mask in _rle_equivalence_cases():
+        encoded = encode_coco_rle(mask)
+        assert encoded["counts"] == _reference_coco_rle(mask)
+        assert encoded["size"] == [int(mask.shape[0]), int(mask.shape[1])]
+        assert sum(encoded["counts"]) == mask.size
+        assert np.array_equal(decode_coco_rle(encoded), mask)
+
+
+def test_coco_rle_encoding_never_iterates_the_mask_in_python(monkeypatch):
+    # A per-pixel loop costs ~44 ms on a 720p mask. The run boundaries must come
+    # from a vectorised scan, so the encoder has to reach np.flatnonzero.
+    scanned = []
+    original_flatnonzero = np.flatnonzero
+
+    def recording_flatnonzero(array, *args, **kwargs):
+        scanned.append(np.size(array))
+        return original_flatnonzero(array, *args, **kwargs)
+
+    monkeypatch.setattr(np, "flatnonzero", recording_flatnonzero)
+    mask = np.zeros((8, 10), dtype=bool)
+    mask[2:6, 3:7] = True
+
+    encoded = encode_coco_rle(mask)
+
+    assert scanned == [mask.size - 1]
+    assert sum(encoded["counts"]) == mask.size
