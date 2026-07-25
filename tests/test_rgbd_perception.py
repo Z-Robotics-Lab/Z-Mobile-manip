@@ -271,3 +271,50 @@ def test_zero_radius_dilation_leaves_the_mask_untouched():
     mask[1:3, 2:5] = True
 
     assert np.array_equal(rgbd_module.dilate_mask(mask, 0), mask)
+
+
+def _gathered_subsample(array, stride):
+    """Explicit index gather, the form the strided views replace."""
+    rows = np.arange(0, array.shape[0], stride)
+    columns = np.arange(0, array.shape[1], stride)
+    return array[np.ix_(rows, columns)]
+
+
+@pytest.mark.parametrize("stride", [1, 2, 3, 5])
+def test_strided_subsample_reproduces_the_index_gather(stride):
+    rng = np.random.default_rng(31)
+    depth = rng.integers(0, 5000, size=(37, 53), dtype=np.uint16)
+    mask = rng.random((37, 53)) < 0.3
+    intrinsics = CameraIntrinsics(600.0, 600.0, 26.5, 18.5, 53, 37)
+
+    points, excluded = depth_to_scene_cloud(
+        depth, intrinsics, target_mask=mask, target_dilation_px=1, stride=stride,
+    )
+
+    sampled = _gathered_subsample(depth, stride).astype(np.float64) * 0.001
+    valid = (sampled >= 0.28) & (sampled <= 5.0)
+    assert len(points) == int(valid.sum())
+    assert np.array_equal(
+        excluded,
+        _gathered_subsample(rgbd_module.dilate_mask(mask, 1), stride)[valid],
+    )
+
+
+def test_subsampling_never_falls_back_to_an_integer_gather(monkeypatch):
+    # np.ix_ copies into a fresh buffer; basic slicing is a free strided view
+    # and is exactly equivalent for arange(0, n, stride) indices.
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("subsampling must use strided slicing, not np.ix_")
+
+    monkeypatch.setattr(np, "ix_", refuse)
+    rng = np.random.default_rng(37)
+    depth = rng.integers(0, 5000, size=(24, 32), dtype=np.uint16)
+    mask = rng.random((24, 32)) < 0.3
+    intrinsics = CameraIntrinsics(600.0, 600.0, 16.0, 12.0, 32, 24)
+
+    depth_to_pointcloud(depth, intrinsics, stride=2, mask=mask)
+    points, excluded = depth_to_scene_cloud(
+        depth, intrinsics, target_mask=mask, target_dilation_px=2, stride=3,
+    )
+
+    assert len(points) == len(excluded)

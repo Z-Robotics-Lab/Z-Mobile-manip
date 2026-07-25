@@ -201,14 +201,14 @@ def depth_to_pointcloud(
     rows = np.arange(0, intrinsics.height, stride)
     columns = np.arange(0, intrinsics.width, stride)
     u, v = np.meshgrid(columns, rows)
-    sampled = depth[np.ix_(rows, columns)].astype(np.float64) * 0.001
+    sampled = depth[::stride, ::stride].astype(np.float64) * 0.001
     valid = (
         np.isfinite(sampled)
         & (sampled >= min_depth_m)
         & (sampled <= max_depth_m)
     )
     if target_mask is not None:
-        valid &= target_mask[np.ix_(rows, columns)]
+        valid &= target_mask[::stride, ::stride]
     z = sampled[valid]
     x = (u[valid] - intrinsics.cx) * z / intrinsics.fx
     y = (v[valid] - intrinsics.cy) * z / intrinsics.fy
@@ -296,15 +296,13 @@ def depth_to_scene_cloud(
         max_depth_m=max_depth_m,
         transform=transform,
     )
-    rows = np.arange(0, intrinsics.height, stride)
-    columns = np.arange(0, intrinsics.width, stride)
-    sampled_depth = depth[np.ix_(rows, columns)].astype(np.float64) * 0.001
+    sampled_depth = depth[::stride, ::stride].astype(np.float64) * 0.001
     valid = (
         np.isfinite(sampled_depth)
         & (sampled_depth >= min_depth_m)
         & (sampled_depth <= max_depth_m)
     )
-    aligned_labels = labels[np.ix_(rows, columns)][valid]
+    aligned_labels = labels[::stride, ::stride][valid]
     if len(aligned_labels) != len(points):
         raise RuntimeError("internal RGB-D label alignment failure")
     return points, aligned_labels.astype(bool, copy=False)

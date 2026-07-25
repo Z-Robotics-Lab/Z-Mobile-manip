@@ -1,9 +1,10 @@
-"""Equivalence and cost guards for the tracker's target-mask dilation.
+"""Equivalence and cost guards for the tracker's scene projection.
 
 ``project_scene_depth`` grows the tracked-target mask before back-projection so
 the contact corridor stays reserved. The dilation must keep the exact geometry
 of a full ``(2r+1) x (2r+1)`` structuring element -- including at the image
-border -- while costing far less than evaluating that element per pixel.
+border -- while costing far less than evaluating that element per pixel, and
+the subsample that follows must stay a strided view rather than a gather.
 """
 
 from __future__ import annotations
@@ -124,3 +125,29 @@ def test_tracker_and_library_dilation_agree(radius):
         tracker_core.dilate_mask(mask, radius),
         library_dilate(mask, radius),
     )
+
+
+def test_scene_projection_never_falls_back_to_an_integer_gather(monkeypatch):
+    # np.ix_ copies into a fresh buffer; basic slicing is a free strided view
+    # and is exactly equivalent for arange(0, n, stride) indices.
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("subsampling must use strided slicing, not np.ix_")
+
+    monkeypatch.setattr(np, "ix_", refuse)
+    intrinsics = tracker_core.CameraIntrinsics(fx=100.0, fy=100.0, cx=8.0, cy=6.0)
+    depth = np.full((12, 16), 1.2, dtype=np.float64)
+    mask = np.zeros((12, 16), dtype=bool)
+    mask[5:7, 7:9] = True
+
+    points = tracker_core.project_scene_depth(
+        mask,
+        depth,
+        intrinsics,
+        target_dilation_px=1,
+        stride=2,
+        min_depth_m=0.3,
+        max_depth_m=3.0,
+        max_points=1024,
+    )
+
+    assert len(points) > 0

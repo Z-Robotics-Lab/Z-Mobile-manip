@@ -1307,8 +1307,8 @@ def project_scene_depth(
     rows = np.arange(0, depth.shape[0], stride)
     columns = np.arange(0, depth.shape[1], stride)
     u, v = np.meshgrid(columns, rows)
-    sampled = depth[np.ix_(rows, columns)]
-    excluded = target[np.ix_(rows, columns)]
+    sampled = depth[::stride, ::stride]
+    excluded = target[::stride, ::stride]
     valid = (
         ~excluded
         & np.isfinite(sampled)
