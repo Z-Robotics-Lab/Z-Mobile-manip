@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TASK_NODE = ROOT / "ros2" / "z_manip_task" / "z_manip_task" / "node.py"
+PLACE_NODE = ROOT / "ros2" / "z_manip_place" / "z_manip_place" / "node.py"
 
 
 def _method(path: Path, class_name: str, method_name: str) -> ast.FunctionDef:
@@ -40,3 +41,23 @@ def test_task_destroy_node_cancels_the_planner_before_shutting_the_executor():
     assert destroy.index("_future_cancel_event") < destroy.index("_worker.shutdown(")
     assert ".set()" in destroy
 
+
+def test_placement_node_shutdown_stops_and_joins_its_daemon_planner():
+    destroy = ast.unparse(_method(PLACE_NODE, "ObservedPlacementNode", "destroy_node"))
+
+    assert "self._shutting_down = True" in destroy
+    # Invalidating the transaction is what makes _planning_cancelled true, so
+    # the worker's next checkpoint aborts instead of touching dead handles.
+    assert "self._transaction.reset()" in destroy
+    assert ".join(timeout=" in destroy
+    assert "super().destroy_node()" in destroy
+
+
+def test_placement_planner_cannot_restart_itself_during_shutdown():
+    auto_plan = ast.unparse(_method(PLACE_NODE, "ObservedPlacementNode", "_maybe_auto_plan"))
+    start_plan = ast.unparse(_method(PLACE_NODE, "ObservedPlacementNode", "_start_plan"))
+
+    # _plan_worker calls _maybe_auto_plan from its own finally, so both the
+    # trigger and the authoritative start have to refuse once teardown began.
+    assert "self._shutting_down" in auto_plan
+    assert "self._shutting_down" in start_plan
