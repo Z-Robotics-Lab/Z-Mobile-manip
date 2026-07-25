@@ -748,3 +748,131 @@ def test_attaching_the_target_invalidates_a_cached_finger_scene_exclusion(tmp_pa
     assert not checker._finger_scene_ready
     assert checker._finger_scene_tree is None
     assert checker._finger_scene_points is None
+
+
+# -- link-frame validation ---------------------------------------------------
+
+
+def _rigid(rotation=None, translation=(0.0, 0.0, 0.0)):
+    matrix = np.eye(4)
+    if rotation is not None:
+        matrix[:3, :3] = rotation
+    matrix[:3, 3] = translation
+    return matrix
+
+
+def test_state_checks_validate_link_frames_without_numpy_isclose(
+    tmp_path,
+    monkeypatch,
+):
+    """Regression test: `_valid_transform` runs once per link frame per state
+    check, i.e. it is on the per-RRT-sample and per-waypoint hot path.  It must
+    evaluate the closeness predicate directly instead of calling
+    `np.allclose`/`np.isclose`, whose errstate context managers and dtype
+    dispatch dominated the cost of every collision query.
+
+    Counting the calls is the only way to see this: the accepted set of
+    transforms is unchanged, which the boundary test below pins separately.
+    """
+
+    checker = _checker(tmp_path)
+    checker.update_scene(np.array([[5.0, 0.0, 0.0]]), stamp_s=10.0)
+    real_allclose = np.allclose
+    real_isclose = np.isclose
+    calls: list[str] = []
+
+    def counting_allclose(*args, **kwargs):
+        calls.append("allclose")
+        return real_allclose(*args, **kwargs)
+
+    def counting_isclose(*args, **kwargs):
+        calls.append("isclose")
+        return real_isclose(*args, **kwargs)
+
+    monkeypatch.setattr(np, "allclose", counting_allclose)
+    monkeypatch.setattr(np, "isclose", counting_isclose)
+    for value in np.linspace(-0.5, 0.5, 12):
+        assert checker.check_state(np.array([value])).valid
+
+    assert calls == []
+
+
+def test_link_frame_validation_keeps_its_exact_rigid_transform_tolerances():
+    """Pin the accept/reject boundary of every rigid-transform criterion.
+
+    Nothing exercised the reject path before, so an over-loosened predicate
+    would have gone unnoticed while silently admitting a skewed or mirrored
+    frame from a misbehaving kinematics service.  The tolerances below are
+    numpy's `allclose`/`isclose` defaults for the original calls: 1e-7 on the
+    bottom row (1.01e-5 on its unit entry), 1e-5 off-diagonal and 2e-5 on the
+    diagonal of R^T R, and 2e-5 on det(R).
+    """
+
+    valid = PointCloudCollisionChecker._valid_transform
+    assert valid(_rigid(translation=(0.3, -0.2, 0.1)))
+
+    # Bottom row: 1e-7 on the zeros, 1e-7 + 1e-5 on the trailing one.
+    inside = _rigid()
+    inside[3, 0] = 9e-8
+    assert valid(inside)
+    outside = _rigid()
+    outside[3, 0] = 1.2e-7
+    assert not valid(outside)
+    inside = _rigid()
+    inside[3, 3] = 1.0 + 9e-6
+    assert valid(inside)
+    outside = _rigid()
+    outside[3, 3] = 1.0 + 1.2e-5
+    assert not valid(outside)
+
+    # Off-diagonal orthonormality: a pure shear leaves det(R) at exactly 1, so
+    # only the 1e-5 off-diagonal bound on R^T R decides.
+    shear = np.eye(3)
+    shear[0, 1] = 8e-6
+    assert valid(_rigid(shear))
+    shear = np.eye(3)
+    shear[0, 1] = 1.3e-5
+    assert not valid(_rigid(shear))
+
+    # Uniform scale by (1 + e) moves R^T R by 2e and det(R) by 3e, so e between
+    # 2e-5/3 and 1e-5 is rejected by the determinant bound alone.
+    assert valid(_rigid(np.eye(3) * (1.0 + 6e-6)))
+    assert not valid(_rigid(np.eye(3) * (1.0 + 8e-6)))
+
+    # Mirrored frames are orthonormal but left-handed.
+    reflection = np.diag((-1.0, 1.0, 1.0))
+    assert not valid(_rigid(reflection))
+
+    # Malformed inputs stay rejected rather than raising.
+    assert not valid(_rigid(np.full((3, 3), np.nan)))
+    assert not valid(np.eye(3))
+    assert not valid("not a transform")
+    assert not valid(None)
+
+
+def test_a_skewed_frame_provider_transform_fails_closed_with_a_named_frame(
+    tmp_path,
+):
+    """End-to-end reject path: a kinematics service that returns a
+    non-orthonormal link transform must invalidate the state, not be trusted.
+    """
+
+    chain, frames = _chain_and_frames(tmp_path)
+
+    def skewed(joints):
+        transforms = dict(frames(joints))
+        matrix = np.array(transforms["tool"], dtype=float)
+        matrix[:3, :3] = matrix[:3, :3] * 1.05
+        transforms["tool"] = matrix
+        return transforms
+
+    checker = _checker(tmp_path)
+    checker.update_scene(np.array([[5.0, 0.0, 0.0]]), stamp_s=10.0)
+    assert checker.check_state(np.array([0.0])).valid
+
+    checker.frame_provider = skewed
+    result = checker.check_state(np.array([0.0]))
+    assert not result.valid
+    assert result.kind == "kinematics"
+    assert "invalid transform for 'tool'" in result.reason
+    assert chain.dof == 1

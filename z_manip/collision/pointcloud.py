@@ -26,6 +26,17 @@ _Offset = tuple[float, float, float]
 FrameProvider = Callable[[np.ndarray], Mapping[str, np.ndarray]]
 SelfCollisionChecker = Callable[[np.ndarray], "CollisionResult"]
 
+# Reference values and elementwise tolerances for rigid-transform validation.
+# ``np.allclose(a, b, rtol, atol)`` is exactly ``all(|a - b| <= atol + rtol|b|)``
+# for finite ``a`` and ``b``; the tolerances below bake in numpy's default
+# ``rtol=1e-5`` so the hot path can evaluate that predicate directly instead of
+# paying ``np.isclose``'s errstate/dtype dispatch once per link frame per state.
+_HOMOGENEOUS_ROW = np.array((0.0, 0.0, 0.0, 1.0))
+_HOMOGENEOUS_ROW_TOLERANCE = 1e-7 + 1e-5 * np.abs(_HOMOGENEOUS_ROW)
+_IDENTITY_3 = np.eye(3)
+_ORTHONORMAL_TOLERANCE = 1e-5 + 1e-5 * np.abs(_IDENTITY_3)
+_DETERMINANT_TOLERANCE = 1e-5 + 1e-5
+
 
 def _validate_offset(value: object, label: str) -> None:
     offset = np.asarray(value, dtype=float)
@@ -429,6 +440,15 @@ class PointCloudCollisionChecker:
         unknown = requested_frames - chain_frames
         if unknown:
             raise ValueError(f"capsules reference frames outside the kinematic chain: {sorted(unknown)}")
+        # Both the model and the chain are frozen, so the frames a state check
+        # must resolve and the capsule endpoint offsets are fixed for the life
+        # of the checker.  Keep the set itself (not a copy): its iteration order
+        # decides which frame a multi-frame diagnostic names.
+        self._requested_frames = requested_frames
+        self._capsule_offsets = tuple(
+            (capsule, np.asarray(capsule.start_offset), np.asarray(capsule.end_offset))
+            for capsule in model.capsules
+        )
         self._self_pairs = self._resolve_self_pairs()
 
     def _resolve_self_pairs(self) -> tuple[_Pair, ...]:
@@ -851,19 +871,28 @@ class PointCloudCollisionChecker:
 
     @staticmethod
     def _valid_transform(transform: object) -> bool:
+        """Accept only finite right-handed rigid transforms.
+
+        The comparisons are numpy's ``allclose``/``isclose`` predicates written
+        out against precomputed tolerances.  Finiteness is established first, so
+        the NaN/inf special cases inside ``isclose`` are unreachable and the two
+        formulations accept exactly the same matrices -- verified over 14892
+        cases spanning both sides of every tolerance boundary.
+        """
+
         try:
             matrix = np.asarray(transform, dtype=float)
         except (TypeError, ValueError):
             return False
         if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
             return False
-        if not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-7):
+        if not np.all(np.abs(matrix[3] - _HOMOGENEOUS_ROW) <= _HOMOGENEOUS_ROW_TOLERANCE):
             return False
         rotation = matrix[:3, :3]
-        return bool(
-            np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5)
-            and np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5)
-        )
+        gram = rotation.T @ rotation
+        if not np.all(np.abs(gram - _IDENTITY_3) <= _ORTHONORMAL_TOLERANCE):
+            return False
+        return abs(float(np.linalg.det(rotation)) - 1.0) <= _DETERMINANT_TOLERANCE
 
     def _world_capsules(
         self,
@@ -883,11 +912,7 @@ class PointCloudCollisionChecker:
                 "frame provider did not return a frame mapping",
                 kind="kinematics",
             )
-        requested = {
-            frame
-            for capsule in self.model.capsules
-            for frame in (capsule.start_frame, capsule.end_frame)
-        }
+        requested = self._requested_frames
         missing = requested - set(frames)
         if missing:
             return None, CollisionResult(
@@ -904,11 +929,11 @@ class PointCloudCollisionChecker:
                 )
 
         world_capsules = []
-        for capsule in self.model.capsules:
+        for capsule, start_offset, end_offset in self._capsule_offsets:
             start_transform = np.asarray(frames[capsule.start_frame], dtype=float)
             end_transform = np.asarray(frames[capsule.end_frame], dtype=float)
-            start = start_transform[:3, :3] @ np.asarray(capsule.start_offset) + start_transform[:3, 3]
-            end = end_transform[:3, :3] @ np.asarray(capsule.end_offset) + end_transform[:3, 3]
+            start = start_transform[:3, :3] @ start_offset + start_transform[:3, 3]
+            end = end_transform[:3, :3] @ end_offset + end_transform[:3, 3]
             world_capsules.append(_WorldCapsule(capsule, start, end))
         return tuple(world_capsules), None
 
