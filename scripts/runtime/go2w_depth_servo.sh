@@ -109,8 +109,14 @@ fi
 # Refuse to start a live servo until the fixed NUC transport has either been
 # verified or restarted and reconnected. Shadow mode remains transport-free.
 if [[ "$MODE" == live ]]; then
-  "$SCRIPT_DIR/go2w_base_transport_preflight.sh"
+  # Check the key before the preflight, so a missing key is reported against
+  # the path this script actually resolved.  The preflight is handed that same
+  # host and key: it must probe and restart the transport on the robot
+  # acquire_arm_owner and the servo below are about to command, not on a
+  # second NUC that happens to be the compiled-in default.
   [[ -f "$NUC_KEY" ]] || { printf 'missing NUC SSH key: %s\n' "$NUC_KEY" >&2; exit 1; }
+  GO2W_NUC_HOST="$NUC_HOST" GO2W_NUC_SSH_KEY="$NUC_KEY" \
+    "$SCRIPT_DIR/go2w_base_transport_preflight.sh"
   acquire_arm_owner
 fi
 
