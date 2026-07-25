@@ -2186,8 +2186,13 @@ class ObservedPlacementNode(Node):
             if attached_collision is not None:
                 attached_collision.clear_snapshot()
             if evaluator is not None:
-                self.destroy_client(evaluator.motion_client)
-                self.destroy_client(evaluator.cartesian_client)
+                for client in (evaluator.motion_client, evaluator.cartesian_client):
+                    try:
+                        self.destroy_client(client)
+                    except Exception:
+                        # One client failing to unwind must not strand the
+                        # other, nor skip the worker-registry release below.
+                        pass
             current = threading.current_thread()
             with self._lock:
                 self._release_planning_worker_locked(

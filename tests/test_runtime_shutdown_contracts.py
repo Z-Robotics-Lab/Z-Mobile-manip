@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 TASK_NODE = ROOT / "ros2" / "z_manip_task" / "z_manip_task" / "node.py"
 PLACE_NODE = ROOT / "ros2" / "z_manip_place" / "z_manip_place" / "node.py"
 EDGETAM_NODE = ROOT / "ros2" / "z_manip_edgetam" / "z_manip_edgetam" / "node.py"
+PLACE_EVALUATOR = (
+    ROOT / "ros2" / "z_manip_place" / "z_manip_place" / "moveit_evaluator.py"
+)
 
 
 def _method(path: Path, class_name: str, method_name: str) -> ast.FunctionDef:
@@ -90,3 +93,30 @@ def test_edgetam_worker_loop_handles_every_command_inside_its_failure_guard():
     # result again, recoverable only by restart.
     unguarded = [node.value for node in kinds if id(node) not in guarded]
     assert not unguarded, f"command kinds handled outside the guard: {unguarded}"
+
+
+def test_placement_evaluator_never_strands_a_created_service_client():
+    init = _method(PLACE_EVALUATOR, "MoveItPlacementEvaluator", "__init__")
+    tries = [node for node in ast.walk(init) if isinstance(node, ast.Try)]
+
+    assert tries, "a throw on the second create_client would strand the first"
+    guarded = ast.unparse(tries[0])
+    assert "create_client(GetCartesianPath" in guarded
+    assert "destroy_client(self.motion_client)" in guarded
+
+
+def test_placement_worker_destroys_each_client_independently():
+    worker = _method(PLACE_NODE, "ObservedPlacementNode", "_plan_worker")
+    guarded = _guarded_ids(worker)
+    destroys = [
+        node
+        for node in ast.walk(worker)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "destroy_client"
+    ]
+
+    assert destroys, "the plan worker no longer releases its service clients"
+    # The cleanup runs in the worker's finally; an unguarded failure there
+    # skips the remaining client and the worker-registry release below it.
+    assert all(id(node) in guarded for node in destroys)
