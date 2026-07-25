@@ -1,16 +1,42 @@
 import numpy as np
 import pytest
+from scipy.spatial import cKDTree
 
+from z_manip.perception import rgbd as rgbd_module
 from z_manip.perception.rgbd import (
     BoundingBox,
     CameraIntrinsics,
     ColorDepthTracker,
+    KDTREE_MAX_WORKERS,
+    KDTREE_PARALLEL_MIN_POINTS,
     depth_bbox_observation,
     depth_to_pointcloud,
     depth_to_scene_cloud,
     filter_object_cloud,
     target_exclusion_mask,
 )
+
+
+class _RecordingKDTree:
+    """cKDTree stand-in that records the ``workers`` used by each query."""
+
+    def __init__(self, data, calls):
+        self._tree = cKDTree(data)
+        self._calls = calls
+
+    def query(self, points, **kwargs):
+        self._calls.append(kwargs.get("workers", 1))
+        return self._tree.query(points, **kwargs)
+
+
+def _recorded_workers(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(
+        rgbd_module,
+        "cKDTree",
+        lambda data: _RecordingKDTree(data, calls),
+    )
+    return calls
 
 
 def test_depth_bbox_is_backprojected_without_ground_truth():
@@ -111,6 +137,52 @@ def test_object_cloud_filter_removes_background_leakage_and_sparse_fliers():
 
     assert 260 <= len(filtered) <= 305
     assert np.max(filtered[:, 2]) < 1.4
+
+
+def _dense_object_cloud(count):
+    rng = np.random.default_rng(17)
+    core = rng.normal((0.4, 0.0, 1.2), (0.015, 0.02, 0.012), size=(count, 3))
+    background = rng.normal((0.4, 0.0, 1.8), 0.02, size=(count // 10, 3))
+    return np.vstack((core, background))
+
+
+def test_neighbour_query_runs_parallel_only_above_the_thread_spawn_threshold(monkeypatch):
+    calls = _recorded_workers(monkeypatch)
+
+    filter_object_cloud(_dense_object_cloud(KDTREE_PARALLEL_MIN_POINTS * 2))
+    filter_object_cloud(_dense_object_cloud(60))
+
+    assert calls == [KDTREE_MAX_WORKERS, 1]
+
+
+def test_target_exclusion_query_runs_parallel_only_above_the_threshold(monkeypatch):
+    rng = np.random.default_rng(23)
+    target = rng.normal((0.4, 0.0, 1.2), 0.02, size=(400, 3))
+    big_scene = rng.normal((0.4, 0.0, 1.2), 0.2, size=(KDTREE_PARALLEL_MIN_POINTS * 2, 3))
+    small_scene = big_scene[:32]
+    calls = _recorded_workers(monkeypatch)
+
+    target_exclusion_mask(big_scene, target)
+    target_exclusion_mask(small_scene, target)
+
+    assert calls == [KDTREE_MAX_WORKERS, 1]
+
+
+def test_parallel_kdtree_queries_return_the_serial_result_exactly():
+    cloud = _dense_object_cloud(KDTREE_PARALLEL_MIN_POINTS * 4)
+    rng = np.random.default_rng(29)
+    scene = rng.normal((0.4, 0.0, 1.2), 0.2, size=(4000, 3))
+
+    filtered = filter_object_cloud(cloud)
+    excluded = target_exclusion_mask(scene, filtered)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(rgbd_module, "_kdtree_workers", lambda _count: 1)
+        serial_filtered = filter_object_cloud(cloud)
+        serial_excluded = target_exclusion_mask(scene, serial_filtered)
+
+    assert np.array_equal(filtered, serial_filtered)
+    assert np.array_equal(excluded, serial_excluded)
 
 
 def test_scene_cloud_keeps_segmentation_labels_aligned_after_depth_filtering():

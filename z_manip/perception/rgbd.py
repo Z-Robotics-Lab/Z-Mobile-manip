@@ -10,12 +10,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from typing import Optional, Sequence
 import warnings
 
 import numpy as np
 from scipy.ndimage import binary_dilation
 from scipy.spatial import cKDTree
+
+
+# SciPy releases the GIL inside a KD-tree query, so a bounded thread count is a
+# free wall-clock win on the multi-core NUC. The bound is deliberate: these
+# queries run inside ROS executor callbacks, where ``workers=-1`` would
+# oversubscribe the machine and starve the control loop.
+KDTREE_MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
+
+# Below this many query points, spawning threads costs more than it saves.
+KDTREE_PARALLEL_MIN_POINTS = 512
+
+
+def _kdtree_workers(query_points: int) -> int:
+    """Thread count for a KD-tree query over ``query_points`` samples."""
+
+    if query_points < KDTREE_PARALLEL_MIN_POINTS:
+        return 1
+    return KDTREE_MAX_WORKERS
 
 
 @dataclass(frozen=True)
@@ -351,7 +370,12 @@ def target_exclusion_mask(
         )
     if radius_m <= 0.0:
         raise ValueError("target exclusion radius must be positive")
-    distance, _ = cKDTree(target).query(scene, k=1, distance_upper_bound=radius_m)
+    distance, _ = cKDTree(target).query(
+        scene,
+        k=1,
+        distance_upper_bound=radius_m,
+        workers=_kdtree_workers(len(scene)),
+    )
     return np.isfinite(distance)
 
 
@@ -391,7 +415,9 @@ def filter_object_cloud(
         raise ValueError("object cloud lost its dominant depth layer")
 
     k = min(max(3, int(neighbour_count)), len(layered))
-    distances, _ = cKDTree(layered).query(layered, k=k)
+    distances, _ = cKDTree(layered).query(
+        layered, k=k, workers=_kdtree_workers(len(layered)),
+    )
     local_spacing = np.mean(distances[:, 1:], axis=1)
     spacing_median = float(np.median(local_spacing))
     spacing_mad = float(np.median(np.abs(local_spacing - spacing_median)))
