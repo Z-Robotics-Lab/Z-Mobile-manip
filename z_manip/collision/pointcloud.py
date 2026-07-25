@@ -598,28 +598,43 @@ class PointCloudCollisionChecker:
         )
         if neighbor_count < 3:
             return support
-        for index in candidates:
+        if len(candidates):
+            # One batched neighbour query and one stacked eigendecomposition for
+            # the whole seed set.  cKDTree.query, np.matmul and np.linalg.eigh
+            # all return bitwise-identical values batched and per candidate, so
+            # this classifies exactly the same points as the per-candidate loop
+            # it replaced.  The final alignment stays a per-row dot: a batched
+            # matvec differs from np.dot in the last bit, and that comparison
+            # sits directly on a configured threshold.
             _, neighbor_indices = self._tree.query(
-                self._points[index],
+                self._points[candidates],
                 k=neighbor_count,
             )
             neighbors = self._points[np.asarray(neighbor_indices, dtype=int)]
-            centered = neighbors - np.mean(neighbors, axis=0)
-            covariance = centered.T @ centered / float(len(neighbors))
+            centered = neighbors - neighbors.mean(axis=1)[:, None, :]
+            covariance = np.matmul(
+                centered.transpose(0, 2, 1),
+                centered,
+            ) / float(neighbor_count)
             eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-            total_variation = float(np.sum(eigenvalues))
-            if total_variation <= 1e-12 or float(eigenvalues[1]) <= 1e-12:
-                continue
-            surface_variation = float(eigenvalues[0]) / total_variation
-            normal_alignment = abs(float(
-                eigenvectors[:, 0] @ departure_direction,
-            ))
-            if (
+            total_variation = eigenvalues.sum(axis=1)
+            usable = (total_variation > 1e-12) & (eigenvalues[:, 1] > 1e-12)
+            surface_variation = np.divide(
+                eigenvalues[:, 0],
+                total_variation,
+                out=np.ones_like(total_variation),
+                where=usable,
+            )
+            planar = usable & (
                 surface_variation
                 <= self.config.support_normal_max_surface_variation
-                and normal_alignment >= self.config.support_normal_min_alignment
-            ):
-                normal_seeds[index] = True
+            )
+            for row in np.flatnonzero(planar):
+                normal_alignment = abs(float(
+                    eigenvectors[row][:, 0] @ departure_direction,
+                ))
+                if normal_alignment >= self.config.support_normal_min_alignment:
+                    normal_seeds[candidates[row]] = True
         seed_indices = np.flatnonzero(normal_seeds)
         if not len(seed_indices):
             return support

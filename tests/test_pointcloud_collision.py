@@ -987,3 +987,101 @@ def test_check_state_inverts_the_tip_transform_once_per_state_when_attached(
     # Three capsules are checked against the attached payload; the tip
     # transform is inverted once for the state, not once per capsule.
     assert inverse_calls == 1
+
+
+# -- support manifold classification ------------------------------------------
+
+
+class _CountingTree:
+    """Wrap a cKDTree and count `query` calls, delegating everything else."""
+
+    def __init__(self, tree):
+        self._tree = tree
+        self.query_calls = 0
+        self.query_rows: list[int] = []
+
+    def query(self, points, **kwargs):
+        self.query_calls += 1
+        self.query_rows.append(int(np.atleast_2d(np.asarray(points)).shape[0]))
+        return self._tree.query(points, **kwargs)
+
+    def query_ball_point(self, *args, **kwargs):
+        return self._tree.query_ball_point(*args, **kwargs)
+
+
+def test_support_contact_mask_queries_the_scene_tree_once_for_all_seeds(tmp_path):
+    """Regression test: `_support_contact_mask` classified one candidate seed
+    per iteration of a Python loop, issuing a separate k-nearest-neighbour
+    query and a separate 3x3 eigendecomposition for each.  It runs once per
+    pick, between grasp closure and the first lift collision query, so the
+    per-seed loop showed up directly as lift latency.
+
+    The batched form must classify exactly the same points: a clean planar
+    support patch is entirely support-facing, and the distant stray sample
+    never becomes a candidate.
+    """
+
+    checker = _checker(tmp_path)
+    values = np.linspace(-0.02, 0.02, 21)
+    yy, zz = np.meshgrid(values, values)
+    plane = np.column_stack((np.full(yy.size, 0.195), yy.ravel(), zz.ravel()))
+    stray = np.array([[0.70, 0.0, 0.0]])
+    checker.update_scene(np.vstack((plane, stray)), stamp_s=10.0)
+    target = np.column_stack((np.full(yy.size, 0.200), yy.ravel(), zz.ravel()))
+
+    real_tree = checker._tree
+    counting = _CountingTree(real_tree)
+    checker._tree = counting
+    try:
+        mask = checker._support_contact_mask(
+            target,
+            np.array([1.0, 0.0, 0.0]),
+            0.006,
+        )
+    finally:
+        checker._tree = real_tree
+
+    assert mask.shape == (len(plane) + 1,)
+    assert int(mask.sum()) == len(plane)  # the whole patch, and only the patch
+    assert not mask[-1]  # the stray sample is never a candidate
+
+    # One batched query covering every candidate, not one query per candidate.
+    assert counting.query_calls == 1
+    assert counting.query_rows == [len(plane)]
+
+
+def test_support_contact_mask_still_rejects_misaligned_and_degenerate_seeds(
+    tmp_path,
+):
+    """The batched normal-alignment and rank gates must reject exactly what the
+    per-seed loop rejected.  A wall beside the payload is locally planar but its
+    normal is perpendicular to the departure direction, and a collinear scan row
+    has no second eigenvalue at all; neither may be exempted as support.
+    """
+
+    values = np.linspace(-0.02, 0.02, 21)
+
+    xx, zz = np.meshgrid(0.20 + values, values)
+    wall = np.column_stack((xx.ravel(), np.zeros(xx.size), zz.ravel()))
+    beside = _checker(tmp_path)
+    beside.update_scene(wall, stamp_s=10.0)
+    wall_mask = beside._support_contact_mask(
+        np.column_stack((0.20 + values, np.full(21, 0.003), np.zeros(21))),
+        np.array([1.0, 0.0, 0.0]),
+        0.006,
+    )
+    assert wall_mask.shape == (len(wall),)
+    assert int(wall_mask.sum()) == 0  # planar, but the normal is misaligned
+
+    line = np.column_stack((
+        np.full(200, 0.195), np.linspace(-0.02, 0.02, 200), np.zeros(200),
+    ))
+    degenerate = _checker(tmp_path)
+    degenerate.update_scene(line, stamp_s=10.0)
+    line_mask = degenerate._support_contact_mask(
+        np.column_stack((np.full(21, 0.200), values, np.zeros(21))),
+        np.array([1.0, 0.0, 0.0]),
+        0.008,
+    )
+    assert line_mask.shape == (len(line),)
+    assert int(line_mask.sum()) == 0  # no plane can be fitted to a line
