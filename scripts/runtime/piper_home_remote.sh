@@ -12,17 +12,18 @@ SPEED_PERCENT="${1:-2}"
 PIPER_HOME_CONFIG="${PIPER_HOME_CONFIG:-$STACK_ROOT/configs/piper_home.json}"
 [[ "$SPEED_PERCENT" =~ ^([1-9]|[1-4][0-9]|50)$ ]] || { printf 'Home speed must be an integer from 1 to 50 percent\n' >&2; exit 2; }
 
+source "$SCRIPT_DIR/lib.sh"
 for path in \
   "$NUC_KEY" \
   "$PIPER_HOME_CONFIG" \
   "$SCRIPT_DIR/piper_home_recovery.py" \
   "$SCRIPT_DIR/piper_reverse_home_recovery.py" \
   "$SCRIPT_DIR/piper_staged_grasp_executor.py"; do
-  [[ -f "$path" ]] || { printf 'required Home input is missing: %s\n' "$path" >&2; exit 1; }
+  require_file "$path" "required Home input is missing"
 done
 
-ssh_args=(-i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 "$NUC_HOST")
-scp_args=(-q -i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5)
+NUC_SSH_EXTRA_OPTS=(-o IdentitiesOnly=yes)
+NUC_SCP_EXTRA_OPTS=(-q -o IdentitiesOnly=yes)
 
 shopt -s nullglob
 planning_dirs=("$INTERACTIVE_ROOT"/planning/*/artifacts/planning)
@@ -71,27 +72,27 @@ else
   printf '[home] no complete checked planning artifact; using direct Home recovery\n'
 fi
 
-ssh "${ssh_args[@]}" "rm -rf '$REMOTE_ACTION'; mkdir -p '$REMOTE_ACTION'"
-scp "${scp_args[@]}" \
+nuc_ssh "rm -rf '$REMOTE_ACTION'; mkdir -p '$REMOTE_ACTION'"
+nuc_scp \
   "$PIPER_HOME_CONFIG" \
   "$NUC_HOST:$REMOTE_ACTION/piper_home.json"
-scp "${scp_args[@]}" \
+nuc_scp \
   "$SCRIPT_DIR/piper_home_recovery.py" \
   "$SCRIPT_DIR/piper_reverse_home_recovery.py" \
   "$SCRIPT_DIR/piper_staged_grasp_executor.py" \
   "$NUC_HOST:$REMOTE_ACTION/"
 
 if [[ -n "$latest_planning" ]]; then
-  scp "${scp_args[@]}" \
+  nuc_scp \
     "$latest_planning/planning_report.json" \
     "$latest_planning/planned_grasp.npz" \
     "$NUC_HOST:$REMOTE_ACTION/"
 fi
 
 if [[ -n "$latest_planning" ]]; then
-  ssh "${ssh_args[@]}" \
+  nuc_ssh \
     "set -e; systemctl --user stop z-manip-piper-passive-feedback.service; trap 'sudo -n /usr/local/sbin/z-manip-piper-passive-can-gate can0 8 >/tmp/z-manip-passive-restore.log 2>&1 || true; systemctl --user start z-manip-piper-passive-feedback.service' EXIT; cd ~/pyAgxArm; if /usr/bin/python3 '$REMOTE_ACTION/piper_home_recovery.py' --home '$REMOTE_ACTION/piper_home.json' --speed-percent $SPEED_PERCENT --max-recovery-deg 20 --max-step-deg 5 --clear-electronic-estop --execute; then exit 0; fi; token=\$(/usr/bin/python3 '$REMOTE_ACTION/piper_reverse_home_recovery.py' --planning-report '$REMOTE_ACTION/planning_report.json' --planned-grasp '$REMOTE_ACTION/planned_grasp.npz' | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)[\"confirmation_token\"])'); /usr/bin/python3 '$REMOTE_ACTION/piper_reverse_home_recovery.py' --planning-report '$REMOTE_ACTION/planning_report.json' --planned-grasp '$REMOTE_ACTION/planned_grasp.npz' --speed-percent $SPEED_PERCENT --execute --confirm \"\$token\""
 else
-  ssh "${ssh_args[@]}" \
+  nuc_ssh \
     "set -e; systemctl --user stop z-manip-piper-passive-feedback.service; trap 'sudo -n /usr/local/sbin/z-manip-piper-passive-can-gate can0 8 >/tmp/z-manip-passive-restore.log 2>&1 || true; systemctl --user start z-manip-piper-passive-feedback.service' EXIT; cd ~/pyAgxArm; /usr/bin/python3 '$REMOTE_ACTION/piper_home_recovery.py' --home '$REMOTE_ACTION/piper_home.json' --speed-percent $SPEED_PERCENT --max-recovery-deg 20 --max-step-deg 5 --clear-electronic-estop --execute"
 fi

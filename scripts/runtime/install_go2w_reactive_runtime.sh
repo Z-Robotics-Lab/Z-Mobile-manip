@@ -9,12 +9,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STACK_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
 NUC_KEY="${GO2W_NUC_SSH_KEY:-$HOME/.ssh/id_ed25519_codex_nuc}"
-SSH=(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST")
-SCP=(scp -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5)
+source "$SCRIPT_DIR/lib.sh"
 
-[[ -f "$NUC_KEY" ]] || { printf 'missing NUC SSH key: %s\n' "$NUC_KEY" >&2; exit 1; }
-"${SSH[@]}" 'mkdir -p "$HOME/.local/lib/z-mobile-manip/z_manip/control" "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics" "$HOME/.local/share/z-mobile-manip" "$HOME/.config/systemd/user" "$HOME/.config/z-mobile-manip"'
-"${SCP[@]}" \
+require_file "$NUC_KEY" "missing NUC SSH key"
+nuc_ssh 'mkdir -p "$HOME/.local/lib/z-mobile-manip/z_manip/control" "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics" "$HOME/.local/share/z-mobile-manip" "$HOME/.config/systemd/user" "$HOME/.config/z-mobile-manip"'
+nuc_scp \
   "$SCRIPT_DIR/go2w_reactive_control_nuc.py" \
   "$SCRIPT_DIR/go2w_reactive_control_nuc.sh" \
   "$SCRIPT_DIR/go2w_base_lock.py" \
@@ -23,33 +22,34 @@ SCP=(scp -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5)
   "$SCRIPT_DIR/piper_reactive_view_executor.py" \
   "$SCRIPT_DIR/piper_reactive_view_executor.sh" \
   "$SCRIPT_DIR/piper_staged_grasp_executor.py" \
+  "$SCRIPT_DIR/lib.sh" \
   "$NUC_HOST:.local/lib/z-mobile-manip/"
-"${SCP[@]}" \
+nuc_scp \
   "$STACK_ROOT/z_manip/__init__.py" \
   "$STACK_ROOT/z_manip/fixed_self_collision.py" \
   "$NUC_HOST:.local/lib/z-mobile-manip/z_manip/"
-"${SCP[@]}" \
+nuc_scp \
   "$STACK_ROOT/configs/nuc-kinematics-init.py" \
   "$STACK_ROOT/z_manip/kinematics/chain.py" \
   "$NUC_HOST:.local/lib/z-mobile-manip/z_manip/kinematics/"
-"${SCP[@]}" \
+nuc_scp \
   "$STACK_ROOT/configs/nuc-control-init.py" \
   "$STACK_ROOT/z_manip/control/go2w_posture.py" \
   "$NUC_HOST:.local/lib/z-mobile-manip/z_manip/control/"
-"${SSH[@]}" 'mv "$HOME/.local/lib/z-mobile-manip/z_manip/control/nuc-control-init.py" "$HOME/.local/lib/z-mobile-manip/z_manip/control/__init__.py"'
-"${SSH[@]}" 'mv "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics/nuc-kinematics-init.py" "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics/__init__.py"'
-"${SCP[@]}" \
+nuc_ssh 'mv "$HOME/.local/lib/z-mobile-manip/z_manip/control/nuc-control-init.py" "$HOME/.local/lib/z-mobile-manip/z_manip/control/__init__.py"'
+nuc_ssh 'mv "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics/nuc-kinematics-init.py" "$HOME/.local/lib/z-mobile-manip/z_manip/kinematics/__init__.py"'
+nuc_scp \
   "$STACK_ROOT/../go2W_Sim/assets/urdf/go2w_sensored.urdf" \
   "$STACK_ROOT/configs/piper_collision_capsules.json" \
   "$NUC_HOST:.local/share/z-mobile-manip/"
-"${SCP[@]}" \
+nuc_scp \
   "$STACK_ROOT/configs/z-mobile-manip-go2w-reactive-live.service" \
   "$STACK_ROOT/configs/z-mobile-manip-piper-reactive-view.service" \
   "$NUC_HOST:.config/systemd/user/"
-"${SCP[@]}" \
+nuc_scp \
   "$STACK_ROOT/configs/go2w-reactive-live.env" \
   "$NUC_HOST:.config/z-mobile-manip/go2w-reactive-live.env"
-"${SSH[@]}" '
+nuc_ssh '
   set -eu
   chmod 0755 \
     "$HOME/.local/lib/z-mobile-manip/go2w_reactive_control_nuc.sh" \

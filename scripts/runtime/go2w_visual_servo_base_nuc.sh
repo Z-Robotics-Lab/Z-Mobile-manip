@@ -4,12 +4,9 @@ set -euo pipefail
 # NUC-side base transport for the Domain-20 manipulation graph.  The visual
 # servo publishes /cmd_vel; cmd_vel_guard is the only producer of
 # /cmd_vel_safe; unitree_control consumes only that guarded topic.
-set +u
-source "$HOME/unitree_venv/bin/activate"
-source /opt/ros/jazzy/setup.bash
-source "$HOME/Z-Navigation-Stack/install/setup.bash"
-source "$HOME/go2w-nuc/ros2_ws/install/setup.bash"
-set -u
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+nuc_ros_env_bootstrap
 
 export ROS_DOMAIN_ID=20
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

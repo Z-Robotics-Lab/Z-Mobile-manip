@@ -20,9 +20,7 @@ CALIBRATION="${Z_MANIP_CAMERA_CALIBRATION_OUTPUT:-$ARTIFACT_ROOT/calibration/pip
 URDF="${Z_MANIP_PIPER_URDF:-$ROBOT_ASSETS/urdf/go2w_sensored.urdf}"
 CAPTURE_ONLY="${Z_MANIP_CALIBRATION_CAPTURE_ONLY:-0}"
 
-require_file() {
-  [[ -f "$1" ]] || { printf 'required file is missing: %s\n' "$1" >&2; exit 1; }
-}
+source "$SCRIPT_DIR/lib.sh"
 
 start() {
   require_file "$DDS_CONFIG"

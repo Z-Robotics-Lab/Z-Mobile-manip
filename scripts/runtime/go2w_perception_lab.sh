@@ -48,9 +48,7 @@ docker_env=(
   -v "$DDS_CONFIG:/config/cyclonedds.xml:ro"
 )
 
-require_file() {
-  [[ -f "$1" ]] || { echo "required file is missing: $1" >&2; exit 1; }
-}
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 runtime_fingerprint() {
   python3 "$FINGERPRINT_TOOL"
@@ -137,8 +135,7 @@ preflight() {
   fi
 
   if [[ -f "$NUC_KEY" ]]; then
-    if camera_state="$(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 \
-        "$NUC_HOST" \
+    if camera_state="$(nuc_ssh \
         'if systemctl --user is-active --quiet d435i.service; then echo active; else echo inactive; fi' \
         2>/dev/null)"; then
       echo "[ready] NUC reachable; d435i.service=$camera_state"
@@ -163,8 +160,7 @@ preflight() {
 
 start_nuc_camera() {
   require_file "$NUC_KEY"
-  ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST" \
-    'systemctl --user start d435i.service && systemctl --user is-active d435i.service'
+  nuc_ssh 'systemctl --user start d435i.service && systemctl --user is-active d435i.service'
 }
 
 start_edgetam() {
@@ -353,7 +349,7 @@ probe() {
 }
 
 status() {
-  echo "NUC camera: $(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST" 'systemctl --user is-active d435i.service' 2>/dev/null || echo unreachable)"
+  echo "NUC camera: $(nuc_ssh 'systemctl --user is-active d435i.service' 2>/dev/null || echo unreachable)"
   docker ps --filter name=z-manip-edgetam --filter name=z-manip-rgbd \
     --filter name=z-manip-hw --filter name=z-manip-perception-runner \
     --filter name=z-manip-planning-runner \

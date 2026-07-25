@@ -15,12 +15,14 @@ PORT="${PIPER_MOUNT_UI_PORT:-8768}"
 UI_CONTAINER="${PIPER_MOUNT_UI_CONTAINER:-piper-mount-report-ui}"
 IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:jazzy}"
 
+source "$SCRIPT_DIR/lib.sh"
+
 stop_report_ui() {
   docker rm -f "$UI_CONTAINER" >/dev/null 2>&1 || true
 }
 
 show_report() {
-  [[ -f "$REPORT" ]] || { printf 'mount report is missing: %s\n' "$REPORT" >&2; exit 1; }
+  require_file "$REPORT" "mount report is missing"
   stop_report_ui
   python3 "$SCRIPT_DIR/piper_mount_ui.py" --report "$REPORT" --check >/dev/null
   docker run -d --name "$UI_CONTAINER" --restart unless-stopped \
@@ -59,7 +61,7 @@ case "${1:-capture}" in
   solve)
     mkdir -p "$MOUNT_DIR"
     for file in "$SAMPLES" "$HAND_EYE" "$ANCHOR" "$URDF"; do
-      [[ -f "$file" ]] || { printf 'required file is missing: %s\n' "$file" >&2; exit 1; }
+      require_file "$file"
     done
     solve_rc=0
     PYTHONPATH="$STACK_ROOT${PYTHONPATH:+:$PYTHONPATH}" \

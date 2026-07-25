@@ -27,8 +27,9 @@ WRIST_SEARCH_INPUTS=(
   "$SCRIPT_DIR/piper_staged_grasp_executor.py"
 )
 
+source "$SCRIPT_DIR/lib.sh"
 for path in "$NUC_KEY" "${WRIST_SEARCH_INPUTS[@]}"; do
-  [[ -f "$path" ]] || { printf 'required wrist-search input is missing: %s\n' "$path" >&2; exit 1; }
+  require_file "$path" "required wrist-search input is missing"
 done
 
 # Reuse one authenticated master connection across the marker probe, the upload,
@@ -38,22 +39,22 @@ done
 # the ~0.5s handshake each per-view command otherwise re-pays down to ~0.05s.
 control_path="$(dirname -- "$NUC_KEY")/z-manip-wrist-%C"
 mux_args=(-o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$control_path")
-ssh_args=(-i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 "${mux_args[@]}" "$NUC_HOST")
-scp_args=(-q -i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 "${mux_args[@]}")
+NUC_SSH_EXTRA_OPTS=(-o IdentitiesOnly=yes "${mux_args[@]}")
+NUC_SCP_EXTRA_OPTS=(-q -o IdentitiesOnly=yes "${mux_args[@]}")
 
 # The 4 uploaded files never change within a single wrist search, yet the search
 # calls this script once per view. Hash the inputs and stamp the marker on the
 # NUC after a complete upload; views 2..N whose marker already matches skip the
 # ~1.0s rm+scp entirely and only pay the (multiplexed) executor call.
 manifest_sha="$(sha256sum "${WRIST_SEARCH_INPUTS[@]}" | awk '{print $1}' | sha256sum | awk '{print $1}')"
-remote_sha="$(ssh "${ssh_args[@]}" "cat '$REMOTE_DIR/.manifest-sha' 2>/dev/null || true")"
+remote_sha="$(nuc_ssh "cat '$REMOTE_DIR/.manifest-sha' 2>/dev/null || true")"
 if [[ "$remote_sha" != "$manifest_sha" ]]; then
-  ssh "${ssh_args[@]}" "rm -rf '$REMOTE_DIR'; mkdir -p '$REMOTE_DIR'"
-  scp "${scp_args[@]}" "${WRIST_SEARCH_INPUTS[@]}" "$NUC_HOST:$REMOTE_DIR/"
+  nuc_ssh "rm -rf '$REMOTE_DIR'; mkdir -p '$REMOTE_DIR'"
+  nuc_scp "${WRIST_SEARCH_INPUTS[@]}" "$NUC_HOST:$REMOTE_DIR/"
   # Stamp the marker only after every file has landed, so an interrupted upload
   # never lets a later view skip a re-upload against a partial payload.
-  ssh "${ssh_args[@]}" "printf '%s' '$manifest_sha' > '$REMOTE_DIR/.manifest-sha'"
+  nuc_ssh "printf '%s' '$manifest_sha' > '$REMOTE_DIR/.manifest-sha'"
 fi
 
-ssh "${ssh_args[@]}" \
+nuc_ssh \
   "set -e; systemctl --user stop z-manip-piper-passive-feedback.service; trap 'sudo -n /usr/local/sbin/z-manip-piper-passive-can-gate can0 8 >/tmp/z-manip-passive-restore.log 2>&1 || true; systemctl --user start z-manip-piper-passive-feedback.service' EXIT; cd ~/pyAgxArm; /usr/bin/python3 '$REMOTE_DIR/piper_wrist_search_executor.py' --home '$REMOTE_DIR/piper_home.json' --view-index '$VIEW_INDEX' --speed-percent '$SPEED_PERCENT' --execute"

@@ -34,9 +34,11 @@ NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
 NUC_KEY="${GO2W_NUC_SSH_KEY:-$HOME/.ssh/id_ed25519_codex_nuc}"
 ARM_OWNER_STARTED=0
 
+source "$SCRIPT_DIR/lib.sh"
+
 release_arm_owner() {
   if [[ "$ARM_OWNER_STARTED" == 1 ]]; then
-    if ! ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST" \
+    if ! nuc_ssh \
       'set -eu; systemctl --user stop z-mobile-manip-piper-reactive-view.service; systemctl --user restart z-manip-piper-passive-feedback.service; systemctl --user is-active --quiet z-manip-piper-passive-feedback.service' \
       >/dev/null 2>&1; then
       printf 'warning: failed to restore the passive PiPER feedback owner on the NUC\n' >&2
@@ -49,7 +51,7 @@ acquire_arm_owner() {
   # The reactive service conflicts with the passive listener, so systemd stops
   # the old CAN owner and starts the new one in one transaction. If start-up or
   # the postcondition check fails, restore the passive owner before returning.
-  ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST" '
+  nuc_ssh '
     set -eu
     restore_passive() {
       systemctl --user stop z-mobile-manip-piper-reactive-view.service >/dev/null 2>&1 || true

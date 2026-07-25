@@ -6,7 +6,7 @@ set -euo pipefail
 NUC_HOST="yusenzlabnuc@192.168.3.8"
 NUC_KEY="$HOME/.ssh/id_ed25519_codex_nuc"
 SERVICE="z-mobile-manip-go2w-reactive-live.service"
-SSH=(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST")
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 [[ -f "$NUC_KEY" ]] || {
   printf 'Go2W transport preflight failed: fixed NUC SSH key is missing\n' >&2
@@ -14,7 +14,7 @@ SSH=(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST")
 }
 
 transport_state() {
-  "${SSH[@]}" "SERVICE='$SERVICE' bash -s" <<'REMOTE'
+  nuc_ssh "SERVICE='$SERVICE' bash -s" <<'REMOTE'
 set -euo pipefail
 active="$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)"
 logs="$(journalctl --user -u "$SERVICE" -n 240 --no-pager -o cat 2>/dev/null || true)"
@@ -31,7 +31,7 @@ REMOTE
 
 if [[ "$(transport_state)" != ready ]]; then
   printf 'Go2W WebRTC transport is stale; restarting the fixed NUC service\n' >&2
-  "${SSH[@]}" "systemctl --user restart '$SERVICE'"
+  nuc_ssh "systemctl --user restart '$SERVICE'"
 fi
 
 for _ in $(seq 1 24); do

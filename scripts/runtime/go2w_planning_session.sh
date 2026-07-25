@@ -38,13 +38,14 @@ JOINT_REPORT="$RUN_DIR/passive_joint_report.json"
 SESSION_GATE="$RUN_DIR/session_gate.json"
 BUNDLE="$RUN_DIR/debug_bundle.json"
 
+source "$SCRIPT_DIR/lib.sh"
 for path in "$NUC_KEY" "$DDS_CONFIG" "$CALIBRATION" "$URDF"; do
-  [[ -f "$path" ]] || { printf 'required file is missing: %s\n' "$path" >&2; exit 1; }
+  require_file "$path"
 done
 docker image inspect "$IMAGE" >/dev/null
 mkdir -p "$PERCEPTION_DIR" "$PLANNING_DIR"
 
-ssh_args=(-i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 "$NUC_HOST")
+NUC_SSH_EXTRA_OPTS=(-o IdentitiesOnly=yes)
 perception_pid=""
 cleanup() {
   if [[ -n "$perception_pid" ]] && kill -0 "$perception_pid" >/dev/null 2>&1; then
@@ -65,7 +66,7 @@ probe_rc=0
 while kill -0 "$perception_pid" >/dev/null 2>&1; do
   probe_index=$((probe_index + 1))
   probe_log="$RUN_DIR/passive_probe_${probe_index}.log"
-  if ! ssh "${ssh_args[@]}" \
+  if ! nuc_ssh \
       /usr/bin/python3 "$REMOTE_PASSIVE_PROBE" \
         --interface can0 \
         --duration "$PASSIVE_CAPTURE_SECONDS" \
@@ -75,7 +76,7 @@ while kill -0 "$perception_pid" >/dev/null 2>&1; do
     break
   fi
   temporary_report="$PERCEPTION_DIR/.live_passive_joint_report.json.tmp"
-  if ! ssh "${ssh_args[@]}" cat "$REMOTE_PASSIVE_REPORT" \
+  if ! nuc_ssh cat "$REMOTE_PASSIVE_REPORT" \
       >"$temporary_report"; then
     probe_rc=1
     break

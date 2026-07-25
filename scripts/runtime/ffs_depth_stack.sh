@@ -53,18 +53,16 @@ JIT_CACHE="${Z_MANIP_FFS_JIT_CACHE:-$HOME/.cache/z-manip/ffs-jit}"
 SERVICE=z-manip-ffs-depth
 RELAY=z-manip-ffs-relay
 
-require_file() {
-  [[ -e "$1" ]] || { echo "required path is missing: $1" >&2; exit 1; }
-}
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 build() {
   (cd "$ROOT_DIR" && docker build -f docker/ffs_service/Dockerfile -t "$IMAGE" .)
 }
 
 up() {
-  require_file "$FFS_REPO/core/foundation_stereo.py"
-  require_file "$CALIB"
-  require_file "$DDS_CONFIG"
+  require_file "$FFS_REPO/core/foundation_stereo.py" "required path is missing" -e
+  require_file "$CALIB" "required path is missing" -e
+  require_file "$DDS_CONFIG" "required path is missing" -e
   mkdir -p "$JIT_CACHE"
   docker rm -f "$SERVICE" "$RELAY" >/dev/null 2>&1 || true
   docker run -d --name "$SERVICE" --gpus all \

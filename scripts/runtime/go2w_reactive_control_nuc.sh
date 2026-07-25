@@ -19,12 +19,8 @@ if [[ "$MODE" == live ]]; then
   }
 fi
 
-set +u
-source "$HOME/unitree_venv/bin/activate"
-source /opt/ros/jazzy/setup.bash
-source "$HOME/Z-Navigation-Stack/install/setup.bash"
-source "$HOME/go2w-nuc/ros2_ws/install/setup.bash"
-set -u
+source "$SCRIPT_DIR/lib.sh"
+nuc_ros_env_bootstrap
 
 export ROS_DOMAIN_ID=20
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

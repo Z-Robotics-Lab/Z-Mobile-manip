@@ -16,9 +16,7 @@ OBSERVER="$SCRIPT_DIR/go2w_runtime_observer.py"
 URDF="${Z_MANIP_ROBOT_URDF:-$WORKSPACE_ROOT/go2W_Sim/assets/urdf/go2w_sensored.urdf}"
 CALIBRATION="${Z_MANIP_CAMERA_CALIBRATION:-$WORKSPACE_ROOT/artifacts/go2w_real/calibration/piper_wrist_camera_calibration.json}"
 
-require_file() {
-  [[ -f "$1" ]] || { printf 'required file is missing: %s\n' "$1" >&2; exit 1; }
-}
+source "$SCRIPT_DIR/lib.sh"
 
 run_observer() {
   require_file "$OBSERVER"
