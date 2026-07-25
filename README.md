@@ -2,8 +2,9 @@
 
 Z-Mobile-Manip 是一套面向研究与现场演示的监督式移动抓取系统，硬件组合为
 Unitree Go2-W EDU、AgileX PiPER 6DoF 机械臂、腕部 Intel RealSense D435、机器人侧
-NUC 和 RTX 4090 工作站。系统将开放词汇 RGB-D 感知、EdgeTAM 跟踪、深度视觉伺服、
-几何抓取候选、Pinocchio IK、碰撞感知规划和有界执行集成到同一个本机 Web 工作台。
+NUC 和 RTX 4090 工作站。系统把开放词汇 RGB-D 感知、EdgeTAM 跟踪、深度视觉伺服、
+几何抓取候选、Pinocchio IK (Inverse Kinematics)、碰撞感知规划和有界执行收在同一个
+本机 Web 工作台里。
 
 当前真机已跑通两条主链路：
 
@@ -37,7 +38,7 @@ PC 与 NUC 默认使用同一 Wi-Fi 和 `ROS_DOMAIN_ID=20`。主流程为：
 - Ubuntu 24.04、ROS 2 Jazzy、CycloneDDS
 - NVIDIA GPU、Docker Engine、NVIDIA Container Toolkit
 - Unitree Go2-W EDU 与可通过 SSH 访问的机载 NUC
-- AgileX PiPER、1 Mbps SocketCAN 接口和正确的机器人 URDF
+- AgileX PiPER、1 Mbps SocketCAN 接口和正确的机器人 URDF (Unified Robot Description Format)
 - RealSense D435/D435i（使用彩色与对齐深度，不要求 IMU）
 - PC/NUC 时间同步，ROS Domain ID 一致
 
@@ -82,7 +83,7 @@ manip url
 
 工作台默认地址是 <http://127.0.0.1:8766/>。`bringup` 启动 UI、相机桥、被动反馈、
 observer、EdgeTAM 与 perception；`status` 会分别报告 NUC 相机、RGB-D、跟踪和反馈状态。
-明天重新开机时仍只需运行上面三条命令；在 `manip status` 全部 healthy 前不要进入 Live。
+每次开机都是这三条命令。`manip status` 全部 healthy 前不要进入 Live。
 
 常用维护命令：
 
@@ -94,13 +95,15 @@ manip restart
 manip stop
 ```
 
-更新仓库中的 perception、IK、planning 代码或配置后，运行 `manip bringup`
-以同时重载 UI、perception runner 和 network-disabled planning runner。仅运行
-`manip restart` 只会重载 UI；如果驻留 worker 仍是旧版本，`manip status perception`
-会显示 `degraded` 和 fingerprint mismatch，而不会静默调用旧模块。只需重载两个
-驻留 worker 时可运行 `manip component restart perception`。
+改完仓库里的 perception、IK、planning 代码或配置后，用 `manip bringup` 重载，它会同时
+重载 UI、perception runner 和 network-disabled planning runner。`manip restart` 只重载 UI，
+不碰驻留 worker。驻留 worker 停在旧版本时，`manip status perception` 会报 `degraded` 和
+fingerprint mismatch，不会静默调用旧模块。只想重载那两个驻留 worker 时用
+`manip component restart perception`。
 
-实机调参前可启动全链路只读 rosbag；它记录 RGB-D、TF、目标/点云、跟踪、PiPER
+## 录制与离线分析
+
+实机调参前可启动全链路只读 rosbag。它记录 RGB-D、TF、目标/点云、跟踪、PiPER
 关节反馈以及 whole-body intent/status，并以 Zstd MCAP 每五分钟切片：
 
 ```bash
@@ -121,8 +124,8 @@ python3 scripts/offline/mobile_pipeline_replay_eval.py \
   --output /tmp/mobile-pipeline-eval.json
 ```
 
-For handoff latency, scope interactive attempts to one rosbag's exact time
-window and report wrapper overhead plus perception/planning rejection stages:
+测量交接延迟时，把交互尝试限定在某个 rosbag 的精确时间窗内，报告 wrapper 开销以及
+perception/planning 的各拒绝阶段：
 
 ```bash
 python3 scripts/offline/mobile_handoff_benchmark.py \
@@ -133,11 +136,10 @@ python3 scripts/offline/mobile_handoff_benchmark.py \
   --markdown /tmp/mobile-handoff.md
 ```
 
-The benchmark is filesystem-only and cannot open ROS, WebRTC, CAN, or PiPER
-transports.
+这个 benchmark 只读文件系统，打不开 ROS、WebRTC、CAN 或 PiPER 传输。
 
-To rerun every valid perception capture inside the same bag window through the
-current planner, using a device-free Docker container with networking disabled:
+用禁网、无设备的 Docker 容器，把同一 bag 窗口内每一次有效的 perception 采集重新过一遍
+当前 planner：
 
 ```bash
 python3 scripts/offline/planning_replay_benchmark.py \
@@ -149,12 +151,9 @@ python3 scripts/offline/planning_replay_benchmark.py \
   --min-success-rate 0.8 --max-p95-s 3 --strict
 ```
 
-Pass a previous report with `--baseline` to reject success-rate or latency
-regressions after changing IK or planning code.
-
-The latest measured rosbag result and the exact interpretation of far approach
-versus near-field IK are recorded in
-[`docs/performance_benchmark_2026-07-22.md`](docs/performance_benchmark_2026-07-22.md).
+改动 IK 或 planning 代码后，用 `--baseline` 传入上一次的报告，可以拦住成功率和延迟的回归。
+最近一次实测 rosbag 结果，以及远距接近与近场 IK 该怎么判读，记录在
+[`docs/performance_benchmark_2026-07-22.md`](docs/performance_benchmark_2026-07-22.md)。
 
 报告分别量化 detect、track、base、posture、arm intent/ACK 和 handoff，并检查 JSON
 完整性、时间戳单调性、必要 topic 以及 MCAP 首尾 framing。需要把缺失 ACK、损坏记录或
@@ -176,10 +175,12 @@ docker run --rm --network none \
     --output /tmp/whole-body-bag-replay.json
 ```
 
+## 平台约束：Go2W 姿态 API
+
 当前 Go2W 的 `ai-w` 是 wheeled sport 服务。它可接受 `Move(1008)`，但实机
 对通用 Go2 的 `Euler(1007)` 返回 3203（API 未实现）。控制器会记录活动模式、
-服务 topic 和机器人返回码，将机身 roll/pitch 自由度从 QP 中锁定，并把
-FOV/垂直观测任务分配给 PiPER；不会把“ROS 已发布”或“WebRTC 已发送”误报成
+服务 topic 和机器人返回码，把机身 roll/pitch 自由度从 QP (Quadratic Programming)
+中锁定，并把 FOV/垂直观测任务分配给 PiPER；不会把“ROS 已发布”或“WebRTC 已发送”误报成
 “姿态已执行”。B2/wheeled API 的 `FreeEuler(1051)` 是布尔模式开关，不是
 roll/pitch/yaw 目标，不能替换 `Euler(1007)`。
 
