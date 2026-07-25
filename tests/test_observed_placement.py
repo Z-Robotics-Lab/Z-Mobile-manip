@@ -1,7 +1,9 @@
 import numpy as np
 import pytest
+from scipy.spatial import cKDTree
 
 from z_manip.models.planner import PlanningError
+from z_manip.planning.placement import SupportPlane
 from z_manip.planning import (
     NormalizedPlacementRegion,
     ObservedPlacementConfig,
@@ -85,6 +87,100 @@ def _planner(**overrides):
 
 def _accept(candidate, _current):
     return PlacementMotionEvaluation(score=1.0, motion={"yaw": candidate.yaw_rad})
+
+
+def _xy_plane():
+    return SupportPlane(
+        origin=np.zeros(3),
+        normal=np.array((0.0, 0.0, 1.0)),
+        tangent_u=np.array((1.0, 0.0, 0.0)),
+        tangent_v=np.array((0.0, 1.0, 0.0)),
+        inlier_count=100,
+        inlier_ratio=1.0,
+        rms_error_m=0.0,
+    )
+
+
+def test_footprint_support_fraction_is_one_on_a_dense_plane_and_falls_off_an_edge():
+    planner = _planner(footprint_samples_per_axis=5, support_neighbor_radius_m=0.03)
+    plane = _xy_plane()
+    axis_x = np.array((1.0, 0.0, 0.0))
+    axis_y = np.array((0.0, 1.0, 0.0))
+    grid = np.linspace(-0.20, 0.20, 41)
+    # A half-plane of support: everything with u <= 0 is supported.
+    supported_uv = np.asarray([(u, v) for u in grid if u <= 0.0 for v in grid])
+    support_tree = cKDTree(supported_uv)
+
+    def fraction(position):
+        return planner._footprint_support_fraction(
+            support_position=np.asarray(position, dtype=float),
+            axis_x=axis_x,
+            axis_y=axis_y,
+            half_x=0.04,
+            half_y=0.03,
+            plane=plane,
+            support_tree=support_tree,
+        )
+
+    assert fraction((-0.12, 0.0, 0.0)) == pytest.approx(1.0)
+    # Straddling the u=0 edge loses part of the footprint, and support keeps
+    # falling as the footprint slides further off.
+    straddling = fraction((0.0, 0.0, 0.0))
+    assert 0.0 < straddling < 1.0
+    assert fraction((0.05, 0.0, 0.0)) < straddling
+    # Fully off the supported half-plane.
+    assert fraction((0.20, 0.0, 0.0)) == pytest.approx(0.0)
+
+
+def test_obstacle_clearance_returns_inf_when_nothing_qualifies():
+    planner = _planner()
+    plane = _xy_plane()
+    axis_x = np.array((1.0, 0.0, 0.0))
+    axis_y = np.array((0.0, 1.0, 0.0))
+
+    def gap(scene):
+        scene = np.asarray(scene, dtype=float)
+        return planner._obstacle_clearance(
+            support_position=np.zeros(3),
+            axis_x=axis_x,
+            axis_y=axis_y,
+            half_x=0.04,
+            half_y=0.03,
+            object_height=0.10,
+            plane=plane,
+            scene_tree=cKDTree(scene),
+            scene=scene,
+            clearance=0.025,
+        )
+
+    # Nothing within the query ball at all.
+    assert gap([[5.0, 5.0, 0.0]]) == np.inf
+    # Points on the support plane itself are excluded by plane_exclusion_m.
+    assert gap([[0.10, 0.0, 0.0], [0.12, 0.0, 0.0]]) == np.inf
+    # Points taller than the object plus its height margin are also excluded.
+    assert gap([[0.10, 0.0, 5.0]]) == np.inf
+
+
+def test_obstacle_clearance_measures_the_gap_from_the_footprint_edge():
+    planner = _planner()
+    plane = _xy_plane()
+    scene = np.asarray([[0.14, 0.0, 0.05]])
+
+    gap = planner._obstacle_clearance(
+        support_position=np.zeros(3),
+        axis_x=np.array((1.0, 0.0, 0.0)),
+        axis_y=np.array((0.0, 1.0, 0.0)),
+        half_x=0.04,
+        half_y=0.03,
+        object_height=0.10,
+        plane=plane,
+        scene_tree=cKDTree(scene),
+        scene=scene,
+        clearance=0.025,
+    )
+
+    # 0.14 from the centre, minus the 0.04 half-extent, is 0.10 of free gap.
+    assert gap == pytest.approx(0.10)
 
 
 def test_rotated_gravity_plane_generates_surface_normal_entry_and_yaw_family():

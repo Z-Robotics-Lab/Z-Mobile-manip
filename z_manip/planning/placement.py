@@ -365,6 +365,86 @@ class ObservedPlacementPlanner:
             self.config.yaw_samples,
         )
 
+    def _footprint_support_fraction(
+        self,
+        *,
+        support_position: np.ndarray,
+        axis_x: np.ndarray,
+        axis_y: np.ndarray,
+        half_x: float,
+        half_y: float,
+        plane: SupportPlane,
+        support_tree: cKDTree,
+    ) -> float:
+        """Fraction of the object's yaw-aligned footprint that has support.
+
+        The footprint is grown by ``boundary_margin_m`` on each axis, projected
+        into the plane's 2-D frame, and tested against the observed support
+        points with a ``support_neighbor_radius_m`` ball.  Tuning knob, not a
+        rejection: the caller owns the accept/reject decision.
+        """
+
+        boundary_x = half_x + self.config.boundary_margin_m
+        boundary_y = half_y + self.config.boundary_margin_m
+        grid_x = np.linspace(-boundary_x, boundary_x, self.config.footprint_samples_per_axis)
+        grid_y = np.linspace(-boundary_y, boundary_y, self.config.footprint_samples_per_axis)
+        footprint = np.asarray([
+            support_position + dx * axis_x + dy * axis_y
+            for dx in grid_x for dy in grid_y
+        ])
+        support_uv = np.column_stack((
+            (footprint - plane.origin) @ plane.tangent_u,
+            (footprint - plane.origin) @ plane.tangent_v,
+        ))
+        support_distances, _ = support_tree.query(support_uv, k=1)
+        return float(np.mean(
+            support_distances <= self.config.support_neighbor_radius_m,
+        ))
+
+    def _obstacle_clearance(
+        self,
+        *,
+        support_position: np.ndarray,
+        axis_x: np.ndarray,
+        axis_y: np.ndarray,
+        half_x: float,
+        half_y: float,
+        object_height: float,
+        plane: SupportPlane,
+        scene_tree: cKDTree,
+        scene: np.ndarray,
+        clearance: float,
+    ) -> float:
+        """Smallest in-plane gap from the object footprint to a scene obstacle.
+
+        Only points between ``plane_exclusion_m`` above the plane (which drops
+        the support surface itself) and the object's own height plus
+        ``obstacle_height_margin_m`` count.  Returns ``inf`` when nothing
+        qualifies, so an empty neighbourhood never rejects a candidate.
+        """
+
+        query_radius = float(np.hypot(
+            np.hypot(half_x + clearance, half_y + clearance),
+            object_height + self.config.obstacle_height_margin_m,
+        ))
+        nearby_indices = scene_tree.query_ball_point(support_position, query_radius)
+        if not nearby_indices:
+            return np.inf
+        delta = scene[np.asarray(nearby_indices, dtype=int)] - support_position
+        height = delta @ plane.normal
+        above = (
+            (height > self.config.plane_exclusion_m)
+            & (height < object_height + self.config.obstacle_height_margin_m)
+        )
+        if not np.any(above):
+            return np.inf
+        delta = delta[above]
+        local_x = np.abs(delta @ axis_x)
+        local_y = np.abs(delta @ axis_y)
+        dx = np.maximum(local_x - half_x, 0.0)
+        dy = np.maximum(local_y - half_y, 0.0)
+        return float(np.min(np.hypot(dx, dy)))
+
     def _candidate_geometry(
         self,
         support_position: np.ndarray,
@@ -383,50 +463,38 @@ class ObservedPlacementPlanner:
         axis_y = -sine * plane.tangent_u + cosine * plane.tangent_v
         half_x = 0.5 * extent[0]
         half_y = 0.5 * extent[1]
-        boundary_x = half_x + self.config.boundary_margin_m
-        boundary_y = half_y + self.config.boundary_margin_m
-        grid_x = np.linspace(-boundary_x, boundary_x, self.config.footprint_samples_per_axis)
-        grid_y = np.linspace(-boundary_y, boundary_y, self.config.footprint_samples_per_axis)
-        footprint = np.asarray([
-            support_position + dx * axis_x + dy * axis_y
-            for dx in grid_x for dy in grid_y
-        ])
-        support_uv = np.column_stack((
-            (footprint - plane.origin) @ plane.tangent_u,
-            (footprint - plane.origin) @ plane.tangent_v,
-        ))
-        support_distances, _ = support_tree.query(support_uv, k=1)
-        support_fraction = float(np.mean(
-            support_distances <= self.config.support_neighbor_radius_m,
-        ))
+        clearance = max(constraints.min_clearance_m, 0.0)
+        object_height = extent[2]
+
+        # The two geometric verdicts are computed by helpers but rejected here,
+        # so every way this candidate can die stays visible in this method (the
+        # third, a tool-shaft intrusion, follows once the poses exist).
+        support_fraction = self._footprint_support_fraction(
+            support_position=support_position,
+            axis_x=axis_x,
+            axis_y=axis_y,
+            half_x=half_x,
+            half_y=half_y,
+            plane=plane,
+            support_tree=support_tree,
+        )
         if support_fraction + 1e-12 < constraints.min_support_fraction:
             return None
 
-        clearance = max(constraints.min_clearance_m, 0.0)
-        object_height = extent[2]
-        query_radius = float(np.hypot(
-            np.hypot(half_x + clearance, half_y + clearance),
-            object_height + self.config.obstacle_height_margin_m,
-        ))
-        nearby_indices = scene_tree.query_ball_point(support_position, query_radius)
-        minimum_clearance = np.inf
-        if nearby_indices:
-            delta = scene[np.asarray(nearby_indices, dtype=int)] - support_position
-            height = delta @ plane.normal
-            above = (
-                (height > self.config.plane_exclusion_m)
-                & (height < object_height + self.config.obstacle_height_margin_m)
-            )
-            if np.any(above):
-                delta = delta[above]
-                local_x = np.abs(delta @ axis_x)
-                local_y = np.abs(delta @ axis_y)
-                dx = np.maximum(local_x - half_x, 0.0)
-                dy = np.maximum(local_y - half_y, 0.0)
-                gaps = np.hypot(dx, dy)
-                minimum_clearance = float(np.min(gaps))
-                if minimum_clearance + 1e-12 < clearance:
-                    return None
+        minimum_clearance = self._obstacle_clearance(
+            support_position=support_position,
+            axis_x=axis_x,
+            axis_y=axis_y,
+            half_x=half_x,
+            half_y=half_y,
+            object_height=object_height,
+            plane=plane,
+            scene_tree=scene_tree,
+            scene=scene,
+            clearance=clearance,
+        )
+        if minimum_clearance + 1e-12 < clearance:
+            return None
 
         object_pose = np.eye(4)
         object_pose[:3, :3] = np.column_stack((axis_x, axis_y, plane.normal))
