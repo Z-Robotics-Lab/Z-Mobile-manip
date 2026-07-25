@@ -95,3 +95,35 @@ def test_distribution_records_expected_quantiles() -> None:
     assert result["p50"] == 2.5
     assert result["p95"] == 3.8499999999999996
     assert result["max"] == 4.0
+
+
+def test_summary_excludes_a_timed_out_trials_missing_search_timing() -> None:
+    trials = [
+        {
+            "wall_s": 1.0,
+            "plan_valid": True,
+            "rejection_stages": {},
+            "timings_s": {"search": 0.5},
+        },
+        {
+            # A timed-out or crashed trial: timings_s is an empty dict, not a
+            # dict with a "search" key. This must not crash the whole report.
+            "wall_s": 30.0,
+            "plan_valid": False,
+            "rejection_stages": {},
+            "timings_s": {},
+        },
+    ]
+
+    summary = MODULE._summary(
+        trials,
+        seed=7,
+        target_sigma_mm=1.0,
+        joint_sigma_deg=0.5,
+    )
+
+    assert summary["trial_count"] == 2
+    assert summary["success_count"] == 1
+    assert summary["latency_s"]["planner_search"]["min"] == 0.5
+    assert summary["latency_s"]["planner_search"]["max"] == 0.5
+    assert summary["latency_s"]["wall"]["max"] == 30.0

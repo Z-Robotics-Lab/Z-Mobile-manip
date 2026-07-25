@@ -165,6 +165,39 @@ def _bounded_planning_seed(
     return perturbed, perturbed - values
 
 
+def _summary(
+    trials: list[dict[str, Any]],
+    *,
+    seed: int,
+    target_sigma_mm: float,
+    joint_sigma_deg: float,
+) -> dict[str, Any]:
+    rejection_totals: Counter[str] = Counter()
+    for trial in trials:
+        rejection_totals.update(trial["rejection_stages"])
+    return {
+        "schema": "z_mobile_manip.ik_monte_carlo_replay.v1",
+        "seed": seed,
+        "target_sigma_mm": target_sigma_mm,
+        "joint_sigma_deg": joint_sigma_deg,
+        "trial_count": len(trials),
+        "success_count": sum(trial["plan_valid"] for trial in trials),
+        "latency_s": {
+            "wall": _distribution([trial["wall_s"] for trial in trials]),
+            "planner_search": _distribution(
+                [
+                    trial["timings_s"]["search"]
+                    for trial in trials
+                    if isinstance(trial.get("timings_s"), dict)
+                    and isinstance(trial["timings_s"].get("search"), (int, float))
+                ],
+            ),
+        },
+        "rejection_totals": dict(sorted(rejection_totals.items())),
+        "trials": trials,
+    }
+
+
 def _distribution(values: list[float]) -> dict[str, float]:
     data = np.asarray(values, dtype=float)
     if data.size == 0 or not np.all(np.isfinite(data)):
@@ -282,25 +315,12 @@ def main() -> int:
             }
             trials.append(record)
             print(json.dumps(record, sort_keys=True), flush=True)
-    rejection_totals: Counter[str] = Counter()
-    for trial in trials:
-        rejection_totals.update(trial["rejection_stages"])
-    summary = {
-        "schema": "z_mobile_manip.ik_monte_carlo_replay.v1",
-        "seed": args.seed,
-        "target_sigma_mm": args.target_sigma_mm,
-        "joint_sigma_deg": args.joint_sigma_deg,
-        "trial_count": len(trials),
-        "success_count": sum(trial["plan_valid"] for trial in trials),
-        "latency_s": {
-            "wall": _distribution([trial["wall_s"] for trial in trials]),
-            "planner_search": _distribution(
-                [trial["timings_s"]["search"] for trial in trials],
-            ),
-        },
-        "rejection_totals": dict(sorted(rejection_totals.items())),
-        "trials": trials,
-    }
+    summary = _summary(
+        trials,
+        seed=args.seed,
+        target_sigma_mm=args.target_sigma_mm,
+        joint_sigma_deg=args.joint_sigma_deg,
+    )
     (output / "report.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
