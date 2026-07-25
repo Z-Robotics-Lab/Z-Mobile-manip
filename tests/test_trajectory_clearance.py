@@ -86,6 +86,54 @@ def test_continuous_sampling_finds_collision_between_safe_waypoints():
     assert evidence.segments[0].document()["valid"] is False
 
 
+class _CountingGuard:
+    """Wraps _LinearMarginGuard and records every checked joint vector."""
+
+    def __init__(self):
+        self._inner = _LinearMarginGuard()
+        self.checked: list[float] = []
+
+    def check_state(self, joints):
+        self.checked.append(float(np.asarray(joints)[0]))
+        return self._inner.check_state(joints)
+
+
+def test_shared_segment_boundary_is_not_double_queried():
+    # Three waypoints -> two segments sharing the joint-1 values -0.5 (segment
+    # 0's end / segment 1's start) so this exercises the alpha=0.0 dedup on a
+    # non-degenerate multi-segment trajectory. _LinearMarginGuard's margin
+    # equals joints[0] directly, so expected per-sample margins are exact.
+    trajectory = np.zeros((3, 6))
+    trajectory[0, 0] = -1.0
+    trajectory[1, 0] = -0.5
+    trajectory[2, 0] = 0.5
+
+    guard = _CountingGuard()
+    evidence = evaluate_fixed_fixture_trajectory(
+        trajectory,
+        guard=guard,
+        max_joint_step_rad=0.25,
+    )
+
+    # Segment 0: |−1.0 − (−0.5)| / 0.25 = 2 intervals -> alphas 0, 0.5, 1 (3 samples).
+    # Segment 1: |−0.5 − 0.5| / 0.25 = 4 intervals -> alphas 0, .25, .5, .75, 1
+    # (5 samples), but alpha=0 (joints[0]=-0.5) duplicates segment 0's alpha=1.
+    assert evidence.segments[0].sample_count == 3
+    assert evidence.segments[1].sample_count == 5
+    assert evidence.state_checks == 3 + 5 - 1  # one shared boundary reused, not re-queried
+    assert guard.checked.count(-0.5) == 1  # the shared boundary was queried exactly once
+
+    # Full per-sample margins (joints[0] value) for both segments, including
+    # the deduplicated boundary: -1.0, -0.75, -0.5 | -0.5, -0.25, 0.0, 0.25, 0.5.
+    assert evidence.segments[0].minimum_margin_m == pytest.approx(-1.0)
+    assert evidence.segments[0].minimum_alpha == pytest.approx(0.0)
+    assert evidence.segments[1].minimum_margin_m == pytest.approx(-0.5)
+    assert evidence.segments[1].minimum_alpha == pytest.approx(0.0)
+    assert evidence.minimum_margin_m == pytest.approx(-1.0)
+    assert evidence.minimum_segment_index == 0
+    assert not evidence.valid
+
+
 def test_recorded_mid360_path_reports_global_and_per_segment_witnesses():
     clear = np.asarray([-0.049, 0.188, -0.009, -0.045, 0.331, 0.0])
     near = np.asarray([-0.139, 0.313, -0.009, -0.121, 0.358, 0.0])

@@ -187,6 +187,7 @@ def evaluate_fixed_fixture_trajectory(
     global_witness: TrajectoryCollisionWitness | None = None
     global_segment = 0
     state_checks = 0
+    boundary_state = None
     for segment_index, (start, end, interval_count) in enumerate(
         zip(trajectory[:-1], trajectory[1:], intervals),
     ):
@@ -195,14 +196,22 @@ def evaluate_fixed_fixture_trajectory(
         minimum_witness: TrajectoryCollisionWitness | None = None
         valid = True
         for alpha in np.linspace(0.0, 1.0, interval_count + 1):
-            state = guard.check_state(start + float(alpha) * (end - start))
-            state_checks += 1
+            # alpha=0.0 of segment N>0 is the exact same joint configuration as
+            # alpha=1.0 of segment N-1 (both equal `trajectory[N]`); reuse that
+            # already-computed state instead of re-querying the guard for it.
+            if segment_index > 0 and alpha == 0.0:
+                state = boundary_state
+            else:
+                state = guard.check_state(start + float(alpha) * (end - start))
+                state_checks += 1
             margin = _state_margin(state)
             valid = valid and bool(state.valid) and margin > 0.0
             if margin < minimum_margin:
                 minimum_margin = margin
                 minimum_alpha = float(alpha)
                 minimum_witness = TrajectoryCollisionWitness.from_state(state)
+            if alpha == 1.0:
+                boundary_state = state
         assert minimum_witness is not None
         segment = TrajectorySegmentClearance(
             segment_index=segment_index,
