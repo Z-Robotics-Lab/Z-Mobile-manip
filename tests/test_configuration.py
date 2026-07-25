@@ -156,6 +156,18 @@ def test_tool_geometry_rejects_invalid_axes_interval_and_tcp():
         replace(geometry, collision_grasp_margin_m=0.08)
 
 
+def test_loader_reports_a_missing_robot_field_by_name(tmp_path):
+    # robot.urdf_path.exists() is checked before tool_geometry is parsed, so
+    # this is the only missing-field case exercisable without a real URDF on
+    # disk; robot and tool_geometry share the same _pop_required call path.
+    missing_urdf = _write_modified_config(
+        tmp_path,
+        lambda values: values["robot"].pop("urdf_path"),
+    )
+    with pytest.raises(ValueError, match=r"robot is missing required field 'urdf_path'"):
+        load_stack_config(missing_urdf)
+
+
 def test_loader_rejects_tool_axis_drift_from_tool_transform(tmp_path):
     path = _write_modified_config(
         tmp_path,

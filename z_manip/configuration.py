@@ -153,6 +153,21 @@ def _mapping(value: object, label: str) -> dict[str, object]:
     return dict(value)
 
 
+def _pop_required(mapping: dict[str, object], key: str, label: str) -> object:
+    """Pop ``key`` from ``mapping``, raising a clear message if it is absent.
+
+    ``robot`` and ``tool_geometry`` build their typed config via individual
+    ``dict.pop`` calls (each field needs its own path/tuple conversion), so a
+    missing field raises a bare ``KeyError('urdf_path')`` instead of the
+    descriptive ``TypeError`` every other section gets for free from
+    ``Cls(**mapping)``. This closes that message-quality gap.
+    """
+    try:
+        return mapping.pop(key)
+    except KeyError:
+        raise ValueError(f"{label} is missing required field {key!r}") from None
+
+
 def _float_tuple(value: object, label: str) -> tuple[float, ...]:
     if not isinstance(value, (list, tuple)):
         raise ValueError(f"{label} must be an array")
@@ -341,17 +356,17 @@ def load_stack_config(
         )
     try:
         robot_values = _mapping(values["robot"], "robot")
-        urdf = Path(str(robot_values.pop("urdf_path"))).expanduser()
+        urdf = Path(str(_pop_required(robot_values, "urdf_path", "robot"))).expanduser()
         if not urdf.is_absolute():
             urdf = config_path.parent / urdf
         robot = RobotModelConfig(
             urdf_path=urdf.resolve(),
-            platform_base_frame=str(robot_values.pop("platform_base_frame")),
-            mount_parent_link=str(robot_values.pop("mount_parent_link")),
-            base_link=str(robot_values.pop("base_link")),
-            tip_link=str(robot_values.pop("tip_link")),
+            platform_base_frame=str(_pop_required(robot_values, "platform_base_frame", "robot")),
+            mount_parent_link=str(_pop_required(robot_values, "mount_parent_link", "robot")),
+            base_link=str(_pop_required(robot_values, "base_link", "robot")),
+            tip_link=str(_pop_required(robot_values, "tip_link", "robot")),
             acceleration_limits=_float_tuple(
-                robot_values.pop("acceleration_limits"),
+                _pop_required(robot_values, "acceleration_limits", "robot"),
                 "robot.acceleration_limits",
             ),
         )
@@ -378,20 +393,24 @@ def load_stack_config(
         tool_values = _mapping(values["tool_geometry"], "tool_geometry")
         tool_geometry = ToolGeometryConfig(
             tip_closing_axis=_float_tuple(
-                tool_values.pop("tip_closing_axis"),
+                _pop_required(tool_values, "tip_closing_axis", "tool_geometry"),
                 "tool_geometry.tip_closing_axis",
             ),
             tip_approach_axis=_float_tuple(
-                tool_values.pop("tip_approach_axis"),
+                _pop_required(tool_values, "tip_approach_axis", "tool_geometry"),
                 "tool_geometry.tip_approach_axis",
             ),
             finger_contact_z_interval_m=_float_tuple(
-                tool_values.pop("finger_contact_z_interval_m"),
+                _pop_required(tool_values, "finger_contact_z_interval_m", "tool_geometry"),
                 "tool_geometry.finger_contact_z_interval_m",
             ),
-            contact_tcp_z_m=float(tool_values.pop("contact_tcp_z_m")),
-            collision_open_aperture_m=float(tool_values.pop("collision_open_aperture_m")),
-            collision_grasp_margin_m=float(tool_values.pop("collision_grasp_margin_m")),
+            contact_tcp_z_m=float(_pop_required(tool_values, "contact_tcp_z_m", "tool_geometry")),
+            collision_open_aperture_m=float(
+                _pop_required(tool_values, "collision_open_aperture_m", "tool_geometry"),
+            ),
+            collision_grasp_margin_m=float(
+                _pop_required(tool_values, "collision_grasp_margin_m", "tool_geometry"),
+            ),
         )
         if tool_values:
             raise ValueError(f"unknown tool_geometry fields: {sorted(tool_values)}")
