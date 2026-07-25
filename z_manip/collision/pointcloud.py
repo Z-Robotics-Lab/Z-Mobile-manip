@@ -763,6 +763,7 @@ class PointCloudCollisionChecker:
         self._target_clearance = float(clearance)
         self._attached_target_allow_scene_contact = bool(allow_scene_contact)
         self._clear_departure_contact()
+        self._clear_finger_scene_exclusion()
         self._attached_departure_contact_mode = bool(allow_initial_scene_contact)
         if allow_initial_scene_contact:
             assert departure_direction is not None

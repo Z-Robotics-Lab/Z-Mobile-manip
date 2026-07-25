@@ -721,3 +721,30 @@ def test_finger_support_plane_exclusion_keeps_off_plane_obstacle(tmp_path):
     on.update_scene(obstacle, stamp_s=10.0)
     on.update_target(target)
     assert on.check_state(joints).kind == "scene"  # off-plane obstacle preserved
+
+
+def test_attaching_the_target_invalidates_a_cached_finger_scene_exclusion(tmp_path):
+    # update_scene() and update_target() both invalidate the finger-exclusion
+    # cache (_clear_finger_scene_exclusion); update_attached_target() did not,
+    # leaving a plane fit computed for the pre-pickup resting target pose
+    # cached after the target detaches from the scene and attaches to the
+    # chain. check_state() re-derives its own "use the exclusion" gate from
+    # `self._target_points is not None` on every call, and update_attached_
+    # target() already sets that to None, so this is not observable through
+    # check_state() today (the audit's own "currently unreachable" framing) —
+    # assert the actual invariant directly: every "install new target
+    # geometry" entry point must leave no stale finger-exclusion fit cached.
+    target = np.array([[0.20, 0.10, z] for z in np.linspace(0.0, 0.05, 6)])
+    floor_graze = np.array([[0.20, 0.0, 0.0]])
+    joints = np.array([0.20])
+
+    checker = _finger_checker(tmp_path, exclusion=True)
+    checker.update_scene(floor_graze, stamp_s=10.0)
+    checker.update_target(target)
+    checker.check_state(joints)
+    assert checker._finger_scene_ready  # caches a plane fit against `target`
+
+    checker.update_attached_target(target, attachment_joints=joints)
+    assert not checker._finger_scene_ready
+    assert checker._finger_scene_tree is None
+    assert checker._finger_scene_points is None
