@@ -299,6 +299,13 @@ class ReadOnlySessionService:
         self._now = now
         self._random_token = random_token or (lambda: secrets.token_hex(16))
         self._lock = threading.Lock()
+        # Context invalidation is the operator's recovery boundary, so it must
+        # never wait behind a backend call.  ``_context_lock`` only ever covers
+        # bounded reference bookkeeping; publication of a run's references is
+        # gated on ``_context_epoch`` instead of on ``_lock``, so a clear
+        # issued while a run is in flight still wins without blocking.
+        self._context_lock = threading.Lock()
+        self._context_epoch = 0
         for name in ("perception", "planning", "_state"):
             (self._root / name).mkdir(parents=True, exist_ok=True)
 
@@ -459,6 +466,7 @@ class ReadOnlySessionService:
         if not self._lock.acquire(blocking=False):
             raise SessionContractError("ACTION_BUSY", "another action is in progress")
         try:
+            context_epoch = self._context_generation()
             session_id, session = self._new_session("perception")
             started = self._now()
             in_flight = session / ".perception.inflight"
@@ -515,10 +523,12 @@ class ReadOnlySessionService:
             }
             _write_json_exclusive(session / "attempt.json", attempt)
             _freeze_tree(session)
-            self._set_reference("perception", "latest_attempt", session_id)
-            if succeeded:
-                self._set_reference("perception", "last_good", session_id)
-                self._set_reference("perception", "selected", session_id)
+            with self._context_lock:
+                if self._context_epoch == context_epoch:
+                    self._set_reference("perception", "latest_attempt", session_id)
+                    if succeeded:
+                        self._set_reference("perception", "last_good", session_id)
+                        self._set_reference("perception", "selected", session_id)
             return attempt
         finally:
             self._lock.release()
@@ -539,6 +549,12 @@ class ReadOnlySessionService:
             "selected_perception_session_id": safe_id,
         }
 
+    def _context_generation(self) -> int:
+        """Read the epoch a run must still own to publish its references."""
+
+        with self._context_lock:
+            return self._context_epoch
+
     def clear_current_context(self) -> dict[str, object]:
         """Invalidate all current task pointers while retaining audit history.
 
@@ -546,21 +562,29 @@ class ReadOnlySessionService:
         diagnosis, but none can be planned or executed until a new perception
         succeeds.  Home completion uses this to prevent stale plans from a
         previous object or robot cycle being reused.
+
+        This deliberately does not take the action lock.  Full Stop and Home
+        call it as a recovery boundary, and a hung perception or planning
+        backend holds that lock for its whole run; waiting would turn the
+        recovery button into an unbounded block.  Bumping the context epoch
+        instead makes any run already in flight drop its references when it
+        finishes, which is the same end state the blocking version reached.
         """
 
-        with self._lock:
+        with self._context_lock:
+            self._context_epoch += 1
             cleared = self._remove_references(
                 "perception", ("selected", "latest_attempt", "last_good"),
             )
             cleared.extend(self._remove_references(
                 "planning", ("latest_attempt", "last_good"),
             ))
-            return {
-                "schema": STATE_SCHEMA,
-                "cleared": True,
-                "cleared_references": cleared,
-                "history_retained": True,
-            }
+        return {
+            "schema": STATE_SCHEMA,
+            "cleared": True,
+            "cleared_references": cleared,
+            "history_retained": True,
+        }
 
     def run_planning(self) -> dict[str, Any]:
         """Run fixed passive/session gates and offline planning for selection."""
@@ -568,6 +592,7 @@ class ReadOnlySessionService:
         if not self._lock.acquire(blocking=False):
             raise SessionContractError("ACTION_BUSY", "another action is in progress")
         try:
+            context_epoch = self._context_generation()
             session_id, session = self._new_session("planning")
             started = self._now()
             selected_id: str | None = None
@@ -634,9 +659,11 @@ class ReadOnlySessionService:
             }
             _write_json_exclusive(session / "attempt.json", attempt)
             _freeze_tree(session)
-            self._set_reference("planning", "latest_attempt", session_id)
-            if succeeded:
-                self._set_reference("planning", "last_good", session_id)
+            with self._context_lock:
+                if self._context_epoch == context_epoch:
+                    self._set_reference("planning", "latest_attempt", session_id)
+                    if succeeded:
+                        self._set_reference("planning", "last_good", session_id)
             return attempt
         finally:
             self._lock.release()

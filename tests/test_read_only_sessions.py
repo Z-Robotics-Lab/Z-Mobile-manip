@@ -363,6 +363,55 @@ def test_home_context_clear_invalidates_current_tasks_but_retains_history(tmp_pa
     assert (tmp_path / "sessions" / "planning" / planning["session_id"]).is_dir()
 
 
+def test_context_clear_never_waits_for_an_in_flight_backend(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingBackend(FakeBackend):
+        """Hold the action lock the way a hung perception backend would."""
+
+        def run_perception(self, *, target, output_dir, log_path):
+            entered.set()
+            assert release.wait(timeout=10.0)
+            return super().run_perception(
+                target=target,
+                output_dir=output_dir,
+                log_path=log_path,
+            )
+
+    service = _service(tmp_path, BlockingBackend())
+    perceiving = threading.Thread(
+        target=service.start_perception,
+        args=("white adapter",),
+        daemon=True,
+    )
+    perceiving.start()
+    assert entered.wait(timeout=10.0)
+
+    cleared: list[dict] = []
+    clearing = threading.Thread(
+        target=lambda: cleared.append(service.clear_current_context()),
+        daemon=True,
+    )
+    clearing.start()
+    clearing.join(timeout=2.0)
+    still_blocked = clearing.is_alive()
+
+    release.set()
+    perceiving.join(timeout=10.0)
+    clearing.join(timeout=10.0)
+    state = service.status()
+
+    assert not still_blocked, "clear_current_context waited on the action lock"
+    assert cleared and cleared[0]["cleared"] is True
+    # The perception that was in flight during the clear must not publish its
+    # references afterwards, exactly as the blocking version's wipe ensured.
+    assert state["selected_perception_session_id"] is None
+    assert state["actions"]["perception"]["latest_attempt"] is None
+    assert state["actions"]["perception"]["last_good"] is None
+    assert list((tmp_path / "sessions" / "perception").iterdir())
+
+
 def test_new_successful_perception_invalidates_previous_plan(tmp_path):
     backend = FakeBackend()
     service = _service(tmp_path, backend)
