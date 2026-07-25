@@ -20,6 +20,7 @@ from z_manip.perception.edgetam_service_client import (
     UrllibJsonTransport,
     decode_coco_rle,
     encode_coco_rle,
+    mask_bounds,
 )
 
 
@@ -397,3 +398,55 @@ def test_declared_image_size_is_bounded_before_rle_allocation():
         client.init(JPEG, [1, 1, 9, 7], session_id="pick-17")
 
     assert not client.active
+
+
+def _reference_mask_bounds(mask):
+    """Original full-index bbox, kept here as the equivalence oracle."""
+    ys, xs = np.nonzero(mask)
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def test_mask_bounds_matches_the_full_index_reference():
+    rng = np.random.default_rng(20260725)
+    cases = [
+        np.ones((5, 7), dtype=bool),
+        np.array([[True]], dtype=bool),
+    ]
+    corners = np.zeros((9, 11), dtype=bool)
+    corners[0, 0] = corners[8, 10] = True
+    cases.append(corners)
+    for _ in range(40):
+        height = int(rng.integers(1, 12))
+        width = int(rng.integers(1, 12))
+        mask = rng.random((height, width)) < 0.3
+        mask[int(rng.integers(0, height)), int(rng.integers(0, width))] = True
+        cases.append(mask)
+
+    for mask in cases:
+        assert mask_bounds(mask) == _reference_mask_bounds(mask)
+
+    with pytest.raises(ValueError, match="empty mask"):
+        mask_bounds(np.zeros((4, 4), dtype=bool))
+
+
+def test_tracked_frame_parse_never_indexes_the_whole_silhouette(monkeypatch):
+    # The per-frame bbox must reduce per axis; np.nonzero on the 2-D mask would
+    # allocate two index arrays sized to the true-pixel count on every frame.
+    responses = [_track_response(), _track_response(frame_seq=1, mask=_mask(offset=1))]
+    expected_bbox = _reference_mask_bounds(_mask(offset=1))
+    transport = FakeTransport(responses)
+    client = EdgeTamServiceClient(transport=transport)
+    indexed_dimensions = []
+    original_nonzero = np.nonzero
+
+    def recording_nonzero(array, *args, **kwargs):
+        indexed_dimensions.append(np.asarray(array).ndim)
+        return original_nonzero(array, *args, **kwargs)
+
+    monkeypatch.setattr(np, "nonzero", recording_nonzero)
+
+    client.init(JPEG, [1, 1, 9, 7], session_id="pick-17")
+    updated = client.update(JPEG)
+
+    assert updated.bbox_xyxy == expected_bbox
+    assert 2 not in indexed_dimensions

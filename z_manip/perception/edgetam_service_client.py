@@ -200,6 +200,21 @@ def decode_coco_rle(value: object, *, max_pixels: int = 16_777_216) -> np.ndarra
     return flat.reshape((height, width), order="F")
 
 
+def mask_bounds(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """Tight half-open ``(x1, y1, x2, y2)`` box around a non-empty bool mask.
+
+    Reducing per axis first keeps this proportional to the image dimensions
+    rather than to the true-pixel count; ``np.nonzero`` would materialise two
+    index arrays sized to the whole silhouette only to take their extrema.
+    """
+
+    columns = np.flatnonzero(mask.any(axis=0))
+    rows = np.flatnonzero(mask.any(axis=1))
+    if not columns.size:
+        raise ValueError("mask bounds are undefined for an empty mask")
+    return int(columns[0]), int(rows[0]), int(columns[-1]) + 1, int(rows[-1]) + 1
+
+
 class UrllibJsonTransport:
     """Small stdlib HTTP transport with bounded response decoding."""
 
@@ -518,16 +533,9 @@ class EdgeTamServiceClient:
         width, height = image_size
         if mask.shape != (height, width):
             raise EdgeTamProtocolError("mask dimensions do not match image_size")
-        ys, xs = np.nonzero(mask)
-        if len(xs) < self._min_mask_pixels:
+        if int(np.count_nonzero(mask)) < self._min_mask_pixels:
             raise EdgeTamTrackingLost("EdgeTAM returned an empty or too-small target mask")
-        mask_bbox = (
-            int(xs.min()),
-            int(ys.min()),
-            int(xs.max()) + 1,
-            int(ys.max()) + 1,
-        )
-        if bbox != mask_bbox:
+        if bbox != mask_bounds(mask):
             raise EdgeTamProtocolError("bbox_xyxy does not exactly bound mask_rle")
         mask.setflags(write=False)
         return EdgeTamTrack(

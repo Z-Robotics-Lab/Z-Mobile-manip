@@ -312,3 +312,57 @@ def test_service_confidence_environment_is_bounded() -> None:
         monkeypatch.setenv("EDGETAM_MIN_SCORE", "1.1")
         with pytest.raises(ValueError, match="EDGETAM_MIN_SCORE"):
             server.ServiceConfig.from_env()
+
+
+def _reference_mask_bounds(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """Original full-index bbox, kept here as the equivalence oracle."""
+    ys, xs = np.nonzero(mask)
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def test_mask_bounds_matches_the_full_index_reference() -> None:
+    rng = np.random.default_rng(20260725)
+    cases = [
+        np.ones((5, 7), dtype=bool),
+        np.array([[True]], dtype=bool),
+    ]
+    corners = np.zeros((9, 11), dtype=bool)
+    corners[0, 0] = corners[8, 10] = True
+    cases.append(corners)
+    for _ in range(40):
+        height = int(rng.integers(1, 12))
+        width = int(rng.integers(1, 12))
+        mask = rng.random((height, width)) < 0.3
+        mask[int(rng.integers(0, height)), int(rng.integers(0, width))] = True
+        cases.append(mask)
+
+    for mask in cases:
+        assert server.mask_bounds(mask) == _reference_mask_bounds(mask)
+
+    with pytest.raises(ValueError, match="empty mask"):
+        server.mask_bounds(np.zeros((4, 4), dtype=bool))
+
+
+def test_tracking_response_never_indexes_the_whole_silhouette(monkeypatch) -> None:
+    # The per-frame bbox must reduce per axis; np.nonzero on the 2-D mask would
+    # allocate two index arrays sized to the true-pixel count on every frame.
+    monkeypatch.setattr(
+        server, "decode_jpeg", lambda _v, _c: np.zeros((8, 8, 3), dtype=np.uint8),
+    )
+    backend = _ScriptedBackend(["track"], image_size=(8, 8))
+    application = server.EdgeTamApplication(server.ServiceConfig(), backend=backend)
+    _seed_session(application)
+    indexed_dimensions: list[int] = []
+    original_nonzero = np.nonzero
+
+    def recording_nonzero(array, *args, **kwargs):
+        indexed_dimensions.append(np.asarray(array).ndim)
+        return original_nonzero(array, *args, **kwargs)
+
+    monkeypatch.setattr(np, "nonzero", recording_nonzero)
+
+    response = _update(application, 1)
+
+    assert response["status"] == "tracking"
+    assert response["bbox_xyxy"] == [0, 0, 8, 8]
+    assert 2 not in indexed_dimensions
