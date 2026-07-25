@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -120,10 +120,14 @@ class _RoundSection:
     the horizontal cross-section recovers the true axis centre and diameter and
     lets the closing axis be any horizontal direction (the gripper picks the one
     whose perpendicular approach is reachable).
+
+    The recovered diameter lives on every ``closing_axes`` entry's ``width``,
+    which is the value the rest of the pipeline commands the jaw to; it is the
+    true object diameter, not the arc depth the raw OBB reports.  There is
+    deliberately no second copy of it on this class.
     """
 
     center: np.ndarray        # (3,) true axis centre at the chosen grasp height
-    diameter: float           # true object diameter (jaw opening), not the arc depth
     closing_axes: list["_ClosingAxis"]  # horizontal closing fan, all width == diameter
 
 
@@ -231,6 +235,18 @@ class AntipodalGraspSource:
             0, int(corridor_backfill_min_candidates)
         )
 
+    def _fits_aperture(
+        self,
+        axes: Iterable["_ClosingAxis"],
+    ) -> list["_ClosingAxis"]:
+        """Keep only the closing directions the jaw can actually open across."""
+
+        return [
+            candidate
+            for candidate in axes
+            if self.min_aperture_m <= candidate.width <= self.graspable_extent_m
+        ]
+
     # -- public API -------------------------------------------------------
 
     def generate(self, context: GraspContext) -> GraspCandidates:
@@ -263,21 +279,15 @@ class AntipodalGraspSource:
         graspable: list[_ClosingAxis] = []
         section = self._round_cross_section(points, obb)
         if section is not None:
-            graspable = [
-                candidate
-                for candidate in section.closing_axes
-                if self.min_aperture_m <= candidate.width <= self.graspable_extent_m
-            ]
+            graspable = self._fits_aperture(section.closing_axes)
             if graspable:
                 grasp_center = section.center
+        # Reaching here means the round fit produced no usable closing axis, so
+        # ``grasp_center`` is still ``obb.center``: the OBB faces are the
+        # fallback and they are centred on the OBB.
         if not graspable:
             closing_axes = self._candidate_closing_axes(points, obb)
-            graspable = [
-                candidate
-                for candidate in closing_axes
-                if self.min_aperture_m <= candidate.width <= self.graspable_extent_m
-            ]
-            grasp_center = obb.center
+            graspable = self._fits_aperture(closing_axes)
             if not graspable:
                 raise GraspGenerationError(
                     "no graspable face fits the gripper aperture with clearance; "
@@ -592,7 +602,7 @@ class AntipodalGraspSource:
             closing_axes.append(_ClosingAxis(axis=axis, width=diameter))
         if not closing_axes:
             return None
-        return _RoundSection(center=center, diameter=diameter, closing_axes=closing_axes)
+        return _RoundSection(center=center, closing_axes=closing_axes)
 
     def _robust_extent_along(self, points: np.ndarray, obb: _OBB, axis: np.ndarray) -> float:
         projection = (points - obb.median) @ axis

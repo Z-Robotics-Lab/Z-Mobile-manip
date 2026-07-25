@@ -1,3 +1,5 @@
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -399,3 +401,76 @@ def test_corridor_backfill_rescues_starved_candidate_set():
     assert len(rescued.grasps) > len(starved.grasps)
     # Penalized backfill never outranks a corridor-clean candidate.
     assert np.max(rescued.scores) == pytest.approx(np.max(starved.scores), abs=1e-5)
+
+
+# -- round-section contract and the round->OBB fallback ----------------------
+
+
+def test_round_section_carries_its_diameter_only_on_the_closing_axes():
+    # The recovered diameter has exactly one home: every closing-fan member's
+    # ``width``, which is what the pipeline commands the jaw to.  A second copy
+    # on the section itself would be a competing source of truth.
+    radius = 0.030
+    points = _upright_half_cylinder(cx=0.5, cy=0.0, radius=radius)
+    source = AntipodalGraspSource(max_candidates=32)
+    obb = source._fit_obb(points)
+    section = source._round_cross_section(points, obb)
+
+    assert section is not None
+    assert {field.name for field in dataclasses.fields(section)} == {
+        "center",
+        "closing_axes",
+    }
+    widths = [axis.width for axis in section.closing_axes]
+    assert widths  # the fan is non-empty
+    assert all(
+        width == pytest.approx(widths[0], abs=1e-12) for width in widths
+    )
+    assert widths[0] == pytest.approx(2.0 * radius, rel=0.10)
+
+
+def test_round_fit_with_no_axis_inside_the_aperture_falls_back_to_the_obb():
+    # The round fit succeeds but every fan member is wider than the jaw can
+    # open.  The OBB faces are then the only source of closing axes, and the
+    # grasp centre must stay on the OBB mid-plane rather than the recovered
+    # circle centre.
+    points = _small_box_cloud(half=(0.020, 0.016, 0.030), center=(0.47, -0.05, 0.05))
+    source = AntipodalGraspSource(max_candidates=8)
+    obb = source._fit_obb(points)
+    decoy_center = np.asarray(obb.center, dtype=float) + np.array([0.25, 0.25, 0.0])
+    unreachable = source.graspable_extent_m * 10.0
+    fan = [
+        antipodal_module._ClosingAxis(
+            axis=np.array([1.0, 0.0, 0.0]),
+            width=unreachable,
+        ),
+        antipodal_module._ClosingAxis(
+            axis=np.array([0.0, 1.0, 0.0]),
+            width=unreachable,
+        ),
+    ]
+    source._round_cross_section = lambda _points, _obb: antipodal_module._RoundSection(
+        center=decoy_center,
+        closing_axes=fan,
+    )
+
+    candidates = source.generate(_context(points))
+
+    assert len(candidates.grasps) > 0
+    for grasp in candidates.grasps:
+        assert np.linalg.norm(grasp[:3, 3] - decoy_center) > 0.10
+    assert np.all(candidates.widths <= source.graspable_extent_m + 1e-9)
+
+
+def test_fits_aperture_keeps_only_the_axes_the_jaw_can_open_across():
+    source = AntipodalGraspSource(max_candidates=8)
+    low = source.min_aperture_m
+    high = source.graspable_extent_m
+    axes = [
+        antipodal_module._ClosingAxis(axis=np.array([1.0, 0.0, 0.0]), width=low / 2.0),
+        antipodal_module._ClosingAxis(axis=np.array([0.0, 1.0, 0.0]), width=low),
+        antipodal_module._ClosingAxis(axis=np.array([0.0, 0.0, 1.0]), width=high),
+        antipodal_module._ClosingAxis(axis=np.array([1.0, 1.0, 0.0]), width=high * 2.0),
+    ]
+
+    assert [axis.width for axis in source._fits_aperture(axes)] == [low, high]
