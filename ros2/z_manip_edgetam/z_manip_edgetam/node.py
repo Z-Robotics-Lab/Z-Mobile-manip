@@ -1945,11 +1945,14 @@ class EdgeTamAdapter(Node):
                 current_generation = self._generation
             if command.generation != current_generation:
                 continue
-            if command.kind == 'reset':
-                self._tracker.reset()
-                continue
             try:
-                if command.kind == 'init':
+                # Every command kind must stay inside this guard: an escape
+                # ends the loop and kills the only consumer of self._commands,
+                # so the node would keep accepting frames while never
+                # producing a result again.
+                if command.kind == 'reset':
+                    self._tracker.reset()
+                elif command.kind == 'init':
                     self._run_init(command)
                 elif command.kind == 'frame':
                     self._run_update(command)

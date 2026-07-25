@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TASK_NODE = ROOT / "ros2" / "z_manip_task" / "z_manip_task" / "node.py"
 PLACE_NODE = ROOT / "ros2" / "z_manip_place" / "z_manip_place" / "node.py"
+EDGETAM_NODE = ROOT / "ros2" / "z_manip_edgetam" / "z_manip_edgetam" / "node.py"
 
 
 def _method(path: Path, class_name: str, method_name: str) -> ast.FunctionDef:
@@ -28,6 +29,17 @@ def _method(path: Path, class_name: str, method_name: str) -> ast.FunctionDef:
             f"{class_name} in {path.relative_to(ROOT)} defines no {method_name}",
         )
     raise AssertionError(f"{path.relative_to(ROOT)} defines no class {class_name}")
+
+
+def _guarded_ids(function: ast.FunctionDef) -> set[int]:
+    """Ids of every node inside the protected body of some ``try``."""
+    guarded: set[int] = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Try):
+            continue
+        for statement in node.body:
+            guarded.update(id(child) for child in ast.walk(statement))
+    return guarded
 
 
 def test_task_destroy_node_cancels_the_planner_before_shutting_the_executor():
@@ -61,3 +73,20 @@ def test_placement_planner_cannot_restart_itself_during_shutdown():
     # trigger and the authoritative start have to refuse once teardown began.
     assert "self._shutting_down" in auto_plan
     assert "self._shutting_down" in start_plan
+
+
+def test_edgetam_worker_loop_handles_every_command_inside_its_failure_guard():
+    loop = _method(EDGETAM_NODE, "EdgeTamAdapter", "_worker_loop")
+    guarded = _guarded_ids(loop)
+    kinds = [
+        node
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Constant) and node.value in {"reset", "init", "frame"}
+    ]
+
+    assert kinds, "the worker loop no longer dispatches on command.kind"
+    # An escape from the dispatch ends the loop and kills the only consumer of
+    # self._commands: the node keeps accepting frames and never produces a
+    # result again, recoverable only by restart.
+    unguarded = [node.value for node in kinds if id(node) not in guarded]
+    assert not unguarded, f"command kinds handled outside the guard: {unguarded}"
