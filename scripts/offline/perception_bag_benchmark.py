@@ -129,6 +129,24 @@ def _status_values(message: object) -> list[dict[str, str]]:
     return result
 
 
+# Generous bound for the lightweight per-message correlation caches below
+# (``requests`` and ``status_by_observation`` hold only small dicts/tuples of
+# strings and ints, not images or point clouds like ``bundles`` does). Sized
+# well above any topic's message count observed in a full-length capture used
+# for this benchmark so a realistic bag never evicts an entry a later message
+# still needs to correlate against; it only bounds memory on a pathologically
+# long scan, mirroring the eviction ``bundles`` already applies below.
+_CORRELATION_CACHE_MAXIMUM = 20_000
+
+
+def _evict_oldest(container: "OrderedDict[Any, Any]", key: Any, *, maximum: int) -> None:
+    """Mark ``key`` as most-recently-used and drop the oldest entries over cap."""
+
+    container.move_to_end(key)
+    while len(container) > maximum:
+        container.popitem(last=False)
+
+
 def _bounded_bundle_insert(
     bundles: OrderedDict[int, dict[str, Any]],
     stamp_ns: int,
@@ -141,9 +159,7 @@ def _bounded_bundle_insert(
     slot = bundles.setdefault(stamp_ns, {"messages": {}, "record_times_ns": {}})
     slot["messages"][topic] = message
     slot["record_times_ns"][topic] = int(record_timestamp_ns)
-    bundles.move_to_end(stamp_ns)
-    while len(bundles) > maximum:
-        bundles.popitem(last=False)
+    _evict_oldest(bundles, stamp_ns, maximum=maximum)
     return slot
 
 
@@ -221,6 +237,16 @@ def _benchmark_bundle(slot: dict[str, Any], repeats: int) -> dict[str, Any]:
 
     messages = slot["messages"]
     bridge = CvBridge()
+    # Fixed configuration, identical every repeat -- built once here (like
+    # `bridge` above) so `grasp_generation_s` measures only `.generate()`
+    # execution, not this solver's own construction cost re-paid per repeat.
+    grasp_source = AntipodalGraspSource(
+        min_aperture_m=0.012,
+        max_aperture_m=0.068,
+        max_candidates=64,
+        approach_samples=8,
+        contact_angle_deg=55.0,
+    )
     measurements: list[dict[str, Any]] = []
     for _ in range(repeats):
         started = time.perf_counter()
@@ -260,13 +286,7 @@ def _benchmark_bundle(slot: dict[str, Any], repeats: int) -> dict[str, Any]:
         candidates = None
         grasp_error = None
         try:
-            candidates = AntipodalGraspSource(
-                min_aperture_m=0.012,
-                max_aperture_m=0.068,
-                max_candidates=64,
-                approach_samples=8,
-                contact_angle_deg=55.0,
-            ).generate(context)
+            candidates = grasp_source.generate(context)
         except GraspGenerationError as error:
             grasp_error = str(error)
         grasp_at = time.perf_counter()
@@ -367,7 +387,7 @@ def benchmark_bag(
     reuse_unresolved = 0
     fresh_rows: dict[str, dict[str, Any]] = {}
     reuse_rows: dict[str, dict[str, Any]] = {}
-    status_by_observation: dict[int, tuple[Any, int]] = {}
+    status_by_observation: OrderedDict[int, tuple[Any, int]] = OrderedDict()
     bundles: OrderedDict[int, dict[str, Any]] = OrderedDict()
     cpu_slots: list[tuple[int, dict[str, Any]]] = []
     cpu_slot_stamps: set[int] = set()
@@ -433,6 +453,9 @@ def benchmark_bag(
                 "record_timestamp_ns": int(record_timestamp_ns),
                 "instruction_sha256": instruction_sha256,
             }
+            _evict_oldest(
+                requests, request_id, maximum=_CORRELATION_CACHE_MAXIMUM
+            )
             if (
                 active_contract is not None
                 and active_contract.instruction_sha256 == instruction_sha256
@@ -481,6 +504,11 @@ def benchmark_bag(
                 status_by_observation[contract.observation_stamp_ns] = (
                     contract,
                     int(record_timestamp_ns),
+                )
+                _evict_oldest(
+                    status_by_observation,
+                    contract.observation_stamp_ns,
+                    maximum=_CORRELATION_CACHE_MAXIMUM,
                 )
                 slot = bundles.get(contract.observation_stamp_ns)
                 if slot is not None:
