@@ -892,3 +892,111 @@ def test_bounded_refinement_selects_better_complete_plan():
     assert planner.path_costs[1] < planner.path_costs[0]
     assert planner.segment_calls == 8
     assert result.candidate_index == 1
+
+
+def _schedule_generator(*, max_feasible_plans=1):
+    return GraspPlanGenerator(
+        FakeIK(),
+        FakePlanner(),
+        GraspPlanConfig(max_feasible_plans=max_feasible_plans),
+    )
+
+
+def _schedule_groups():
+    # candidate -> [(symmetry_index, grasp, width, cached advisory cost)]
+    def entry(candidate, symmetry, cost):
+        return (symmetry, np.full((4, 4), float(candidate * 10 + symmetry)), 0.05, cost)
+
+    return {
+        0: [entry(0, 0, 0.0), entry(0, 1, 5.0)],
+        1: [entry(1, 0, 1.0), entry(1, 1, float("inf")), entry(1, 2, 2.0)],
+        2: [],  # every symmetry of candidate 2 was already rejected
+        4: [entry(4, 0, 3.0), entry(4, 1, 0.5)],
+    }
+
+
+def _schedule_keys(schedule):
+    return [(candidate, symmetry) for candidate, symmetry, _grasp, _width in schedule]
+
+
+def test_hypothesis_schedule_stops_scheduling_once_the_search_gave_up():
+    generator = _schedule_generator()
+    assert generator._hypothesis_schedule(
+        order=np.asarray([0, 1, 2, 4], dtype=int),
+        hypothesis_groups=_schedule_groups(),
+        reachability_costs={(0, 0): 1.0},
+        global_ranks=np.arange(1, 6),
+        stop_search=True,
+    ) == []
+
+
+def test_hypothesis_schedule_is_candidate_major_without_cached_reachability():
+    generator = _schedule_generator()
+    schedule = generator._hypothesis_schedule(
+        order=np.asarray([0, 1, 2, 4], dtype=int),
+        hypothesis_groups=_schedule_groups(),
+        reachability_costs={},
+        global_ranks=np.arange(1, 6),
+        stop_search=False,
+    )
+    assert _schedule_keys(schedule) == [
+        (0, 0), (0, 1),
+        (1, 0), (1, 1), (1, 2),
+        (4, 0), (4, 1),
+    ]
+
+
+def test_hypothesis_schedule_is_candidate_major_when_several_plans_are_wanted():
+    generator = _schedule_generator(max_feasible_plans=3)
+    schedule = generator._hypothesis_schedule(
+        order=np.asarray([0, 1, 2, 4], dtype=int),
+        hypothesis_groups=_schedule_groups(),
+        reachability_costs={(0, 0): 1.0},
+        global_ranks=np.arange(1, 6),
+        stop_search=False,
+    )
+    assert _schedule_keys(schedule) == [
+        (0, 0), (0, 1),
+        (1, 0), (1, 1), (1, 2),
+        (4, 0), (4, 1),
+    ]
+
+
+def test_hypothesis_schedule_probes_one_symmetry_per_candidate_before_the_rest():
+    # First-feasible search with cached advisory costs: the leading candidate
+    # keeps its whole family up front, then the best symmetry of every other
+    # candidate in ``order``, then all remaining symmetries by cached cost
+    # (infinite last), tie-broken by global score rank and symmetry index.
+    # Candidate 2 has no surviving symmetry and must not appear at all.
+    generator = _schedule_generator()
+    global_ranks = np.asarray([1, 3, 2, 5, 4])
+    schedule = generator._hypothesis_schedule(
+        order=np.asarray([0, 1, 2, 4], dtype=int),
+        hypothesis_groups=_schedule_groups(),
+        reachability_costs={(0, 0): 1.0},
+        global_ranks=global_ranks,
+        stop_search=False,
+    )
+    assert _schedule_keys(schedule) == [
+        (0, 0), (0, 1),   # leading candidate keeps its full family up front
+        (1, 0), (4, 0),   # one probe per remaining candidate, in order
+        (4, 1),           # cost 0.5
+        (1, 2),           # cost 2.0
+        (1, 1),           # infinite cost sinks to the back
+    ]
+    # The flattened tuples carry the grasp/width payload, not the cost.
+    assert len(schedule[0]) == 4
+    assert schedule[0][2].shape == (4, 4)
+    assert schedule[0][3] == pytest.approx(0.05)
+
+
+def test_hypothesis_schedule_keeps_a_leading_candidate_with_no_surviving_family():
+    generator = _schedule_generator()
+    schedule = generator._hypothesis_schedule(
+        order=np.asarray([2, 0], dtype=int),
+        hypothesis_groups=_schedule_groups(),
+        reachability_costs={(2, 0): 1.0},
+        global_ranks=np.arange(1, 6),
+        stop_search=False,
+    )
+    assert _schedule_keys(schedule) == [(0, 0), (0, 1)]
