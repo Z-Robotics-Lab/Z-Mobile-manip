@@ -8,6 +8,7 @@ from z_manip.planning.grasp_pipeline import (
     GraspPlanConfig,
     GraspPlanGenerator,
     grasp_pregrasp_pose,
+    tool_tip_pose,
 )
 from z_manip.planning.rrt_connect import JointSpaceRRTConnect, RRTConnectConfig
 from z_manip.planning_control import PlanningCancelled, PlanningControl
@@ -892,3 +893,104 @@ def test_bounded_refinement_selects_better_complete_plan():
     assert planner.path_costs[1] < planner.path_costs[0]
     assert planner.segment_calls == 8
     assert result.candidate_index == 1
+
+
+# -- configured tool/tip geometry --------------------------------------------
+
+
+_PIPER_TOOL_FROM_TIP = (
+    (0.0, -1.0, 0.0, 0.0),
+    (1.0, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0, -0.1358),
+    (0.0, 0.0, 0.0, 1.0),
+)
+
+
+def test_tip_pose_inverts_the_configured_tool_offset_once_per_generator(
+    monkeypatch,
+):
+    """Regression test: `tool_from_tip` is a frozen configuration field, so its
+    inverse is invariant across a whole grasp plan.  `_tip_pose` is called once
+    per pregrasp, once per approach and lift waypoint, and once per
+    (candidate, symmetry) pair of the reachability-ordering pass, so
+    re-deriving the inverse on every call is pure overhead in the per-candidate
+    loop.
+    """
+
+    poses = [
+        _pose(
+            (0.55 + 0.01 * index, 0.0, 0.22),
+            approach=(np.cos(0.3 * index), 0.0, 1.0),
+        )
+        for index in range(6)
+    ]
+    candidates = _candidates(poses, widths=[0.05] * len(poses))
+    generator = GraspPlanGenerator(
+        FakeIK(),
+        FakePlanner(),
+        GraspPlanConfig(
+            approach_steps=4,
+            lift_steps=3,
+            symmetry_samples=3,
+            tool_from_tip=_PIPER_TOOL_FROM_TIP,
+        ),
+    )
+    real_inverse = np.linalg.inv
+    inverse_calls = 0
+
+    def counting_inverse(matrix):
+        nonlocal inverse_calls
+        inverse_calls += 1
+        return real_inverse(matrix)
+
+    monkeypatch.setattr(np.linalg, "inv", counting_inverse)
+    result = generator.plan(
+        candidates,
+        current_joints=np.zeros(2),
+        pose_ranker=lambda target, *, control=None: float(
+            np.linalg.norm(np.asarray(target)[:3, 3]),
+        ),
+    )
+
+    assert result.candidate_index is not None
+    assert len(generator.ik_solver.calls) > 4  # a real multi-waypoint plan
+    assert inverse_calls == 1
+
+
+def test_tip_pose_matches_the_public_helper_and_keeps_its_error_contract():
+    """The cached form must be bitwise equal to `tool_tip_pose`, must keep
+    validating every tool pose after the first call, and must not move a bad
+    configuration's failure from plan time to construction time.
+    """
+
+    generator = GraspPlanGenerator(
+        FakeIK(),
+        FakePlanner(),
+        GraspPlanConfig(tool_from_tip=_PIPER_TOOL_FROM_TIP),
+    )
+    pose = _pose((0.42, -0.13, 0.27), approach=(0.3, 0.1, 1.0))
+    expected = tool_tip_pose(pose, _PIPER_TOOL_FROM_TIP)
+
+    assert generator._tip_pose(pose).tobytes() == expected.tobytes()
+    # Cached now, but every later pose is still validated and still exact.
+    assert generator._tip_pose(pose).tobytes() == expected.tobytes()
+    with pytest.raises(ValueError, match="must be 4x4"):
+        generator._tip_pose(np.eye(3))
+    with pytest.raises(ValueError, match="must be finite"):
+        generator._tip_pose(np.full((4, 4), np.nan))
+
+    # A non-finite rotation passes GraspPlanConfig validation, which only
+    # checks the shape and the homogeneous last row.  Building the generator
+    # must stay silent; the failure must still surface on the first use.
+    malformed = GraspPlanGenerator(
+        FakeIK(),
+        FakePlanner(),
+        GraspPlanConfig(tool_from_tip=(
+            (np.nan, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        )),
+    )
+    with pytest.raises(ValueError, match="must be finite"):
+        malformed._tip_pose(pose)

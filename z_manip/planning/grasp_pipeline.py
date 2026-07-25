@@ -386,6 +386,9 @@ class GraspPlanGenerator:
             sentinel,
         )
         self.config = config or GraspPlanConfig()
+        # Derived on first use by `_tip_pose`; `tool_from_tip` is a frozen
+        # configuration field, so the inverse never has to be taken again.
+        self._tip_from_tool: np.ndarray | None = None
         self.approach_segment_valid = approach_segment_valid
         self.approach_path_valid = approach_path_valid
         self._approach_path_control_mode = (
@@ -434,7 +437,32 @@ class GraspPlanGenerator:
         )
 
     def _tip_pose(self, tool_pose: np.ndarray) -> np.ndarray:
-        return tool_tip_pose(tool_pose, self.config.tool_from_tip)
+        """Map a grasp-tool pose to the IK chain tip, reusing the tip inverse.
+
+        Equivalent to ``tool_tip_pose(tool_pose, self.config.tool_from_tip)``,
+        but the configured offset is a frozen dataclass field, so re-deriving
+        its inverse is wasted work: this runs once per pregrasp, once per
+        approach and lift waypoint, and once per ``(candidate, symmetry)`` pair
+        of the reachability-ordering pass.  The offset is validated on first
+        use with the same checks, the same order and the same messages, so a
+        malformed configuration still fails exactly where it did before.
+        """
+
+        tool = np.asarray(tool_pose, dtype=float)
+        tip_from_tool = self._tip_from_tool
+        if tip_from_tool is None:
+            offset = np.asarray(self.config.tool_from_tip, dtype=float)
+            if tool.shape != (4, 4) or offset.shape != (4, 4):
+                raise ValueError("tool and tip transforms must be 4x4")
+            if not np.all(np.isfinite(tool)) or not np.all(np.isfinite(offset)):
+                raise ValueError("tool and tip transforms must be finite")
+            tip_from_tool = np.linalg.inv(offset)
+            self._tip_from_tool = tip_from_tool
+        elif tool.shape != (4, 4):
+            raise ValueError("tool and tip transforms must be 4x4")
+        elif not np.all(np.isfinite(tool)):
+            raise ValueError("tool and tip transforms must be finite")
+        return tool @ tip_from_tool
 
     def _reachability_order(
         self,
