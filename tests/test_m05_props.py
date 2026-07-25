@@ -30,11 +30,7 @@ pytestmark = [pytest.mark.m05]
 _M05_PROPS = sorted(C.PROP_XYZ)
 
 
-def _probe(fn, *a, **k):
-    try:
-        return fn(*a, **k)
-    except H.ProbeSkip as exc:
-        pytest.skip(str(exc))
+_probe = H.probe
 
 
 def _require_topic(topic: str) -> None:

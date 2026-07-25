@@ -25,6 +25,8 @@ import subprocess
 import textwrap
 from dataclasses import dataclass
 
+import pytest
+
 
 class ProbeSkip(Exception):
     """A live probe could not reach the chain (attach-only failure → skip).
@@ -34,6 +36,14 @@ class ProbeSkip(Exception):
     Reasons: container absent, ROS env missing, topic silent, probe timeout,
     or the chain disappeared mid-probe (tolerated by contract).
     """
+
+
+def probe(fn, *a, **k):
+    """Call a live probe; convert an attach-only ProbeSkip into pytest.skip."""
+    try:
+        return fn(*a, **k)
+    except ProbeSkip as exc:
+        pytest.skip(str(exc))
 
 
 # --------------------------------------------------------------------- exec seam
@@ -586,7 +596,7 @@ class JointErr:
 
 
 __all__ = [
-    "ProbeSkip", "ros_exec_prefix", "ros2_cli", "list_topics", "topic_exists",
+    "ProbeSkip", "probe", "ros_exec_prefix", "ros2_cli", "list_topics", "topic_exists",
     "topic_hz_sim", "clock_rtf", "wait_sim_seconds", "depth_frame_stats",
     "camera_info", "image_encoding", "joint_error", "optical_axis_pitch_deg",
     "set_named_pose", "DepthStats", "CamInfo", "JointErr",

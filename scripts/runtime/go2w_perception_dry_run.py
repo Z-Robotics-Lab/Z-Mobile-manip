@@ -193,19 +193,19 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--bundle-gate-reference-points",
         type=int,
-        default=400,
+        default=BundleGateConfig.reference_points,
         help="target points a reference object yields at the reference depth",
     )
     parser.add_argument(
         "--bundle-gate-reference-depth-m",
         type=float,
-        default=1.3,
+        default=BundleGateConfig.reference_depth_m,
         help="reference depth (m) at which the reference point count was measured",
     )
     parser.add_argument(
         "--bundle-gate-floor-points",
         type=int,
-        default=120,
+        default=BundleGateConfig.floor_points,
         help="hard floor below which any depth cluster is treated as noise",
     )
     parser.add_argument("--request-id", default="")

@@ -18,12 +18,7 @@ from tests import helpers as H
 pytestmark = [pytest.mark.m0]
 
 
-def _probe(fn, *a, **k):
-    """Call a live probe; convert an attach-only ProbeSkip into pytest.skip."""
-    try:
-        return fn(*a, **k)
-    except H.ProbeSkip as exc:
-        pytest.skip(str(exc))
+_probe = H.probe
 
 
 # ------------------------------------------------------------------------ G-a

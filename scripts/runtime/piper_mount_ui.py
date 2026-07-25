@@ -55,6 +55,7 @@ def make_handler(report_path: Path, index_path: Path) -> type[BaseHTTPRequestHan
     load_report(report_path)
     if not index_path.is_file():
         raise FileNotFoundError(f"mount dashboard HTML does not exist: {index_path}")
+    index_bytes = index_path.read_bytes()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ZManipMountDashboard/1"
@@ -93,7 +94,7 @@ def make_handler(report_path: Path, index_path: Path) -> type[BaseHTTPRequestHan
                 self._json({"error": "queries are not supported"}, HTTPStatus.BAD_REQUEST, include_body)
             elif route.path in {"/", "/index.html"}:
                 self._write(
-                    index_path.read_bytes(),
+                    index_bytes,
                     "text/html; charset=utf-8",
                     HTTPStatus.OK,
                     include_body,

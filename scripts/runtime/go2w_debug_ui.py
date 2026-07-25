@@ -99,6 +99,7 @@ def make_handler(
     index_path = index_path.expanduser().resolve()
     if not index_path.is_file():
         raise FileNotFoundError(f"dashboard HTML does not exist: {index_path}")
+    index_bytes = index_path.read_bytes()
     runtime_scene_path = index_path.parent / "runtime_scene.js"
 
     def current_bundle_path() -> Path:
@@ -159,7 +160,7 @@ def make_handler(
                 return
             if route.path in ("/", "/index.html"):
                 self._bytes(
-                    index_path.read_bytes(),
+                    index_bytes,
                     "text/html; charset=utf-8",
                     include_body=include_body,
                 )

@@ -20,11 +20,7 @@ from tests import helpers as H
 pytestmark = [pytest.mark.e2e, pytest.mark.m0, pytest.mark.slow]
 
 
-def _probe(fn, *a, **k):
-    try:
-        return fn(*a, **k)
-    except H.ProbeSkip as exc:
-        pytest.skip(str(exc))
+_probe = H.probe
 
 
 def test_e2e_m0_lookout_sees_scene(chain):

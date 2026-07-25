@@ -20,11 +20,7 @@ from tests import helpers as H
 pytestmark = [pytest.mark.m0]
 
 
-def _probe(fn, *a, **k):
-    try:
-        return fn(*a, **k)
-    except H.ProbeSkip as exc:
-        pytest.skip(str(exc))
+_probe = H.probe
 
 
 # ------------------------------------------------------------------------ G-b
