@@ -160,7 +160,22 @@ class _HypothesisRejected(PlanningError):
 
 
 def _path_validator_control_mode(callback: Callable[..., object]) -> str:
-    """Classify a path callback without executing or retrying its body."""
+    """Classify a path callback without executing or retrying its body.
+
+    NOT interchangeable with
+    :func:`z_manip.concurrency.control.classify_control_mode`, which the
+    work-pose and standoff evaluators share.  Two rules differ here and the
+    difference is observable:
+
+    * precedence -- positional binding is tried first, so a permissive
+      ``(*args, **kwargs)`` wrapper is classified "positional" here and
+      "keyword" there;
+    * a non-inspectable callable raises instead of falling back to "legacy".
+
+    Whether that divergence is intended is a behaviour question for the
+    maintainer; it is documented rather than unified so a future fix to the
+    shared rule does not silently change this one.
+    """
 
     try:
         signature = inspect.signature(callback)

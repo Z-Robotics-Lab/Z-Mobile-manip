@@ -13,7 +13,6 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
-import inspect
 import math
 
 import numpy as np
@@ -26,6 +25,7 @@ from z_manip.concurrency.control import (
     PlanningControl,
     PlanningDeadlineExceeded,
     checkpoint,
+    classify_control_mode,
 )
 
 
@@ -416,26 +416,15 @@ def _history_poses(history: Iterable[object]) -> tuple[np.ndarray, ...]:
 
 
 def _evaluator_control_mode(callback: Callable[..., object]) -> str:
-    try:
-        signature = inspect.signature(callback)
-    except (TypeError, ValueError):
-        return "legacy"
-    sentinel = object()
-    try:
-        signature.bind(sentinel, control=sentinel)
-    except TypeError:
-        try:
-            signature.bind(sentinel, sentinel)
-        except TypeError:
-            try:
-                signature.bind(sentinel)
-            except TypeError as error:
-                raise TypeError(
-                    "work-pose evaluator must accept a candidate and optional control",
-                ) from error
-            return "legacy"
-        return "positional"
-    return "keyword"
+    """Classify the work-pose evaluator's control transport (one candidate)."""
+
+    return classify_control_mode(
+        callback,
+        arity=1,
+        requirement=(
+            "work-pose evaluator must accept a candidate and optional control"
+        ),
+    )
 
 
 def _evaluate(

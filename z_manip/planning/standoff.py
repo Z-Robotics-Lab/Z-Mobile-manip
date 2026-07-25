@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-import inspect
 import math
 
 import numpy as np
@@ -19,6 +18,7 @@ from z_manip.concurrency.control import (
     PlanningControl,
     PlanningDeadlineExceeded,
     checkpoint,
+    classify_control_mode,
 )
 
 
@@ -180,27 +180,14 @@ def _cost_ranked_hypothesis_order(costs: object) -> Iterator[tuple[int, int]]:
 def _evaluator_control_mode(callback: Callable[..., object]) -> str:
     """Classify evaluator control transport without executing its body."""
 
-    try:
-        signature = inspect.signature(callback)
-    except (TypeError, ValueError):
-        return "legacy"
-    sentinel = object()
-    try:
-        signature.bind(sentinel, sentinel, sentinel, control=sentinel)
-    except TypeError:
-        try:
-            signature.bind(sentinel, sentinel, sentinel, sentinel)
-        except TypeError:
-            try:
-                signature.bind(sentinel, sentinel, sentinel)
-            except TypeError as error:
-                raise TypeError(
-                    "standoff evaluator must accept three observations and "
-                    "optional control",
-                ) from error
-            return "legacy"
-        return "positional"
-    return "keyword"
+    return classify_control_mode(
+        callback,
+        arity=3,
+        requirement=(
+            "standoff evaluator must accept three observations and "
+            "optional control"
+        ),
+    )
 
 
 def _evaluate(
