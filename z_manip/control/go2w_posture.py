@@ -256,6 +256,23 @@ def sport_response_code(response: Mapping[str, Any]) -> int | None:
         return None
 
 
+def _single_height(candidates: list[tuple[float, str]]) -> tuple[float, str] | None:
+    """Return the one agreed height, or ``None`` when nothing was decoded.
+
+    Every decoded envelope must agree to within 1e-9 m; a firmware response
+    that reports two different heights is a hard failure, never a silent pick.
+    The agreement tolerance and the message live here once so a firmware
+    revision that needs a looser tolerance cannot be applied to one envelope
+    shape and forgotten on the other.
+    """
+    if not candidates:
+        return None
+    first = candidates[0]
+    if any(abs(item[0] - first[0]) > 1e-9 for item in candidates[1:]):
+        raise ValueError("GetBodyHeight response contains conflicting height values")
+    return first
+
+
 def _height_scalar(value: Any, *, path: str) -> tuple[float, str] | None:
     """Decode one explicitly height-shaped GetBodyHeight response value.
 
@@ -292,12 +309,7 @@ def _height_scalar(value: Any, *, path: str) -> tuple[float, str] | None:
                 parsed = _height_scalar(value[key], path=f"{path}.{key}")
                 if parsed is not None:
                     candidates.append(parsed)
-        if not candidates:
-            return None
-        first = candidates[0]
-        if any(abs(item[0] - first[0]) > 1e-9 for item in candidates[1:]):
-            raise ValueError("GetBodyHeight response contains conflicting height values")
-        return first
+        return _single_height(candidates)
     return None
 
 
@@ -330,12 +342,10 @@ def get_body_height_from_response(response: Mapping[str, Any]) -> tuple[float, s
             parsed = _height_scalar(response[key], path=key)
             if parsed is not None:
                 candidates.append(parsed)
-    if not candidates:
+    resolved = _single_height(candidates)
+    if resolved is None:
         raise ValueError("GetBodyHeight response contains no supported height payload")
-    first = candidates[0]
-    if any(abs(item[0] - first[0]) > 1e-9 for item in candidates[1:]):
-        raise ValueError("GetBodyHeight response contains conflicting height values")
-    return first
+    return resolved
 
 
 class SportCommandArbiter:
