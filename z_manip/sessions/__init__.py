@@ -1,14 +1,13 @@
-"""Deprecated import path — moved to :mod:`z_manip.sessions` (implementation
-in :mod:`z_manip.sessions.service`).
+"""Fail-closed interactive session contracts for the workbench UI.
 
-Kept as a thin re-export shim so existing ``from z_manip.read_only_sessions
-import ...`` call sites keep working. New code should import from
-:mod:`z_manip.sessions` directly.
+Session identifier/target validation, read-only artifact selection, and the
+immutable-artifact freeze/manifest machinery used by the perception and
+planning workbench servers.
 """
 
 from __future__ import annotations
 
-from z_manip.sessions.service import (
+from .service import (
     ATTEMPT_SCHEMA,
     MANIFEST_SCHEMA,
     MAX_TARGET_BYTES,
@@ -21,7 +20,6 @@ from z_manip.sessions.service import (
     validate_session_id,
     validate_target_description,
 )
-from z_manip.sessions.service import _freeze_tree  # noqa: F401 (white-box test seam)
 
 __all__ = [
     "ATTEMPT_SCHEMA",

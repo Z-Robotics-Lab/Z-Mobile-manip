@@ -28,7 +28,10 @@ from z_manip.read_only_sessions import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PURE_MODULE = ROOT / "z_manip" / "read_only_sessions.py"
+# The real implementation (z_manip/read_only_sessions.py is now a thin
+# re-export shim at the old import path; the no-transport-imports contract
+# below must hold for the implementation itself, not the shim).
+PURE_MODULE = ROOT / "z_manip" / "sessions" / "service.py"
 INTEGRATION = ROOT / "scripts" / "runtime" / "go2w_interactive_sessions.py"
 
 
