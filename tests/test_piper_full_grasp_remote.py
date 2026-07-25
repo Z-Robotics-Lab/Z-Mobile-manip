@@ -25,6 +25,10 @@ wrapper = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(wrapper)
 
+# Login home of a NUC that is *not* the lab account baked into the old
+# hardcoded remote root, so a regression back to it is visible.
+REMOTE_HOME = "/home/robot"
+
 
 class FakeRuns:
     """Dispatch wrapper subprocess calls by shape; record every invocation."""
@@ -45,12 +49,14 @@ class FakeRuns:
         self.execute_raises_timeout = execute_raises_timeout
         self.fetch_attempts = 0
         self.remote_deleted = False
+        self.calls: list[str] = []
 
     def __call__(self, arguments, *, timeout):
         def done(rc, out=""):
             return subprocess.CompletedProcess(arguments, rc, stdout=out, stderr=None)
 
         tail = str(arguments[-1])
+        self.calls.append(" ".join(str(part) for part in arguments))
         if str(arguments[0]) == sys.executable:
             return done(0, json.dumps({"confirmation_token": "PIPER-FULL-test"}))
         if str(arguments[0]) == "scp":
@@ -69,6 +75,10 @@ class FakeRuns:
             rc = self.probe_rcs.pop(0) if self.probe_rcs else 255
             return done(rc)
         if "mkdir -p" in tail:
+            # The action-directory call also asks the NUC for its own login
+            # home, so the fake must answer it the way a real shell would.
+            if wrapper.REMOTE_HOME_MARKER in tail:
+                return done(0, f"{wrapper.REMOTE_HOME_MARKER}{REMOTE_HOME}\n")
             return done(0)
         if tail.startswith("set -e;"):
             if self.execute_raises_timeout:
@@ -144,6 +154,45 @@ def test_success_path_fetches_and_cleans_remote(tmp_path, monkeypatch, capsys):
     assert fake.remote_deleted is True
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["success"] is True
+
+
+def test_remote_workspace_follows_the_nuc_login_home(tmp_path, monkeypatch):
+    """GO2W_NUC_HOST is a documented override and .env.example ships a
+    different account, so nothing may pin the staging root to one lab user.
+
+    The wrapper asks the NUC for its own ``$HOME`` while it creates the action
+    directory, and every later absolute path (the executor runs after
+    ``cd ~/pyAgxArm``) must be built from that answer.
+    """
+    fake = FakeRuns(
+        executor_rc=0,
+        probe_rcs=(0,),
+        fetch_rc=0,
+        receipt_dir=tmp_path / "receipts",
+    )
+    assert _invoke(tmp_path, monkeypatch, fake) == 0
+
+    assert wrapper.REMOTE_ROOT == "z-manip-runtime/full-grasp-actions"
+    # The default *host* may still name the lab account (it is a documented
+    # override); no remote *path* may.
+    joined = "\n".join(fake.calls)
+    assert "/home/yusenzlabnuc" not in joined
+
+    # The creation call is the only one allowed to defer to the remote shell;
+    # it must both create the directory under $HOME and report that home back.
+    creations = [call for call in fake.calls if "mkdir -p" in call and wrapper.REMOTE_HOME_MARKER in call]
+    assert len(creations) == 1
+    assert '"$HOME"/z-manip-runtime/full-grasp-actions/' in creations[0]
+
+    # Everything afterwards is absolute and rooted at the reported home: the
+    # upload target, the executor invocation, the receipt probe and fetch, and
+    # the cleanup.
+    prefix = f"{REMOTE_HOME}/z-manip-runtime/full-grasp-actions/"
+    for needle in ("scp", "cd ~/pyAgxArm", "test -f", "rm -rf"):
+        matching = [call for call in fake.calls if needle in call]
+        assert matching, needle
+        for call in matching:
+            assert prefix in call, (needle, call)
 
 
 def test_execute_timeout_before_probe_preserves_remote(tmp_path, monkeypatch):
