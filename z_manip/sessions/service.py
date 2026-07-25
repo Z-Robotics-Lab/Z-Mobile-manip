@@ -539,11 +539,24 @@ class ReadOnlySessionService:
         return self.run_perception(target)
 
     def select_perception(self, session_id: object) -> dict[str, object]:
-        """Select one verified successful server session for later planning."""
+        """Select one verified successful server session for later planning.
+
+        Selection writes the same reference ``run_perception`` publishes and
+        ``run_planning`` consumes, so it takes the action lock like they do.
+        An unserialized write could land between a run's plan invalidation and
+        its own selection write, leaving planning pointed at a perception the
+        operator never chose.
+        """
 
         safe_id = validate_session_id(session_id)
-        self._successful_perception(safe_id)
-        self._set_reference("perception", "selected", safe_id)
+        if not self._lock.acquire(blocking=False):
+            raise SessionContractError("ACTION_BUSY", "another action is in progress")
+        try:
+            self._successful_perception(safe_id)
+            with self._context_lock:
+                self._set_reference("perception", "selected", safe_id)
+        finally:
+            self._lock.release()
         return {
             "schema": STATE_SCHEMA,
             "selected_perception_session_id": safe_id,

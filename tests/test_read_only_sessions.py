@@ -490,6 +490,45 @@ def test_failed_perception_cannot_be_selected(tmp_path):
     assert caught.value.code == "PERCEPTION_NOT_SUCCESSFUL"
 
 
+def test_select_perception_is_serialized_against_an_in_flight_action(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class GatedBackend(FakeBackend):
+        """Block only the second perception so the first stays selectable."""
+
+        def run_perception(self, *, target, output_dir, log_path):
+            if self.perception_calls:
+                entered.set()
+                assert release.wait(timeout=10.0)
+            return super().run_perception(
+                target=target,
+                output_dir=output_dir,
+                log_path=log_path,
+            )
+
+    service = _service(tmp_path, GatedBackend())
+    first = service.start_perception("white adapter")
+    selected = service.select_perception(first["session_id"])
+    assert selected["selected_perception_session_id"] == first["session_id"]
+
+    perceiving = threading.Thread(
+        target=service.start_perception,
+        args=("black earphones",),
+        daemon=True,
+    )
+    perceiving.start()
+    assert entered.wait(timeout=10.0)
+    try:
+        with pytest.raises(SessionContractError) as caught:
+            service.select_perception(first["session_id"])
+    finally:
+        release.set()
+        perceiving.join(timeout=10.0)
+
+    assert caught.value.code == "ACTION_BUSY"
+
+
 def test_changed_perception_is_rejected_before_planning(tmp_path):
     backend = FakeBackend()
     service = _service(tmp_path, backend)
