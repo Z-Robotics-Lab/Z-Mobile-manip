@@ -365,32 +365,45 @@ class ObservedPlacementPlanner:
             self.config.yaw_samples,
         )
 
+    def _footprint_grid(self, extent: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return the footprint sample offsets along the yawed object axes.
+
+        The offsets depend only on the object extent and the configuration, so
+        every ``(sample, yaw)`` candidate reuses the same pair of grids.
+        """
+
+        boundary_x = 0.5 * extent[0] + self.config.boundary_margin_m
+        boundary_y = 0.5 * extent[1] + self.config.boundary_margin_m
+        return (
+            np.linspace(-boundary_x, boundary_x, self.config.footprint_samples_per_axis),
+            np.linspace(-boundary_y, boundary_y, self.config.footprint_samples_per_axis),
+        )
+
     def _candidate_geometry(
         self,
         support_position: np.ndarray,
         yaw: float,
         plane: SupportPlane,
         extent: np.ndarray,
-        tool_from_object: np.ndarray,
+        object_from_tool: np.ndarray,
         support_tree: cKDTree,
         scene_tree: cKDTree,
         scene: np.ndarray,
         constraints: PlacementConstraints,
         region_radius: float,
+        footprint_grid: tuple[np.ndarray, np.ndarray],
     ) -> PlacementCandidate | None:
         cosine, sine = float(np.cos(yaw)), float(np.sin(yaw))
         axis_x = cosine * plane.tangent_u + sine * plane.tangent_v
         axis_y = -sine * plane.tangent_u + cosine * plane.tangent_v
         half_x = 0.5 * extent[0]
         half_y = 0.5 * extent[1]
-        boundary_x = half_x + self.config.boundary_margin_m
-        boundary_y = half_y + self.config.boundary_margin_m
-        grid_x = np.linspace(-boundary_x, boundary_x, self.config.footprint_samples_per_axis)
-        grid_y = np.linspace(-boundary_y, boundary_y, self.config.footprint_samples_per_axis)
-        footprint = np.asarray([
-            support_position + dx * axis_x + dy * axis_y
-            for dx in grid_x for dy in grid_y
-        ])
+        grid_x, grid_y = footprint_grid
+        footprint = (
+            support_position
+            + grid_x[:, None, None] * axis_x
+            + grid_y[None, :, None] * axis_y
+        ).reshape(-1, 3)
         support_uv = np.column_stack((
             (footprint - plane.origin) @ plane.tangent_u,
             (footprint - plane.origin) @ plane.tangent_v,
@@ -431,7 +444,7 @@ class ObservedPlacementPlanner:
         object_pose = np.eye(4)
         object_pose[:3, :3] = np.column_stack((axis_x, axis_y, plane.normal))
         object_pose[:3, 3] = support_position + 0.5 * extent[2] * plane.normal
-        place_pose = object_pose @ np.linalg.inv(tool_from_object)
+        place_pose = object_pose @ object_from_tool
 
         tool_neighbors = scene_tree.query_ball_point(
             place_pose[:3, 3], self.config.tool_clearance_radius_m,
@@ -512,22 +525,28 @@ class ObservedPlacementPlanner:
         samples = samples[np.argsort(np.linalg.norm(samples, axis=1), kind="stable")]
         region_radius = float(np.max(np.linalg.norm(support_uv, axis=1)))
 
+        # Invariant across every (sample, yaw) candidate: hoisted out of the loop.
+        yaw_values = self._yaw_values(observation.constraints)
+        footprint_grid = self._footprint_grid(extent)
+        object_from_tool = np.linalg.inv(tool_from_object)
+
         candidates: list[PlacementCandidate] = []
         for uv in samples:
             checkpoint(control, "placement geometric candidate generation")
             support_position = plane.origin + uv[0] * plane.tangent_u + uv[1] * plane.tangent_v
-            for yaw in self._yaw_values(observation.constraints):
+            for yaw in yaw_values:
                 candidate = self._candidate_geometry(
                     support_position,
                     float(yaw),
                     plane,
                     extent,
-                    tool_from_object,
+                    object_from_tool,
                     support_tree,
                     scene_tree,
                     scene,
                     observation.constraints,
                     region_radius,
+                    footprint_grid,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
