@@ -32,6 +32,7 @@ import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from _atomic_io import atomic_write_text as _atomic_write_text
 import go2w_base_lock
 import go2w_debug_ui
 import go2w_interactive_sessions
@@ -2205,9 +2206,7 @@ class PiperGraspRunner:
     def _set_workflow(self, **values: Any) -> None:
         self._workflow.update(values)
         document = {"schema": "z_manip.grasp_workflow.v1", **self._workflow}
-        temporary = self._workflow_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(temporary, self._workflow_path)
+        _atomic_write_text(self._workflow_path, json.dumps(document, sort_keys=True) + "\n")
 
     def reset_workflow(self) -> None:
         """Invalidate every staged receipt after an ordinary Home recovery."""
@@ -2941,9 +2940,7 @@ class PiperGraspRunner:
             "hold_finished_unix_ns": int(hold_finished_unix_ns),
         }
         path = action_dir / "hold-receipt.json"
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
+        _atomic_write_text(path, json.dumps(document, sort_keys=True) + "\n")
         return path
 
     def _hold_at_home(

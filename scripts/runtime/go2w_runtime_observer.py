@@ -19,8 +19,13 @@ import os
 from pathlib import Path
 import stat as stat_module
 import struct
+import sys
 import time
 from typing import Callable
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _atomic_io import atomic_write_bytes as _atomic_write_bytes  # noqa: E402
+from _atomic_io import atomic_write_text as _atomic_write_text  # noqa: E402
 
 
 SCHEMA = "z_manip.runtime_state.v1"
@@ -1097,30 +1102,11 @@ def build_runtime_state(
 
 
 def atomic_write_json(path: Path, document: dict[str, object]) -> None:
-    destination = path.expanduser().resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(document, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(destination)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    _atomic_write_text(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
 
 
 def atomic_write_bytes(path: Path, payload: bytes) -> None:
-    destination = path.expanduser().resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_bytes(payload)
-        temporary.replace(destination)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    _atomic_write_bytes(path, payload)
 
 
 class CameraFrameWriter:

@@ -19,6 +19,7 @@ from typing import Protocol, Sequence
 import numpy as np
 from scipy.optimize import minimize
 
+from ._shared import point3 as _point3
 from .whole_body_model import (
     ARM_DOF,
     CONTROL_DOF,
@@ -47,13 +48,6 @@ class WholeBodyVisibilityError(ValueError):
             f"target camera depth {self.camera_depth_m:.6f} m is not above "
             f"the minimum {self.minimum_depth_m:.6f} m",
         )
-
-
-def _point3(value: Sequence[float], *, label: str) -> np.ndarray:
-    point = np.asarray(value, dtype=float)
-    if point.shape != (3,) or not np.isfinite(point).all():
-        raise ValueError(f"{label} must contain exactly three finite values")
-    return point
 
 
 def _homogeneous_inverse(transform: np.ndarray) -> np.ndarray:

@@ -18,11 +18,15 @@ import os
 from pathlib import Path
 import signal
 import statistics
+import sys
 import threading
 import time
 from typing import Any
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _atomic_io import atomic_write_text as _atomic_write_text  # noqa: E402
 
 from z_manip.control.reactive_servo import (
     ArmViewIntent,
@@ -1062,13 +1066,10 @@ class DepthServoCore:
 
 
 def _atomic_json(path: Path, document: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
+    _atomic_write_text(
+        path,
         json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
-        encoding="utf-8",
     )
-    os.replace(temporary, path)
 
 
 def _append_jsonl(path: Path, document: dict[str, Any]) -> None:

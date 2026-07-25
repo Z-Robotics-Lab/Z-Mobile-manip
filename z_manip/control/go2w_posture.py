@@ -24,6 +24,8 @@ import json
 import math
 from typing import Any, Mapping, Protocol
 
+from z_manip.control._shared import clamp as _clamp
+
 
 POSTURE_STATUS_SCHEMA = "z_manip.go2w_posture_status.v1"
 
@@ -239,10 +241,6 @@ class PostureOutput:
             },
             "command": asdict(self.command),
         }
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return min(max(value, low), high)
 
 
 def _step(current: float, target: float, maximum: float) -> float:

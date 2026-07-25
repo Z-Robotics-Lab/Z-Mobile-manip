@@ -14,10 +14,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _atomic_io import atomic_write_text as _atomic_write_text  # noqa: E402
 
 from z_manip.kinematics import KinematicChain
 
@@ -928,10 +932,7 @@ def main() -> int:
         calibration=args.calibration,
         urdf=args.urdf,
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(output)
+    _atomic_write_text(output, json.dumps(bundle, indent=2) + "\n")
     print(json.dumps({"output": str(output), "status": bundle["status"]}, indent=2))
     return 0
 

@@ -10,14 +10,16 @@ R2 ``modularity.md`` §181-208).
 Contracts (see each module):
 
 - :mod:`z_manip.models.grasp_source` — ``GraspSource`` (a.k.a. GraspGenerator):
-  ``generate(GraspContext) -> GraspCandidates``. Backends: HGGD (A budget) /
-  AnyGrasp / geometric antipodal (always-on fallback) / GT-heuristic (bring-up).
+  ``generate(GraspContext) -> GraspCandidates``. Implemented; backends include
+  the geometric antipodal fallback (:mod:`z_manip.models.antipodal_grasp`) and
+  a learned-model source (:mod:`z_manip.models.learned_grasp`).
 - :mod:`z_manip.models.detector`     — ``Detector``: open-vocab 2D detection.
+  Still a placeholder; raises ``NotImplementedError``.
 - :mod:`z_manip.models.tracker`      — ``Tracker``: EdgeTAM mask stream (track_3d).
+  Still a placeholder; raises ``NotImplementedError``.
 - :mod:`z_manip.models.planner`      — ``Planner``: MoveIt2-RRT / VAMP.
-
-Skeleton only (M0). No model is implemented; each Protocol raises
-``NotImplementedError`` in its placeholder.
+  Still a placeholder; raises ``NotImplementedError``. The real motion
+  planner used today lives in :mod:`z_manip.planning`.
 """
 
 from __future__ import annotations

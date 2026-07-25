@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
+from z_manip.control._shared import clamp as _clamp
+
 
 @dataclass(frozen=True)
 class VisualServoConfig:
@@ -60,10 +62,6 @@ class ServoCommand:
     converged: bool
     depth_error_m: float = 0.0
     yaw_error_rad: float = 0.0
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return min(max(value, low), high)
 
 
 class VisualServoController:

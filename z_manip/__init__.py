@@ -21,9 +21,13 @@ Layer map (design authority: ``docs/plan.md`` §2 L0-L4):
 - :mod:`z_manip.adapters`    L0 — isaac_adapter (consumes topics only) /
                             real_adapter (D435i + piper_sdk).
 
-This module is a **skeleton** (M0 bootstrap): the code below defines only the
-contracts (Protocols / ABCs + docstrings). No algorithm is implemented here;
-concrete backends land in later milestones (M1-M5, see ``docs/plan.md`` §5).
+``docs/plan.md`` §5 describes the original M0-M5 bring-up roadmap. Perception,
+grasp generation, IK, planning, collision and configuration are implemented
+and run on real hardware today (see the project README); the L3
+:mod:`z_manip.skills` layer and a few L1 model backends
+(:mod:`z_manip.models.detector`, :mod:`z_manip.models.tracker`,
+:mod:`z_manip.models.planner`) remain declared-but-unimplemented Protocol
+placeholders.
 """
 
 from __future__ import annotations

@@ -24,16 +24,7 @@ from typing import Sequence
 
 import numpy as np
 
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return min(max(value, low), high)
-
-
-def _point3(value: Sequence[float], *, label: str) -> np.ndarray:
-    point = np.asarray(value, dtype=float)
-    if point.shape != (3,) or not np.isfinite(point).all():
-        raise ValueError(f"{label} must contain exactly three finite values")
-    return point
+from z_manip.control._shared import clamp as _clamp, point3 as _point3
 
 
 def transform_point(

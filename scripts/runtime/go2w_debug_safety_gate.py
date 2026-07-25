@@ -16,8 +16,12 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 import time
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _atomic_io import atomic_write_text as _atomic_write_text  # noqa: E402
 
 
 BUNDLE_SCHEMA = "z_manip.debug_bundle.v1"
@@ -486,10 +490,7 @@ def main() -> int:
         joint_report=args.joint_report,
     )
     output = args.output.expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(json.dumps(audit, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(output)
+    _atomic_write_text(output, json.dumps(audit, indent=2) + "\n")
     print(json.dumps({
         "output": str(output),
         "passed": audit["passed"],
