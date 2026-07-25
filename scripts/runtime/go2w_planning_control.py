@@ -39,11 +39,6 @@ import go2w_reactive_supervision
 import go2w_wrist_search
 from go2w_live_perception import LivePerceptionRenderer
 from go2w_runtime_state import (
-    MAX_RUNTIME_CANDIDATES,
-    MAX_RUNTIME_LINKS,
-    MAX_RUNTIME_PATH_POINTS,
-    MAX_RUNTIME_POINT_CLOUDS,
-    MAX_RUNTIME_POINTS,
     RUNTIME_SCHEMA,
     RuntimeStateError,
     _finite_number,

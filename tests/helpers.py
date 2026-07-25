@@ -19,7 +19,6 @@ Frame / topic names are the go2w source of truth (``~/Desktop/go2w/scripts/sim/
 from __future__ import annotations
 
 import json
-import math
 import os
 import shlex
 import subprocess
@@ -135,39 +134,6 @@ def topic_exists(topic: str, timeout: float = 12.0) -> bool:
     return topic in list_topics(timeout=timeout)
 
 
-def topic_hz(topic: str, window_s: float = 8.0) -> float:
-    """WALL-CLOCK publish rate of ``topic`` via ``ros2 topic hz`` (Hz).
-
-    Parses the last ``average rate:`` line ``ros2 topic hz`` prints within a
-    ``window_s`` wall window. WALL rate scales with RTF (≈0.2 here): a healthy
-    10 fps-sim stream reads ~2.1 Hz wall — the exact trap M0 verify documented.
-    So this is NOT the M0 hz-gate quantity; use it only for wall-side
-    observations (e.g. WiFi bandwidth budgeting). Gates use
-    :func:`topic_hz_sim`. Raises :class:`ProbeSkip` if no sample lands in the
-    window (silent topic / chain gone).
-    """
-    # `ros2 topic hz` runs until killed; bound it with the container-side timeout
-    # so the average is computed over ~window_s of real time.
-    proc = _run(
-        f"timeout {window_s:.1f} ros2 topic hz {shlex.quote(topic)}",
-        timeout=window_s + 12.0,
-    )
-    rates: list[float] = []
-    for line in (proc.stdout or "").splitlines():
-        line = line.strip()
-        if line.startswith("average rate:"):
-            try:
-                rates.append(float(line.split(":", 1)[1].strip()))
-            except ValueError:
-                pass
-    if not rates:
-        raise ProbeSkip(
-            f"no `average rate:` for {topic} in {window_s}s "
-            f"(silent or chain gone): {(proc.stderr or '').strip()[:160]}"
-        )
-    return rates[-1]  # last reported average = most settled
-
-
 def topic_hz_sim(topic: str, msg_module: str = "sensor_msgs.msg",
                  msg_class: str = "Image", n_msgs: int = 15,
                  timeout: float = 45.0) -> dict:
@@ -215,19 +181,6 @@ def topic_hz_sim(topic: str, msg_module: str = "sensor_msgs.msg",
             "(silent or chain gone)"
         )
     return res
-
-
-def echo_once(topic: str, timeout: float = 10.0) -> str:
-    """Raw YAML of one message via ``ros2 topic echo --once`` (``ProbeSkip`` if
-    none arrives)."""
-    proc = _run(
-        f"timeout {timeout:.1f} ros2 topic echo --once {shlex.quote(topic)}",
-        timeout=timeout + 8.0,
-    )
-    out = (proc.stdout or "").strip()
-    if not out:
-        raise ProbeSkip(f"no message on {topic} within {timeout}s")
-    return out
 
 
 # ------------------------------------------------------------------ rclpy probes
@@ -632,22 +585,9 @@ class JointErr:
     per_joint: dict
 
 
-def rtf_scaled_min_hz(sim_hz: float, floor_wall_hz: float,
-                      assume_rtf: float = 0.15) -> float:
-    """Wall-rate floor for a sim-Hz publisher: ``max(sim_hz*assume_rtf, floor)``.
-
-    A 5 Hz sim-time publisher at RTF 0.15 shows ~0.75 Hz on the wall. We assert
-    against the RTF-folded expectation but never below an absolute ``floor``.
-    """
-    return max(sim_hz * assume_rtf, floor_wall_hz)
-
-
-# Re-export so ``from tests.helpers import math`` isn't needed by callers who
-# only want the constant π-based helpers; keeps the public surface obvious.
 __all__ = [
     "ProbeSkip", "ros_exec_prefix", "ros2_cli", "list_topics", "topic_exists",
-    "topic_hz", "topic_hz_sim", "echo_once", "clock_rtf", "wait_sim_seconds", "depth_frame_stats",
+    "topic_hz_sim", "clock_rtf", "wait_sim_seconds", "depth_frame_stats",
     "camera_info", "image_encoding", "joint_error", "optical_axis_pitch_deg",
-    "set_named_pose", "DepthStats", "CamInfo", "JointErr", "rtf_scaled_min_hz",
-    "math",
+    "set_named_pose", "DepthStats", "CamInfo", "JointErr",
 ]

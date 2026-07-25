@@ -20,7 +20,7 @@ from pathlib import Path
 import stat as stat_module
 import struct
 import time
-from typing import Any, Callable
+from typing import Callable
 
 
 SCHEMA = "z_manip.runtime_state.v1"

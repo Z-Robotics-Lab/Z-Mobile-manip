@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 import json
 import math
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 
 POSTURE_STATUS_SCHEMA = "z_manip.go2w_posture_status.v1"

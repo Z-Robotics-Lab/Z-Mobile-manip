@@ -20,8 +20,6 @@ M0 skeleton: signature + docstring only.
 
 from __future__ import annotations
 
-from typing import Optional
-
 
 def track_init(seed_bbox: object, *, lost_timeout_sim_s: float = 5.0) -> object:
     """Seed a new track from ``seed_bbox`` and wait for a stable lock.

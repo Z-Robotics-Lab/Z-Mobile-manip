@@ -27,7 +27,6 @@ import numpy as np
 from z_manip.control.wrist_search import (
     BoundedWristSearch,
     WristSearchConfig,
-    WristSearchDecision,
     WristSearchPhase,
 )
 

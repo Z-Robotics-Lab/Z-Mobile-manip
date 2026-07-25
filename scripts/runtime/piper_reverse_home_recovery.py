@@ -10,7 +10,6 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
-import time
 
 import numpy as np
 

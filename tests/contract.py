@@ -30,16 +30,13 @@ TOPIC_NAMED_POSE = "/piper/named_pose"
 # NOT a generic "/piper/joint_states". G-c compares these two per joint-name.
 TOPIC_JOINT_STATE = "/piper/state"
 TOPIC_JOINT_CMD = "/piper/cmd"
-TOPIC_EE_POSE = "/piper/ee_pose"        # PoseStamped, EE GT (frame "world")
 
 POSE_STOW = "STOW"
 POSE_LOOKOUT = "LOOKOUT"
 POSE_CARRY = "CARRY"
 POSE_CYCLE = (POSE_STOW, POSE_LOOKOUT, POSE_CARRY)
-POSE_DEFAULT = POSE_LOOKOUT             # wrist_camera.DEFAULT_POSE
 
 # --------------------------------------------------------------- ground truth
-TOPIC_CLOCK = "/clock"
 
 
 def _load_office_scene() -> tuple[_Path, dict]:
@@ -170,13 +167,9 @@ GE_MIN_DEPTH_M = 0.28
 # GT rate: designed 5 Hz sim (warehouse_nav step % 20); gate ≥4 Hz sim-time.
 GT_SIM_HZ = 5.0
 GT_SIM_HZ_MIN = 4.0
-GT_WALL_HZ_FLOOR = 0.5  # legacy wall-side floor（仅带宽观察用，非 gate）
 
 # e2e "sees the scene": ≥5% of a depth frame in the [0.3, 3.0] m band.
 E2E_INBAND_FRAC_MIN = 0.05
 
 # Settle windows in SIM seconds (never wall — RTF 0.2 pitfall).
 SETTLE_SIM_S = 3.0
-
-# xfail marker for the two gates blocked by the in-flight arm-stiffness fix.
-XFAIL_ARM_STIFFNESS = "arm stiffness fix in flight: task_6dd89fc1"

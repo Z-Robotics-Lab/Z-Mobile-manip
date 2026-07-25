@@ -37,7 +37,6 @@ from z_manip.models.grasp_source import (
     select_grasp_source,
 )
 from z_manip.perception.rgbd import (
-    CameraIntrinsics,
     filter_object_cloud,
     target_exclusion_mask,
 )
@@ -766,14 +765,6 @@ def main(
         ),
         dtype=np.float32,
     ).reshape(-1, 3)
-    camera = CameraIntrinsics(
-        fx=float(info_message.k[0]),
-        fy=float(info_message.k[4]),
-        cx=float(info_message.k[2]),
-        cy=float(info_message.k[5]),
-        width=int(info_message.width),
-        height=int(info_message.height),
-    )
     if scene_cloud_message.header.frame_id != cloud_message.header.frame_id:
         raise RuntimeError("filtered target and scene clouds use different frames")
     scene_points = np.asarray(
