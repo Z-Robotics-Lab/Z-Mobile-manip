@@ -78,8 +78,11 @@ PLANNING_RUNNER_CONTAINER_SCRATCH_ROOT = Path("/workspace-planning-output")
 SAFE_RUNTIME_IMAGE = re.compile(
     r"z-manip-runtime:[a-z0-9][a-z0-9._-]{0,63}\Z",
 )
-NUC_HOST = "yusenzlabnuc@192.168.3.8"
-NUC_KEY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".ssh" / "id_ed25519_codex_nuc"
+NUC_HOST = os.environ.get("GO2W_NUC_HOST", "yusenzlabnuc@192.168.3.8")
+NUC_KEY = Path(os.environ.get(
+    "GO2W_NUC_SSH_KEY",
+    str(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".ssh" / "id_ed25519_codex_nuc"),
+)).expanduser().resolve()
 REMOTE_PASSIVE_REPORT = "/tmp/z-manip-passive-live.json"
 REMOTE_PASSIVE_PROBE = "/usr/local/libexec/z-manip/piper_passive_probe.py"
 PASSIVE_CAPTURE_SECONDS = "0.25"
