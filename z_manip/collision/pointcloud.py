@@ -38,6 +38,14 @@ _ORTHONORMAL_TOLERANCE = 1e-5 + 1e-5 * np.abs(_IDENTITY_3)
 _DETERMINANT_TOLERANCE = 1e-5 + 1e-5
 
 
+def _readonly(value: object) -> np.ndarray:
+    """Convert once and freeze: shared per-checker constants are never written."""
+
+    array = np.asarray(value)
+    array.setflags(write=False)
+    return array
+
+
 def _validate_offset(value: object, label: str) -> None:
     offset = np.asarray(value, dtype=float)
     if offset.shape != (3,) or not np.all(np.isfinite(offset)):
@@ -446,7 +454,7 @@ class PointCloudCollisionChecker:
         # decides which frame a multi-frame diagnostic names.
         self._requested_frames = requested_frames
         self._capsule_offsets = tuple(
-            (capsule, np.asarray(capsule.start_offset), np.asarray(capsule.end_offset))
+            (capsule, _readonly(capsule.start_offset), _readonly(capsule.end_offset))
             for capsule in model.capsules
         )
         self._self_pairs = self._resolve_self_pairs()
