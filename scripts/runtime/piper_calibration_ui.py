@@ -597,6 +597,7 @@ def make_handler(state: CalibrationState, index_path: Path) -> type[BaseHTTPRequ
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
             self.end_headers()
 
         def _json(self, value: object, status: HTTPStatus = HTTPStatus.OK) -> None:

@@ -151,6 +151,17 @@ def test_server_is_loopback_only_and_read_only(tmp_path):
         thread.join(timeout=2)
 
 
+def test_out_of_range_port_is_a_clean_argparse_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["piper_joint_zero_ui.py", "--report", str(tmp_path / "missing.json"), "--port", "-1"],
+    )
+    with pytest.raises(SystemExit) as caught:
+        UI.main()
+    assert caught.value.code == 2
+    assert "port must be between 0 and 65535" in capsys.readouterr().err
+
+
 def test_server_has_no_robot_transport_or_subprocess_integration():
     source = SERVER.read_text(encoding="utf-8")
     tree = ast.parse(source)

@@ -75,6 +75,7 @@ def make_handler(report_path: Path, index_path: Path) -> type[BaseHTTPRequestHan
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
             self.end_headers()
             if include_body:
                 self.wfile.write(payload)
@@ -150,6 +151,8 @@ def main() -> int:
     parser.add_argument("--index", type=Path)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error("port must be between 0 and 65535")
     report = load_report(args.report)
     if args.check:
         print(json.dumps({"ok": True, "calibrated": report.get("calibrated")}))

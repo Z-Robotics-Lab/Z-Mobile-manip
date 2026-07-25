@@ -189,6 +189,8 @@ def main() -> int:
     parser.add_argument("--index", type=Path)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error("port must be between 0 and 65535")
     report = load_report(args.report)
     if args.check:
         print(json.dumps({

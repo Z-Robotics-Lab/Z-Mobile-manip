@@ -376,7 +376,10 @@ def _arguments() -> argparse.Namespace:
         action="store_true",
         help="validate the bundle and exit without opening a listener",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error("port must be between 0 and 65535")
+    return args
 
 
 def main() -> int:

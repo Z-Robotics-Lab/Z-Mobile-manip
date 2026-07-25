@@ -568,3 +568,15 @@ def test_launcher_contains_no_remote_or_actuator_commands():
     assert "go2w_debug_safety_gate.py" in source
     assert "--artifact-root" in source
     assert "--output" in source
+
+
+def test_out_of_range_port_is_a_clean_argparse_error(tmp_path, monkeypatch, capsys):
+    bundle = tmp_path / "bundle.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["go2w_debug_ui.py", "--bundle", str(bundle), "--port", "99999"],
+    )
+    with pytest.raises(SystemExit) as caught:
+        DEBUG_UI._arguments()
+    assert caught.value.code == 2
+    assert "port must be between 0 and 65535" in capsys.readouterr().err

@@ -50,6 +50,7 @@ def test_loopback_server_is_read_only(tmp_path):
         with urlopen(base + "/api/report", timeout=2) as response:
             assert json.load(response)["motion_commands_published"] == 0
             assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["Cross-Origin-Resource-Policy"] == "same-origin"
         with pytest.raises(HTTPError) as caught:
             urlopen(Request(base + "/api/report", method="POST"), timeout=2)
         assert caught.value.code == 405
@@ -57,6 +58,17 @@ def test_loopback_server_is_read_only(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_out_of_range_port_is_a_clean_argparse_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["piper_mount_ui.py", "--report", str(tmp_path / "missing.json"), "--port", "-1"],
+    )
+    with pytest.raises(SystemExit) as caught:
+        MODULE.main()
+    assert caught.value.code == 2
+    assert "port must be between 0 and 65535" in capsys.readouterr().err
 
 
 def test_page_renders_mount_and_residual_views():
