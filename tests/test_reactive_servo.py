@@ -762,3 +762,34 @@ def test_view_damping_can_be_disabled_for_a_transparent_passthrough():
         commanded_rate_rps=_MAX_QDOT_RPS,
         update_period_s=0.133,
     ) == pytest.approx(1.0)
+
+
+def test_base_approach_reports_one_corridor_evaluation_and_a_constant_reason():
+    # BASE_APPROACH is only reachable when the handoff corridor test already
+    # returned False, so the corridor must be evaluated exactly once per update
+    # and its reason string must not depend on a second evaluation.
+    controller = ReactiveTargetController()
+    calls: list[float] = []
+    original = controller._handoff_geometry_ok
+
+    def _counting(geometry, *, desired_target_lateral_m):
+        calls.append(desired_target_lateral_m)
+        return original(geometry, desired_target_lateral_m=desired_target_lateral_m)
+
+    controller._handoff_geometry_ok = _counting
+    geometry = _geometry(
+        camera_xyz=(0.0, 0.0, 0.45),
+        base_xyz=(0.90, 0.0, -0.10),
+        arm_xyz=(0.75, 0.0, 0.10),
+    )
+
+    decision = controller.update(
+        geometry,
+        now_s=1.0,
+        tracking=True,
+        body_settled=True,
+    )
+
+    assert decision.phase is ReactivePhase.BASE_APPROACH
+    assert len(calls) == 1
+    assert decision.reason == "approaching with ground-plane Euclidean distance"
