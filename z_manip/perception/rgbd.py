@@ -173,7 +173,7 @@ def depth_bbox_observation(
     )
 
 
-def depth_to_pointcloud(
+def _project_depth(
     depth_mm: np.ndarray,
     intrinsics: CameraIntrinsics,
     *,
@@ -182,8 +182,13 @@ def depth_to_pointcloud(
     min_depth_m: float = 0.28,
     max_depth_m: float = 5.0,
     transform: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Back-project aligned 16UC1 depth to an observed metric point cloud."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Back-project depth, returning the cloud and the subsampled validity mask.
+
+    The validity mask is returned so a caller carrying per-pixel labels can line
+    them up with the cloud without recomputing the subsample and the three depth
+    comparisons that produced it.
+    """
 
     depth = np.asarray(depth_mm)
     if depth.shape != (intrinsics.height, intrinsics.width):
@@ -227,7 +232,31 @@ def depth_to_pointcloud(
             points @ target_from_camera[:3, :3].T
             + target_from_camera[:3, 3]
         )
-    return points.astype(np.float32, copy=False)
+    return points.astype(np.float32, copy=False), valid
+
+
+def depth_to_pointcloud(
+    depth_mm: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    *,
+    mask: Optional[np.ndarray] = None,
+    stride: int = 1,
+    min_depth_m: float = 0.28,
+    max_depth_m: float = 5.0,
+    transform: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Back-project aligned 16UC1 depth to an observed metric point cloud."""
+
+    points, _valid = _project_depth(
+        depth_mm,
+        intrinsics,
+        mask=mask,
+        stride=stride,
+        min_depth_m=min_depth_m,
+        max_depth_m=max_depth_m,
+        transform=transform,
+    )
+    return points
 
 
 def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
@@ -288,7 +317,9 @@ def depth_to_scene_cloud(
         raise ValueError("target mask dilation cannot be negative")
     if target_dilation_px:
         labels = dilate_mask(labels, int(target_dilation_px))
-    points = depth_to_pointcloud(
+    # Reusing the validity mask the back-projection already built is what keeps
+    # the labels aligned by construction rather than by a recomputed guess.
+    points, valid = _project_depth(
         depth,
         intrinsics,
         stride=stride,
@@ -296,15 +327,7 @@ def depth_to_scene_cloud(
         max_depth_m=max_depth_m,
         transform=transform,
     )
-    sampled_depth = depth[::stride, ::stride].astype(np.float64) * 0.001
-    valid = (
-        np.isfinite(sampled_depth)
-        & (sampled_depth >= min_depth_m)
-        & (sampled_depth <= max_depth_m)
-    )
     aligned_labels = labels[::stride, ::stride][valid]
-    if len(aligned_labels) != len(points):
-        raise RuntimeError("internal RGB-D label alignment failure")
     return points, aligned_labels.astype(bool, copy=False)
 
 

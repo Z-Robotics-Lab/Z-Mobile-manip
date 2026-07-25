@@ -318,3 +318,30 @@ def test_subsampling_never_falls_back_to_an_integer_gather(monkeypatch):
     )
 
     assert len(points) == len(excluded)
+
+
+def test_scene_cloud_computes_the_depth_validity_mask_only_once(monkeypatch):
+    # The label alignment must reuse the mask the back-projection already built.
+    # Rebuilding it costs a second (H/stride)x(W/stride) float64 array and three
+    # more comparison passes over it, and makes the alignment a coincidence
+    # rather than a structural guarantee.
+    calls = []
+    original_isfinite = np.isfinite
+
+    def counting_isfinite(array, *args, **kwargs):
+        calls.append(np.shape(array))
+        return original_isfinite(array, *args, **kwargs)
+
+    monkeypatch.setattr(np, "isfinite", counting_isfinite)
+    depth = np.full((12, 16), 1200, dtype=np.uint16)
+    depth[0, 0] = 0
+    target = np.zeros_like(depth, dtype=bool)
+    target[4:8, 6:10] = True
+    intrinsics = CameraIntrinsics(100.0, 100.0, 8.0, 6.0, 16, 12)
+
+    points, excluded = depth_to_scene_cloud(
+        depth, intrinsics, target_mask=target, target_dilation_px=1, stride=2,
+    )
+
+    assert calls == [(6, 8)]
+    assert len(points) == len(excluded) == 47
