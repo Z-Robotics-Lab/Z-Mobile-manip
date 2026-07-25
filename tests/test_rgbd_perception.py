@@ -204,3 +204,70 @@ def test_scene_cloud_keeps_segmentation_labels_aligned_after_depth_filtering():
     assert excluded.dtype == np.bool_
     assert int(excluded.sum()) == 9
     assert np.all(points[excluded, 2] == pytest.approx(1.2))
+
+
+def _reference_dilation(mask, radius):
+    """Original full-square scipy dilation, kept here as the equivalence oracle."""
+    from scipy.ndimage import binary_dilation
+
+    size = 2 * radius + 1
+    return binary_dilation(mask, structure=np.ones((size, size), dtype=bool))
+
+
+def _dilation_equivalence_cases():
+    rng = np.random.default_rng(20260725)
+    cases = [
+        np.ones((17, 23), dtype=bool),
+        np.zeros((17, 23), dtype=bool),
+        np.array([[True]]),
+        np.array([[False]]),
+        np.zeros((3, 40), dtype=bool),
+    ]
+    border = np.zeros((21, 19), dtype=bool)
+    border[0, :] = True
+    border[:, 0] = True
+    border[-1, -1] = True
+    cases.append(border)
+    for _ in range(20):
+        shape = (int(rng.integers(1, 30)), int(rng.integers(1, 30)))
+        cases.append(rng.random(shape) < 0.15)
+    return cases
+
+
+def test_separable_dilation_matches_the_full_square_structuring_element():
+    for mask in _dilation_equivalence_cases():
+        for radius in range(1, 6):
+            assert np.array_equal(
+                rgbd_module.dilate_mask(mask, radius),
+                _reference_dilation(mask, radius),
+            ), f"radius {radius} diverged on shape {mask.shape}"
+
+
+def test_scene_cloud_dilation_never_evaluates_a_full_square_element(monkeypatch):
+    # scipy evaluates a (2r+1)x(2r+1) element in O(r^2) per pixel. Nothing on
+    # this path may call it; the separable passes are the whole point.
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("dilation must not evaluate a full square element")
+
+    monkeypatch.setattr(rgbd_module, "binary_dilation", refuse, raising=False)
+    depth = np.full((6, 8), 1200, dtype=np.uint16)
+    target = np.zeros_like(depth, dtype=bool)
+    target[2:5, 3:6] = True
+    intrinsics = CameraIntrinsics(100.0, 100.0, 4.0, 3.0, 8, 6)
+
+    _points, excluded = depth_to_scene_cloud(
+        depth,
+        intrinsics,
+        target_mask=target,
+        target_dilation_px=1,
+        stride=1,
+    )
+
+    assert int(excluded.sum()) == int(_reference_dilation(target, 1).sum())
+
+
+def test_zero_radius_dilation_leaves_the_mask_untouched():
+    mask = np.zeros((5, 7), dtype=bool)
+    mask[1:3, 2:5] = True
+
+    assert np.array_equal(rgbd_module.dilate_mask(mask, 0), mask)

@@ -15,7 +15,6 @@ from typing import Optional, Sequence
 import warnings
 
 import numpy as np
-from scipy.ndimage import binary_dilation
 from scipy.spatial import cKDTree
 
 
@@ -231,6 +230,36 @@ def depth_to_pointcloud(
     return points.astype(np.float32, copy=False)
 
 
+def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Grow a bool mask by ``radius`` pixels under a square structuring element.
+
+    A square element is separable, so one horizontal pass followed by one
+    vertical pass costs ``2 * (2r + 1)`` shifted ORs instead of the
+    ``(2r + 1) ** 2`` that ``scipy.ndimage.binary_dilation`` evaluates for a
+    full square. Zero padding reproduces scipy's out-of-bounds behaviour
+    exactly, including at the image border. This module stays on the numpy and
+    scipy dependency budget declared in pyproject; the tracker node's copy in
+    ``z_manip_edgetam.core`` may use OpenCV because it already depends on it.
+    """
+
+    if radius < 1:
+        return np.asarray(mask, dtype=bool)
+    height, width = mask.shape
+    span = 2 * radius + 1
+    padded_columns = np.zeros((height, width + 2 * radius), dtype=bool)
+    padded_columns[:, radius:radius + width] = mask
+    # The horizontal pass writes straight through a view of the row-padded
+    # buffer, so the two passes need no intermediate copy between them.
+    padded_rows = np.zeros((height + 2 * radius, width), dtype=bool)
+    horizontal = padded_rows[radius:radius + height, :]
+    for offset in range(span):
+        horizontal |= padded_columns[:, offset:offset + width]
+    dilated = np.zeros((height, width), dtype=bool)
+    for offset in range(span):
+        dilated |= padded_rows[offset:offset + height, :]
+    return dilated
+
+
 def depth_to_scene_cloud(
     depth_mm: np.ndarray,
     intrinsics: CameraIntrinsics,
@@ -258,8 +287,7 @@ def depth_to_scene_cloud(
     if target_dilation_px < 0:
         raise ValueError("target mask dilation cannot be negative")
     if target_dilation_px:
-        size = 2 * int(target_dilation_px) + 1
-        labels = binary_dilation(labels, structure=np.ones((size, size), dtype=bool))
+        labels = dilate_mask(labels, int(target_dilation_px))
     points = depth_to_pointcloud(
         depth,
         intrinsics,
