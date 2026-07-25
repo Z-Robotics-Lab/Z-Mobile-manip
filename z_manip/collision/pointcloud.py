@@ -1035,15 +1035,14 @@ class PointCloudCollisionChecker:
         self,
         capsule: _WorldCapsule,
         *,
-        base_t_tip: np.ndarray | None = None,
+        tip_t_base: np.ndarray | None = None,
     ) -> CollisionResult | None:
         tree = self._target_tree
         start = capsule.start
         end = capsule.end
         if self._attached_target_tree_tip is not None:
-            if base_t_tip is None:
+            if tip_t_base is None:
                 raise RuntimeError("attached target check requires the tip transform")
-            tip_t_base = np.linalg.inv(base_t_tip)
             start = tip_t_base[:3, :3] @ start + tip_t_base[:3, 3]
             end = tip_t_base[:3, :3] @ end + tip_t_base[:3, 3]
             tree = self._attached_target_tree_tip
@@ -1235,7 +1234,17 @@ class PointCloudCollisionChecker:
         if frame_problem is not None:
             return frame_problem
         assert capsules is not None
-        base_t_tip = self.chain.forward(values)
+        # The tip transform is consulted only by the attached-payload checks,
+        # and `_attached_target_points_tip` / `_attached_target_tree_tip` are
+        # installed and cleared together, so this guard is exact.  Transit and
+        # approach states -- the common case -- skip the forward kinematics
+        # pass entirely.  `chain.forward` is pure and cannot raise here because
+        # `_validate_joints` has already established shape and finiteness.
+        base_t_tip = (
+            self.chain.forward(values)
+            if self._attached_target_points_tip is not None
+            else None
+        )
         # With no mesh backend, the capsule model owns all configured pairs.
         # With a mesh backend, keep only explicitly supplemental platform
         # fixtures here; the mesh checker continues to own the existing arm
@@ -1261,9 +1270,13 @@ class PointCloudCollisionChecker:
                 self_problem = None
             if self_problem is not None:
                 return self_problem
-        attached_scene_collision = self._check_attached_target_scene(base_t_tip)
-        if attached_scene_collision is not None:
-            return attached_scene_collision
+        tip_t_base = None
+        if base_t_tip is not None:
+            attached_scene_collision = self._check_attached_target_scene(base_t_tip)
+            if attached_scene_collision is not None:
+                return attached_scene_collision
+            # One inverse per state instead of one per checked capsule.
+            tip_t_base = np.linalg.inv(base_t_tip)
         finger_exclusion = (
             self.model.finger_support_plane_exclusion
             and self._target_points is not None
@@ -1285,7 +1298,7 @@ class PointCloudCollisionChecker:
             if capsule.spec.check_target:
                 target_collision = self._check_target_capsule(
                     capsule,
-                    base_t_tip=base_t_tip,
+                    tip_t_base=tip_t_base,
                 )
                 if target_collision is not None:
                     return target_collision

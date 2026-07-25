@@ -876,3 +876,114 @@ def test_a_skewed_frame_provider_transform_fails_closed_with_a_named_frame(
     assert result.kind == "kinematics"
     assert "invalid transform for 'tool'" in result.reason
     assert chain.dof == 1
+
+
+# -- forward kinematics on the state-check hot path ---------------------------
+
+
+def _fk_attributable_checker(tmp_path):
+    """A checker whose frame provider uses `link_transforms`, so every
+    `chain.forward` call can be attributed to `check_state` itself."""
+
+    chain, _frames = _chain_and_frames(tmp_path)
+    model = RobotCollisionModel(
+        capsules=(
+            CapsuleSpec(
+                "wrist", "tool", "tool", 0.02,
+                start_offset=(0.0, 0.0, -0.06), end_offset=(0.0, 0.0, 0.06),
+            ),
+            CapsuleSpec(
+                "palm", "tool", "tool", 0.02,
+                start_offset=(0.0, 0.0, 0.06), end_offset=(0.0, 0.0, 0.10),
+            ),
+            CapsuleSpec(
+                "forearm", "base", "tool", 0.02,
+                start_offset=(0.0, 0.0, -0.20), end_offset=(0.0, 0.0, -0.10),
+            ),
+        ),
+    )
+    return PointCloudCollisionChecker(
+        chain=chain,
+        model=model,
+        frame_provider=chain.link_transforms,
+        config=PointCloudCollisionConfig(
+            clearance=0.01,
+            point_radius=0.0,
+            min_scene_points=1,
+            max_scene_age_s=0.5,
+            segment_joint_step=0.02,
+        ),
+        now_fn=lambda: 10.0,
+    )
+
+
+def test_check_state_runs_no_forward_kinematics_without_an_attached_payload(
+    tmp_path,
+    monkeypatch,
+):
+    """Regression test: the tip transform is consulted only by the attached
+    payload checks, so transit and approach states -- the common case, and the
+    ones an RRT samples by the thousand -- must not pay a full forward
+    kinematics pass they then throw away.
+    """
+
+    checker = _fk_attributable_checker(tmp_path)
+    checker.update_scene(np.array([[5.0, 0.0, 0.0]]), stamp_s=10.0)
+    real_forward = checker.chain.forward
+    calls = 0
+
+    def counting_forward(joints):
+        nonlocal calls
+        calls += 1
+        return real_forward(joints)
+
+    monkeypatch.setattr(checker.chain, "forward", counting_forward)
+
+    assert checker.check_state(np.array([0.1])).valid
+    assert calls == 0  # no payload attached
+
+    checker.update_target(np.array([[5.0, 0.0, 0.5]]))
+    assert checker.check_state(np.array([0.1])).valid
+    assert calls == 0  # a static target already lives in the base frame
+
+
+def test_check_state_inverts_the_tip_transform_once_per_state_when_attached(
+    tmp_path,
+    monkeypatch,
+):
+    """With a payload attached the tip transform is needed, but exactly once:
+    one forward kinematics pass and one inverse per state, not one inverse per
+    checked capsule.
+    """
+
+    checker = _fk_attributable_checker(tmp_path)
+    checker.update_scene(np.array([[5.0, 0.0, 0.0]]), stamp_s=10.0)
+    checker.update_attached_target(
+        np.array([[0.0, 0.0, 0.30], [0.0, 0.01, 0.31]]),
+        attachment_joints=np.array([0.0]),
+    )
+    real_forward = checker.chain.forward
+    real_inverse = np.linalg.inv
+    forward_calls = 0
+    inverse_calls = 0
+
+    def counting_forward(joints):
+        nonlocal forward_calls
+        forward_calls += 1
+        return real_forward(joints)
+
+    def counting_inverse(matrix):
+        nonlocal inverse_calls
+        inverse_calls += 1
+        return real_inverse(matrix)
+
+    monkeypatch.setattr(checker.chain, "forward", counting_forward)
+    monkeypatch.setattr(np.linalg, "inv", counting_inverse)
+
+    result = checker.check_state(np.array([0.1]))
+
+    assert result.valid
+    assert forward_calls == 1
+    # Three capsules are checked against the attached payload; the tip
+    # transform is inverted once for the state, not once per capsule.
+    assert inverse_calls == 1
