@@ -757,6 +757,7 @@ class GraspPlanGenerator:
             lift_attempts += (("up-and-back", fallback_lift),)
 
         lift_failures: list[tuple[str, str]] = []
+        lift_pose = None
         lift_joints = None
         lift_solution = None
         for lift_name, lift in lift_attempts:
@@ -777,21 +778,21 @@ class GraspPlanGenerator:
             for first, second in zip(lift_path, lift_path[1:]):
                 checkpoint(control, "grasp lift collision checking")
                 if self.lift_segment_valid is None:
-                    valid = self._segment_valid(first, second, control=control)
+                    segment_ok = self._segment_valid(first, second, control=control)
                 else:
                     width_kwargs = (
                         {"required_width_m": width}
                         if self._lift_accepts_width
                         else {}
                     )
-                    valid = self.lift_segment_valid(
+                    segment_ok = self.lift_segment_valid(
                         first,
                         second,
                         grasp_solution.joints,
                         **width_kwargs,
                     )
                     checkpoint(control, "grasp lift collision checking")
-                if not valid:
+                if not segment_ok:
                     lift_valid = False
                     break
             if not lift_valid:
@@ -800,11 +801,16 @@ class GraspPlanGenerator:
                     f"{lift_name} Cartesian lift intersects the planning scene",
                 ))
                 continue
+            # Capture the winning pose explicitly.  The result tuple below is
+            # built ~50 lines later; relying on the loop variable surviving the
+            # break would let any statement in between silently ship the wrong
+            # lift pose into PlannedGrasp.lift_pose.
+            lift_pose = lift
             lift_joints = candidate_lift_joints
             lift_solution = candidate_lift_solution
             break
 
-        if lift_joints is None or lift_solution is None:
+        if lift_pose is None or lift_joints is None or lift_solution is None:
             stage = (
                 "lift_collision"
                 if lift_failures and all(item[0] == "lift_collision" for item in lift_failures)
@@ -846,7 +852,7 @@ class GraspPlanGenerator:
             symmetry_index,
             grasp.copy(),
             pregrasp,
-            lift.copy(),
+            lift_pose.copy(),
             transit,
             approach_joints,
             lift_joints,

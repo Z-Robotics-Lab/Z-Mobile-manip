@@ -894,6 +894,62 @@ def test_bounded_refinement_selects_better_complete_plan():
     assert result.candidate_index == 1
 
 
+class _CeilingIK:
+    """Solve everything at or below ``max_z``; reject anything above it."""
+
+    def __init__(self, max_z):
+        self.max_z = float(max_z)
+
+    def solve(self, target, current=None, *, control=None):
+        z = float(np.asarray(target)[2, 3])
+        if z > self.max_z:
+            raise IKFailure(f"above the synthetic ceiling: {z:.4f}")
+        return IKSolution(np.full(2, z), 0.0, 0.0, 0.2, 3, 0)
+
+
+def _lift_config():
+    return GraspPlanConfig(
+        pregrasp_distance_m=0.10,
+        approach_steps=3,
+        lift_distance_m=0.10,
+        lift_steps=3,
+        fallback_lift_vertical_m=0.045,
+        fallback_lift_retreat_m=0.025,
+        symmetry_samples=1,
+        max_feasible_plans=1,
+    )
+
+
+def _lift_candidates():
+    return _candidates((_pose((0.60, 0.0, 0.25)),), widths=(0.04,))
+
+
+def test_nominal_lift_pose_is_reported_when_the_straight_lift_solves():
+    generator = GraspPlanGenerator(_CeilingIK(10.0), FakePlanner(), _lift_config())
+
+    result = generator.plan(_lift_candidates(), current_joints=np.zeros(2))
+
+    assert result.lift_pose is not None
+    assert result.lift_pose[:3, 3] == pytest.approx((0.60, 0.0, 0.35))
+
+
+def test_fallback_lift_pose_is_reported_when_the_straight_lift_is_unreachable():
+    # The nominal +100 mm world-Z lift leaves the synthetic ceiling; the
+    # up-and-back fallback (+45 mm up, 25 mm toward the arm base) stays under
+    # it. PlannedGrasp.lift_pose must be the pose that was actually validated,
+    # not whichever candidate the loop happened to leave bound.
+    generator = GraspPlanGenerator(_CeilingIK(0.30), FakePlanner(), _lift_config())
+
+    result = generator.plan(_lift_candidates(), current_joints=np.zeros(2))
+
+    assert result.lift_pose is not None
+    assert result.lift_pose[:3, 3] == pytest.approx((0.575, 0.0, 0.295))
+    # Explicitly not the nominal lift, which is the pose that failed IK.
+    assert result.lift_pose[:3, 3] != pytest.approx((0.60, 0.0, 0.35))
+    # The reported lift joints came from the same (fallback) pose.
+    assert result.lift_joints[-1] == pytest.approx(np.full(2, 0.295))
+
+
 def _schedule_generator(*, max_feasible_plans=1):
     return GraspPlanGenerator(
         FakeIK(),
