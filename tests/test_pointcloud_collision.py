@@ -11,6 +11,7 @@ from z_manip.collision import (
     RobotCollisionModel,
     SelfCollisionConfig,
 )
+from z_manip.collision.pointcloud import _unit_departure_direction
 from z_manip.kinematics import KinematicChain
 from z_manip.planning_control import (
     PlanningCancelled,
@@ -748,3 +749,69 @@ def test_attaching_the_target_invalidates_a_cached_finger_scene_exclusion(tmp_pa
     assert not checker._finger_scene_ready
     assert checker._finger_scene_tree is None
     assert checker._finger_scene_points is None
+
+
+# -- departure-direction validation and the departure-contact exemption ------
+
+
+def test_unit_departure_direction_normalizes_without_changing_the_ray():
+    unit = _unit_departure_direction((3.0, 0.0, 4.0))
+
+    assert unit == pytest.approx((0.6, 0.0, 0.8))
+    assert float(np.linalg.norm(unit)) == pytest.approx(1.0)
+    # A list, tuple and array of the same ray all normalize identically.
+    assert _unit_departure_direction([3.0, 0.0, 4.0]) == pytest.approx(unit)
+    assert _unit_departure_direction(np.array([3.0, 0.0, 4.0])) == pytest.approx(unit)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        None,                      # not array-like at all
+        "up",                      # array-like but not numeric
+        object(),                  # opaque object
+        (1.0, 2.0),                # wrong shape
+        (1.0, 2.0, 3.0, 4.0),      # wrong shape
+        ((1.0, 0.0, 0.0),),        # right count, wrong rank
+        (np.nan, 0.0, 1.0),        # non-finite
+        (np.inf, 0.0, 0.0),        # non-finite
+        (0.0, 0.0, 0.0),           # zero length
+        (0.0, 0.0, 5e-10),         # below the 1e-9 length floor
+    ),
+)
+def test_unit_departure_direction_rejects_everything_with_one_message(value):
+    with pytest.raises(
+        ValueError,
+        match=r"^departure_direction_base must be a finite nonzero three-vector$",
+    ):
+        _unit_departure_direction(value)
+
+
+def test_departure_exemption_is_never_consulted_while_the_scene_is_blocked(tmp_path):
+    # The departure scene excludes the support manifold.  When something other
+    # than the support is inside the threshold the exemption must not be asked
+    # at all -- the carried object is against a real obstacle, not lifting off.
+    scene = np.vstack((_x_plane(0.195), [[0.2049, 0.0, 0.0]]))
+    checker = _checker(tmp_path)
+    checker.update_scene(scene, stamp_s=10.0)
+    checker.update_attached_target(
+        np.array([[0.20, 0.0, 0.0]]),
+        attachment_joints=np.array([0.0]),
+        allowed_contact_capsules=("wrist",),
+        allow_initial_scene_contact=True,
+        departure_direction_base=np.array([1.0, 0.0, 0.0]),
+    )
+    consulted = []
+    original = checker._departure_support_contact_is_exempt
+
+    def _recording(points, threshold):
+        consulted.append(threshold)
+        return original(points, threshold)
+
+    checker._departure_support_contact_is_exempt = _recording
+
+    result = checker.check_state(np.array([0.0]))
+
+    assert not result.valid
+    assert result.kind == "attached_target"
+    assert consulted == []
