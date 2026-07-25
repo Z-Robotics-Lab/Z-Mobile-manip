@@ -15,7 +15,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from z_manip.models.planner import PlanningError
-from z_manip.planning_control import (
+from z_manip.concurrency.control import (
     PlanningAborted,
     PlanningControl,
     checkpoint,

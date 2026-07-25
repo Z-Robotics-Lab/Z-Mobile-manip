@@ -114,7 +114,7 @@ class WholeBodyRuntimeController:
         desired_standoff_m: float = 0.52,
         view_damping: ViewMeasurementDampingConfig | None = None,
     ) -> None:
-        from z_manip.fixed_self_collision import FixedSelfCollisionGuard
+        from z_manip.collision.fixed_fixture import FixedSelfCollisionGuard
 
         calibration = _json_document(calibration_path)
         if calibration.get("calibrated") is not True or calibration.get("synthetic") is not False:

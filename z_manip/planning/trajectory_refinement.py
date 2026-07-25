@@ -23,7 +23,7 @@ from typing import Protocol
 import numpy as np
 from scipy.optimize import minimize
 
-from z_manip.trajectory_clearance import (
+from z_manip.collision.trajectory_clearance import (
     FixedFixtureStateGuard,
     FixedFixtureTrajectoryEvidence,
     evaluate_fixed_fixture_trajectory,

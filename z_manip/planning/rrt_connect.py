@@ -10,7 +10,7 @@ from typing import Callable, Sequence
 import numpy as np
 
 from z_manip.models.planner import JointTrajectory, PlanningError
-from z_manip.planning_control import (
+from z_manip.concurrency.control import (
     PlanningControl,
     PlanningDeadlineExceeded,
     checkpoint,

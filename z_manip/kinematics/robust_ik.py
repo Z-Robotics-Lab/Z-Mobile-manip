@@ -9,7 +9,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from .chain import KinematicChain, rotation_log
-from z_manip.planning_control import (
+from z_manip.concurrency.control import (
     PlanningControl,
     PlanningDeadlineExceeded,
     checkpoint,

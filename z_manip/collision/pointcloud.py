@@ -18,7 +18,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from z_manip.kinematics import KinematicChain
-from z_manip.planning_control import PlanningControl, checkpoint
+from z_manip.concurrency.control import PlanningControl, checkpoint
 
 
 _Pair = tuple[str, str]

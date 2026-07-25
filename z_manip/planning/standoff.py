@@ -13,7 +13,7 @@ from scipy.optimize import linear_sum_assignment
 from z_manip.models.grasp_source import GraspCandidates
 from z_manip.models.grasp_ordering import directionally_diverse_indices
 from z_manip.models.planner import PlanningError
-from z_manip.planning_control import (
+from z_manip.concurrency.control import (
     PlanningAborted,
     PlanningCancelled,
     PlanningControl,

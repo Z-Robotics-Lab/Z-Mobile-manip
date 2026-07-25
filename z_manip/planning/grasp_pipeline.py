@@ -18,7 +18,7 @@ from z_manip.models.grasp_ordering import (
     lateral_approach_scores,
 )
 from z_manip.models.planner import JointTrajectory, PlanningError
-from z_manip.planning_control import (
+from z_manip.concurrency.control import (
     PlanningAborted,
     PlanningControl,
     PlanningDeadlineExceeded,

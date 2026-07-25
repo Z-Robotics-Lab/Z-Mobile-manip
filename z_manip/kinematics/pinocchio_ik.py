@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from z_manip.planning_control import (
+from z_manip.concurrency.control import (
     PlanningControl,
     PlanningDeadlineExceeded,
     checkpoint,

@@ -8,7 +8,7 @@ from typing import Protocol
 
 import numpy as np
 
-from z_manip.planning_control import PlanningControl, checkpoint
+from z_manip.concurrency.control import PlanningControl, checkpoint
 
 from .pointcloud import SegmentCollisionResult
 

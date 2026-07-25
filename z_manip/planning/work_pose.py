@@ -20,7 +20,7 @@ import numpy as np
 
 from z_manip.models.grasp_source import GraspCandidates
 from z_manip.models.planner import PlanningError
-from z_manip.planning_control import (
+from z_manip.concurrency.control import (
     PlanningAborted,
     PlanningCancelled,
     PlanningControl,
