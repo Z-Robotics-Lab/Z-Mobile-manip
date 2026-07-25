@@ -378,6 +378,44 @@ def test_new_successful_perception_invalidates_previous_plan(tmp_path):
     assert state["actions"]["planning"]["last_good"] is None
 
 
+class PoisonedArtifactBackend(FakeBackend):
+    """Perceive successfully but leave a tree the immutable manifest rejects."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.poison = False
+
+    def run_perception(self, *, target, output_dir, log_path):
+        result = super().run_perception(
+            target=target,
+            output_dir=output_dir,
+            log_path=log_path,
+        )
+        if self.poison:
+            (output_dir / "grasp_candidates_alias.npz").symlink_to(
+                output_dir / "grasp_candidates.npz",
+            )
+        return result
+
+
+def test_perception_artifact_failure_still_invalidates_the_previous_plan(tmp_path):
+    backend = PoisonedArtifactBackend()
+    service = _service(tmp_path, backend)
+    service.start_perception("white adapter")
+    plan = service.start_planning()
+    assert plan["status"] == "succeeded"
+    assert service.status()["actions"]["planning"]["last_good"] is not None
+
+    backend.poison = True
+    with pytest.raises(SessionContractError) as caught:
+        service.start_perception("black earphones")
+    state = service.status()
+
+    assert caught.value.code == "INVALID_SERVER_ARTIFACT"
+    assert state["actions"]["planning"]["latest_attempt"] is None
+    assert state["actions"]["planning"]["last_good"] is None
+
+
 def test_planning_without_selection_records_blocked_attempt(tmp_path):
     backend = FakeBackend()
     service = _service(tmp_path, backend)

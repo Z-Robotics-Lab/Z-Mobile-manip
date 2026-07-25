@@ -479,6 +479,13 @@ class ReadOnlySessionService:
             perception = session / "perception"
             in_flight.rename(perception)
             succeeded = self._perception_succeeded(perception, result)
+            if succeeded:
+                # A plan is valid only for the exact selected perception.  Do
+                # not let a newly perceived object inherit an older green plan.
+                # Invalidate before the manifest/attempt/freeze writes so that
+                # a failure while recording the new attempt still leaves the
+                # stale plan unusable instead of green.
+                self._remove_references("planning", ("latest_attempt", "last_good"))
             manifest = _artifact_manifest(perception)
             _write_json_exclusive(session / "perception_manifest.json", manifest)
             attempt: dict[str, Any] = {
@@ -510,9 +517,6 @@ class ReadOnlySessionService:
             _freeze_tree(session)
             self._set_reference("perception", "latest_attempt", session_id)
             if succeeded:
-                # A plan is valid only for the exact selected perception.  Do
-                # not let a newly perceived object inherit an older green plan.
-                self._remove_references("planning", ("latest_attempt", "last_good"))
                 self._set_reference("perception", "last_good", session_id)
                 self._set_reference("perception", "selected", session_id)
             return attempt
