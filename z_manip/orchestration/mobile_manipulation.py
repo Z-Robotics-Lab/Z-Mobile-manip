@@ -83,6 +83,62 @@ class Transition:
     counters: Mapping[str, int]
 
 
+# Failure kinds whose recovery is exactly "increment one counter, retry from
+# one stage, or fail with one message".  The first tuple element names both the
+# counter key and the matching ``RetryBudget`` field -- they are deliberately
+# the same name, so a new entry cannot pair a counter with the wrong budget.
+# Kinds with extra bookkeeping (NO_GRASP/IK_UNREACHABLE reset plan_candidates,
+# PLAN_BLOCKED runs its own candidate ladder) stay as explicit branches in
+# ``apply`` so their difference remains visible.
+_RECOVERY: dict[FailureKind, tuple[str, Stage, str]] = {
+    FailureKind.NOT_FOUND: (
+        "search_misses",
+        Stage.SEARCH,
+        "target not found within search budget",
+    ),
+    FailureKind.TARGET_LOST: (
+        "tracker_reacquisitions",
+        Stage.SEARCH,
+        "persistent target tracking could not be reacquired",
+    ),
+    FailureKind.NAV_BLOCKED: (
+        "nav_replans",
+        Stage.COARSE_NAV,
+        "navigation/visual approach budget exhausted",
+    ),
+    FailureKind.VISUAL_APPROACH_FAILED: (
+        "nav_replans",
+        Stage.COARSE_NAV,
+        "navigation/visual approach budget exhausted",
+    ),
+    FailureKind.EXECUTION_FAILED: (
+        "grasp_attempts",
+        Stage.OBSERVE_GRASP,
+        "whole-task grasp attempts exhausted",
+    ),
+    FailureKind.EMPTY_GRASP: (
+        "grasp_attempts",
+        Stage.OBSERVE_GRASP,
+        "whole-task grasp attempts exhausted",
+    ),
+    FailureKind.VERIFY_FAILED: (
+        "grasp_attempts",
+        Stage.OBSERVE_GRASP,
+        "whole-task grasp attempts exhausted",
+    ),
+    FailureKind.PLACE_BLOCKED: (
+        "place_replans",
+        Stage.PLAN_PLACE,
+        "place planning budget exhausted",
+    ),
+    FailureKind.RELEASE_FAILED: (
+        "release_attempts",
+        Stage.EXECUTE_PLACE,
+        "object release budget exhausted",
+    ),
+}
+
+
 _SUCCESSOR = {
     Stage.SEARCH: Stage.COARSE_NAV,
     Stage.COARSE_NAV: Stage.VISUAL_APPROACH,
@@ -167,30 +223,6 @@ class MobileManipulationStateMachine:
                 Stage.FAILED,
                 result.detail or kind.value,
             )
-        if kind == FailureKind.NOT_FOUND:
-            return self._increment_or_fail(
-                previous,
-                "search_misses",
-                self.budget.search_misses,
-                Stage.SEARCH,
-                "target not found within search budget",
-            )
-        if kind == FailureKind.TARGET_LOST:
-            return self._increment_or_fail(
-                previous,
-                "tracker_reacquisitions",
-                self.budget.tracker_reacquisitions,
-                Stage.SEARCH,
-                "persistent target tracking could not be reacquired",
-            )
-        if kind in (FailureKind.NAV_BLOCKED, FailureKind.VISUAL_APPROACH_FAILED):
-            return self._increment_or_fail(
-                previous,
-                "nav_replans",
-                self.budget.nav_replans,
-                Stage.COARSE_NAV,
-                "navigation/visual approach budget exhausted",
-            )
         if kind in (FailureKind.NO_GRASP, FailureKind.IK_UNREACHABLE):
             self.counters["plan_candidates"] = 0
             return self._increment_or_fail(
@@ -212,32 +244,14 @@ class MobileManipulationStateMachine:
                 Stage.VISUAL_APPROACH,
                 "motion planning re-standoff budget exhausted",
             )
-        if kind in (
-            FailureKind.EXECUTION_FAILED,
-            FailureKind.EMPTY_GRASP,
-            FailureKind.VERIFY_FAILED,
-        ):
+        recovery = _RECOVERY.get(kind)
+        if recovery is not None:
+            counter, stage, exhausted = recovery
             return self._increment_or_fail(
                 previous,
-                "grasp_attempts",
-                self.budget.grasp_attempts,
-                Stage.OBSERVE_GRASP,
-                "whole-task grasp attempts exhausted",
-            )
-        if kind == FailureKind.PLACE_BLOCKED:
-            return self._increment_or_fail(
-                previous,
-                "place_replans",
-                self.budget.place_replans,
-                Stage.PLAN_PLACE,
-                "place planning budget exhausted",
-            )
-        if kind == FailureKind.RELEASE_FAILED:
-            return self._increment_or_fail(
-                previous,
-                "release_attempts",
-                self.budget.release_attempts,
-                Stage.EXECUTE_PLACE,
-                "object release budget exhausted",
+                counter,
+                getattr(self.budget, counter),
+                stage,
+                exhausted,
             )
         return self._transition(previous, Stage.FAILED, result.detail or kind.value)
