@@ -867,7 +867,7 @@ def test_curl_cancellation_terminates_then_kills_its_process_group(monkeypatch):
             killed.set()
 
     monkeypatch.setattr(subprocess, "Popen", popen)
-    monkeypatch.setattr("z_manip.perception.vlm_affordance.os.killpg", killpg)
+    monkeypatch.setattr("z_manip.perception.vlm_transport.os.killpg", killpg)
     monkeypatch.setenv('OPENROUTER_API_KEY', api_key)
     cancel_event = threading.Event()
     outcome = []
@@ -916,7 +916,7 @@ def test_process_group_cleanup_kills_descendant_after_curl_leader_exits(monkeypa
             raise subprocess.TimeoutExpired('curl', timeout)
 
     monkeypatch.setattr(
-        'z_manip.perception.vlm_affordance.os.killpg',
+        'z_manip.perception.vlm_transport.os.killpg',
         lambda pid, sig: signals.append(sig) if pid == 5432 else None,
     )
 
@@ -936,7 +936,7 @@ def test_invalid_payload_does_not_open_a_header_pipe(monkeypatch):
         raise AssertionError('header pipe must not open before payload serialization')
 
     monkeypatch.setattr(
-        'z_manip.perception.vlm_affordance._open_curl_header_pipe',
+        'z_manip.perception.vlm_transport._open_curl_header_pipe',
         open_pipe,
     )
 
@@ -973,7 +973,7 @@ def test_invalid_response_cleans_descendants_after_curl_leader_exits(monkeypatch
     process = ExitedLeaderWithDetachedDescendant()
     monkeypatch.setattr(subprocess, 'Popen', lambda *_args, **_kwargs: process)
     monkeypatch.setattr(
-        'z_manip.perception.vlm_affordance.os.killpg',
+        'z_manip.perception.vlm_transport.os.killpg',
         lambda pid, sig: signals.append(sig) if pid == process.pid else None,
     )
 
