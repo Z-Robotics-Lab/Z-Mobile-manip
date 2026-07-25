@@ -14,6 +14,11 @@
 !scripts/runtime/go2w_perception_probe.py
 !scripts/runtime/go2w_perception_dry_run.py
 !scripts/runtime/go2w_perception_worker.py
+!scripts/runtime/piper_planning_dry_run.py
+!scripts/runtime/piper_hand_eye_calibrate.py
+!scripts/runtime/piper_hand_eye_sample.py
+!scripts/runtime/piper_charuco_tool.py
+!scripts/runtime/go2w_latest_only_ros_verify.py
 
 !ros2/
 !ros2/z_manip_ros/
