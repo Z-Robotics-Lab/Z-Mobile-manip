@@ -8349,6 +8349,14 @@ class MobileManipulationRuntime(Node):
         self._release_terminal_ownership()
         self._publish_zero()
         self._arm_cancel_pub.publish(Bool(data=True))
+        # cancel_futures only drops queued work.  The planner already running
+        # on the worker honours exactly one cooperative stop signal, and the
+        # executor's non-daemon threads are joined unbounded at interpreter
+        # exit, so without this the process outlives its own node for the rest
+        # of the planning budget (up to the 20 s standoff budget).
+        cancel_event = self._future_cancel_event
+        if cancel_event is not None:
+            cancel_event.set()
         self._worker.shutdown(wait=False, cancel_futures=True)
         return super().destroy_node()
 
