@@ -1259,6 +1259,28 @@ def _backproject_pixels(
     )
 
 
+def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Grow a bool mask by ``radius`` pixels under a square structuring element.
+
+    OpenCV evaluates a rectangular element separably in C, which is far cheaper
+    than the ``(2r + 1) ** 2`` shifted ORs this replaces. A bool array is
+    exactly a 0/1 uint8 array, so the view costs nothing, and a zero constant
+    border reproduces the previous out-of-bounds behaviour at the image edge.
+    """
+
+    if radius < 1:
+        return np.asarray(mask, dtype=bool)
+    contiguous = np.ascontiguousarray(mask, dtype=bool)
+    size = 2 * radius + 1
+    dilated = cv2.dilate(
+        contiguous.view(np.uint8),
+        np.ones((size, size), dtype=np.uint8),
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return dilated.view(bool)
+
+
 def project_scene_depth(
     mask: object,
     depth_m: object,
@@ -1281,22 +1303,12 @@ def project_scene_depth(
     if not 0.0 <= min_depth_m < max_depth_m:
         raise ValueError('scene depth interval is invalid')
     if target_dilation_px:
-        radius = int(target_dilation_px)
-        padded = np.pad(target, radius, mode='constant', constant_values=False)
-        dilated = np.zeros_like(target)
-        height, width = target.shape
-        for row_offset in range(2 * radius + 1):
-            for column_offset in range(2 * radius + 1):
-                dilated |= padded[
-                    row_offset:row_offset + height,
-                    column_offset:column_offset + width,
-                ]
-        target = dilated
+        target = dilate_mask(target, int(target_dilation_px))
     rows = np.arange(0, depth.shape[0], stride)
     columns = np.arange(0, depth.shape[1], stride)
     u, v = np.meshgrid(columns, rows)
-    sampled = depth[np.ix_(rows, columns)]
-    excluded = target[np.ix_(rows, columns)]
+    sampled = depth[::stride, ::stride]
+    excluded = target[::stride, ::stride]
     valid = (
         ~excluded
         & np.isfinite(sampled)

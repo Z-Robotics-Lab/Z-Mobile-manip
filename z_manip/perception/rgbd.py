@@ -10,12 +10,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from typing import Optional, Sequence
 import warnings
 
 import numpy as np
-from scipy.ndimage import binary_dilation
 from scipy.spatial import cKDTree
+
+
+# SciPy releases the GIL inside a KD-tree query, so a bounded thread count is a
+# free wall-clock win on the multi-core NUC. The bound is deliberate: these
+# queries run inside ROS executor callbacks, where ``workers=-1`` would
+# oversubscribe the machine and starve the control loop.
+KDTREE_MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
+
+# Below this many query points, spawning threads costs more than it saves.
+KDTREE_PARALLEL_MIN_POINTS = 512
+
+
+def _kdtree_workers(query_points: int) -> int:
+    """Thread count for a KD-tree query over ``query_points`` samples."""
+
+    if query_points < KDTREE_PARALLEL_MIN_POINTS:
+        return 1
+    return KDTREE_MAX_WORKERS
 
 
 @dataclass(frozen=True)
@@ -155,7 +173,7 @@ def depth_bbox_observation(
     )
 
 
-def depth_to_pointcloud(
+def _project_depth(
     depth_mm: np.ndarray,
     intrinsics: CameraIntrinsics,
     *,
@@ -164,8 +182,13 @@ def depth_to_pointcloud(
     min_depth_m: float = 0.28,
     max_depth_m: float = 5.0,
     transform: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Back-project aligned 16UC1 depth to an observed metric point cloud."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Back-project depth, returning the cloud and the subsampled validity mask.
+
+    The validity mask is returned so a caller carrying per-pixel labels can line
+    them up with the cloud without recomputing the subsample and the three depth
+    comparisons that produced it.
+    """
 
     depth = np.asarray(depth_mm)
     if depth.shape != (intrinsics.height, intrinsics.width):
@@ -183,14 +206,14 @@ def depth_to_pointcloud(
     rows = np.arange(0, intrinsics.height, stride)
     columns = np.arange(0, intrinsics.width, stride)
     u, v = np.meshgrid(columns, rows)
-    sampled = depth[np.ix_(rows, columns)].astype(np.float64) * 0.001
+    sampled = depth[::stride, ::stride].astype(np.float64) * 0.001
     valid = (
         np.isfinite(sampled)
         & (sampled >= min_depth_m)
         & (sampled <= max_depth_m)
     )
     if target_mask is not None:
-        valid &= target_mask[np.ix_(rows, columns)]
+        valid &= target_mask[::stride, ::stride]
     z = sampled[valid]
     x = (u[valid] - intrinsics.cx) * z / intrinsics.fx
     y = (v[valid] - intrinsics.cy) * z / intrinsics.fy
@@ -209,7 +232,61 @@ def depth_to_pointcloud(
             points @ target_from_camera[:3, :3].T
             + target_from_camera[:3, 3]
         )
-    return points.astype(np.float32, copy=False)
+    return points.astype(np.float32, copy=False), valid
+
+
+def depth_to_pointcloud(
+    depth_mm: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    *,
+    mask: Optional[np.ndarray] = None,
+    stride: int = 1,
+    min_depth_m: float = 0.28,
+    max_depth_m: float = 5.0,
+    transform: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Back-project aligned 16UC1 depth to an observed metric point cloud."""
+
+    points, _valid = _project_depth(
+        depth_mm,
+        intrinsics,
+        mask=mask,
+        stride=stride,
+        min_depth_m=min_depth_m,
+        max_depth_m=max_depth_m,
+        transform=transform,
+    )
+    return points
+
+
+def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Grow a bool mask by ``radius`` pixels under a square structuring element.
+
+    A square element is separable, so one horizontal pass followed by one
+    vertical pass costs ``2 * (2r + 1)`` shifted ORs instead of the
+    ``(2r + 1) ** 2`` that ``scipy.ndimage.binary_dilation`` evaluates for a
+    full square. Zero padding reproduces scipy's out-of-bounds behaviour
+    exactly, including at the image border. This module stays on the numpy and
+    scipy dependency budget declared in pyproject; the tracker node's copy in
+    ``z_manip_edgetam.core`` may use OpenCV because it already depends on it.
+    """
+
+    if radius < 1:
+        return np.asarray(mask, dtype=bool)
+    height, width = mask.shape
+    span = 2 * radius + 1
+    padded_columns = np.zeros((height, width + 2 * radius), dtype=bool)
+    padded_columns[:, radius:radius + width] = mask
+    # The horizontal pass writes straight through a view of the row-padded
+    # buffer, so the two passes need no intermediate copy between them.
+    padded_rows = np.zeros((height + 2 * radius, width), dtype=bool)
+    horizontal = padded_rows[radius:radius + height, :]
+    for offset in range(span):
+        horizontal |= padded_columns[:, offset:offset + width]
+    dilated = np.zeros((height, width), dtype=bool)
+    for offset in range(span):
+        dilated |= padded_rows[offset:offset + height, :]
+    return dilated
 
 
 def depth_to_scene_cloud(
@@ -239,9 +316,10 @@ def depth_to_scene_cloud(
     if target_dilation_px < 0:
         raise ValueError("target mask dilation cannot be negative")
     if target_dilation_px:
-        size = 2 * int(target_dilation_px) + 1
-        labels = binary_dilation(labels, structure=np.ones((size, size), dtype=bool))
-    points = depth_to_pointcloud(
+        labels = dilate_mask(labels, int(target_dilation_px))
+    # Reusing the validity mask the back-projection already built is what keeps
+    # the labels aligned by construction rather than by a recomputed guess.
+    points, valid = _project_depth(
         depth,
         intrinsics,
         stride=stride,
@@ -249,17 +327,7 @@ def depth_to_scene_cloud(
         max_depth_m=max_depth_m,
         transform=transform,
     )
-    rows = np.arange(0, intrinsics.height, stride)
-    columns = np.arange(0, intrinsics.width, stride)
-    sampled_depth = depth[np.ix_(rows, columns)].astype(np.float64) * 0.001
-    valid = (
-        np.isfinite(sampled_depth)
-        & (sampled_depth >= min_depth_m)
-        & (sampled_depth <= max_depth_m)
-    )
-    aligned_labels = labels[np.ix_(rows, columns)][valid]
-    if len(aligned_labels) != len(points):
-        raise RuntimeError("internal RGB-D label alignment failure")
+    aligned_labels = labels[::stride, ::stride][valid]
     return points, aligned_labels.astype(bool, copy=False)
 
 
@@ -351,7 +419,12 @@ def target_exclusion_mask(
         )
     if radius_m <= 0.0:
         raise ValueError("target exclusion radius must be positive")
-    distance, _ = cKDTree(target).query(scene, k=1, distance_upper_bound=radius_m)
+    distance, _ = cKDTree(target).query(
+        scene,
+        k=1,
+        distance_upper_bound=radius_m,
+        workers=_kdtree_workers(len(scene)),
+    )
     return np.isfinite(distance)
 
 
@@ -391,7 +464,9 @@ def filter_object_cloud(
         raise ValueError("object cloud lost its dominant depth layer")
 
     k = min(max(3, int(neighbour_count)), len(layered))
-    distances, _ = cKDTree(layered).query(layered, k=k)
+    distances, _ = cKDTree(layered).query(
+        layered, k=k, workers=_kdtree_workers(len(layered)),
+    )
     local_spacing = np.mean(distances[:, 1:], axis=1)
     spacing_median = float(np.median(local_spacing))
     spacing_mad = float(np.median(np.abs(local_spacing - spacing_median)))

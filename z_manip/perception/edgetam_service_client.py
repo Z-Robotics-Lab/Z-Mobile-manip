@@ -141,22 +141,23 @@ def encode_coco_rle(mask: object) -> dict[str, object]:
     if array.ndim != 2 or array.shape[0] < 1 or array.shape[1] < 1:
         raise ValueError("mask must be a non-empty 2-D array")
     flat = array.reshape(-1, order="F")
-    counts: list[int] = []
-    current = False
-    run = 0
-    for pixel in flat:
-        value = bool(pixel)
-        if value == current:
-            run += 1
-        else:
-            counts.append(run)
-            current = value
-            run = 1
-    counts.append(run)
+    # Vectorized run-length encoding.  This is byte-for-byte equivalent to the
+    # per-pixel loop it replaces -- and to the service-side encoder in
+    # docker/edgetam_service/server.py, which tests/test_edgetam_service_server
+    # pins it against -- but costs no Python iteration per image pixel.
+    changes = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+    boundaries = np.concatenate(
+        (np.array([0], dtype=np.int64), changes, np.array([flat.size], dtype=np.int64)),
+    )
+    counts = np.diff(boundaries).tolist()
+    # COCO RLE counts always begin with a background (False) run; prepend a
+    # zero-length run when the first pixel is foreground.
+    if bool(flat[0]):
+        counts = [0] + counts
     return {
         "encoding": "coco_rle",
         "size": [int(array.shape[0]), int(array.shape[1])],
-        "counts": counts,
+        "counts": [int(count) for count in counts],
     }
 
 
@@ -198,6 +199,21 @@ def decode_coco_rle(value: object, *, max_pixels: int = 16_777_216) -> np.ndarra
         offset += count
         foreground = not foreground
     return flat.reshape((height, width), order="F")
+
+
+def mask_bounds(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """Tight half-open ``(x1, y1, x2, y2)`` box around a non-empty bool mask.
+
+    Reducing per axis first keeps this proportional to the image dimensions
+    rather than to the true-pixel count; ``np.nonzero`` would materialise two
+    index arrays sized to the whole silhouette only to take their extrema.
+    """
+
+    columns = np.flatnonzero(mask.any(axis=0))
+    rows = np.flatnonzero(mask.any(axis=1))
+    if not columns.size:
+        raise ValueError("mask bounds are undefined for an empty mask")
+    return int(columns[0]), int(rows[0]), int(columns[-1]) + 1, int(rows[-1]) + 1
 
 
 class UrllibJsonTransport:
@@ -518,16 +534,9 @@ class EdgeTamServiceClient:
         width, height = image_size
         if mask.shape != (height, width):
             raise EdgeTamProtocolError("mask dimensions do not match image_size")
-        ys, xs = np.nonzero(mask)
-        if len(xs) < self._min_mask_pixels:
+        if int(np.count_nonzero(mask)) < self._min_mask_pixels:
             raise EdgeTamTrackingLost("EdgeTAM returned an empty or too-small target mask")
-        mask_bbox = (
-            int(xs.min()),
-            int(ys.min()),
-            int(xs.max()) + 1,
-            int(ys.max()) + 1,
-        )
-        if bbox != mask_bbox:
+        if bbox != mask_bounds(mask):
             raise EdgeTamProtocolError("bbox_xyxy does not exactly bound mask_rle")
         mask.setflags(write=False)
         return EdgeTamTrack(

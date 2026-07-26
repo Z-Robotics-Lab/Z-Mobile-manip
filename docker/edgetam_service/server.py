@@ -283,6 +283,21 @@ def encode_coco_rle(mask: np.ndarray) -> dict[str, object]:
     }
 
 
+def mask_bounds(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """Tight half-open ``(x1, y1, x2, y2)`` box around a non-empty bool mask.
+
+    Reducing per axis first keeps this proportional to the image dimensions
+    rather than to the true-pixel count; ``np.nonzero`` would materialise two
+    index arrays sized to the whole silhouette only to take their extrema.
+    """
+
+    columns = np.flatnonzero(mask.any(axis=0))
+    rows = np.flatnonzero(mask.any(axis=1))
+    if not columns.size:
+        raise ValueError("mask bounds are undefined for an empty mask")
+    return int(columns[0]), int(rows[0]), int(columns[-1]) + 1, int(rows[-1]) + 1
+
+
 class EdgeTamBackend:
     """Lazily loaded official Transformers EdgeTAM streaming backend."""
 
@@ -754,20 +769,14 @@ class EdgeTamApplication:
                 "tracking_lost",
                 "model mask dimensions do not match the session image",
             )
-        ys, xs = np.nonzero(mask)
-        if len(xs) < self.config.min_mask_pixels:
+        if int(np.count_nonzero(mask)) < self.config.min_mask_pixels:
             self._drop(session)
             raise ServiceFault(
                 HTTPStatus.GONE,
                 "tracking_lost",
                 "model returned an empty or too-small target mask",
             )
-        bbox = [
-            int(xs.min()),
-            int(ys.min()),
-            int(xs.max()) + 1,
-            int(ys.max()) + 1,
-        ]
+        bbox = list(mask_bounds(mask))
         return {
             "protocol": PROTOCOL_VERSION,
             "status": "tracking",
