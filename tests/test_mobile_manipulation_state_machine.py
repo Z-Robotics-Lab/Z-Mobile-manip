@@ -1,6 +1,7 @@
 import pytest
 
 from z_manip.orchestration.mobile_manipulation import (
+    _RECOVERY,
     FailureKind,
     MobileManipulationStateMachine,
     RetryBudget,
@@ -92,3 +93,57 @@ def test_events_cannot_advance_a_terminal_task():
     machine.apply(StageResult.failure(FailureKind.FATAL, "stop"))
     with pytest.raises(RuntimeError, match="terminal"):
         machine.apply(StageResult.success())
+
+
+def test_recovery_table_counters_name_a_real_counter_and_a_real_budget_field():
+    # The table's first element is used both as a ``counters`` key and as a
+    # ``RetryBudget`` attribute name.  A copy-paste that names one but not the
+    # other would otherwise surface only as a runtime KeyError/AttributeError
+    # on a rare failure path.
+    machine = MobileManipulationStateMachine()
+    budget_fields = set(vars(RetryBudget()))
+    for kind, (counter, stage, exhausted) in _RECOVERY.items():
+        assert counter in machine.counters, kind
+        assert counter in budget_fields, kind
+        assert isinstance(stage, Stage), kind
+        assert exhausted, kind
+
+
+def test_recovery_table_covers_every_failure_kind_without_its_own_bookkeeping():
+    # Kinds outside the table each carry extra behaviour: terminal safety
+    # faults, the plan_candidates reset, and the candidate-retry ladder.
+    explicit = {
+        FailureKind.POSTURE_UNSAFE,
+        FailureKind.FATAL,
+        FailureKind.NO_GRASP,
+        FailureKind.IK_UNREACHABLE,
+        FailureKind.PLAN_BLOCKED,
+    }
+    assert set(_RECOVERY) | explicit == set(FailureKind)
+    assert set(_RECOVERY) & explicit == set()
+
+
+@pytest.mark.parametrize(
+    ("kind", "recovery_stage", "counter"),
+    [
+        (FailureKind.NOT_FOUND, Stage.SEARCH, "search_misses"),
+        (FailureKind.TARGET_LOST, Stage.SEARCH, "tracker_reacquisitions"),
+        (FailureKind.NAV_BLOCKED, Stage.COARSE_NAV, "nav_replans"),
+        (FailureKind.VISUAL_APPROACH_FAILED, Stage.COARSE_NAV, "nav_replans"),
+        (FailureKind.EXECUTION_FAILED, Stage.OBSERVE_GRASP, "grasp_attempts"),
+        (FailureKind.EMPTY_GRASP, Stage.OBSERVE_GRASP, "grasp_attempts"),
+        (FailureKind.VERIFY_FAILED, Stage.OBSERVE_GRASP, "grasp_attempts"),
+        (FailureKind.PLACE_BLOCKED, Stage.PLAN_PLACE, "place_replans"),
+        (FailureKind.RELEASE_FAILED, Stage.EXECUTE_PLACE, "release_attempts"),
+    ],
+)
+def test_table_driven_recovery_matches_the_declared_stage_and_counter(
+    kind,
+    recovery_stage,
+    counter,
+):
+    machine = MobileManipulationStateMachine()
+    transition = machine.apply(StageResult.failure(kind))
+    assert transition.current == recovery_stage
+    assert transition.reason == f"recovering from {counter}"
+    assert transition.counters[counter] == 1

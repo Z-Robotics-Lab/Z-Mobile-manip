@@ -348,6 +348,23 @@ class _JointPlanner(Protocol):
     def plan_joint(self, start_joints: object, goal_joints: object, **kwargs: object) -> object: ...
 
 
+_NO_SOLVE = object()
+
+# Fields ``replan_remaining`` may override; every other request field is
+# inherited verbatim. The name is used both as the keyword on
+# ``StagedGraspRequest`` and as the attribute read off the previous plan, so a
+# mismatched pair cannot be written.
+_REPLAN_OVERRIDES = (
+    "pregrasp_offset_m",
+    "approach_clearance_m",
+    "lift_distance_m",
+    "lift_direction",
+    "side_entry_offset_m",
+    "direct_approach",
+    "contact_speed_scale",
+)
+
+
 def _accepts_timeout(callback: Callable[..., object]) -> bool:
     try:
         signature = inspect.signature(callback)
@@ -403,8 +420,16 @@ class StagedGraspTrajectoryBuilder:
         return cls(ik_solver, velocity, acceleration_limits, **kwargs)
 
     def _solve(self, pose: np.ndarray, seed: np.ndarray) -> np.ndarray:
-        callback = getattr(self.ik_solver, "solve", self.ik_solver)
-        result = callback(pose, current=seed) if hasattr(self.ik_solver, "solve") else callback(pose, seed)
+        # One probe, not two: the previous form asked `getattr(..., "solve", ...)`
+        # and `hasattr(..., "solve")` for the same attribute and left the reader
+        # to match them. The sentinel keeps a solver that sets `solve = None`
+        # failing exactly as it does today rather than silently falling back.
+        solve = getattr(self.ik_solver, "solve", _NO_SOLVE)
+        result = (
+            self.ik_solver(pose, seed)
+            if solve is _NO_SOLVE
+            else solve(pose, current=seed)
+        )
         joints = getattr(result, "joints", result)
         return _readonly_vector(joints, "IK solution", len(self.velocity_limits))
 
@@ -658,43 +683,26 @@ class StagedGraspTrajectoryBuilder:
         target = previous.target
         if updated_grasp_pose is not None:
             target = replace(target, grasp_pose=_readonly_pose(updated_grasp_pose, "grasp pose"))
+        supplied = {
+            "pregrasp_offset_m": pregrasp_offset_m,
+            "approach_clearance_m": approach_clearance_m,
+            "lift_distance_m": lift_distance_m,
+            "lift_direction": lift_direction,
+            "side_entry_offset_m": side_entry_offset_m,
+            "direct_approach": direct_approach,
+            "contact_speed_scale": contact_speed_scale,
+        }
+        assert tuple(supplied) == _REPLAN_OVERRIDES
         request = StagedGraspRequest(
             current_joints=np.asarray(measured_joints, dtype=float),
             target=target,
-            pregrasp_offset_m=(
-                previous.pregrasp_offset_m
-                if pregrasp_offset_m is None
-                else pregrasp_offset_m
-            ),
-            approach_clearance_m=(
-                previous.approach_clearance_m
-                if approach_clearance_m is None
-                else approach_clearance_m
-            ),
-            lift_distance_m=(
-                previous.lift_distance_m
-                if lift_distance_m is None
-                else lift_distance_m
-            ),
-            lift_direction=(
-                previous.lift_direction if lift_direction is None else lift_direction
-            ),
+            # ``side_preference`` is not overridable: a rolling replan must not
+            # flip which side the arm enters from mid-approach.
             side_preference=previous.side_preference,
-            side_entry_offset_m=(
-                previous.side_entry_offset_m
-                if side_entry_offset_m is None
-                else side_entry_offset_m
-            ),
-            direct_approach=(
-                previous.direct_approach
-                if direct_approach is None
-                else direct_approach
-            ),
-            contact_speed_scale=(
-                previous.contact_speed_scale
-                if contact_speed_scale is None
-                else contact_speed_scale
-            ),
+            **{
+                name: getattr(previous, name) if value is None else value
+                for name, value in supplied.items()
+            },
         )
         return self.build(
             request,

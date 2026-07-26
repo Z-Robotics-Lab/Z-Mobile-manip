@@ -310,3 +310,141 @@ def test_contact_speed_scale_is_validated():
         _direct_request(contact_speed_scale=0.0)
     with pytest.raises(ValueError, match="contact speed scale"):
         _direct_request(contact_speed_scale=1.5)
+
+
+# -- rolling-replan override table -------------------------------------------
+
+
+_BASELINE_OVERRIDES = {
+    "pregrasp_offset_m": 0.075,
+    "approach_clearance_m": 0.045,
+    "lift_distance_m": 0.085,
+    "lift_direction": (0.0, 0.0, 1.0),
+    "side_entry_offset_m": 0.0,
+    "direct_approach": True,
+    "contact_speed_scale": 0.5,
+}
+_REPLACEMENT_OVERRIDES = {
+    "pregrasp_offset_m": 0.061,
+    "approach_clearance_m": 0.037,
+    "lift_distance_m": 0.123,
+    "lift_direction": (0.0, 1.0, 0.0),
+    "side_entry_offset_m": 0.021,
+    "direct_approach": False,
+    "contact_speed_scale": 0.31,
+}
+
+
+def _replan_baseline(builder):
+    return builder.build(
+        StagedGraspRequest(
+            np.zeros(6),
+            _target(),
+            side_preference=SidePreference.LEFT,
+            **_BASELINE_OVERRIDES,
+        ),
+        plan_id="baseline",
+    )
+
+
+def test_replan_override_table_matches_the_request_and_plan_field_names():
+    import dataclasses
+
+    from z_manip.planning.staged_trajectory import _REPLAN_OVERRIDES
+
+    request_fields = {field.name for field in dataclasses.fields(StagedGraspRequest)}
+    builder = _builder()
+    plan = _replan_baseline(builder)
+
+    assert set(_REPLAN_OVERRIDES) <= request_fields
+    for name in _REPLAN_OVERRIDES:
+        assert hasattr(plan, name), name
+    # side_preference is deliberately excluded: a rolling replan must not flip
+    # the entry side mid-approach.
+    assert "side_preference" not in _REPLAN_OVERRIDES
+    assert set(_REPLAN_OVERRIDES) == set(_BASELINE_OVERRIDES)
+
+
+def test_each_replan_override_moves_exactly_its_own_field():
+    # A copy-pasted pair such as `previous.lift_distance_m if lift_direction is
+    # None` would be invisible on review; overriding one field at a time and
+    # checking the other six are inherited is what catches it. The field list
+    # is spelled out locally so this asserts behaviour, not implementation.
+    _REPLAN_OVERRIDES = tuple(_BASELINE_OVERRIDES)
+
+    builder = _builder()
+    for name in _REPLAN_OVERRIDES:
+        previous = _replan_baseline(builder)
+        measured = previous.segment(GraspStage.PREGRASP).goal_joints + 0.01
+        replanned = builder.replan_remaining(
+            previous,
+            measured,
+            from_stage=GraspStage.GRASP,
+            **{name: _REPLACEMENT_OVERRIDES[name]},
+        )
+        assert getattr(replanned, name) == _REPLACEMENT_OVERRIDES[name], name
+        for other in _REPLAN_OVERRIDES:
+            if other == name:
+                continue
+            assert getattr(replanned, other) == _BASELINE_OVERRIDES[other], (
+                name,
+                other,
+            )
+        assert replanned.side_preference is SidePreference.LEFT
+
+
+def test_replan_without_overrides_inherits_every_field():
+    _REPLAN_OVERRIDES = tuple(_BASELINE_OVERRIDES)
+
+    builder = _builder()
+    previous = _replan_baseline(builder)
+    replanned = builder.replan_remaining(
+        previous,
+        previous.segment(GraspStage.PREGRASP).goal_joints,
+        from_stage=GraspStage.GRASP,
+    )
+
+    for name in _REPLAN_OVERRIDES:
+        assert getattr(replanned, name) == _BASELINE_OVERRIDES[name], name
+
+
+def test_solve_probes_the_ik_solver_attribute_exactly_once_per_call():
+    # The old form asked getattr(..., "solve", ...) and hasattr(..., "solve")
+    # for the same attribute and left the reader to match the two probes.
+    probes = []
+
+    class _CountingIK(_PoseEncodingIK):
+        def __getattribute__(self, name):
+            if name == "solve":
+                probes.append(name)
+            return super().__getattribute__(name)
+
+    builder = _builder()
+    builder.ik_solver = _CountingIK()
+    joints = builder._solve(_target().grasp_pose, np.zeros(6))
+
+    assert joints.shape == (6,)
+    assert len(probes) == 1
+
+
+def test_a_bare_callable_ik_solver_is_still_invoked_positionally():
+    calls = []
+
+    def solver(pose, seed):
+        calls.append((np.asarray(pose).copy(), np.asarray(seed).copy()))
+        xyz = np.asarray(pose)[:3, 3]
+        return IKSolution(
+            np.array((xyz[0], xyz[1], xyz[2], xyz.sum(), xyz[2] - xyz[0], 0.1)),
+            0.0,
+            0.0,
+            1.0,
+            1,
+            0,
+        )
+
+    builder = _builder()
+    builder.ik_solver = solver
+    plan = builder.build(StagedGraspRequest(np.zeros(6), _target()))
+
+    assert calls
+    assert tuple(segment.stage for segment in plan.segments) == tuple(GraspStage)

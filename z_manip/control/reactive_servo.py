@@ -757,18 +757,16 @@ class ReactiveTargetController:
         # Keep moving coarsely aligned instead of demanding camera-perfect
         # yaw from a stepping legged base.  A hard view-risk condition above
         # stops translation and requests camera/body tracking instead.
+        #
+        # ``handoff_geometry_ok`` is necessarily False here: the corridor test
+        # above returns on both of its arms (HANDOFF_READY / HANDOFF_PROBE), so
+        # BASE_APPROACH is only reachable when the corridor has *not* been
+        # reached.  The reason is therefore a constant, not a re-evaluation.
         return ReactiveServoDecision(
             phase=self.phase,
             base=BaseMotionIntent(linear_x_mps=linear, angular_z_rps=angular),
             posture=PostureIntent(),
             arm_view=arm_view,
             geometry=geometry,
-            reason=(
-                "inside the coarse arm corridor; waiting for an IK-feasible grasp"
-                if self._handoff_geometry_ok(
-                    geometry,
-                    desired_target_lateral_m=desired_lateral,
-                )
-                else "approaching with ground-plane Euclidean distance"
-            ),
+            reason="approaching with ground-plane Euclidean distance",
         )

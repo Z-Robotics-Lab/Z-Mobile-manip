@@ -355,3 +355,48 @@ def test_targets_outside_initial_manipulation_envelope_are_rejected(target, matc
     adapter = Go2WPostureAdapter(mode="shadow")
     with pytest.raises(ValueError, match=match):
         adapter.set_target(target)
+
+
+# -- one agreement rule for both GetBodyHeight envelope shapes ---------------
+
+
+_OK = {"header": {"status": {"code": 0}}}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        # Nested mapping envelope: decoded inside _height_scalar's Mapping arm.
+        {"data": dict(_OK, data={"body_height": -0.055, "height": -0.061})},
+        # Top-level envelope: decoded by get_body_height_from_response itself.
+        {"data": _OK, "body_height": -0.055, "height": -0.061},
+        # Mixed: one height from the data envelope, one from the top level.
+        {"data": dict(_OK, body_height=-0.055), "height": -0.061},
+    ],
+)
+def test_conflicting_heights_are_rejected_in_every_envelope_shape(response):
+    with pytest.raises(ValueError, match="conflicting height values"):
+        get_body_height_from_response(response)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "data": dict(
+                _OK,
+                data={"body_height": -0.055, "height": -0.055 + 5e-10},
+            ),
+        },
+        {"data": _OK, "body_height": -0.055, "height": -0.055 + 5e-10},
+        {"data": dict(_OK, body_height=-0.055), "height": -0.055 + 5e-10},
+    ],
+)
+def test_heights_agreeing_within_one_nanometre_are_accepted_everywhere(response):
+    height, _source = get_body_height_from_response(response)
+    assert height == pytest.approx(-0.055)
+
+
+def test_an_envelope_with_no_height_payload_is_a_hard_failure():
+    with pytest.raises(ValueError, match="no supported height payload"):
+        get_body_height_from_response({"data": _OK})

@@ -396,6 +396,27 @@ def _segment_distance(
     return float(np.linalg.norm(separation))
 
 
+def _unit_departure_direction(value: object) -> np.ndarray:
+    """Validate and normalize the base-frame lift-off direction.
+
+    Every rejection raises the same message on purpose: the caller passes one
+    argument and the four ways it can be wrong (not array-like, wrong shape,
+    non-finite, zero length) are one contract from the caller's point of view.
+    """
+
+    message = "departure_direction_base must be a finite nonzero three-vector"
+    try:
+        direction = np.asarray(value, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError(message) from error
+    if direction.shape != (3,) or not np.all(np.isfinite(direction)):
+        raise ValueError(message)
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-9:
+        raise ValueError(message)
+    return direction / norm
+
+
 class PointCloudCollisionChecker:
     """Check joint states and interpolated segments against perceived points."""
 
@@ -764,28 +785,7 @@ class PointCloudCollisionChecker:
                 raise ValueError(
                     "initial attached-target contact requires a valid scene cloud",
                 )
-            try:
-                departure_direction = np.asarray(
-                    departure_direction_base,
-                    dtype=float,
-                )
-            except (TypeError, ValueError) as error:
-                raise ValueError(
-                    "departure_direction_base must be a finite nonzero three-vector",
-                ) from error
-            if (
-                departure_direction.shape != (3,)
-                or not np.all(np.isfinite(departure_direction))
-            ):
-                raise ValueError(
-                    "departure_direction_base must be a finite nonzero three-vector",
-                )
-            direction_norm = float(np.linalg.norm(departure_direction))
-            if direction_norm <= 1e-9:
-                raise ValueError(
-                    "departure_direction_base must be a finite nonzero three-vector",
-                )
-            departure_direction = departure_direction / direction_norm
+            departure_direction = _unit_departure_direction(departure_direction_base)
         observed_target = filtered
         if len(filtered) > self.config.max_attached_points:
             indices = np.linspace(
@@ -1195,11 +1195,18 @@ class PointCloudCollisionChecker:
                 self._attached_departure_scene_tree,
                 points,
             )
-            if (
-                closest is None or closest > threshold
-            ) and self._departure_support_contact_is_exempt(points, threshold):
+            # The departure scene excludes the support manifold.  When it is
+            # clear, the only remaining contact can be with the support itself:
+            # either it is an exempt lift-off contact (accept) or it must be
+            # measured against the support tree (fall through to the check
+            # below).  One question, asked once.
+            non_support_clear = closest is None or closest > threshold
+            if non_support_clear and self._departure_support_contact_is_exempt(
+                points,
+                threshold,
+            ):
                 return None
-            if closest is None or closest > threshold:
+            if non_support_clear:
                 closest = self._attached_scene_distance(
                     self._attached_departure_support_tree,
                     points,

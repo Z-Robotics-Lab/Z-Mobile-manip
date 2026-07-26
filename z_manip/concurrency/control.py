@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import time
 from collections.abc import Callable
@@ -117,10 +118,51 @@ def checkpoint(control: PlanningControl | None, operation: str) -> None:
         control.checkpoint(operation)
 
 
+def classify_control_mode(
+    callback: Callable[..., object],
+    *,
+    arity: int,
+    requirement: str,
+) -> str:
+    """Classify how an injected callback transports its optional ``control``.
+
+    Returns ``"keyword"``, ``"positional"`` or ``"legacy"`` without executing
+    the callback's body, so a planner can pick one invocation shape per search
+    instead of retrying a failed call.  ``arity`` is the number of required
+    non-control arguments the callback takes.
+
+    Keyword transport is preferred: an opaque ``*args, **kwargs`` wrapper binds
+    every shape, and passing ``control=`` keeps it out of the callback's own
+    positional slots.  A callable whose signature cannot be inspected at all
+    keeps the pre-budget legacy invocation.  ``requirement`` is the message
+    raised when the callback accepts none of the three supported shapes.
+    """
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return "legacy"
+    sentinel = object()
+    required = (sentinel,) * arity
+    try:
+        signature.bind(*required, control=sentinel)
+    except TypeError:
+        try:
+            signature.bind(*required, sentinel)
+        except TypeError:
+            try:
+                signature.bind(*required)
+            except TypeError as error:
+                raise TypeError(requirement) from error
+            return "legacy"
+        return "positional"
+    return "keyword"
+
+
 __all__ = [
     "PlanningAborted",
     "PlanningCancelled",
     "PlanningControl",
     "PlanningDeadlineExceeded",
     "checkpoint",
+    "classify_control_mode",
 ]

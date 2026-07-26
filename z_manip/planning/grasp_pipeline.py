@@ -160,7 +160,22 @@ class _HypothesisRejected(PlanningError):
 
 
 def _path_validator_control_mode(callback: Callable[..., object]) -> str:
-    """Classify a path callback without executing or retrying its body."""
+    """Classify a path callback without executing or retrying its body.
+
+    NOT interchangeable with
+    :func:`z_manip.concurrency.control.classify_control_mode`, which the
+    work-pose and standoff evaluators share.  Two rules differ here and the
+    difference is observable:
+
+    * precedence -- positional binding is tried first, so a permissive
+      ``(*args, **kwargs)`` wrapper is classified "positional" here and
+      "keyword" there;
+    * a non-inspectable callable raises instead of falling back to "legacy".
+
+    Whether that divergence is intended is a behaviour question for the
+    maintainer; it is documented rather than unified so a future fix to the
+    shared rule does not silently change this one.
+    """
 
     try:
         signature = inspect.signature(callback)
@@ -770,6 +785,7 @@ class GraspPlanGenerator:
             lift_attempts += (("up-and-back", fallback_lift),)
 
         lift_failures: list[tuple[str, str]] = []
+        lift_pose = None
         lift_joints = None
         lift_solution = None
         for lift_name, lift in lift_attempts:
@@ -790,21 +806,21 @@ class GraspPlanGenerator:
             for first, second in zip(lift_path, lift_path[1:]):
                 checkpoint(control, "grasp lift collision checking")
                 if self.lift_segment_valid is None:
-                    valid = self._segment_valid(first, second, control=control)
+                    segment_ok = self._segment_valid(first, second, control=control)
                 else:
                     width_kwargs = (
                         {"required_width_m": width}
                         if self._lift_accepts_width
                         else {}
                     )
-                    valid = self.lift_segment_valid(
+                    segment_ok = self.lift_segment_valid(
                         first,
                         second,
                         grasp_solution.joints,
                         **width_kwargs,
                     )
                     checkpoint(control, "grasp lift collision checking")
-                if not valid:
+                if not segment_ok:
                     lift_valid = False
                     break
             if not lift_valid:
@@ -813,11 +829,16 @@ class GraspPlanGenerator:
                     f"{lift_name} Cartesian lift intersects the planning scene",
                 ))
                 continue
+            # Capture the winning pose explicitly.  The result tuple below is
+            # built ~50 lines later; relying on the loop variable surviving the
+            # break would let any statement in between silently ship the wrong
+            # lift pose into PlannedGrasp.lift_pose.
+            lift_pose = lift
             lift_joints = candidate_lift_joints
             lift_solution = candidate_lift_solution
             break
 
-        if lift_joints is None or lift_solution is None:
+        if lift_pose is None or lift_joints is None or lift_solution is None:
             stage = (
                 "lift_collision"
                 if lift_failures and all(item[0] == "lift_collision" for item in lift_failures)
@@ -859,12 +880,74 @@ class GraspPlanGenerator:
             symmetry_index,
             grasp.copy(),
             pregrasp,
-            lift.copy(),
+            lift_pose.copy(),
             transit,
             approach_joints,
             lift_joints,
             width,
         )
+
+    def _hypothesis_schedule(
+        self,
+        *,
+        order: np.ndarray,
+        hypothesis_groups: dict[
+            int,
+            list[tuple[int, np.ndarray, float | None, float]],
+        ],
+        reachability_costs: dict[tuple[int, int], float],
+        global_ranks: np.ndarray,
+        stop_search: bool,
+    ) -> list[tuple[int, int, np.ndarray, float | None]]:
+        """Flatten per-candidate symmetry groups into one exact-IK order.
+
+        Pure: reads only its arguments and ``max_feasible_plans``, and owns no
+        budget or failure bookkeeping.  Three mutually exclusive strategies:
+
+        * the ranking pass already gave up -- nothing left to schedule;
+        * a first-feasible search with cached advisory costs -- the leading
+          candidate's whole family first, then the best symmetry of every other
+          candidate, then all remaining symmetries ordered by cached cost;
+        * otherwise plain candidate-major order.
+        """
+        if stop_search:
+            return []
+        if not reachability_costs or self.config.max_feasible_plans != 1:
+            return [
+                (int(candidate_index_raw), symmetry_index, grasp, width)
+                for candidate_index_raw in order
+                for symmetry_index, grasp, width, _ in hypothesis_groups.get(
+                    int(candidate_index_raw),
+                    [],
+                )
+            ]
+
+        first_candidate = int(order[0])
+        first_group = hypothesis_groups.get(first_candidate, [])
+        first_pass: list[tuple[int, int, np.ndarray, float | None, float]] = []
+        later_pass: list[tuple[int, int, np.ndarray, float | None, float]] = []
+        for candidate_index_raw in order[1:]:
+            candidate_index = int(candidate_index_raw)
+            group = hypothesis_groups.get(candidate_index, [])
+            if not group:
+                continue
+            first_pass.append((candidate_index, *group[0]))
+            later_pass.extend(
+                (candidate_index, *item) for item in group[1:]
+            )
+        later_pass.sort(key=lambda item: (
+            not np.isfinite(item[4]),
+            item[4] if np.isfinite(item[4]) else 0.0,
+            int(global_ranks[item[0]]),
+            item[1],
+        ))
+        scheduled_with_cost = [
+            (first_candidate, *item) for item in first_group
+        ] + first_pass + later_pass
+        return [
+            (candidate_index, symmetry_index, grasp, width)
+            for candidate_index, symmetry_index, grasp, width, _ in scheduled_with_cost
+        ]
 
     def plan(
         self,
@@ -1032,49 +1115,13 @@ class GraspPlanGenerator:
                 )
                 for symmetry_index, grasp in indexed_family
             ]
-        if stop_search:
-            hypothesis_schedule: list[
-                tuple[int, int, np.ndarray, float | None]
-            ] = []
-        elif reachability_costs and self.config.max_feasible_plans == 1:
-            first_candidate = int(order[0])
-            first_group = hypothesis_groups.get(first_candidate, [])
-            first_pass = [
-                (candidate_index, *group[0])
-                for candidate_index_raw in order[1:]
-                if (group := hypothesis_groups.get(
-                    int(candidate_index_raw),
-                    [],
-                ))
-                for candidate_index in (int(candidate_index_raw),)
-            ]
-            later_pass = [
-                (int(candidate_index_raw), *item)
-                for candidate_index_raw in order[1:]
-                for item in hypothesis_groups.get(int(candidate_index_raw), [])[1:]
-            ]
-            later_pass.sort(key=lambda item: (
-                not np.isfinite(item[4]),
-                item[4] if np.isfinite(item[4]) else 0.0,
-                int(global_ranks[item[0]]),
-                item[1],
-            ))
-            scheduled_with_cost = [
-                (first_candidate, *item) for item in first_group
-            ] + first_pass + later_pass
-            hypothesis_schedule = [
-                (candidate_index, symmetry_index, grasp, width)
-                for candidate_index, symmetry_index, grasp, width, _ in scheduled_with_cost
-            ]
-        else:
-            hypothesis_schedule = [
-                (int(candidate_index_raw), symmetry_index, grasp, width)
-                for candidate_index_raw in order
-                for symmetry_index, grasp, width, _ in hypothesis_groups.get(
-                    int(candidate_index_raw),
-                    [],
-                )
-            ]
+        hypothesis_schedule = self._hypothesis_schedule(
+            order=order,
+            hypothesis_groups=hypothesis_groups,
+            reachability_costs=reachability_costs,
+            global_ranks=global_ranks,
+            stop_search=stop_search,
+        )
 
         for candidate_index, symmetry_index, grasp, width in hypothesis_schedule:
             if hypotheses_evaluated >= self.config.max_hypotheses:
