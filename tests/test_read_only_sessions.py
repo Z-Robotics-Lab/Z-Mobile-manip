@@ -363,6 +363,55 @@ def test_home_context_clear_invalidates_current_tasks_but_retains_history(tmp_pa
     assert (tmp_path / "sessions" / "planning" / planning["session_id"]).is_dir()
 
 
+def test_context_clear_never_waits_for_an_in_flight_backend(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingBackend(FakeBackend):
+        """Hold the action lock the way a hung perception backend would."""
+
+        def run_perception(self, *, target, output_dir, log_path):
+            entered.set()
+            assert release.wait(timeout=10.0)
+            return super().run_perception(
+                target=target,
+                output_dir=output_dir,
+                log_path=log_path,
+            )
+
+    service = _service(tmp_path, BlockingBackend())
+    perceiving = threading.Thread(
+        target=service.start_perception,
+        args=("white adapter",),
+        daemon=True,
+    )
+    perceiving.start()
+    assert entered.wait(timeout=10.0)
+
+    cleared: list[dict] = []
+    clearing = threading.Thread(
+        target=lambda: cleared.append(service.clear_current_context()),
+        daemon=True,
+    )
+    clearing.start()
+    clearing.join(timeout=2.0)
+    still_blocked = clearing.is_alive()
+
+    release.set()
+    perceiving.join(timeout=10.0)
+    clearing.join(timeout=10.0)
+    state = service.status()
+
+    assert not still_blocked, "clear_current_context waited on the action lock"
+    assert cleared and cleared[0]["cleared"] is True
+    # The perception that was in flight during the clear must not publish its
+    # references afterwards, exactly as the blocking version's wipe ensured.
+    assert state["selected_perception_session_id"] is None
+    assert state["actions"]["perception"]["latest_attempt"] is None
+    assert state["actions"]["perception"]["last_good"] is None
+    assert list((tmp_path / "sessions" / "perception").iterdir())
+
+
 def test_new_successful_perception_invalidates_previous_plan(tmp_path):
     backend = FakeBackend()
     service = _service(tmp_path, backend)
@@ -374,6 +423,44 @@ def test_new_successful_perception_invalidates_previous_plan(tmp_path):
     assert first["session_id"] != second["session_id"]
     assert plan["status"] == "succeeded"
     assert state["selected_perception_session_id"] == second["session_id"]
+    assert state["actions"]["planning"]["latest_attempt"] is None
+    assert state["actions"]["planning"]["last_good"] is None
+
+
+class PoisonedArtifactBackend(FakeBackend):
+    """Perceive successfully but leave a tree the immutable manifest rejects."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.poison = False
+
+    def run_perception(self, *, target, output_dir, log_path):
+        result = super().run_perception(
+            target=target,
+            output_dir=output_dir,
+            log_path=log_path,
+        )
+        if self.poison:
+            (output_dir / "grasp_candidates_alias.npz").symlink_to(
+                output_dir / "grasp_candidates.npz",
+            )
+        return result
+
+
+def test_perception_artifact_failure_still_invalidates_the_previous_plan(tmp_path):
+    backend = PoisonedArtifactBackend()
+    service = _service(tmp_path, backend)
+    service.start_perception("white adapter")
+    plan = service.start_planning()
+    assert plan["status"] == "succeeded"
+    assert service.status()["actions"]["planning"]["last_good"] is not None
+
+    backend.poison = True
+    with pytest.raises(SessionContractError) as caught:
+        service.start_perception("black earphones")
+    state = service.status()
+
+    assert caught.value.code == "INVALID_SERVER_ARTIFACT"
     assert state["actions"]["planning"]["latest_attempt"] is None
     assert state["actions"]["planning"]["last_good"] is None
 
@@ -401,6 +488,45 @@ def test_failed_perception_cannot_be_selected(tmp_path):
     with pytest.raises(SessionContractError) as caught:
         service.select_perception(failed["session_id"])
     assert caught.value.code == "PERCEPTION_NOT_SUCCESSFUL"
+
+
+def test_select_perception_is_serialized_against_an_in_flight_action(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class GatedBackend(FakeBackend):
+        """Block only the second perception so the first stays selectable."""
+
+        def run_perception(self, *, target, output_dir, log_path):
+            if self.perception_calls:
+                entered.set()
+                assert release.wait(timeout=10.0)
+            return super().run_perception(
+                target=target,
+                output_dir=output_dir,
+                log_path=log_path,
+            )
+
+    service = _service(tmp_path, GatedBackend())
+    first = service.start_perception("white adapter")
+    selected = service.select_perception(first["session_id"])
+    assert selected["selected_perception_session_id"] == first["session_id"]
+
+    perceiving = threading.Thread(
+        target=service.start_perception,
+        args=("black earphones",),
+        daemon=True,
+    )
+    perceiving.start()
+    assert entered.wait(timeout=10.0)
+    try:
+        with pytest.raises(SessionContractError) as caught:
+            service.select_perception(first["session_id"])
+    finally:
+        release.set()
+        perceiving.join(timeout=10.0)
+
+    assert caught.value.code == "ACTION_BUSY"
 
 
 def test_changed_perception_is_rejected_before_planning(tmp_path):

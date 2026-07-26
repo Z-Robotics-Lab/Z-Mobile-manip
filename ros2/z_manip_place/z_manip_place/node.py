@@ -249,6 +249,7 @@ class ObservedPlacementNode(Node):
         self._planning_identity: ObservedPerceptionIdentity | None = None
         self._worker: threading.Thread | None = None
         self._workers: dict[int, threading.Thread] = {}
+        self._shutting_down = False
         self._transaction = PlacementTransactionLifecycle(
             ros_timeout_s=float(
                 self.get_parameter('transaction_ros_timeout_s').value,
@@ -1849,6 +1850,11 @@ class ObservedPlacementNode(Node):
         return response
 
     def _maybe_auto_plan(self) -> None:
+        # The plan worker calls this from its own finally, so without the
+        # guard a teardown could start a brand new worker after destroy_node
+        # has already invalidated this node's rcl handles.
+        if self._shutting_down:
+            return
         if bool(self.get_parameter('auto_plan_on_region').value):
             self._start_plan()
 
@@ -1937,6 +1943,8 @@ class ObservedPlacementNode(Node):
 
     def _start_plan(self) -> tuple[bool, str]:
         with self._lock:
+            if self._shutting_down:
+                return False, 'placement node is shutting down'
             for generation, worker in tuple(self._workers.items()):
                 if not worker.is_alive():
                     self._workers.pop(generation, None)
@@ -2178,8 +2186,13 @@ class ObservedPlacementNode(Node):
             if attached_collision is not None:
                 attached_collision.clear_snapshot()
             if evaluator is not None:
-                self.destroy_client(evaluator.motion_client)
-                self.destroy_client(evaluator.cartesian_client)
+                for client in (evaluator.motion_client, evaluator.cartesian_client):
+                    try:
+                        self.destroy_client(client)
+                    except Exception:
+                        # One client failing to unwind must not strand the
+                        # other, nor skip the worker-registry release below.
+                        pass
             current = threading.current_thread()
             with self._lock:
                 self._release_planning_worker_locked(
@@ -2323,6 +2336,24 @@ class ObservedPlacementNode(Node):
             allow_nan=False,
         )
         self._status_publisher.publish(message)
+
+    def destroy_node(self) -> bool:
+        """Cancel and join the plan worker before rcl handles are invalidated.
+
+        The worker is a daemon thread that keeps calling node APIs --
+        destroy_client, get_parameter, get_clock, publishers -- and whose
+        finally can start another worker through _maybe_auto_plan.  Latch the
+        shutdown flag, invalidate the transaction so the worker's next
+        cooperative checkpoint aborts, then join it.
+        """
+        with self._lock:
+            self._shutting_down = True
+            self._transaction.reset()
+            workers = tuple(self._workers.values())
+        for worker in workers:
+            if worker.is_alive():
+                worker.join(timeout=3.0)
+        return super().destroy_node()
 
 
 def main(args: list[str] | None = None) -> None:

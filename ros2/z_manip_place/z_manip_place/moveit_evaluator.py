@@ -140,8 +140,20 @@ class MoveItPlacementEvaluator:
     ) -> None:
         self.node = node
         self.config = config
+        # The caller can only destroy clients it can reach through a
+        # constructed evaluator, so a throw on the second create_client would
+        # strand the first one.  _new_planning_backend runs once per plan
+        # attempt, which would turn a persistent middleware-entity failure
+        # into a slow leak of graph entities instead of a clean error.
         self.motion_client = node.create_client(GetMotionPlan, motion_service)
-        self.cartesian_client = node.create_client(GetCartesianPath, cartesian_service)
+        try:
+            self.cartesian_client = node.create_client(
+                GetCartesianPath,
+                cartesian_service,
+            )
+        except BaseException:
+            node.destroy_client(self.motion_client)
+            raise
         self.attached_collision_auditor = attached_collision_auditor
         self.goal_id = ''
 
