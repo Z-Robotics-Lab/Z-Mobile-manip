@@ -2,14 +2,17 @@
 set -euo pipefail
 
 # Fixed, non-interactive preflight for the Go2W WebRTC command transport.
-# The UI cannot supply a host, service, command, or environment override.
-NUC_HOST="yusenzlabnuc@192.168.3.8"
-NUC_KEY="$HOME/.ssh/id_ed25519_codex_nuc"
+# The UI cannot supply a service, command, or environment override, and it
+# never sets GO2W_NUC_*: the sole caller (go2w_depth_servo.sh) passes its own
+# already-resolved host and key so the transport is validated and restarted on
+# the same robot the servo is about to command, not a second one on the bench.
+NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
+NUC_KEY="${GO2W_NUC_SSH_KEY:-$HOME/.ssh/id_ed25519_codex_nuc}"
 SERVICE="z-mobile-manip-go2w-reactive-live.service"
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 [[ -f "$NUC_KEY" ]] || {
-  printf 'Go2W transport preflight failed: fixed NUC SSH key is missing\n' >&2
+  printf 'Go2W transport preflight failed: NUC SSH key is missing: %s\n' "$NUC_KEY" >&2
   exit 1
 }
 

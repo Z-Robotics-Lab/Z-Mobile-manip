@@ -22,7 +22,15 @@ NUC_KEY = Path(os.environ.get(
     "GO2W_NUC_SSH_KEY",
     str(Path.home() / ".ssh" / "id_ed25519_codex_nuc"),
 )).expanduser().resolve()
-REMOTE_ROOT = "/home/yusenzlabnuc/z-manip-runtime/full-grasp-actions"
+# Staging root on the NUC, relative to that host's own login home rather than
+# one hardcoded lab account: GO2W_NUC_HOST is a documented operator override
+# and .env.example ships a different user, so an absolute
+# /home/<lab-user>/... root fails with a permission error naming a path the
+# operator never configured.  The absolute directory is resolved from the NUC's
+# own $HOME inside the directory-creation call below, which costs no extra
+# round trip and yields the previous path verbatim for the lab account.
+REMOTE_ROOT = "z-manip-runtime/full-grasp-actions"
+REMOTE_HOME_MARKER = "z-manip-remote-home="
 
 
 def run(arguments: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -84,8 +92,6 @@ def main() -> int:
             raise RuntimeError("full-grasp validation omitted its bound token")
 
         action_id = f"{time.time_ns()}-{secrets.token_hex(5)}"
-        remote_dir = f"{REMOTE_ROOT}/{action_id}"
-        remote_receipts = f"{remote_dir}/receipts"
         ssh = [
             "ssh", "-i", str(NUC_KEY), "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5", NUC_HOST,
@@ -94,9 +100,25 @@ def main() -> int:
             "scp", "-q", "-p", "-i", str(NUC_KEY), "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5",
         ]
-        created = run([*ssh, f"mkdir -p {shlex.quote(remote_dir)}"], timeout=10.0)
+        # Create the action directory under the NUC's own $HOME and report that
+        # home back in the same round trip, so every absolute path below (the
+        # executor runs after `cd ~/pyAgxArm`) follows GO2W_NUC_HOST.
+        created = run([
+            *ssh,
+            "set -e; "
+            f"mkdir -p \"$HOME\"/{shlex.quote(REMOTE_ROOT)}/{shlex.quote(action_id)}; "
+            f"printf '{REMOTE_HOME_MARKER}%s\\n' \"$HOME\"",
+        ], timeout=10.0)
         if created.returncode != 0:
             raise RuntimeError(f"cannot create NUC action directory: {created.stdout.strip()}")
+        remote_home = ""
+        for line in created.stdout.splitlines():
+            if line.startswith(REMOTE_HOME_MARKER):
+                remote_home = line[len(REMOTE_HOME_MARKER):].strip()
+        if not remote_home.startswith("/"):
+            raise RuntimeError("NUC did not report an absolute login home directory")
+        remote_dir = f"{remote_home}/{REMOTE_ROOT}/{action_id}"
+        remote_receipts = f"{remote_dir}/receipts"
         started = None
         receipts_fetched = False
         receipt_proved_absent = False

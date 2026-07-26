@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import numpy as np
@@ -13,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "runtime" / "go2w_depth_servo.py"
 LAUNCHER = ROOT / "scripts" / "runtime" / "go2w_depth_servo.sh"
+PREFLIGHT = ROOT / "scripts" / "runtime" / "go2w_base_transport_preflight.sh"
 SPEC = importlib.util.spec_from_file_location("go2w_depth_servo", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 SERVO = importlib.util.module_from_spec(SPEC)
@@ -894,6 +897,61 @@ def test_launcher_uses_fixed_cyclonedds_runtime_for_pc_to_nuc_commands():
     assert "configs/piper_collision_capsules.json" in launcher
     assert ":/robot/piper_collision_capsules.json:ro" in launcher
     assert "--whole-body-collision-model /robot/piper_collision_capsules.json" in launcher
+
+
+def test_transport_preflight_targets_the_same_nuc_the_servo_will_command(tmp_path):
+    """The preflight probes and restarts the WebRTC bridge; the servo then
+    commands the base over it.  On a two-robot bench a preflight pinned to a
+    compiled-in host would validate and restart one robot while another moves,
+    so it must honour the host and key its caller resolved.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh_log = tmp_path / "ssh.log"
+    (bin_dir / "ssh").write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {ssh_log}\n"
+        "cat >/dev/null\n"
+        "printf 'ready\\n'\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "ssh").chmod(0o755)
+    key = tmp_path / "operator-key"
+    key.write_text("key", encoding="utf-8")
+
+    environment = dict(os.environ)
+    environment.update({
+        "PATH": f"{bin_dir}:{environment['PATH']}",
+        "GO2W_NUC_HOST": "robot@go2w-nuc.local",
+        "GO2W_NUC_SSH_KEY": str(key),
+    })
+    result = subprocess.run(
+        (str(PREFLIGHT),),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [line for line in ssh_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert calls
+    for call in calls:
+        assert "robot@go2w-nuc.local" in call
+        assert str(key) in call
+        assert "yusenzlabnuc@192.168.3.8" not in call
+
+
+def test_live_launcher_hands_its_resolved_nuc_identity_to_the_preflight():
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert 'GO2W_NUC_HOST="$NUC_HOST" GO2W_NUC_SSH_KEY="$NUC_KEY" \\\n' in launcher
+    # The key must be checked before the preflight, so a missing key is
+    # reported against the path this launcher resolved rather than against a
+    # default the operator never chose.
+    key_check = launcher.index('missing NUC SSH key: %s')
+    preflight_call = launcher.index("go2w_base_transport_preflight.sh")
+    assert key_check < preflight_call
 
 
 def test_stale_capture_data_is_rejected_even_when_received_fresh():

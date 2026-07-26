@@ -102,6 +102,37 @@ def test_home_skips_failed_latest_and_uses_previous_checked_path(tmp_path: Path)
     assert "piper_reverse_home_recovery.py" in ssh_log
 
 
+def test_remote_workspace_follows_the_nuc_login_home(tmp_path: Path) -> None:
+    """GO2W_NUC_HOST is a documented override and .env.example ships a
+    different account, so the staging root may not name one lab user.
+
+    scp targets stay relative (resolved against the login home); the ssh
+    payloads run after ``cd ~/pyAgxArm`` and so must defer to the NUC's own
+    ``$HOME`` rather than an absolute ``/home/<lab-user>`` path.
+    """
+    root = tmp_path / "sessions"
+    checked = root / "planning/20260720-010000/artifacts/planning"
+    _write_plan(checked, valid=True)
+
+    result, ssh_log, scp_log = _run(tmp_path, root)
+
+    assert result.returncode == 0
+    assert "/home/yusenzlabnuc" not in ssh_log
+    assert "/home/yusenzlabnuc" not in scp_log
+    # Every remote path the NUC shell resolves is anchored to its own $HOME.
+    for remote_path in (
+        "$HOME/z-manip-runtime/smart-home/piper_home_recovery.py",
+        "$HOME/z-manip-runtime/smart-home/piper_home.json",
+        "$HOME/z-manip-runtime/smart-home/piper_reverse_home_recovery.py",
+        "$HOME/z-manip-runtime/smart-home/planning_report.json",
+        "$HOME/z-manip-runtime/smart-home/planned_grasp.npz",
+    ):
+        assert f'"{remote_path}"' in ssh_log, remote_path
+    assert 'rm -rf "$HOME/z-manip-runtime/smart-home"' in ssh_log
+    # scp has no remote shell, so its targets stay relative to the login home.
+    assert ":z-manip-runtime/smart-home/" in scp_log
+
+
 def test_home_rejects_archive_whose_digest_does_not_match(tmp_path: Path) -> None:
     root = tmp_path / "sessions"
     corrupt = root / "planning/20260720-030000/artifacts/planning"

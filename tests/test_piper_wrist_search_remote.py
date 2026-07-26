@@ -79,6 +79,33 @@ def _scp_calls(scp_log: Path) -> int:
     return len([line for line in scp_log.read_text(encoding="utf-8").splitlines() if line.strip()])
 
 
+def test_default_remote_workspace_follows_the_nuc_login_home() -> None:
+    """GO2W_NUC_HOST is a documented override and .env.example ships a
+    different account, so the default staging root may not name one lab user.
+
+    Checked against the source rather than by running the launcher: the default
+    branch cannot be exercised without the operator-supplied (gitignored)
+    ``configs/piper_home.json`` that ``require_file`` demands.
+    """
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert 'GO2W_WRIST_SEARCH_REMOTE_DIR:-z-manip-runtime/wrist-search' in source
+    assert "/home/yusenzlabnuc" not in source
+    # An absolute operator override is still used verbatim; a relative one is
+    # resolved by the NUC's own shell, because the executor call runs after
+    # `cd ~/pyAgxArm` and a relative path would break there.
+    assert 'REMOTE_DIR_HOME="$REMOTE_DIR"' in source
+    assert 'REMOTE_DIR_HOME="\\$HOME/$REMOTE_DIR"' in source
+    for remote_path in (
+        "$REMOTE_DIR_HOME/.manifest-sha",
+        "$REMOTE_DIR_HOME/piper_wrist_search_executor.py",
+        "$REMOTE_DIR_HOME/piper_home.json",
+    ):
+        assert f'\\"{remote_path}\\"' in source, remote_path
+    # scp has no remote shell, so its target stays relative to the login home.
+    assert '"$NUC_HOST:$REMOTE_DIR/"' in source
+
+
 def test_transport_persists_a_control_master_across_ssh_and_scp(tmp_path: Path) -> None:
     bin_dir, ssh_log, _scp_log = _install_stubs(tmp_path)
     remote_dir = tmp_path / "remote"
