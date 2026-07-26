@@ -26,6 +26,25 @@ _Offset = tuple[float, float, float]
 FrameProvider = Callable[[np.ndarray], Mapping[str, np.ndarray]]
 SelfCollisionChecker = Callable[[np.ndarray], "CollisionResult"]
 
+# Reference values and elementwise tolerances for rigid-transform validation.
+# ``np.allclose(a, b, rtol, atol)`` is exactly ``all(|a - b| <= atol + rtol|b|)``
+# for finite ``a`` and ``b``; the tolerances below bake in numpy's default
+# ``rtol=1e-5`` so the hot path can evaluate that predicate directly instead of
+# paying ``np.isclose``'s errstate/dtype dispatch once per link frame per state.
+_HOMOGENEOUS_ROW = np.array((0.0, 0.0, 0.0, 1.0))
+_HOMOGENEOUS_ROW_TOLERANCE = 1e-7 + 1e-5 * np.abs(_HOMOGENEOUS_ROW)
+_IDENTITY_3 = np.eye(3)
+_ORTHONORMAL_TOLERANCE = 1e-5 + 1e-5 * np.abs(_IDENTITY_3)
+_DETERMINANT_TOLERANCE = 1e-5 + 1e-5
+
+
+def _readonly(value: object) -> np.ndarray:
+    """Convert once and freeze: shared per-checker constants are never written."""
+
+    array = np.asarray(value)
+    array.setflags(write=False)
+    return array
+
 
 def _validate_offset(value: object, label: str) -> None:
     offset = np.asarray(value, dtype=float)
@@ -429,6 +448,15 @@ class PointCloudCollisionChecker:
         unknown = requested_frames - chain_frames
         if unknown:
             raise ValueError(f"capsules reference frames outside the kinematic chain: {sorted(unknown)}")
+        # Both the model and the chain are frozen, so the frames a state check
+        # must resolve and the capsule endpoint offsets are fixed for the life
+        # of the checker.  Keep the set itself (not a copy): its iteration order
+        # decides which frame a multi-frame diagnostic names.
+        self._requested_frames = requested_frames
+        self._capsule_offsets = tuple(
+            (capsule, _readonly(capsule.start_offset), _readonly(capsule.end_offset))
+            for capsule in model.capsules
+        )
         self._self_pairs = self._resolve_self_pairs()
 
     def _resolve_self_pairs(self) -> tuple[_Pair, ...]:
@@ -578,28 +606,43 @@ class PointCloudCollisionChecker:
         )
         if neighbor_count < 3:
             return support
-        for index in candidates:
+        if len(candidates):
+            # One batched neighbour query and one stacked eigendecomposition for
+            # the whole seed set.  cKDTree.query, np.matmul and np.linalg.eigh
+            # all return bitwise-identical values batched and per candidate, so
+            # this classifies exactly the same points as the per-candidate loop
+            # it replaced.  The final alignment stays a per-row dot: a batched
+            # matvec differs from np.dot in the last bit, and that comparison
+            # sits directly on a configured threshold.
             _, neighbor_indices = self._tree.query(
-                self._points[index],
+                self._points[candidates],
                 k=neighbor_count,
             )
             neighbors = self._points[np.asarray(neighbor_indices, dtype=int)]
-            centered = neighbors - np.mean(neighbors, axis=0)
-            covariance = centered.T @ centered / float(len(neighbors))
+            centered = neighbors - neighbors.mean(axis=1)[:, None, :]
+            covariance = np.matmul(
+                centered.transpose(0, 2, 1),
+                centered,
+            ) / float(neighbor_count)
             eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-            total_variation = float(np.sum(eigenvalues))
-            if total_variation <= 1e-12 or float(eigenvalues[1]) <= 1e-12:
-                continue
-            surface_variation = float(eigenvalues[0]) / total_variation
-            normal_alignment = abs(float(
-                eigenvectors[:, 0] @ departure_direction,
-            ))
-            if (
+            total_variation = eigenvalues.sum(axis=1)
+            usable = (total_variation > 1e-12) & (eigenvalues[:, 1] > 1e-12)
+            surface_variation = np.divide(
+                eigenvalues[:, 0],
+                total_variation,
+                out=np.ones_like(total_variation),
+                where=usable,
+            )
+            planar = usable & (
                 surface_variation
                 <= self.config.support_normal_max_surface_variation
-                and normal_alignment >= self.config.support_normal_min_alignment
-            ):
-                normal_seeds[index] = True
+            )
+            for row in np.flatnonzero(planar):
+                normal_alignment = abs(float(
+                    eigenvectors[row][:, 0] @ departure_direction,
+                ))
+                if normal_alignment >= self.config.support_normal_min_alignment:
+                    normal_seeds[candidates[row]] = True
         seed_indices = np.flatnonzero(normal_seeds)
         if not len(seed_indices):
             return support
@@ -851,19 +894,28 @@ class PointCloudCollisionChecker:
 
     @staticmethod
     def _valid_transform(transform: object) -> bool:
+        """Accept only finite right-handed rigid transforms.
+
+        The comparisons are numpy's ``allclose``/``isclose`` predicates written
+        out against precomputed tolerances.  Finiteness is established first, so
+        the NaN/inf special cases inside ``isclose`` are unreachable and the two
+        formulations accept exactly the same matrices -- verified over 14892
+        cases spanning both sides of every tolerance boundary.
+        """
+
         try:
             matrix = np.asarray(transform, dtype=float)
         except (TypeError, ValueError):
             return False
         if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
             return False
-        if not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-7):
+        if not np.all(np.abs(matrix[3] - _HOMOGENEOUS_ROW) <= _HOMOGENEOUS_ROW_TOLERANCE):
             return False
         rotation = matrix[:3, :3]
-        return bool(
-            np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5)
-            and np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5)
-        )
+        gram = rotation.T @ rotation
+        if not np.all(np.abs(gram - _IDENTITY_3) <= _ORTHONORMAL_TOLERANCE):
+            return False
+        return abs(float(np.linalg.det(rotation)) - 1.0) <= _DETERMINANT_TOLERANCE
 
     def _world_capsules(
         self,
@@ -883,11 +935,7 @@ class PointCloudCollisionChecker:
                 "frame provider did not return a frame mapping",
                 kind="kinematics",
             )
-        requested = {
-            frame
-            for capsule in self.model.capsules
-            for frame in (capsule.start_frame, capsule.end_frame)
-        }
+        requested = self._requested_frames
         missing = requested - set(frames)
         if missing:
             return None, CollisionResult(
@@ -904,11 +952,11 @@ class PointCloudCollisionChecker:
                 )
 
         world_capsules = []
-        for capsule in self.model.capsules:
+        for capsule, start_offset, end_offset in self._capsule_offsets:
             start_transform = np.asarray(frames[capsule.start_frame], dtype=float)
             end_transform = np.asarray(frames[capsule.end_frame], dtype=float)
-            start = start_transform[:3, :3] @ np.asarray(capsule.start_offset) + start_transform[:3, 3]
-            end = end_transform[:3, :3] @ np.asarray(capsule.end_offset) + end_transform[:3, 3]
+            start = start_transform[:3, :3] @ start_offset + start_transform[:3, 3]
+            end = end_transform[:3, :3] @ end_offset + end_transform[:3, 3]
             world_capsules.append(_WorldCapsule(capsule, start, end))
         return tuple(world_capsules), None
 
@@ -1010,15 +1058,14 @@ class PointCloudCollisionChecker:
         self,
         capsule: _WorldCapsule,
         *,
-        base_t_tip: np.ndarray | None = None,
+        tip_t_base: np.ndarray | None = None,
     ) -> CollisionResult | None:
         tree = self._target_tree
         start = capsule.start
         end = capsule.end
         if self._attached_target_tree_tip is not None:
-            if base_t_tip is None:
+            if tip_t_base is None:
                 raise RuntimeError("attached target check requires the tip transform")
-            tip_t_base = np.linalg.inv(base_t_tip)
             start = tip_t_base[:3, :3] @ start + tip_t_base[:3, 3]
             end = tip_t_base[:3, :3] @ end + tip_t_base[:3, 3]
             tree = self._attached_target_tree_tip
@@ -1210,7 +1257,17 @@ class PointCloudCollisionChecker:
         if frame_problem is not None:
             return frame_problem
         assert capsules is not None
-        base_t_tip = self.chain.forward(values)
+        # The tip transform is consulted only by the attached-payload checks,
+        # and `_attached_target_points_tip` / `_attached_target_tree_tip` are
+        # installed and cleared together, so this guard is exact.  Transit and
+        # approach states -- the common case -- skip the forward kinematics
+        # pass entirely.  `chain.forward` is pure and cannot raise here because
+        # `_validate_joints` has already established shape and finiteness.
+        base_t_tip = (
+            self.chain.forward(values)
+            if self._attached_target_points_tip is not None
+            else None
+        )
         # With no mesh backend, the capsule model owns all configured pairs.
         # With a mesh backend, keep only explicitly supplemental platform
         # fixtures here; the mesh checker continues to own the existing arm
@@ -1236,9 +1293,13 @@ class PointCloudCollisionChecker:
                 self_problem = None
             if self_problem is not None:
                 return self_problem
-        attached_scene_collision = self._check_attached_target_scene(base_t_tip)
-        if attached_scene_collision is not None:
-            return attached_scene_collision
+        tip_t_base = None
+        if base_t_tip is not None:
+            attached_scene_collision = self._check_attached_target_scene(base_t_tip)
+            if attached_scene_collision is not None:
+                return attached_scene_collision
+            # One inverse per state instead of one per checked capsule.
+            tip_t_base = np.linalg.inv(base_t_tip)
         finger_exclusion = (
             self.model.finger_support_plane_exclusion
             and self._target_points is not None
@@ -1260,7 +1321,7 @@ class PointCloudCollisionChecker:
             if capsule.spec.check_target:
                 target_collision = self._check_target_capsule(
                     capsule,
-                    base_t_tip=base_t_tip,
+                    tip_t_base=tip_t_base,
                 )
                 if target_collision is not None:
                     return target_collision

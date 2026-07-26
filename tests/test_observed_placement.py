@@ -239,3 +239,79 @@ def test_cancellation_stops_candidate_evaluation_before_the_next_moveit_call():
             control=control,
         )
     assert calls == 1
+
+
+# -- loop-invariant candidate geometry ---------------------------------------
+
+
+def test_plan_builds_yaw_family_footprint_grid_and_tool_inverse_once(monkeypatch):
+    """Regression test: the yaw family, the two footprint sample grids and the
+    inverse of ``tool_from_object`` depend only on the constraints, the object
+    extent and the configuration, so ``plan()`` must build each of them once
+    per plan instead of once per ``(sample, yaw)`` candidate.
+
+    Rebuilding them inside the loop is invisible in the returned plan but costs
+    roughly a third of geometric candidate generation, so only a call count can
+    catch a regression.
+    """
+
+    observation = _observed_plane(half_size=0.16, extent=(0.07, 0.05, 0.08))
+    planner = _planner(sample_spacing_m=0.03)
+    real_linspace = np.linspace
+    real_inverse = np.linalg.inv
+    linspace_calls = 0
+    inverse_calls = 0
+
+    def counting_linspace(*args, **kwargs):
+        nonlocal linspace_calls
+        linspace_calls += 1
+        return real_linspace(*args, **kwargs)
+
+    def counting_inverse(*args, **kwargs):
+        nonlocal inverse_calls
+        inverse_calls += 1
+        return real_inverse(*args, **kwargs)
+
+    monkeypatch.setattr(np, "linspace", counting_linspace)
+    monkeypatch.setattr(np.linalg, "inv", counting_inverse)
+    result = planner.plan(observation, current_joints=np.zeros(6), evaluate=_accept)
+
+    # Many candidates were generated, but the invariants were built once each:
+    # one yaw family plus one footprint grid per in-plane object axis.
+    assert result.geometric_candidates > 1
+    assert linspace_calls == 3
+    assert inverse_calls == 1
+
+
+def test_footprint_grid_offsets_match_the_per_row_reference_exactly():
+    """The vectorised footprint must stay bitwise identical to the per-row
+    ``support_position + dx * axis_x + dy * axis_y`` form it replaced, with the
+    same dx-major row order and the same dx/axis_x pairing.  A transposed
+    broadcast would silently swap the object's in-plane extents.
+    """
+
+    planner = _planner(footprint_samples_per_axis=5)
+    extent = np.asarray((0.083, 0.061, 0.104))
+    grid_x, grid_y = planner._footprint_grid(extent)
+    margin = planner.config.boundary_margin_m
+
+    assert len(grid_x) == len(grid_y) == 5
+    assert grid_x[0] == pytest.approx(-(0.5 * extent[0] + margin))
+    assert grid_x[-1] == pytest.approx(0.5 * extent[0] + margin)
+    assert grid_y[0] == pytest.approx(-(0.5 * extent[1] + margin))
+    assert grid_y[-1] == pytest.approx(0.5 * extent[1] + margin)
+
+    _, axis_x, axis_y = _basis((0.2, -0.3, 0.9))
+    support_position = np.asarray((0.31, -0.12, 0.47))
+    reference = np.asarray([
+        support_position + dx * axis_x + dy * axis_y
+        for dx in grid_x for dy in grid_y
+    ])
+    vectorised = (
+        support_position
+        + grid_x[:, None, None] * axis_x
+        + grid_y[None, :, None] * axis_y
+    ).reshape(-1, 3)
+
+    assert vectorised.shape == reference.shape
+    assert vectorised.tobytes() == reference.tobytes()

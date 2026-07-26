@@ -748,3 +748,340 @@ def test_attaching_the_target_invalidates_a_cached_finger_scene_exclusion(tmp_pa
     assert not checker._finger_scene_ready
     assert checker._finger_scene_tree is None
     assert checker._finger_scene_points is None
+
+
+# -- link-frame validation ---------------------------------------------------
+
+
+def _rigid(rotation=None, translation=(0.0, 0.0, 0.0)):
+    matrix = np.eye(4)
+    if rotation is not None:
+        matrix[:3, :3] = rotation
+    matrix[:3, 3] = translation
+    return matrix
+
+
+def test_state_checks_validate_link_frames_without_numpy_isclose(
+    tmp_path,
+    monkeypatch,
+):
+    """Regression test: `_valid_transform` runs once per link frame per state
+    check, i.e. it is on the per-RRT-sample and per-waypoint hot path.  It must
+    evaluate the closeness predicate directly instead of calling
+    `np.allclose`/`np.isclose`, whose errstate context managers and dtype
+    dispatch dominated the cost of every collision query.
+
+    Counting the calls is the only way to see this: the accepted set of
+    transforms is unchanged, which the boundary test below pins separately.
+    """
+
+    checker = _checker(tmp_path)
+    checker.update_scene(np.array([[5.0, 0.0, 0.0]]), stamp_s=10.0)
+    real_allclose = np.allclose
+    real_isclose = np.isclose
+    calls: list[str] = []
+
+    def counting_allclose(*args, **kwargs):
+        calls.append("allclose")
+        return real_allclose(*args, **kwargs)
+
+    def counting_isclose(*args, **kwargs):
+        calls.append("isclose")
+        return real_isclose(*args, **kwargs)
+
+    monkeypatch.setattr(np, "allclose", counting_allclose)
+    monkeypatch.setattr(np, "isclose", counting_isclose)
+    for value in np.linspace(-0.5, 0.5, 12):
+        assert checker.check_state(np.array([value])).valid
+
+    assert calls == []
+
+
+def test_link_frame_validation_keeps_its_exact_rigid_transform_tolerances():
+    """Pin the accept/reject boundary of every rigid-transform criterion.
+
+    Nothing exercised the reject path before, so an over-loosened predicate
+    would have gone unnoticed while silently admitting a skewed or mirrored
+    frame from a misbehaving kinematics service.  The tolerances below are
+    numpy's `allclose`/`isclose` defaults for the original calls: 1e-7 on the
+    bottom row (1.01e-5 on its unit entry), 1e-5 off-diagonal and 2e-5 on the
+    diagonal of R^T R, and 2e-5 on det(R).
+    """
+
+    valid = PointCloudCollisionChecker._valid_transform
+    assert valid(_rigid(translation=(0.3, -0.2, 0.1)))
+
+    # Bottom row: 1e-7 on the zeros, 1e-7 + 1e-5 on the trailing one.
+    inside = _rigid()
+    inside[3, 0] = 9e-8
+    assert valid(inside)
+    outside = _rigid()
+    outside[3, 0] = 1.2e-7
+    assert not valid(outside)
+    inside = _rigid()
+    inside[3, 3] = 1.0 + 9e-6
+    assert valid(inside)
+    outside = _rigid()
+    outside[3, 3] = 1.0 + 1.2e-5
+    assert not valid(outside)
+
+    # Off-diagonal orthonormality: a pure shear leaves det(R) at exactly 1, so
+    # only the 1e-5 off-diagonal bound on R^T R decides.
+    shear = np.eye(3)
+    shear[0, 1] = 8e-6
+    assert valid(_rigid(shear))
+    shear = np.eye(3)
+    shear[0, 1] = 1.3e-5
+    assert not valid(_rigid(shear))
+
+    # Uniform scale by (1 + e) moves R^T R by 2e and det(R) by 3e, so e between
+    # 2e-5/3 and 1e-5 is rejected by the determinant bound alone.
+    assert valid(_rigid(np.eye(3) * (1.0 + 6e-6)))
+    assert not valid(_rigid(np.eye(3) * (1.0 + 8e-6)))
+
+    # Mirrored frames are orthonormal but left-handed.
+    reflection = np.diag((-1.0, 1.0, 1.0))
+    assert not valid(_rigid(reflection))
+
+    # Malformed inputs stay rejected rather than raising.
+    assert not valid(_rigid(np.full((3, 3), np.nan)))
+    assert not valid(np.eye(3))
+    assert not valid("not a transform")
+    assert not valid(None)
+
+
+def test_a_skewed_frame_provider_transform_fails_closed_with_a_named_frame(
+    tmp_path,
+):
+    """End-to-end reject path: a kinematics service that returns a
+    non-orthonormal link transform must invalidate the state, not be trusted.
+    """
+
+    chain, frames = _chain_and_frames(tmp_path)
+
+    def skewed(joints):
+        transforms = dict(frames(joints))
+        matrix = np.array(transforms["tool"], dtype=float)
+        matrix[:3, :3] = matrix[:3, :3] * 1.05
+        transforms["tool"] = matrix
+        return transforms
+
+    checker = _checker(tmp_path)
+    checker.update_scene(np.array([[5.0, 0.0, 0.0]]), stamp_s=10.0)
+    assert checker.check_state(np.array([0.0])).valid
+
+    checker.frame_provider = skewed
+    result = checker.check_state(np.array([0.0]))
+    assert not result.valid
+    assert result.kind == "kinematics"
+    assert "invalid transform for 'tool'" in result.reason
+    assert chain.dof == 1
+
+
+# -- forward kinematics on the state-check hot path ---------------------------
+
+
+def _fk_attributable_checker(tmp_path):
+    """A checker whose frame provider uses `link_transforms`, so every
+    `chain.forward` call can be attributed to `check_state` itself."""
+
+    chain, _frames = _chain_and_frames(tmp_path)
+    model = RobotCollisionModel(
+        capsules=(
+            CapsuleSpec(
+                "wrist", "tool", "tool", 0.02,
+                start_offset=(0.0, 0.0, -0.06), end_offset=(0.0, 0.0, 0.06),
+            ),
+            CapsuleSpec(
+                "palm", "tool", "tool", 0.02,
+                start_offset=(0.0, 0.0, 0.06), end_offset=(0.0, 0.0, 0.10),
+            ),
+            CapsuleSpec(
+                "forearm", "base", "tool", 0.02,
+                start_offset=(0.0, 0.0, -0.20), end_offset=(0.0, 0.0, -0.10),
+            ),
+        ),
+    )
+    return PointCloudCollisionChecker(
+        chain=chain,
+        model=model,
+        frame_provider=chain.link_transforms,
+        config=PointCloudCollisionConfig(
+            clearance=0.01,
+            point_radius=0.0,
+            min_scene_points=1,
+            max_scene_age_s=0.5,
+            segment_joint_step=0.02,
+        ),
+        now_fn=lambda: 10.0,
+    )
+
+
+def test_check_state_runs_no_forward_kinematics_without_an_attached_payload(
+    tmp_path,
+    monkeypatch,
+):
+    """Regression test: the tip transform is consulted only by the attached
+    payload checks, so transit and approach states -- the common case, and the
+    ones an RRT samples by the thousand -- must not pay a full forward
+    kinematics pass they then throw away.
+    """
+
+    checker = _fk_attributable_checker(tmp_path)
+    checker.update_scene(np.array([[5.0, 0.0, 0.0]]), stamp_s=10.0)
+    real_forward = checker.chain.forward
+    calls = 0
+
+    def counting_forward(joints):
+        nonlocal calls
+        calls += 1
+        return real_forward(joints)
+
+    monkeypatch.setattr(checker.chain, "forward", counting_forward)
+
+    assert checker.check_state(np.array([0.1])).valid
+    assert calls == 0  # no payload attached
+
+    checker.update_target(np.array([[5.0, 0.0, 0.5]]))
+    assert checker.check_state(np.array([0.1])).valid
+    assert calls == 0  # a static target already lives in the base frame
+
+
+def test_check_state_inverts_the_tip_transform_once_per_state_when_attached(
+    tmp_path,
+    monkeypatch,
+):
+    """With a payload attached the tip transform is needed, but exactly once:
+    one forward kinematics pass and one inverse per state, not one inverse per
+    checked capsule.
+    """
+
+    checker = _fk_attributable_checker(tmp_path)
+    checker.update_scene(np.array([[5.0, 0.0, 0.0]]), stamp_s=10.0)
+    checker.update_attached_target(
+        np.array([[0.0, 0.0, 0.30], [0.0, 0.01, 0.31]]),
+        attachment_joints=np.array([0.0]),
+    )
+    real_forward = checker.chain.forward
+    real_inverse = np.linalg.inv
+    forward_calls = 0
+    inverse_calls = 0
+
+    def counting_forward(joints):
+        nonlocal forward_calls
+        forward_calls += 1
+        return real_forward(joints)
+
+    def counting_inverse(matrix):
+        nonlocal inverse_calls
+        inverse_calls += 1
+        return real_inverse(matrix)
+
+    monkeypatch.setattr(checker.chain, "forward", counting_forward)
+    monkeypatch.setattr(np.linalg, "inv", counting_inverse)
+
+    result = checker.check_state(np.array([0.1]))
+
+    assert result.valid
+    assert forward_calls == 1
+    # Three capsules are checked against the attached payload; the tip
+    # transform is inverted once for the state, not once per capsule.
+    assert inverse_calls == 1
+
+
+# -- support manifold classification ------------------------------------------
+
+
+class _CountingTree:
+    """Wrap a cKDTree and count `query` calls, delegating everything else."""
+
+    def __init__(self, tree):
+        self._tree = tree
+        self.query_calls = 0
+        self.query_rows: list[int] = []
+
+    def query(self, points, **kwargs):
+        self.query_calls += 1
+        self.query_rows.append(int(np.atleast_2d(np.asarray(points)).shape[0]))
+        return self._tree.query(points, **kwargs)
+
+    def query_ball_point(self, *args, **kwargs):
+        return self._tree.query_ball_point(*args, **kwargs)
+
+
+def test_support_contact_mask_queries_the_scene_tree_once_for_all_seeds(tmp_path):
+    """Regression test: `_support_contact_mask` classified one candidate seed
+    per iteration of a Python loop, issuing a separate k-nearest-neighbour
+    query and a separate 3x3 eigendecomposition for each.  It runs once per
+    pick, between grasp closure and the first lift collision query, so the
+    per-seed loop showed up directly as lift latency.
+
+    The batched form must classify exactly the same points: a clean planar
+    support patch is entirely support-facing, and the distant stray sample
+    never becomes a candidate.
+    """
+
+    checker = _checker(tmp_path)
+    values = np.linspace(-0.02, 0.02, 21)
+    yy, zz = np.meshgrid(values, values)
+    plane = np.column_stack((np.full(yy.size, 0.195), yy.ravel(), zz.ravel()))
+    stray = np.array([[0.70, 0.0, 0.0]])
+    checker.update_scene(np.vstack((plane, stray)), stamp_s=10.0)
+    target = np.column_stack((np.full(yy.size, 0.200), yy.ravel(), zz.ravel()))
+
+    real_tree = checker._tree
+    counting = _CountingTree(real_tree)
+    checker._tree = counting
+    try:
+        mask = checker._support_contact_mask(
+            target,
+            np.array([1.0, 0.0, 0.0]),
+            0.006,
+        )
+    finally:
+        checker._tree = real_tree
+
+    assert mask.shape == (len(plane) + 1,)
+    assert int(mask.sum()) == len(plane)  # the whole patch, and only the patch
+    assert not mask[-1]  # the stray sample is never a candidate
+
+    # One batched query covering every candidate, not one query per candidate.
+    assert counting.query_calls == 1
+    assert counting.query_rows == [len(plane)]
+
+
+def test_support_contact_mask_still_rejects_misaligned_and_degenerate_seeds(
+    tmp_path,
+):
+    """The batched normal-alignment and rank gates must reject exactly what the
+    per-seed loop rejected.  A wall beside the payload is locally planar but its
+    normal is perpendicular to the departure direction, and a collinear scan row
+    has no second eigenvalue at all; neither may be exempted as support.
+    """
+
+    values = np.linspace(-0.02, 0.02, 21)
+
+    xx, zz = np.meshgrid(0.20 + values, values)
+    wall = np.column_stack((xx.ravel(), np.zeros(xx.size), zz.ravel()))
+    beside = _checker(tmp_path)
+    beside.update_scene(wall, stamp_s=10.0)
+    wall_mask = beside._support_contact_mask(
+        np.column_stack((0.20 + values, np.full(21, 0.003), np.zeros(21))),
+        np.array([1.0, 0.0, 0.0]),
+        0.006,
+    )
+    assert wall_mask.shape == (len(wall),)
+    assert int(wall_mask.sum()) == 0  # planar, but the normal is misaligned
+
+    line = np.column_stack((
+        np.full(200, 0.195), np.linspace(-0.02, 0.02, 200), np.zeros(200),
+    ))
+    degenerate = _checker(tmp_path)
+    degenerate.update_scene(line, stamp_s=10.0)
+    line_mask = degenerate._support_contact_mask(
+        np.column_stack((np.full(21, 0.200), values, np.zeros(21))),
+        np.array([1.0, 0.0, 0.0]),
+        0.008,
+    )
+    assert line_mask.shape == (len(line),)
+    assert int(line_mask.sum()) == 0  # no plane can be fitted to a line
