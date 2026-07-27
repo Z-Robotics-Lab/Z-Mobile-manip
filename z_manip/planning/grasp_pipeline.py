@@ -403,6 +403,10 @@ class GraspPlanGenerator:
             sentinel,
         )
         self.config = config or GraspPlanConfig()
+        tool_from_tip = np.asarray(self.config.tool_from_tip, dtype=float)
+        if tool_from_tip.shape != (4, 4) or not np.all(np.isfinite(tool_from_tip)):
+            raise ValueError("tool and tip transforms must be finite 4x4")
+        self._tip_from_tool = np.linalg.inv(tool_from_tip)
         self.approach_segment_valid = approach_segment_valid
         self.approach_path_valid = approach_path_valid
         self._approach_path_control_mode = (
@@ -451,7 +455,15 @@ class GraspPlanGenerator:
         )
 
     def _tip_pose(self, tool_pose: np.ndarray) -> np.ndarray:
-        return tool_tip_pose(tool_pose, self.config.tool_from_tip)
+        # ``tool_from_tip`` is immutable configuration, so its inverse is
+        # resolved once instead of on each of the ~11 tip poses every
+        # hypothesis needs (pregrasp, six approach steps, five lift steps).
+        tool = np.asarray(tool_pose, dtype=float)
+        if tool.shape != (4, 4):
+            raise ValueError("tool and tip transforms must be 4x4")
+        if not np.all(np.isfinite(tool)):
+            raise ValueError("tool and tip transforms must be finite")
+        return tool @ self._tip_from_tool
 
     def _reachability_order(
         self,

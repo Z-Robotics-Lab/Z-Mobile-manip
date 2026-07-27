@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from collections import OrderedDict, deque
 from pathlib import Path
@@ -23,6 +24,18 @@ from .robust_ik import (
     _halton,
     control_point_delta,
 )
+
+
+def _euclidean_norm(vector: np.ndarray) -> float:
+    """Return ``numpy.linalg.norm`` for a 1-D float vector, without its wrapper.
+
+    ``numpy.linalg.norm`` evaluates ``sqrt(x.dot(x))`` for this case, so the
+    returned double is bit-identical; only the dispatch/validation overhead
+    (~0.4 us per call, and this runs several times per damped-least-squares
+    iteration) is removed.
+    """
+
+    return math.sqrt(float(vector @ vector))
 
 
 class PinocchioUnavailable(RuntimeError):
@@ -193,6 +206,42 @@ class PinocchioIKSolver:
             maxlen=self._WARM_START_CAPACITY,
         )
         self._maximum_tip_radius_m = self._maximum_chain_radius(chain)
+        # Loop invariants of the damped-least-squares iteration, prepared once.
+        # They carry exactly the values the inner loop used to rebuild per
+        # iteration, so every residual and acceptance test is unchanged.
+        self._identity = np.eye(self.model.nv)
+        self._position_error_offset = np.asarray(
+            self.config.position_error_offset_tip_m,
+            dtype=float,
+        )
+        free_axis = np.asarray(self.config.orientation_free_axis, dtype=float)
+        self._orientation_free_axis = free_axis / float(np.linalg.norm(free_axis))
+        self._static_base_placement = self._resolve_static_base_placement()
+
+    def _resolve_static_base_placement(self) -> object | None:
+        """Return the arm base placement when no active joint can move it.
+
+        ``buildReducedModel`` folds every joint outside the arm chain into the
+        universe joint, so the chain base frame is normally carried by joint 0
+        and its world placement is a solve-invariant constant.  That is checked
+        against the model rather than assumed: a base frame carried by an active
+        joint returns ``None`` and keeps the per-iteration recomputation.
+        """
+
+        pin = self.pin
+        frame = self.model.frames[self.base_frame_id]
+        parent = getattr(frame, "parentJoint", None)
+        if parent is None:
+            parent = getattr(frame, "parent", None)
+        if parent is None or int(parent) != 0:
+            return None
+        pin.forwardKinematics(self.model, self.data, pin.neutral(self.model))
+        pin.updateFramePlacement(self.model, self.data, self.base_frame_id)
+        placement = self.data.oMf[self.base_frame_id]
+        return pin.SE3(
+            np.array(placement.rotation, dtype=float),
+            np.array(placement.translation, dtype=float),
+        )
 
     @staticmethod
     def _maximum_chain_radius(chain: KinematicChain) -> float:
@@ -219,13 +268,22 @@ class PinocchioIKSolver:
         upper: np.ndarray,
     ) -> list[np.ndarray]:
         unique: list[np.ndarray] = []
+        stacked: np.ndarray | None = None
         for seed in seeds:
             bounded = np.minimum(
                 np.maximum(np.asarray(seed, dtype=float), lower + 1e-10),
                 upper - 1e-10,
             )
-            if not any(np.allclose(bounded, other, atol=1e-10) for other in unique):
-                unique.append(bounded)
+            # Element-wise form of ``allclose(bounded, other, atol=1e-10)``
+            # against every retained seed at once (numpy default rtol=1e-5,
+            # tolerance taken on the retained seed, as the pairwise call did).
+            if stacked is not None and np.any(np.all(
+                np.abs(stacked - bounded) <= 1e-10 + 1e-5 * np.abs(stacked),
+                axis=1,
+            )):
+                continue
+            unique.append(bounded)
+            stacked = np.asarray(unique)
         return unique
 
     def _prepend_warm_starts(
@@ -273,35 +331,62 @@ class PinocchioIKSolver:
     ):
         return self._ranker.make_seed_pose_ranker(current, control)
 
-    def _pose_error(
-        self,
-        joints: np.ndarray,
-        goal: np.ndarray,
-    ) -> tuple[float, float, object, object]:
+    def _tip_placement(self, joints: np.ndarray) -> object:
+        """Return the tip placement, updating only the frames the solve reads.
+
+        ``updateFramePlacements`` refreshes all 96 model frames; the solve reads
+        two of them, and the base frame is usually a constant (see
+        ``_resolve_static_base_placement``).  The returned placement aliases the
+        solver workspace and is only valid until the next kinematics call.
+        """
+
         pin = self.pin
         pin.forwardKinematics(self.model, self.data, joints)
-        pin.updateFramePlacements(self.model, self.data)
-        base_world = self.data.oMf[self.base_frame_id]
-        tip_world = self.data.oMf[self.tip_frame_id]
-        desired_world = base_world * pin.SE3(goal[:3, :3], goal[:3, 3])
+        pin.updateFramePlacement(self.model, self.data, self.tip_frame_id)
+        return self.data.oMf[self.tip_frame_id]
+
+    def _desired_placement(self, goal_local: object) -> object:
+        pin = self.pin
+        pin.updateFramePlacement(self.model, self.data, self.base_frame_id)
+        return self.data.oMf[self.base_frame_id] * goal_local
+
+    def _placements(
+        self,
+        joints: np.ndarray,
+        goal_local: object,
+        static_desired: object | None,
+    ) -> tuple[object, object]:
+        """Return the tip placement and the goal placement in world frame."""
+
+        tip_world = self._tip_placement(joints)
+        if static_desired is not None:
+            return tip_world, static_desired
+        return tip_world, self._desired_placement(goal_local)
+
+    def _pose_error(
+        self,
+        tip_world: object,
+        desired_world: object,
+    ) -> tuple[float, float, np.ndarray]:
         # Position acceptance is measured at the configured tip-frame control
         # point (the tool contact TCP when wired), so orientation leverage over
         # the tool offset is bounded by the position gate.  A zero offset is
         # exactly the historical tip-origin error.
-        offset = np.asarray(self.config.position_error_offset_tip_m, dtype=float)
-        position_error = float(np.linalg.norm(control_point_delta(
-            np.asarray(tip_world.translation, dtype=float),
-            np.asarray(tip_world.rotation, dtype=float),
-            np.asarray(desired_world.translation, dtype=float),
-            np.asarray(desired_world.rotation, dtype=float),
-            offset,
-        )))
-        orientation_error = float(
-            np.linalg.norm(
-                pin.log3(desired_world.rotation @ tip_world.rotation.T),
-            ),
+        position_error = _euclidean_norm(control_point_delta(
+            tip_world.translation,
+            tip_world.rotation,
+            desired_world.translation,
+            desired_world.rotation,
+            self._position_error_offset,
+        ))
+        orientation_residual = self.pin.log3(
+            desired_world.rotation @ tip_world.rotation.T,
         )
-        return position_error, orientation_error, tip_world, desired_world
+        return (
+            position_error,
+            _euclidean_norm(orientation_residual),
+            orientation_residual,
+        )
 
     def _solution(
         self,
@@ -373,12 +458,12 @@ class PinocchioIKSolver:
 
     @staticmethod
     def _weighted_cost(error_twist: np.ndarray, weights: np.ndarray) -> float:
-        return float(np.linalg.norm(weights * np.asarray(error_twist, dtype=float)))
+        return _euclidean_norm(weights * np.asarray(error_twist, dtype=float))
 
     def _orientation_accepted(
         self,
         desired_world: object,
-        tip_world: object,
+        orientation_residual: np.ndarray,
         geodesic_error: float,
     ) -> bool:
         """Accept an orientation residual, optionally anisotropically.
@@ -394,16 +479,10 @@ class PinocchioIKSolver:
         free_tolerance = self.config.orientation_free_axis_tolerance_rad
         if free_tolerance <= 0.0:
             return geodesic_error < self.config.orientation_tolerance_rad
-        pin = self.pin
-        residual = np.asarray(
-            pin.log3(desired_world.rotation @ tip_world.rotation.T),
-            dtype=float,
-        )
-        axis = np.asarray(self.config.orientation_free_axis, dtype=float)
-        axis = axis / float(np.linalg.norm(axis))
-        free_axis_base = desired_world.rotation @ axis
+        residual = np.asarray(orientation_residual, dtype=float)
+        free_axis_base = desired_world.rotation @ self._orientation_free_axis
         axial = abs(float(residual @ free_axis_base))
-        transverse = float(np.linalg.norm(residual - (residual @ free_axis_base) * free_axis_base))
+        transverse = _euclidean_norm(residual - (residual @ free_axis_base) * free_axis_base)
         return (
             transverse < self.config.orientation_tolerance_rad
             and axial < free_tolerance
@@ -424,10 +503,21 @@ class PinocchioIKSolver:
         best = (float("inf"), float("inf"))
         best_joints = joints.copy()
         damping = self._DAMPING
+        goal_local = pin.SE3(goal[:3, :3], goal[:3, 3])
+        static_desired = (
+            None
+            if self._static_base_placement is None
+            else self._static_base_placement * goal_local
+        )
         for iteration in range(self.config.max_iterations):
             checkpoint(control, "Pinocchio inverse kinematics")
-            position_error, orientation_error, tip_world, desired_world = (
-                self._pose_error(joints, goal)
+            tip_world, desired_world = self._placements(
+                joints,
+                goal_local,
+                static_desired,
+            )
+            position_error, orientation_error, orientation_residual = (
+                self._pose_error(tip_world, desired_world)
             )
             if position_error + orientation_error < sum(best):
                 best = (position_error, orientation_error)
@@ -435,7 +525,7 @@ class PinocchioIKSolver:
             if (
                 position_error < self.config.position_tolerance_m
                 and self._orientation_accepted(
-                    desired_world, tip_world, orientation_error
+                    desired_world, orientation_residual, orientation_error
                 )
             ):
                 return self._solution(
@@ -462,10 +552,10 @@ class PinocchioIKSolver:
             normal = weighted_jacobian.T @ weighted_jacobian
             gradient = weighted_jacobian.T @ weighted_error
             tangent = -np.linalg.solve(
-                normal + damping * np.eye(self.model.nv),
+                normal + damping * self._identity,
                 gradient,
             )
-            tangent_norm = float(np.linalg.norm(tangent))
+            tangent_norm = _euclidean_norm(tangent)
             if tangent_norm > self._MAX_TANGENT_STEP:
                 tangent *= self._MAX_TANGENT_STEP / tangent_norm
             current_cost = self._weighted_cost(error_twist, weights)
@@ -481,9 +571,13 @@ class PinocchioIKSolver:
                     np.maximum(candidate, lower + 1e-10),
                     upper - 1e-10,
                 )
-                _, _, candidate_tip, candidate_desired = self._pose_error(
+                # The line search only ranks the twist norm, so the acceptance
+                # residuals (control-point delta and geodesic error) that the
+                # iteration head computes are deliberately not evaluated here.
+                candidate_tip, candidate_desired = self._placements(
                     candidate,
-                    goal,
+                    goal_local,
+                    static_desired,
                 )
                 candidate_error = pin.log6(
                     candidate_tip.actInv(candidate_desired),
