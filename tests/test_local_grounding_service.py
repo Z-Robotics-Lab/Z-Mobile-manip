@@ -401,3 +401,247 @@ def test_roi_zoom_skipped_without_qualifier():
     with pytest.raises(LookupError):
         runtime.ground(encoded.getvalue(), "充电器")
     assert runtime._model.predict_sizes == [(640, 480)]
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    (
+        # The support noun precedes the target noun in _ZH_NOUNS, so tuple order
+        # alone grounded the thing the target rests on.
+        ("箱子上的瓶子", ("bottle",)),
+        ("盒子里的杯子", ("cup",)),
+        ("黑色箱子上的彩色瓶子", ("bottle",)),
+        ("黑色箱子上斜着的彩色瓶子", ("bottle",)),
+        ("黑色台子上的瓶子", ("bottle",)),
+        ("机器狗身上的小充电器", ("charger", "wall charger", "usb charger",
+                                  "power adapter", "electrical plug")),
+        # English names the target before the preposition, not after it.
+        ("the colourful bottle on the black box", ("colourful bottle",)),
+        ("small white charger on the black box in the middile", ("small white charger",)),
+        ("white charger on the shelf", ("white charger",)),
+        ("the  tissue box  on  black box", ("tissue box",)),
+    ),
+)
+def test_support_relation_grounds_the_target_not_the_support(instruction, expected):
+    assert SERVICE.grounding_prompts(instruction) == expected
+
+
+def test_support_colour_does_not_leak_onto_the_target():
+    # 黑色 describes the stand; the bottle has no stated colour.
+    assert SERVICE.grounding_prompts("黑色台子上的瓶子") == ("bottle",)
+    assert SERVICE.grounding_prompts("黑色箱子上的黑色盒子") == ("black box", "small black box")
+
+
+def test_trailing_clause_after_a_separator_never_supplies_the_noun():
+    assert SERVICE.grounding_prompts("黑色箱子上的瓶子，不要黑色盒子") == ("bottle",)
+    assert SERVICE.grounding_prompts(
+        "the colourful bottle on the black box， you need to search for it"
+    ) == ("colourful bottle",)
+
+
+def test_english_colour_reaches_an_ascii_noun_lexicon_entry():
+    assert SERVICE.grounding_prompts("the black airpods on the black box") == (
+        "black wireless earbuds",
+    )
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    (
+        ("黑色箱子上右边的白色充电器", "right"),
+        ("黑色箱上面右边的小白色充电器", "right"),
+        ("黑色箱上面的右边白色充电器", "right"),
+        ("黑色箱子上左边的瓶子", "left"),
+        ("远处彩色瓶子", "far"),
+        ("中间的瓶子", "middle"),
+        ("the bottle on the left", "left"),
+        ("the charger in the middle", "middle"),
+        # A qualifier that describes the support must not move to the target.
+        ("远处箱子上白色充电器", None),
+        ("远处地上的白色充电器", None),
+        ("small white charger on the black box in the middile", None),
+        ("白色充电器", None),
+        ("the farm charger", None),
+    ),
+)
+def test_spatial_preference_extraction(instruction, expected):
+    assert SERVICE.spatial_preference(instruction) == expected
+
+
+def test_left_and_right_no_longer_produce_identical_requests():
+    left = "黑色箱子上左边的白色充电器"
+    right = "黑色箱子上右边的白色充电器"
+    assert SERVICE.grounding_prompts(left) == SERVICE.grounding_prompts(right)
+    assert SERVICE.spatial_preference(left) == "left"
+    assert SERVICE.spatial_preference(right) == "right"
+
+
+_TWO_INSTANCE_BOXES = ((100, 200, 160, 260), (400, 200, 460, 260))
+
+
+@pytest.mark.parametrize(
+    ("preference", "expected_x1"),
+    (("left", 100 / 640), ("right", 400 / 640)),
+)
+def test_select_detection_uses_the_qualifier_to_disambiguate(preference, expected_x1):
+    selected = SERVICE.select_detection(
+        _TWO_INSTANCE_BOXES,
+        (0.52, 0.61),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference=preference,
+    )
+
+    assert selected is not None
+    assert selected["bbox_xyxy"][0] == pytest.approx(expected_x1)
+
+
+def test_select_detection_without_qualifier_is_unchanged():
+    selected = SERVICE.select_detection(
+        _TWO_INSTANCE_BOXES,
+        (0.52, 0.61),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.61)
+
+
+def test_qualifier_does_not_promote_a_much_weaker_detection():
+    selected = SERVICE.select_detection(
+        _TWO_INSTANCE_BOXES,
+        (0.18, 0.90),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference="left",
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.90)
+
+
+def test_qualifier_is_ignored_when_boxes_are_not_separated():
+    selected = SERVICE.select_detection(
+        ((300, 200, 360, 260), (310, 205, 370, 265)),
+        (0.52, 0.61),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference="left",
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.61)
+
+
+@pytest.mark.parametrize(
+    ("preference", "expected_confidence"),
+    (("far", 0.52), ("near", 0.61)),
+)
+def test_near_and_far_rank_on_apparent_size(preference, expected_confidence):
+    selected = SERVICE.select_detection(
+        ((100, 200, 130, 230), (400, 180, 480, 260)),
+        (0.52, 0.61),
+        ("bottle", "bottle"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference=preference,
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(expected_confidence)
+
+
+def test_middle_qualifier_picks_the_central_instance():
+    selected = SERVICE.select_detection(
+        ((60, 200, 120, 260), (300, 200, 360, 260), (520, 200, 580, 260)),
+        (0.61, 0.52, 0.58),
+        ("bottle", "bottle", "bottle"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference="middle",
+    )
+
+    assert selected is not None
+    assert selected["bbox_xyxy"][0] == pytest.approx(300 / 640)
+
+
+def test_select_detection_rejects_an_unsupported_qualifier():
+    with pytest.raises(ValueError):
+        SERVICE.select_detection(
+            _TWO_INSTANCE_BOXES,
+            (0.52, 0.61),
+            ("white charger", "white charger"),
+            width=640,
+            height=480,
+            minimum_confidence=0.15,
+            maximum_area_ratio=0.45,
+            spatial_preference="behind",
+        )
+
+
+class _TwoInstanceModel:
+    """Both instances of the requested class are visible in one frame."""
+
+    def __init__(self):
+        self.model = self
+
+    def get_text_pe(self, classes, *, cache_clip_model=False):
+        return ("embedding", *classes)
+
+    def set_classes(self, classes, embeddings=None):
+        pass
+
+    def predict(self, **kwargs):
+        return [
+            _RoiFakeResult(
+                [[100, 200, 160, 260], [400, 200, 460, 260]],
+                [0.52, 0.61],
+                [0, 0],
+            )
+        ]
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected_preference", "expected_x1"),
+    (
+        ("黑色箱子上左边的白色充电器", "left", 100 / 640),
+        ("黑色箱子上右边的白色充电器", "right", 400 / 640),
+        ("黑色箱子上的白色充电器", None, 400 / 640),
+    ),
+)
+def test_ground_applies_the_qualifier_end_to_end(
+    instruction, expected_preference, expected_x1
+):
+    runtime = SERVICE.GroundingRuntime(
+        model_id="fake.pt",
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+    )
+    runtime._model = _TwoInstanceModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (640, 480), color=(90, 90, 90))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+
+    response = runtime.ground(encoded.getvalue(), instruction)
+
+    assert response["prompt"] == "white charger"
+    assert response["spatial_preference"] == expected_preference
+    assert response["target"]["bbox_xyxy"][0] == pytest.approx(expected_x1)
