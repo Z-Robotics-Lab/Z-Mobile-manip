@@ -19,6 +19,7 @@ from z_manip.control.visual_servo import VisualServoConfig
 from z_manip.kinematics.robust_ik import IKConfig
 from z_manip.orchestration.mobile_manipulation import RetryBudget
 from z_manip.planning.grasp_pipeline import GraspPlanConfig
+from z_manip.planning.placement import PlacementDeploymentConfig
 from z_manip.planning.rrt_connect import RRTConnectConfig
 from z_manip.planning.standoff import ReachabilityStandoffConfig
 from z_manip.planning.time_parameterization import TimeParameterizationConfig
@@ -27,6 +28,11 @@ from z_manip.planning.work_pose import WorkPoseConfig
 
 _ENVIRONMENT_VALUE = re.compile(r"^\$\{([A-Z][A-Z0-9_]*)\}$")
 _SCHEMA_VERSION = 2
+# Sections a deployment MAY carry. The stack config is bind-mounted into the
+# planning container as a single file, so a checkout that adds a section
+# reaches the loader through the hot-reloaded package long before the stale
+# mount is replaced; requiring one would take the running stack down.
+_OPTIONAL_SECTIONS = frozenset({"placement"})
 
 
 @dataclass(frozen=True)
@@ -127,6 +133,7 @@ class StackConfig:
     grasp_plan: GraspPlanConfig
     time_parameterization: TimeParameterizationConfig
     retry_budget: RetryBudget
+    placement: PlacementDeploymentConfig | None
     collision_model_path: Path
     vlm_models: tuple[str, ...]
 
@@ -332,7 +339,7 @@ def load_stack_config(
         "time_parameterization", "retry_budget",
         "collision_model", "vlm_models",
     }
-    unknown = set(values) - expected_sections
+    unknown = set(values) - expected_sections - _OPTIONAL_SECTIONS
     missing = expected_sections - set(values)
     if unknown or missing:
         raise ValueError(
@@ -483,6 +490,13 @@ def load_stack_config(
                 **_mapping(values["time_parameterization"], "time_parameterization"),
             ),
             retry_budget=RetryBudget(**_mapping(values["retry_budget"], "retry_budget")),
+            placement=(
+                PlacementDeploymentConfig.from_mapping(
+                    _mapping(values["placement"], "placement"),
+                )
+                if "placement" in values
+                else None
+            ),
             collision_model_path=collision,
             vlm_models=models,
         )

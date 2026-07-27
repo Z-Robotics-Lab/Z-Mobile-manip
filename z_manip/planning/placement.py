@@ -9,10 +9,10 @@ descriptions, semantic object classes, and simulator poses are not inputs.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
-from scipy.spatial import cKDTree
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 
 from z_manip.models.planner import PlanningError
 from z_manip.planning_control import (
@@ -108,6 +108,9 @@ class ObservedPlacementConfig:
     retreat_distance_m: float = 0.14
     yaw_samples: int = 8
     max_geometric_candidates: int = 96
+    release_clearance_m: float = 0.0
+    tool_probe_points_m: tuple[tuple[float, float, float], ...] = ()
+    tool_probe_clearance_m: float = 0.004
     seed: int = 7
     support_score_weight: float = 0.3
     clearance_score_weight: float = 0.15
@@ -141,6 +144,21 @@ class ObservedPlacementConfig:
             raise ValueError("placement sampling counts are too small")
         if self.max_geometric_candidates < 1:
             raise ValueError("at least one geometric candidate must be evaluated")
+        # The default 0.0 releases at contact. A deployment that raises it
+        # must stay above ``plane_exclusion_m``, or the released object ends
+        # up inside the band where obstacle points are deliberately ignored.
+        if not np.isfinite(self.release_clearance_m) or self.release_clearance_m < 0.0:
+            raise ValueError("release clearance must be finite and non-negative")
+        if (
+            not np.isfinite(self.tool_probe_clearance_m)
+            or self.tool_probe_clearance_m <= 0.0
+        ):
+            raise ValueError("tool probe clearance must be finite and positive")
+        probes = np.asarray(self.tool_probe_points_m, dtype=float)
+        if self.tool_probe_points_m and (
+            probes.ndim != 2 or probes.shape[1] != 3 or not np.all(np.isfinite(probes))
+        ):
+            raise ValueError("tool probe points must be finite (N, 3) tool-frame points")
         if min(
             self.support_score_weight,
             self.clearance_score_weight,
@@ -149,8 +167,83 @@ class ObservedPlacementConfig:
             raise ValueError("placement score weights cannot be negative")
 
 
+@dataclass(frozen=True)
+class PlacementDeploymentConfig:
+    """The measured, robot-specific half of placement search.
+
+    ``ObservedPlacementConfig`` stays sensor- and robot-independent; everything
+    here is a property of THIS gripper and THIS deployment and therefore lives
+    in the stack config next to ``tool_geometry``.
+    """
+
+    release_clearance_m: float
+    max_geometric_candidates: int
+    tool_probe_clearance_m: float
+    gripper_probe_points_tool_m: tuple[tuple[float, float, float], ...]
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.release_clearance_m) or self.release_clearance_m < 0.0:
+            raise ValueError("release clearance must be finite and non-negative")
+        if self.max_geometric_candidates < 1:
+            raise ValueError("at least one geometric candidate must be evaluated")
+        if (
+            not np.isfinite(self.tool_probe_clearance_m)
+            or self.tool_probe_clearance_m <= 0.0
+        ):
+            raise ValueError("tool probe clearance must be finite and positive")
+        probes = np.asarray(self.gripper_probe_points_tool_m, dtype=float)
+        if probes.ndim != 2 or probes.shape[1] != 3 or len(probes) < 1:
+            raise ValueError("gripper probe points must be (N, 3) tool-frame points")
+        if not np.all(np.isfinite(probes)):
+            raise ValueError("gripper probe points must be finite")
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, object]) -> "PlacementDeploymentConfig":
+        """Parse the stack-config ``placement`` section without silent defaults."""
+
+        if not isinstance(values, Mapping):
+            raise ValueError("placement section must be an object")
+        expected = set(cls.__dataclass_fields__)
+        unknown = set(values) - expected
+        missing = expected - set(values)
+        if unknown or missing:
+            raise ValueError(
+                "placement section fields mismatch; "
+                f"unknown={sorted(unknown)}, missing={sorted(missing)}",
+            )
+        return cls(
+            release_clearance_m=float(values["release_clearance_m"]),
+            max_geometric_candidates=int(values["max_geometric_candidates"]),
+            tool_probe_clearance_m=float(values["tool_probe_clearance_m"]),
+            gripper_probe_points_tool_m=tuple(
+                tuple(float(component) for component in point)
+                for point in values["gripper_probe_points_tool_m"]
+            ),
+        )
+
+    def planner_config(self, **overrides: object) -> ObservedPlacementConfig:
+        """Build the search config this deployment's gripper geometry implies."""
+
+        values: dict[str, object] = {
+            "release_clearance_m": self.release_clearance_m,
+            "max_geometric_candidates": self.max_geometric_candidates,
+            "tool_probe_clearance_m": self.tool_probe_clearance_m,
+            "tool_probe_points_m": self.gripper_probe_points_tool_m,
+        }
+        values.update(overrides)
+        return ObservedPlacementConfig(**values)
+
+
 @dataclass(frozen=True, eq=False)
 class SupportPlane:
+    """Fitted support geometry.
+
+    ``inlier_polygon_uv`` holds the outward half-plane equations of the convex
+    hull of the measured inliers, in the ``(tangent_u, tangent_v)`` frame
+    centred on ``origin``.  It bounds where the surface was actually OBSERVED;
+    beyond it the plane is an extrapolation and nothing may be released.
+    """
+
     origin: np.ndarray
     normal: np.ndarray
     tangent_u: np.ndarray
@@ -158,11 +251,19 @@ class SupportPlane:
     inlier_count: int
     inlier_ratio: float
     rms_error_m: float
+    inlier_polygon_uv: np.ndarray | None = None
 
 
 @dataclass(frozen=True, eq=False)
 class PlacementCandidate:
-    """One geometrically supported 6-DoF tool motion family."""
+    """One geometrically supported 6-DoF tool motion family.
+
+    ``object_pose`` is the RESTING pose: the object bottom on the fitted plane.
+    ``place_pose`` is the tool pose at release, which sits a further
+    ``release_clearance_m`` along the surface normal, so
+    ``place_pose @ tool_from_object`` is ``object_pose`` raised by that
+    clearance rather than ``object_pose`` itself.
+    """
 
     support_position: np.ndarray
     surface_normal: np.ndarray
@@ -354,6 +455,52 @@ class ObservedPlacementPlanner:
         )
         return plane, inliers
 
+    def _tool_volume_clear(
+        self,
+        probe_points: np.ndarray,
+        radius_m: float,
+        plane: SupportPlane,
+        scene: np.ndarray,
+        scene_tree: cKDTree,
+    ) -> bool:
+        """Reject gripper volume that meets scene structure standing off the plane.
+
+        Points within ``plane_exclusion_m`` of the fitted plane are the support
+        surface itself and are expected under the tool; anything taller is a
+        wall, a rim, or a neighbouring object.
+        """
+
+        for neighbors in scene_tree.query_ball_point(probe_points, radius_m):
+            if not neighbors:
+                continue
+            points = scene[np.asarray(neighbors, dtype=int)]
+            height = np.abs((points - plane.origin) @ plane.normal)
+            if np.any(height > self.config.plane_exclusion_m):
+                return False
+        return True
+
+    @staticmethod
+    def _support_polygon(support_uv: np.ndarray) -> np.ndarray:
+        """Outward half-plane equations of the observed inlier hull."""
+
+        try:
+            hull = ConvexHull(support_uv)
+        except (QhullError, ValueError) as error:
+            raise PlanningError(
+                "fitted support plane inliers form no usable polygon",
+            ) from error
+        return np.asarray(hull.equations, dtype=float)
+
+    @staticmethod
+    def _inside_support_polygon(
+        position: np.ndarray, plane: SupportPlane, polygon: np.ndarray,
+    ) -> bool:
+        uv = np.asarray((
+            float((position - plane.origin) @ plane.tangent_u),
+            float((position - plane.origin) @ plane.tangent_v),
+        ))
+        return bool(np.all(polygon[:, :2] @ uv + polygon[:, 2] <= 1e-9))
+
     def _yaw_values(self, constraints: PlacementConstraints) -> np.ndarray:
         if constraints.preferred_yaw_rad is None:
             return np.linspace(0.0, 2.0 * np.pi, self.config.yaw_samples, endpoint=False)
@@ -431,15 +578,27 @@ class ObservedPlacementPlanner:
         object_pose = np.eye(4)
         object_pose[:3, :3] = np.column_stack((axis_x, axis_y, plane.normal))
         object_pose[:3, 3] = support_position + 0.5 * extent[2] * plane.normal
-        place_pose = object_pose @ np.linalg.inv(tool_from_object)
+        release_object_pose = object_pose.copy()
+        release_object_pose[:3, 3] += self.config.release_clearance_m * plane.normal
+        place_pose = release_object_pose @ np.linalg.inv(tool_from_object)
 
-        tool_neighbors = scene_tree.query_ball_point(
-            place_pose[:3, 3], self.config.tool_clearance_radius_m,
-        )
-        if tool_neighbors:
-            tool_points = scene[np.asarray(tool_neighbors, dtype=int)]
-            plane_height = np.abs((tool_points - plane.origin) @ plane.normal)
-            if np.any(plane_height > self.config.plane_exclusion_m):
+        if not self._tool_volume_clear(
+            place_pose[:3, 3][None, :],
+            self.config.tool_clearance_radius_m,
+            plane,
+            scene,
+            scene_tree,
+        ):
+            return None
+        if self.config.tool_probe_points_m:
+            probes = np.asarray(self.config.tool_probe_points_m, dtype=float)
+            if not self._tool_volume_clear(
+                probes @ place_pose[:3, :3].T + place_pose[:3, 3],
+                self.config.tool_probe_clearance_m,
+                plane,
+                scene,
+                scene_tree,
+            ):
                 return None
 
         preplace_pose = place_pose.copy()
@@ -498,6 +657,8 @@ class ObservedPlacementPlanner:
             (support_points - plane.origin) @ plane.tangent_u,
             (support_points - plane.origin) @ plane.tangent_v,
         ))
+        polygon = self._support_polygon(support_uv)
+        plane = replace(plane, inlier_polygon_uv=polygon)
         support_tree = cKDTree(support_uv)
         scene_tree = cKDTree(scene)
         lower = np.min(support_uv, axis=0)
@@ -513,6 +674,7 @@ class ObservedPlacementPlanner:
         region_radius = float(np.max(np.linalg.norm(support_uv, axis=1)))
 
         candidates: list[PlacementCandidate] = []
+        outside_polygon = 0
         for uv in samples:
             checkpoint(control, "placement geometric candidate generation")
             support_position = plane.origin + uv[0] * plane.tangent_u + uv[1] * plane.tangent_v
@@ -529,9 +691,23 @@ class ObservedPlacementPlanner:
                     observation.constraints,
                     region_radius,
                 )
-                if candidate is not None:
-                    candidates.append(candidate)
+                if candidate is None:
+                    continue
+                # The tool must come down over surface that was measured. A
+                # place pose beyond the inlier hull is over extrapolated plane,
+                # and the support/clearance tests above say nothing about it.
+                if not self._inside_support_polygon(
+                    candidate.place_pose[:3, 3], plane, polygon,
+                ):
+                    outside_polygon += 1
+                    continue
+                candidates.append(candidate)
         if not candidates:
+            if outside_polygon:
+                raise PlanningError(
+                    f"all {outside_polygon} supported placement poses put the tool "
+                    "outside the observed support-plane inlier polygon",
+                )
             raise PlanningError(
                 "no placement pose has full boundary support and observed obstacle clearance",
             )
@@ -576,6 +752,7 @@ __all__ = [
     "ObservedPlacementPlanner",
     "PlacementCandidate",
     "PlacementConstraints",
+    "PlacementDeploymentConfig",
     "PlacementMotionEvaluation",
     "PlannedPlacement",
     "SupportPlane",

@@ -221,6 +221,78 @@ def test_motion_layer_must_return_finite_score_and_can_reject_every_pose():
         )
 
 
+def test_place_pose_outside_the_observed_inlier_polygon_is_refused():
+    # The object still lands on measured plane, but the tool that releases it
+    # stands 0.6 m away, over surface the sensor never observed.
+    displaced = np.eye(4)
+    displaced[0, 3] = 0.6
+    plane = _observed_plane()
+    observation = ObservedPlacementInput(**{
+        **{
+            field: getattr(plane, field)
+            for field in plane.__dataclass_fields__
+        },
+        "tool_from_object": displaced,
+    })
+    calls = 0
+
+    def evaluate(*_args):
+        nonlocal calls
+        calls += 1
+        return PlacementMotionEvaluation(score=1.0)
+
+    with pytest.raises(PlanningError, match="outside the observed support-plane"):
+        _planner().plan(observation, current_joints=np.zeros(6), evaluate=evaluate)
+    assert calls == 0
+
+
+def test_inlier_polygon_bounds_the_measured_surface_not_the_sample_grid():
+    result = _planner().plan(
+        _observed_plane(), current_joints=np.zeros(6), evaluate=_accept,
+    )
+    polygon = result.plane.inlier_polygon_uv
+
+    assert polygon is not None and polygon.shape[1] == 3
+    inside = polygon[:, :2] @ np.zeros(2) + polygon[:, 2]
+    assert float(inside.max()) < 0.0
+    outside = polygon[:, :2] @ np.asarray((0.6, 0.0)) + polygon[:, 2]
+    assert float(outside.max()) > 0.0
+
+
+def test_gripper_probe_points_reject_a_release_that_straddles_an_obstacle():
+    obstacle_center = np.array((0.0, 0.0, 0.0))
+    observation = _observed_plane(
+        half_size=0.20,
+        extent=(0.06, 0.05, 0.08),
+        obstacles=((obstacle_center, 0.06, 0.30),),
+        constraints=PlacementConstraints(min_clearance_m=0.0),
+    )
+    # A finger pair that reaches 0.05 m to either side of the tool origin, at
+    # the object's own height, must not be planned through the standing column
+    # even where the object footprint itself clears it.
+    probes = ((0.0, 0.05, 0.0), (0.0, -0.05, 0.0))
+    clearance = 0.04
+    permissive = _planner(
+        sample_spacing_m=0.03, max_geometric_candidates=10_000,
+    ).plan(observation, current_joints=np.zeros(6), evaluate=_accept)
+    guarded = _planner(
+        sample_spacing_m=0.03,
+        max_geometric_candidates=10_000,
+        tool_probe_points_m=probes,
+        tool_probe_clearance_m=clearance,
+    ).plan(observation, current_joints=np.zeros(6), evaluate=_accept)
+
+    # The single tool-origin sphere admits 608 releases here; modelling the
+    # finger pair removes 60 of them.
+    assert guarded.geometric_candidates < permissive.geometric_candidates
+    world = np.asarray(probes) @ guarded.candidate.place_pose[:3, :3].T
+    world = world + guarded.candidate.place_pose[:3, 3]
+    column = np.asarray(observation.scene_points)
+    column = column[np.abs(column[:, 2]) > 0.012]
+    gaps = np.linalg.norm(world[:, None, :] - column[None, :, :], axis=2)
+    assert float(gaps.min()) > clearance
+
+
 def test_cancellation_stops_candidate_evaluation_before_the_next_moveit_call():
     observation = _observed_plane()
     calls = 0

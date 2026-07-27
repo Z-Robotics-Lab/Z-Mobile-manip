@@ -222,6 +222,43 @@
     "place_replans": 2,
     "release_attempts": 2
   },
+  "placement": {
+    "release_clearance_m": 0.015,
+    "max_geometric_candidates": 24,
+    "tool_probe_clearance_m": 0.004,
+    "gripper_probe_points_tool_m": [
+      [
+        -0.00475,
+        -0.042,
+        0.0315
+      ],
+      [
+        -0.00475,
+        0.042,
+        0.0315
+      ],
+      [
+        0.0,
+        0.04825,
+        0.072
+      ],
+      [
+        0.0,
+        0.04825,
+        0.11
+      ],
+      [
+        0.0,
+        -0.04825,
+        0.072
+      ],
+      [
+        0.0,
+        -0.04825,
+        0.11
+      ]
+    ]
+  },
   "collision_model": "piper_collision_capsules.json",
   "vlm_models": [
     "qwen/qwen3-vl-8b-instruct:nitro",
