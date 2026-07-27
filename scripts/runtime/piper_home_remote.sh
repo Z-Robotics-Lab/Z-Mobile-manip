@@ -6,23 +6,29 @@ STACK_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 NUC_HOST="${GO2W_NUC_HOST:-yusenzlabnuc@192.168.3.8}"
 NUC_KEY="${GO2W_NUC_SSH_KEY:-$HOME/.ssh/id_ed25519_codex_nuc}"
 REMOTE_DIR="/home/yusenzlabnuc/z-manip-runtime"
-REMOTE_ACTION="$REMOTE_DIR/smart-home"
+REMOTE_ACTION="${GO2W_HOME_REMOTE_DIR:-$REMOTE_DIR/smart-home}"
 INTERACTIVE_ROOT="${Z_MANIP_INTERACTIVE_RUN_ROOT:-$STACK_ROOT/../artifacts/go2w_real/interactive_sessions}"
 SPEED_PERCENT="${1:-2}"
 PIPER_HOME_CONFIG="${PIPER_HOME_CONFIG:-$STACK_ROOT/configs/piper_home.json}"
 [[ "$SPEED_PERCENT" =~ ^([1-9]|[1-4][0-9]|50)$ ]] || { printf 'Home speed must be an integer from 1 to 50 percent\n' >&2; exit 2; }
 
-for path in \
-  "$NUC_KEY" \
-  "$PIPER_HOME_CONFIG" \
-  "$SCRIPT_DIR/piper_home_recovery.py" \
-  "$SCRIPT_DIR/piper_reverse_home_recovery.py" \
-  "$SCRIPT_DIR/piper_staged_grasp_executor.py"; do
+HOME_INPUTS=(
+  "$PIPER_HOME_CONFIG"
+  "$SCRIPT_DIR/piper_home_recovery.py"
+  "$SCRIPT_DIR/piper_reverse_home_recovery.py"
+  "$SCRIPT_DIR/piper_staged_grasp_executor.py"
+)
+
+for path in "$NUC_KEY" "${HOME_INPUTS[@]}"; do
   [[ -f "$path" ]] || { printf 'required Home input is missing: %s\n' "$path" >&2; exit 1; }
 done
 
-ssh_args=(-i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 "$NUC_HOST")
-scp_args=(-q -i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5)
+# A dedicated control path: sharing the grasp master would let this wrapper's
+# teardown drop a connection the grasp legs still depend on.
+control_path="$(dirname -- "$NUC_KEY")/z-manip-home-%C"
+mux_args=(-o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$control_path")
+ssh_args=(-i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 "${mux_args[@]}" "$NUC_HOST")
+scp_args=(-q -i "$NUC_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 "${mux_args[@]}")
 
 shopt -s nullglob
 planning_dirs=("$INTERACTIVE_ROOT"/planning/*/artifacts/planning)
@@ -71,21 +77,35 @@ else
   printf '[home] no complete checked planning artifact; using direct Home recovery\n'
 fi
 
-ssh "${ssh_args[@]}" "rm -rf '$REMOTE_ACTION'; mkdir -p '$REMOTE_ACTION'"
-scp "${scp_args[@]}" \
-  "$PIPER_HOME_CONFIG" \
-  "$NUC_HOST:$REMOTE_ACTION/piper_home.json"
-scp "${scp_args[@]}" \
-  "$SCRIPT_DIR/piper_home_recovery.py" \
-  "$SCRIPT_DIR/piper_reverse_home_recovery.py" \
-  "$SCRIPT_DIR/piper_staged_grasp_executor.py" \
-  "$NUC_HOST:$REMOTE_ACTION/"
-
+staged_inputs=("${HOME_INPUTS[@]}")
 if [[ -n "$latest_planning" ]]; then
+  staged_inputs+=("$latest_planning/planning_report.json" "$latest_planning/planned_grasp.npz")
+fi
+
+manifest_sha="$(sha256sum "${staged_inputs[@]}" | awk '{print $1}' | sha256sum | awk '{print $1}')"
+remote_sha="$(ssh "${ssh_args[@]}" "cat '$REMOTE_ACTION/.manifest-sha' 2>/dev/null || true")"
+if [[ "$remote_sha" != "$manifest_sha" ]]; then
+  ssh "${ssh_args[@]}" "rm -rf '$REMOTE_ACTION'; mkdir -p '$REMOTE_ACTION'"
   scp "${scp_args[@]}" \
-    "$latest_planning/planning_report.json" \
-    "$latest_planning/planned_grasp.npz" \
+    "$PIPER_HOME_CONFIG" \
+    "$NUC_HOST:$REMOTE_ACTION/piper_home.json"
+  scp "${scp_args[@]}" \
+    "$SCRIPT_DIR/piper_home_recovery.py" \
+    "$SCRIPT_DIR/piper_reverse_home_recovery.py" \
+    "$SCRIPT_DIR/piper_staged_grasp_executor.py" \
     "$NUC_HOST:$REMOTE_ACTION/"
+
+  if [[ -n "$latest_planning" ]]; then
+    scp "${scp_args[@]}" \
+      "$latest_planning/planning_report.json" \
+      "$latest_planning/planned_grasp.npz" \
+      "$NUC_HOST:$REMOTE_ACTION/"
+  fi
+
+  # Stamp the marker only after every file has landed, so an interrupted upload
+  # forces a full re-stage instead of letting the next call skip onto a partial
+  # payload.
+  ssh "${ssh_args[@]}" "printf '%s' '$manifest_sha' > '$REMOTE_ACTION/.manifest-sha'"
 fi
 
 if [[ -n "$latest_planning" ]]; then
