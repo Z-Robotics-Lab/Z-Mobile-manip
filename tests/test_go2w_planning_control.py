@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gzip
 import hashlib
 import http.client
 import importlib.util
@@ -824,6 +825,8 @@ def test_depth_servo_api_has_separate_shadow_live_and_stop_actions(tmp_path):
             # demo cycle); hold-at-Home dwell defaults to 2.0s.
             "place_back": True,
             "hold_seconds": 2.0,
+            # No combo slug was sent, so none is named back to the runner.
+            "combo": None,
         }
 
         connection.request(
@@ -895,6 +898,7 @@ def test_depth_servo_api_accepts_server_owned_automatic_workflow(tmp_path):
             "speed_percent": 20,
             "place_back": True,
             "hold_seconds": 2.0,
+            "combo": None,
         }
     finally:
         connection.close()
@@ -4328,3 +4332,439 @@ def test_dashboard_handler_swallows_benign_client_disconnect(tmp_path, monkeypat
             handler.handle_one_request()
     finally:
         server.server_close()
+
+
+def test_cloud_binary_is_gzipped_only_when_the_client_asks_and_keeps_one_etag(tmp_path):
+    class FakeControl:
+        def status(self):
+            return {"available": True, "running": False, "state": "idle"}
+
+        def start(self):
+            raise AssertionError("cloud reads must never start planning")
+
+    cloud_path = tmp_path / "cloud-latest.bin"
+    binary = _cloud_binary(4096, source_flag=1)
+    cloud_path.write_bytes(binary)
+    server = CONTROL.create_server(
+        _bundle(tmp_path / "debug_bundle.json"),
+        port=0,
+        index_path=HTML,
+        control_backend=FakeControl(),
+        runtime_state=None,
+        cloud_bin=cloud_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        # A client that does not negotiate gzip still gets exactly the raw ZMPC
+        # frame: header + count * CLOUD_POINT_BYTES, byte-identical to the file.
+        connection.request("GET", "/api/cloud/latest.bin")
+        response = connection.getresponse()
+        plain = response.read()
+        etag = response.getheader("ETag")
+        assert response.status == 200
+        assert response.getheader("Content-Encoding") is None
+        assert response.getheader("Vary") == "Accept-Encoding"
+        assert plain == binary
+        assert len(plain) == CONTROL.CLOUD_HEADER_STRUCT.size + 4096 * CONTROL.CLOUD_POINT_BYTES
+
+        connection.request("GET", "/api/cloud/latest.bin", headers={"Accept-Encoding": "gzip"})
+        response = connection.getresponse()
+        compressed = response.read()
+        assert response.status == 200
+        assert response.getheader("Content-Encoding") == "gzip"
+        assert int(response.getheader("Content-Length")) == len(compressed)
+        assert len(compressed) < len(plain)
+        assert gzip.decompress(compressed) == binary
+        # The validator is the digest of the RAW frame in both encodings, so a
+        # client that switches encodings mid-stream cannot be handed a 304 for
+        # bytes it does not have.
+        assert response.getheader("ETag") == etag
+
+        connection.request(
+            "GET",
+            "/api/cloud/latest.bin",
+            headers={"Accept-Encoding": "gzip", "If-None-Match": etag},
+        )
+        response = connection.getresponse()
+        assert response.status == 304
+        assert response.read() == b""
+        assert response.getheader("Content-Encoding") is None
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_cloud_gzip_cache_is_rebuilt_per_frame_and_refuses_a_foreign_etag(tmp_path):
+    path = tmp_path / "cloud-latest.bin"
+    path.write_bytes(_cloud_binary(8, source_flag=1))
+    reader = CONTROL.CloudSnapshotReader(path)
+    _status, payload, etag, *_rest = reader.snapshot()
+    assert payload is not None and etag is not None
+    first = reader.compressed(etag)
+    assert first is not None and gzip.decompress(first) == payload
+    # Cached: the same validator returns the very same object, not a re-deflate.
+    assert reader.compressed(etag) is first
+    # A validator this reader does not hold can never yield bytes.
+    assert reader.compressed('"cloud-not-this-frame"') is None
+
+    time.sleep(0.01)
+    path.write_bytes(_cloud_binary(9, source_flag=1))
+    _status, payload, next_etag, *_rest = reader.snapshot()
+    assert next_etag != etag
+    assert reader.compressed(etag) is None
+    later = reader.compressed(next_etag)
+    assert later is not None and gzip.decompress(later) == payload
+
+
+def test_component_status_shell_is_memoized_without_stampeding_or_hiding_actions(tmp_path):
+    (tmp_path / "scripts" / "runtime").mkdir(parents=True)
+    script = tmp_path / "scripts" / "runtime" / "go2w_component_manager.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    manager = CONTROL.VisualComponentManager(script)
+    calls: list[tuple[str, ...]] = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Completed:
+        returncode = 0
+        stdout = "edgetam\thealthy\tup 3 minutes\n"
+
+    def _shell(*arguments, timeout):
+        calls.append(arguments)
+        entered.set()
+        release.wait(5)
+        return _Completed()
+
+    manager._shell = _shell  # noqa: SLF001 - exercising the memo, not the shell
+
+    # Cold cache: a concurrent poll has nothing truthful to serve, so it waits
+    # for the single in-flight reading instead of forking a second shell.
+    cold: list[dict[str, object]] = []
+    first = threading.Thread(target=lambda: cold.append(manager.status()), daemon=True)
+    first.start()
+    assert entered.wait(5)
+    second = threading.Thread(target=lambda: cold.append(manager.status()), daemon=True)
+    second.start()
+    time.sleep(0.05)
+    assert second.is_alive()
+    assert len(calls) == 1
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert len(calls) == 1
+    assert len(cold) == 2
+    for document in cold:
+        assert document["schema"] == "z_manip.visual_components.v1"
+        assert document["components"]["edgetam"]["state"] == "healthy"
+        assert set(document["components"]) == set(CONTROL.VISUAL_COMPONENTS)
+
+    # Inside the TTL a poll never reaches the shell, and the action state that
+    # this process owns is still recomputed live rather than memoized.
+    hit = manager.status()
+    assert len(calls) == 1
+    assert hit["components"]["edgetam"]["state"] == "healthy"
+    assert hit["busy"] is False
+    assert hit["available"] is True
+
+    # Expired cache with a refresh in flight: the loser is served the previous
+    # reading immediately rather than stampeding a second 1.5-2.9 s shell.
+    entered.clear()
+    release.clear()
+    manager._states_at = time.monotonic() - CONTROL.COMPONENT_STATUS_TTL_S - 0.01  # noqa: SLF001
+    refresher = threading.Thread(target=manager.status, daemon=True)
+    refresher.start()
+    assert entered.wait(5)
+    served = manager.status()
+    assert len(calls) == 2
+    assert served["components"]["edgetam"]["state"] == "healthy"
+    release.set()
+    refresher.join(timeout=5)
+    assert len(calls) == 2
+
+    # An action that can move a component invalidates the memo immediately, so
+    # the memo can never hide a state change the operator just caused.
+    manager._invalidate_states()  # noqa: SLF001 - restart()/bringup() call this
+    assert manager.status()["components"]["edgetam"]["state"] == "healthy"
+    assert len(calls) == 3
+
+    # And the TTL expires on its own.
+    manager._states_at = time.monotonic() - CONTROL.COMPONENT_STATUS_TTL_S - 0.01  # noqa: SLF001
+    manager.status()
+    assert len(calls) == 4
+
+    # A reading that was already in flight when an action invalidated the memo
+    # is served to its own caller but never cached, so it cannot mask the action
+    # for a full TTL.
+    entered.clear()
+    release.clear()
+    manager._invalidate_states()  # noqa: SLF001
+    inflight = threading.Thread(target=manager.status, daemon=True)
+    inflight.start()
+    assert entered.wait(5)
+    manager._invalidate_states()  # noqa: SLF001 - operator restarts mid-read
+    release.set()
+    inflight.join(timeout=5)
+    assert manager._states_at is None  # noqa: SLF001
+    before = len(calls)
+    manager.status()
+    assert len(calls) == before + 1
+
+    # The two operator actions that move component state invalidate through
+    # exactly that path, synchronously, before they return.
+    assert manager.restart("edgetam")["started"] is True
+    assert manager._states_at is None  # noqa: SLF001
+    manager.status()
+    manager._thread.join(timeout=5)  # noqa: SLF001
+    manager._states_at = time.monotonic()  # noqa: SLF001
+    assert manager.bringup()["started"] is True
+    assert manager._states_at is None  # noqa: SLF001
+    manager._thread.join(timeout=5)  # noqa: SLF001
+
+
+def test_control_status_trims_the_log_tail_and_keeps_the_full_tail_on_demand(tmp_path):
+    run_root = tmp_path / "runs"
+    run_root.mkdir()
+    session = tmp_path / "session.sh"
+    session.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    session.chmod(0o755)
+    runner = CONTROL.PlanningOnlyRunner(session, run_root)
+    runner.log_path.write_text("x" * (CONTROL.MAX_LOG_TAIL_BYTES * 2), encoding="utf-8")
+
+    status = runner.status()
+    assert len(status["log_tail"]) == CONTROL.CONTROL_LOG_TAIL_BYTES
+    assert CONTROL.CONTROL_LOG_TAIL_BYTES < CONTROL.MAX_LOG_TAIL_BYTES
+    # The tooltip shows the END of the log, and the untruncated bounded tail is
+    # still reachable, so nothing that was displayable stopped being displayable.
+    assert status["log_tail"] == runner.log_tail()[-CONTROL.CONTROL_LOG_TAIL_BYTES:]
+    assert len(runner.log_tail()) == CONTROL.MAX_LOG_TAIL_BYTES
+
+
+def test_runtime_geometry_etag_is_opt_in_and_freshness_rides_on_every_response(tmp_path):
+    class FakeControl:
+        def status(self):
+            return {"available": True, "running": False, "state": "idle"}
+
+        def start(self):
+            raise AssertionError("runtime reads must never start planning")
+
+    runtime_path = tmp_path / "runtime.json"
+    runtime_path.write_text(json.dumps(_runtime_state(time.time_ns())), encoding="utf-8")
+    server = CONTROL.create_server(
+        _bundle(tmp_path / "debug_bundle.json"),
+        port=0,
+        index_path=HTML,
+        control_backend=FakeControl(),
+        runtime_state=runtime_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    geometry = {"X-Z-Manip-Runtime-Etag": CONTROL.RUNTIME_GEOMETRY_ETAG_MODE}
+    try:
+        connection.request("GET", "/api/runtime")
+        response = connection.getresponse()
+        default_etag = response.getheader("ETag")
+        response.read()
+        assert response.status == 200
+        assert response.getheader("X-Z-Manip-Runtime-State") == "live"
+        assert response.getheader("X-Z-Manip-Runtime-Sequence") == "1"
+        assert int(response.getheader("X-Z-Manip-Runtime-Age-Ms")) >= 0
+
+        connection.request("GET", "/api/runtime", headers=geometry)
+        response = connection.getresponse()
+        geometry_etag = response.getheader("ETag")
+        response.read()
+        assert response.status == 200
+        # The two modes must never collide: a client switching modes cannot be
+        # handed a 304 computed under the other mode's rules.
+        assert geometry_etag != default_etag
+        assert geometry_etag.startswith('"runtime-geometry-')
+
+        # A new sequence and a new source timestamp with identical geometry
+        # revalidates in geometry mode but not in the default mode.
+        time.sleep(0.01)
+        runtime_path.write_text(
+            json.dumps(_runtime_state(time.time_ns(), sequence=2)),
+            encoding="utf-8",
+        )
+        connection.request(
+            "GET",
+            "/api/runtime",
+            headers={**geometry, "If-None-Match": geometry_etag},
+        )
+        response = connection.getresponse()
+        assert response.status == 304
+        assert response.read() == b""
+        # Freshness and the producer sequence are still carried on the 304, so a
+        # conditional client keeps a truthful staleness badge and rate readout.
+        assert response.getheader("X-Z-Manip-Runtime-State") == "live"
+        assert response.getheader("X-Z-Manip-Runtime-Sequence") == "2"
+        assert int(response.getheader("X-Z-Manip-Runtime-Age-Ms")) >= 0
+
+        connection.request("GET", "/api/runtime", headers={"If-None-Match": default_etag})
+        response = connection.getresponse()
+        assert response.status == 200
+        response.read()
+
+        # Moving geometry still forces a body in geometry mode.
+        time.sleep(0.01)
+        moved = _runtime_state(time.time_ns(), sequence=3)
+        moved["joint_positions_rad"][0] = 0.9
+        runtime_path.write_text(json.dumps(moved), encoding="utf-8")
+        connection.request(
+            "GET",
+            "/api/runtime",
+            headers={**geometry, "If-None-Match": geometry_etag},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["joint_positions_rad"][0] == 0.9
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_runtime_geometry_etag_still_flips_when_feedback_goes_stale():
+    now = [1_800_000_000_000_000_000]
+    live = CONTROL.validate_runtime_state(_runtime_state(now[0]))
+    live["received_timestamp_ns"] = now[0]
+    live["error"] = None
+    live["status"] = "live"
+    live["age_s"] = 0.01
+    fresh_etag = CONTROL.runtime_geometry_etag(live)
+
+    # Same geometry, same sequence, only the clocks moved: no redraw is owed.
+    ticked = dict(live)
+    ticked["sequence"] = 99
+    ticked["source_timestamp_ns"] = now[0] + 500_000_000
+    ticked["received_timestamp_ns"] = now[0] + 500_000_000
+    ticked["age_s"] = 0.4
+    assert CONTROL.runtime_geometry_etag(ticked) == fresh_etag
+
+    # The freshness CLASS is inside the validator, so the live -> stale flip and
+    # every offline reason still force a fresh body.
+    stale = dict(live)
+    stale["status"] = "stale"
+    assert CONTROL.runtime_geometry_etag(stale) != fresh_etag
+    offline = dict(live)
+    offline["status"] = "offline"
+    offline["error"] = {"code": "RUNTIME_STATE_MISSING", "message": "gone"}
+    assert CONTROL.runtime_geometry_etag(offline) != fresh_etag
+
+
+def test_named_task_combos_only_rename_already_validated_approach_options():
+    # Every slug must resolve inside the range the runner already validates, so
+    # the UI can never produce an INVALID_HOLD_SECONDS the operator cannot read.
+    for slug, options in CONTROL.APPROACH_TASK_COMBOS.items():
+        assert isinstance(options["place_back"], bool)
+        assert 0.0 <= options["hold_seconds"] <= CONTROL.MOBILE_HANDOFF_MAX_HOLD_SECONDS
+        # A combo must never carry a speed field; #motion-speed stays the single
+        # speed authority.
+        assert set(options) == {"place_back", "hold_seconds"}
+
+    # The default slug is today's behaviour bit-for-bit.
+    assert CONTROL.resolve_approach_combo({"combo": "pick_place_back"}) == (
+        True,
+        CONTROL.MOBILE_HANDOFF_HOLD_SECONDS,
+        "pick_place_back",
+    )
+    assert CONTROL.resolve_approach_combo({"combo": "pick_and_hold"}) == (False, 0.0, "pick_and_hold")
+    assert CONTROL.resolve_approach_combo({"combo": "pick_hold_long"}) == (
+        True,
+        CONTROL.MOBILE_HANDOFF_MAX_HOLD_SECONDS,
+        "pick_hold_long",
+    )
+    # No combo at all is exactly the pre-existing default.
+    assert CONTROL.resolve_approach_combo({}) == (True, CONTROL.MOBILE_HANDOFF_HOLD_SECONDS, None)
+    # An explicit option always beats the slug it would otherwise default.
+    assert CONTROL.resolve_approach_combo(
+        {"combo": "pick_and_hold", "place_back": True, "hold_seconds": 4.0},
+    ) == (True, 4.0, "pick_and_hold")
+
+
+def test_approach_start_accepts_a_named_combo_and_rejects_an_unknown_one(tmp_path):
+    class FakeControl:
+        def status(self):
+            return {"available": True, "running": False, "state": "idle"}
+
+    approach = _FakeApproachRunner()
+    server = CONTROL.create_server(
+        _bundle(tmp_path / "debug_bundle.json"),
+        port=0,
+        index_path=HTML,
+        control_backend=FakeControl(),
+        runtime_state=None,
+        approach_runner=approach,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    try:
+        connection.request(
+            "POST",
+            "/api/approach/start",
+            body=json.dumps({"mode": "shadow", "combo": "pick_and_hold"}).encode(),
+            headers=_interactive_headers(port, "approach-start"),
+        )
+        response = connection.getresponse()
+        assert response.status == 202
+        response.read()
+        assert approach.options["place_back"] is False
+        assert approach.options["hold_seconds"] == 0.0
+        assert approach.options["combo"] == "pick_and_hold"
+
+        approach.running = False
+        connection.request(
+            "POST",
+            "/api/approach/start",
+            body=json.dumps({"mode": "shadow", "combo": "drive_into_the_wall"}).encode(),
+            headers=_interactive_headers(port, "approach-start"),
+        )
+        response = connection.getresponse()
+        assert response.status == 400
+        assert json.loads(response.read())["error"]["code"] == "INVALID_COMBO"
+
+        connection.request(
+            "POST",
+            "/api/approach/start",
+            body=json.dumps({"mode": "shadow", "combo": ["pick_and_hold"]}).encode(),
+            headers=_interactive_headers(port, "approach-start"),
+        )
+        response = connection.getresponse()
+        assert response.status == 400
+        assert json.loads(response.read())["error"]["code"] == "INVALID_COMBO"
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_named_combo_is_echoed_into_the_live_approach_workflow(tmp_path):
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "servo-status.json",
+        tmp_path / "servo.log",
+    )
+    assert runner.status()["workflow"]["combo"] is None
+    result = runner.start(
+        "shadow",
+        place_back=False,
+        hold_seconds=0.0,
+        combo="pick_and_hold",
+    )
+    assert result.get("started") is True
+    workflow = runner.status()["workflow"]
+    assert workflow["combo"] == "pick_and_hold"
+    assert workflow["place_back"] is False
+    assert workflow["hold_seconds"] == 0.0
+    runner.stop()
