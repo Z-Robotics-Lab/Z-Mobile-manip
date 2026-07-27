@@ -54,11 +54,18 @@ def load_home(path: Path) -> np.ndarray:
 
 
 def fixed_view_targets(home: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Whole-arm joint targets for every fixed search view, limit-checked.
+
+    The pan axis is PiPER J1, so a view moves the WHOLE chain and not just the
+    wrist.  The limit check below therefore covers all six joints and refuses
+    the search outright if any view leaves the firmware envelope.
+    """
+
     search = BoundedWristSearch(WristSearchConfig())
     targets = []
     for view in search.views:
         target = home.copy()
-        target[search.config.yaw_joint_index] += view.yaw_offset_rad
+        target[search.config.pan_joint_index] += view.pan_offset_rad
         target[search.config.pitch_joint_index] += view.pitch_offset_rad
         if np.any(target < executor.JOINT_LIMITS_RAD[:, 0]) or np.any(target > executor.JOINT_LIMITS_RAD[:, 1]):
             raise executor.SafetyError(f"fixed wrist view {view.index} exceeds PiPER limits")
@@ -118,10 +125,22 @@ def main() -> int:
             after_timestamp=stamp,
             timeout_s=1.5,
         )
-        wrist_indices = (WristSearchConfig().yaw_joint_index, WristSearchConfig().pitch_joint_index)
-        non_wrist = [index for index in range(6) if index not in wrist_indices]
-        if float(np.max(np.abs(current[non_wrist] - home[non_wrist]))) > MAX_NON_WRIST_ERROR_RAD:
-            raise executor.SafetyError("wrist search may start only from the measured Home arm posture")
+        search_config = WristSearchConfig()
+        # The two swept joints are now J1 (pan) and J5 (pitch).  Every OTHER
+        # joint must still be at the measured Home posture, which is what this
+        # check enforces -- note that since the pan axis moved from J4 to J1,
+        # J4 GAINED this protection and J1 LEFT it, so this check no longer
+        # pins the base yaw.  The base yaw is covered instead by the
+        # MAX_VIEW_START_ERROR_RAD check immediately below, which requires the
+        # live posture to match Home or one of the fixed views on all six
+        # joints.  Both are fail-closed; neither was relaxed.
+        search_indices = (search_config.pan_joint_index, search_config.pitch_joint_index)
+        held = [index for index in range(6) if index not in search_indices]
+        if float(np.max(np.abs(current[held] - home[held]))) > MAX_NON_WRIST_ERROR_RAD:
+            raise executor.SafetyError(
+                "wrist search may start only from the measured Home posture on "
+                "every joint the search does not sweep",
+            )
         nearest = min(float(np.max(np.abs(current - candidate))) for candidate in targets)
         if nearest > MAX_VIEW_START_ERROR_RAD:
             raise executor.SafetyError("live joints do not match Home or a fixed wrist-search view")
