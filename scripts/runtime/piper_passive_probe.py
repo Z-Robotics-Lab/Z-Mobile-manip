@@ -6,6 +6,12 @@ It opens a receive-only code path, filters for the three PiPER joint-feedback
 identifiers, and verifies that the kernel TX packet counter did not increase
 during the observation.  It is intended as the first real-hardware integration
 gate before any ROS arm driver or controller is allowed to run.
+
+``--duration`` is an upper bound.  The window closes early only when a complete
+six-joint set has been decoded, MIN_OBSERVATION_S has elapsed, and the joint
+spread seen so far certifies at least as low a drift RATE as a full-duration
+window would have had to (see STILLNESS_REFERENCE_RANGE_RAD).  An incomplete set
+holds the window open for the whole bound and then fails closed.
 """
 
 from __future__ import annotations
@@ -18,6 +24,31 @@ import socket
 import struct
 import time
 
+
+# Closing the window early is a success-only path: an incomplete joint set must
+# still burn the full --duration before it fails closed, otherwise a silent bus
+# would be reported as a fast pass.  Raising this floor widens the zero-transmit
+# evidence window at a one-for-one cost in gate latency.
+MIN_OBSERVATION_S = 1.0
+
+# ``max_joint_range_rad`` is read downstream (piper_hand_eye_sample.py,
+# go2w_debug_bundle.py) as a fail-closed "the arm did not move" attestation
+# against this ABSOLUTE radian threshold.  The measurement it tests is the
+# max-minus-min spread over the observation window, so it grows with the window:
+# closing the window early would weaken that gate in proportion to the time
+# saved, and the threshold lives in files this probe must not import.
+#
+# The probe therefore refuses to exit early on weaker evidence than a full
+# --duration window would have demanded, expressed as a RATE rather than a fixed
+# spread: the reference sensitivity is STILLNESS_REFERENCE_RANGE_RAD over
+# --duration (0.00025 rad/s at --duration 8), and the spread observed so far must
+# sit inside that same rate scaled to the elapsed window.  A still arm has a
+# spread near zero and still leaves at MIN_OBSERVATION_S; an arm drifting fast
+# enough to matter holds the window open to the bound, and the downstream
+# absolute gate then rejects it exactly as it does on a full-duration report.
+# Keeping this a rate is what makes it stay correct if --duration or
+# MIN_OBSERVATION_S is changed later.
+STILLNESS_REFERENCE_RANGE_RAD = 0.002
 
 JOINT_FEEDBACK_IDS = (0x2A5, 0x2A6, 0x2A7)
 CAN_SFF_MASK = 0x7FF
@@ -46,6 +77,41 @@ def decode_joint_pair(can_id: int, payload: bytes) -> tuple[tuple[int, float], .
         (indices[0], raw_first * scale),
         (indices[1], raw_second * scale),
     )
+
+
+def joint_ranges_rad(
+    minima: list[float | None],
+    maxima: list[float | None],
+) -> list[float | None]:
+    """Per-joint max-minus-min spread over the window so far."""
+
+    return [
+        None if lower is None or upper is None else upper - lower
+        for lower, upper in zip(minima, maxima)
+    ]
+
+
+def stillness_supports_early_exit(
+    ranges: list[float | None],
+    elapsed_s: float,
+    duration_s: float,
+) -> bool:
+    """Is the stillness seen so far as strong, per second, as a full window?
+
+    The downstream gate compares ``max_joint_range_rad`` against a fixed radian
+    budget sized for a full ``--duration`` observation.  Scaling that budget by
+    the fraction of the window actually observed keeps the drift RATE the probe
+    can certify identical no matter when the window closes, so a short window
+    can never be a cheaper way to pass than a long one.
+    """
+
+    if not (elapsed_s > 0.0) or not (duration_s > 0.0):
+        return False
+    if any(value is None for value in ranges):
+        return False
+    observed = max(float(value) for value in ranges)
+    allowance = STILLNESS_REFERENCE_RANGE_RAD * (min(elapsed_s, duration_s) / duration_s)
+    return observed <= allowance
 
 
 def _counter(interface: str, name: str) -> int:
@@ -82,7 +148,10 @@ def main() -> int:
     last_by_id_unix_ns: dict[int, int] = {}
     total_frames = 0
     bus_error: str | None = None
-    deadline = time.monotonic() + args.duration
+    complete = False
+    window_start = time.monotonic()
+    deadline = window_start + args.duration
+    earliest_exit = window_start + min(MIN_OBSERVATION_S, args.duration)
 
     # The only socket operation after bind is recv().  In particular this
     # program contains no transmit call and installs filters before binding.
@@ -95,7 +164,20 @@ def main() -> int:
         channel.settimeout(min(0.25, args.duration))
         try:
             channel.bind((args.interface,))
-            while time.monotonic() < deadline:
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                if (
+                    complete
+                    and now >= earliest_exit
+                    and stillness_supports_early_exit(
+                        joint_ranges_rad(joint_minima, joint_maxima),
+                        now - window_start,
+                        args.duration,
+                    )
+                ):
+                    break
                 try:
                     frame = channel.recv(CAN_FRAME.size)
                 except TimeoutError:
@@ -136,6 +218,8 @@ def main() -> int:
                         if joint_maxima[index] is None
                         else max(joint_maxima[index], value)
                     )
+                if not complete:
+                    complete = all(value is not None for value in joints)
         except OSError as error:
             # bind() raises ENETDOWN when the interface is already down at the
             # start of the window; treat it identically to a mid-window drop so
@@ -145,11 +229,7 @@ def main() -> int:
     tx_after = _counter(args.interface, "tx_packets")
     rx_after = _counter(args.interface, "rx_packets")
     observation_end_unix_ns = time.time_ns()
-    complete = all(value is not None for value in joints)
-    joint_ranges = [
-        None if lower is None or upper is None else upper - lower
-        for lower, upper in zip(joint_minima, joint_maxima)
-    ]
+    joint_ranges = joint_ranges_rad(joint_minima, joint_maxima)
     tx_delta = tx_after - tx_before
     report = {
         "schema": "z_manip.piper_passive_joint_report.v1",
