@@ -38,6 +38,7 @@ def _core(*, mode: str = "live"):
             rotate_only_bearing_rad=0.4363323129985824,
             yaw_deadband_rad=0.10471975511965978,
             target_timeout_s=0.25,
+            tracking_hold_s=0.55,
             tracking_loss_grace_s=0.75,
             allow_legacy_optical_depth_for_tests=True,
         )
@@ -56,6 +57,7 @@ def _reactive_core(
             desired_depth_m=0.50,
             handoff_depth_m=0.62,
             target_timeout_s=target_timeout_s,
+            tracking_hold_s=0.55,
             tracking_loss_grace_s=max(0.75, target_timeout_s),
             transform_timeout_s=transform_timeout_s,
         )
@@ -950,3 +952,242 @@ def test_whole_body_branch_defers_to_the_loss_stair_and_capture_freshness():
         assert f'"{phase}"' in window, phase
     assert "max_target_capture_age_s" in window
     assert "fallback.target_age_s" in window
+
+
+# ---------------------------------------------------------------------------
+# WS-C: grace widen, trace resolution, teardown robustness, diagnostics.
+# ---------------------------------------------------------------------------
+
+
+def test_default_stair_widens_grace_and_hold_within_validators():
+    """The no-arg defaults carry the widened loss stair and stay valid.
+
+    The orchestrator spawns the servo with no stair args, so the file defaults
+    are authoritative; grace 1.25->2.75 and hold 0.55->0.80 must satisfy the
+    hold<grace and grace>=target_timeout validators.
+    """
+
+    settings = SERVO.DepthServoSettings()
+    assert settings.tracking_hold_s == 0.80
+    assert settings.tracking_loss_grace_s == 2.75
+    assert settings.tracking_hold_s < settings.tracking_loss_grace_s
+    assert settings.tracking_loss_grace_s >= settings.target_timeout_s
+
+
+def test_argparse_stair_defaults_match_widened_grace(monkeypatch):
+    """A no-stair-arg CLI spawn resolves the widened grace/hold defaults."""
+
+    monkeypatch.setattr(sys, "argv", ["go2w_depth_servo.py", "--status-file", "/tmp/s.json"])
+    args = SERVO._arguments()
+    assert args.tracking_hold_s == 0.80
+    assert args.tracking_loss_grace_s == 2.75
+
+
+def test_max_target_capture_age_default_is_pinned_at_070():
+    """Hard contract: the capture-freshness budget must remain 0.70 s."""
+
+    assert SERVO.DepthServoSettings().max_target_capture_age_s == 0.70
+
+
+def test_filter_stats_exposes_stale_data_rejections():
+    """Stale-capture rejections are a first-class diagnostics field."""
+
+    core = _reactive_core(target_timeout_s=0.40)
+    assert core.filter_stats["stale_data_rejections"] == 0
+    assert core.observe_target(x_m=0.0, y_m=0.0, z_m=1.5, stamp_s=1.0, capture_age_s=0.20)
+    assert not core.observe_target(
+        x_m=0.0, y_m=0.0, z_m=1.5, stamp_s=1.1, capture_age_s=1.2
+    )
+    assert core.filter_stats["stale_data_rejections"] == 1
+    # A stale-capture rejection is also tallied in the overall rejection count
+    # (pre-existing behaviour); stale_data_rejections isolates the freshness
+    # cause from geometric-outlier rejections.
+    assert core.filter_stats["rejected_outliers"] == 1
+    core.reset()
+    assert core.filter_stats["stale_data_rejections"] == 0
+
+
+def test_view_period_update_accepts_only_in_band_cadence():
+    """Only intervals inside the measured FFS band advance the EMA."""
+
+    # First bundle (no prior arrival) leaves the seed period untouched.
+    assert SERVO._view_period_update(
+        previous_period_s=0.13, last_arrival_s=None, arrival_s=0.5, loss_phase_exit=False
+    ) == 0.13
+    # An in-band interval seeds a None period directly.
+    assert SERVO._view_period_update(
+        previous_period_s=None, last_arrival_s=1.00, arrival_s=1.13, loss_phase_exit=False
+    ) == pytest.approx(0.13)
+    # Band edges (0.10 and 0.20) are inclusive.
+    assert SERVO._view_period_update(
+        previous_period_s=None, last_arrival_s=0.0, arrival_s=0.10, loss_phase_exit=False
+    ) == pytest.approx(0.10)
+    assert SERVO._view_period_update(
+        previous_period_s=None, last_arrival_s=0.0, arrival_s=0.20, loss_phase_exit=False
+    ) == pytest.approx(0.20)
+
+
+def test_view_period_update_rejects_out_of_band_and_loss_exit_intervals():
+    """Gaps, jitter, and loss-phase exits never poison the damping period."""
+
+    # Sub-band jitter and super-band gaps both leave the period unchanged.
+    for arrival_s in (0.09, 0.25, 2.0):
+        assert SERVO._view_period_update(
+            previous_period_s=0.13,
+            last_arrival_s=0.0,
+            arrival_s=arrival_s,
+            loss_phase_exit=False,
+        ) == 0.13
+    # An in-band interval that is a loss-phase exit is still skipped: the
+    # interval spans the loss dwell and must not feed the damper.
+    assert SERVO._view_period_update(
+        previous_period_s=0.13,
+        last_arrival_s=0.0,
+        arrival_s=0.13,
+        loss_phase_exit=True,
+    ) == 0.13
+
+
+def test_view_period_update_blends_with_light_weight():
+    """An accepted in-band interval blends into the EMA at a 0.3 weight."""
+
+    assert SERVO._view_period_update(
+        previous_period_s=0.10, last_arrival_s=0.0, arrival_s=0.15, loss_phase_exit=False
+    ) == pytest.approx(0.7 * 0.10 + 0.3 * 0.15)
+
+
+def test_loss_stair_phase_set_matches_the_loss_stair():
+    """Every loss/hold phase must be recognised as a loss-phase exit source."""
+
+    for phase in (
+        "waiting_target",
+        "transform_unavailable",
+        "tracking_lost",
+        "reacquiring",
+        "posture_blocked",
+        "tracking_hold",
+        "view_recovery",
+        "search_required",
+    ):
+        assert phase in SERVO.LOSS_STAIR_PHASES
+    # A live-motion phase is not a loss-phase exit.
+    assert "approach" not in SERVO.LOSS_STAIR_PHASES
+    assert "whole_body_approach" not in SERVO.LOSS_STAIR_PHASES
+
+
+def test_trace_cadence_floor_is_5hz_in_motion_and_1hz_when_parked():
+    """Non-terminal motion samples at 5 Hz; a parked/terminal servo at 1 Hz."""
+
+    assert SERVO._trace_min_interval_s(terminal=False) == 0.20
+    assert SERVO._trace_min_interval_s(terminal=True) == 1.0
+    # The 5 Hz floor is a genuine drop from the retired >=1 s/row throttle.
+    assert (
+        SERVO._trace_min_interval_s(terminal=False)
+        < SERVO._trace_min_interval_s(terminal=True)
+    )
+
+
+def test_trace_row_promotes_view_period_and_bundle_count():
+    """view_update_period_s and the monotonic bundle counter are first-class."""
+
+    document = {
+        "updated_unix_ns": 1_700_000_000_000_000_000,
+        "mode": "live",
+        "phase": "whole_body_approach",
+        "tracking": True,
+        "target": {"x_m": 0.1, "y_m": 0.0, "z_m": 0.9, "frame_id": "cam"},
+        "source_stamp_ns": 42,
+        "output": {"phase": "whole_body_approach"},
+        "filter": {"stale_data_rejections": 3},
+        "posture_status": {"age_s": 0.1},
+        "arm_view_status": {"age_s": 0.2},
+        "whole_body": {"enabled": True},
+    }
+
+    row = SERVO._trace_row(document, view_update_period_s=0.132, bundle_count=57)
+
+    assert row["schema"] == "z_manip.depth_servo_trace.v1"
+    assert row["view_update_period_s"] == pytest.approx(0.132)
+    assert row["bundle_count"] == 57
+    # The status document fields are copied through verbatim.
+    for key in (
+        "updated_unix_ns",
+        "mode",
+        "phase",
+        "tracking",
+        "target",
+        "source_stamp_ns",
+        "output",
+        "filter",
+        "posture_status",
+        "arm_view_status",
+        "whole_body",
+    ):
+        assert row[key] == document[key]
+
+
+def test_trace_row_carries_a_none_view_period_before_the_first_interval():
+    """Before any cadence measurement the trace still emits the field as null."""
+
+    document = {
+        "updated_unix_ns": 1,
+        "mode": "shadow",
+        "phase": "waiting_target",
+        "tracking": None,
+        "target": None,
+        "source_stamp_ns": None,
+        "output": {},
+        "filter": {},
+        "posture_status": {},
+        "arm_view_status": {},
+        "whole_body": {},
+    }
+    row = SERVO._trace_row(document, view_update_period_s=None, bundle_count=0)
+    assert "view_update_period_s" in row
+    assert row["view_update_period_s"] is None
+    assert row["bundle_count"] == 0
+
+
+def test_tick_should_skip_on_stop_request_or_dead_context():
+    """A tick after stop or a torn-down rcl context must no-op."""
+
+    assert SERVO._tick_should_skip(stop_requested=True, ros_ok=True) is True
+    assert SERVO._tick_should_skip(stop_requested=False, ros_ok=False) is True
+    assert SERVO._tick_should_skip(stop_requested=True, ros_ok=False) is True
+    assert SERVO._tick_should_skip(stop_requested=False, ros_ok=True) is False
+
+
+def test_tick_and_teardown_wire_the_stop_event_and_context_guards():
+    """The ROS node (uninstantiable without rclpy) wires the teardown guards.
+
+    Proven by source inspection, mirroring the loss-stair guard test above.
+    """
+
+    source = Path(SERVO.__file__).read_text(encoding="utf-8")
+    # The stop Event exists and the signal handler latches it.
+    assert "self.stop_event = threading.Event()" in source
+    assert "node.stop_event.set()" in source
+    # _tick consults the stop Event + rclpy.ok() at its very top.
+    tick_marker = source.index("def _tick(self) -> None:")
+    tick_window = source[tick_marker:tick_marker + 400]
+    assert "_tick_should_skip(" in tick_window
+    assert "self.stop_event.is_set()" in tick_window
+    assert "ros_ok=rclpy.ok()" in tick_window
+
+
+def test_publish_swallows_shutdown_race_but_reraises_a_live_fault():
+    """_publish gates on rclpy.ok() and only swallows a torn-down-context error.
+
+    A still-valid context re-raises (fail-loud), matching the sibling passive
+    joint-state bridge convention.
+    """
+
+    source = Path(SERVO.__file__).read_text(encoding="utf-8")
+    pub_marker = source.index("def _publish(self, linear_x: float, angular_z: float) -> None:")
+    pub_window = source[pub_marker:pub_marker + 1400]
+    assert "if not rclpy.ok():" in pub_window
+    assert "self.publisher.publish(message)" in pub_window
+    assert "except Exception:" in pub_window
+    # Genuine faults on a live context are re-raised, not hidden.
+    assert "if rclpy.ok():" in pub_window
+    assert "raise" in pub_window

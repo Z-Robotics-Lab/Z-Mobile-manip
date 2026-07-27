@@ -105,8 +105,8 @@ class DepthServoSettings:
     # timeout then holds/stops the base safely.  The allowance absorbs the
     # measured PC/NUC NTP skew (~0.3s) plus the normal FFS+relay latency.
     max_target_capture_age_s: float = 0.70
-    tracking_hold_s: float = 0.55
-    tracking_loss_grace_s: float = 1.25
+    tracking_hold_s: float = 0.80
+    tracking_loss_grace_s: float = 2.75
     handoff_settle_s: float = 0.30
     target_filter_window: int = 5
     target_filter_alpha: float = 0.55
@@ -197,6 +197,38 @@ class DepthServoOutput:
 
 
 HANDOFF_TERMINAL_PHASES = frozenset({"reached", "handoff_probe", "handoff_ready"})
+
+
+# Phases in which the servo has lost or frozen its live track.  A tracked-bundle
+# arrival that immediately follows one of these is a loss-phase exit: the
+# inter-arrival interval spans the loss dwell and must not feed the view-update
+# damping EMA (a multi-second stall would otherwise poison the arm-view period).
+LOSS_STAIR_PHASES = frozenset({
+    "waiting_target",
+    "transform_unavailable",
+    "tracking_lost",
+    "reacquiring",
+    "posture_blocked",
+    "tracking_hold",
+    "view_recovery",
+    "search_required",
+})
+
+
+# The tracked-target bundle cadence is the measured FFS rate (~7.5-8.1 Hz, i.e.
+# ~0.123-0.133 s/bundle).  Only inter-arrival intervals inside this band update
+# the view-update damping period; gaps outside it are process pauses,
+# reacquisition, or jitter and are ignored so the damper tracks the true rate.
+VIEW_UPDATE_PERIOD_MIN_INTERVAL_S = 0.10
+VIEW_UPDATE_PERIOD_MAX_INTERVAL_S = 0.20
+
+
+# Trace cadence floors.  A non-terminal (actively approaching/recovering) servo
+# is sampled at 5 Hz so diagnostics are not quantized into a phantom 1 Hz
+# cadence; a terminal/parked servo changes slowly, so 1 Hz keeps the trace
+# bounded.  Phase transitions always emit a row regardless of the floor.
+TRACE_MOTION_MIN_INTERVAL_S = 0.20
+TRACE_TERMINAL_MIN_INTERVAL_S = 1.0
 
 
 def _latch_handoff_output(
@@ -697,6 +729,7 @@ class DepthServoCore:
             "window_samples": len(self._samples),
             "accepted": self._accepted_observations,
             "rejected_outliers": self._rejected_observations,
+            "stale_data_rejections": self._stale_data_rejections,
             "outlier_cluster_samples": len(self._outlier_samples),
             "rebases": self._rebases,
             "raw_x_m": None if self._raw_target is None else self._raw_target[0],
@@ -1082,6 +1115,84 @@ def _append_jsonl(path: Path, document: dict[str, Any]) -> None:
         stream.write(json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def _view_period_update(
+    *,
+    previous_period_s: float | None,
+    last_arrival_s: float | None,
+    arrival_s: float,
+    loss_phase_exit: bool,
+) -> float | None:
+    """Return the view-update damping EMA after a fresh bundle arrival.
+
+    The period is only advanced by genuine cadence intervals: the first bundle
+    (``last_arrival_s is None``), a loss-phase exit, and any interval outside
+    the measured FFS band leave the previous period untouched so a stall never
+    inflates the arm-view damper.
+    """
+
+    if last_arrival_s is None or loss_phase_exit:
+        return previous_period_s
+    interval_s = arrival_s - last_arrival_s
+    if not (
+        VIEW_UPDATE_PERIOD_MIN_INTERVAL_S
+        <= interval_s
+        <= VIEW_UPDATE_PERIOD_MAX_INTERVAL_S
+    ):
+        return previous_period_s
+    if previous_period_s is None:
+        return interval_s
+    # Light 0.3 weight: a single jittered frame cannot swing the damping cap.
+    return 0.7 * previous_period_s + 0.3 * interval_s
+
+
+def _trace_min_interval_s(*, terminal: bool) -> float:
+    """Trace-row cadence floor: 1 Hz when parked, 5 Hz during live motion."""
+
+    return TRACE_TERMINAL_MIN_INTERVAL_S if terminal else TRACE_MOTION_MIN_INTERVAL_S
+
+
+def _trace_row(
+    document: dict[str, Any],
+    *,
+    view_update_period_s: float | None,
+    bundle_count: int,
+) -> dict[str, Any]:
+    """Build a compact trace row from an already-written status document.
+
+    ``view_update_period_s`` (the live FFS-rate damping period) and the
+    monotonic ``bundle_count`` are promoted to first-class fields so a trace can
+    be read for cadence health without cross-referencing the status file.
+    """
+
+    return {
+        "schema": "z_manip.depth_servo_trace.v1",
+        "updated_unix_ns": document["updated_unix_ns"],
+        "mode": document["mode"],
+        "phase": document["phase"],
+        "tracking": document["tracking"],
+        "target": document["target"],
+        "source_stamp_ns": document["source_stamp_ns"],
+        "view_update_period_s": view_update_period_s,
+        "bundle_count": bundle_count,
+        "output": document["output"],
+        "filter": document["filter"],
+        "posture_status": document["posture_status"],
+        "arm_view_status": document["arm_view_status"],
+        "whole_body": document["whole_body"],
+    }
+
+
+def _tick_should_skip(*, stop_requested: bool, ros_ok: bool) -> bool:
+    """A servo tick after a stop request or a torn-down context must no-op.
+
+    The ROS timer can fire the tick after SIGTERM latched the stop or after the
+    rcl context began tearing down; publishing then would crash-loop the
+    shutdown path instead of letting it settle on the transport watchdog stop.
+    """
+
+    return stop_requested or not ros_ok
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("shadow", "live"), default="shadow")
@@ -1107,8 +1218,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--yaw-deadband-deg", type=float, default=10.0)
     parser.add_argument("--max-yaw-step-rps", type=float, default=0.015)
     parser.add_argument("--target-timeout-s", type=float, default=0.40)
-    parser.add_argument("--tracking-hold-s", type=float, default=0.55)
-    parser.add_argument("--tracking-loss-grace-s", type=float, default=1.25)
+    parser.add_argument("--tracking-hold-s", type=float, default=0.80)
+    parser.add_argument("--tracking-loss-grace-s", type=float, default=2.75)
     parser.add_argument("--handoff-settle-s", type=float, default=0.30)
     parser.add_argument("--transform-timeout-s", type=float, default=0.25)
     parser.add_argument("--rate-hz", type=float, default=20.0)
@@ -1160,6 +1271,9 @@ def _run_ros(args: argparse.Namespace) -> int:
     class DepthServoNode(Node):
         def __init__(self) -> None:
             super().__init__("z_manip_depth_servo")
+            # Latched by the signal handler; the timer-driven tick checks it (and
+            # rclpy.ok()) at its top so no publish races a context teardown.
+            self.stop_event = threading.Event()
             self.core = DepthServoCore(settings)
             self.tracking: bool | None = None
             self.last_source_stamp_ns: int | None = None
@@ -1171,6 +1285,10 @@ def _run_ros(args: argparse.Namespace) -> int:
             # arrival is timed on the skew-free local monotonic clock.
             self.last_bundle_monotonic_s: float | None = None
             self.view_update_period_s: float | None = None
+            # Monotonic count of genuine new tracked-target bundles (advancing
+            # source stamp), promoted to a first-class trace field for cadence
+            # health without cross-referencing the status file.
+            self.bundle_count = 0
             self.last_transform_error: str | None = "no target transforms received"
             self.last_transform_success_s: float | None = None
             self.last_transform_source: str | None = None
@@ -1402,20 +1520,17 @@ def _run_ros(args: argparse.Namespace) -> int:
                 )
                 if new_source_stamp_ns != self.last_source_stamp_ns:
                     arrival_s = time.monotonic()
-                    if self.last_bundle_monotonic_s is not None:
-                        interval_s = arrival_s - self.last_bundle_monotonic_s
-                        # Ignore non-positive or absurd gaps (process pauses,
-                        # reacquisition); a fresh EMA otherwise tracks the live
-                        # rate with a light 0.3 weight so a single jittered
-                        # frame cannot swing the damping cap.
-                        if 0.0 < interval_s <= 2.0:
-                            if self.view_update_period_s is None:
-                                self.view_update_period_s = interval_s
-                            else:
-                                self.view_update_period_s = (
-                                    0.7 * self.view_update_period_s
-                                    + 0.3 * interval_s
-                                )
+                    self.bundle_count += 1
+                    # A bundle that lands right after a loss-stair phase spans the
+                    # loss dwell; skip its interval so the stall cannot inflate
+                    # the view-update damping period (only clamped in-band
+                    # cadence intervals advance the EMA).
+                    self.view_update_period_s = _view_period_update(
+                        previous_period_s=self.view_update_period_s,
+                        last_arrival_s=self.last_bundle_monotonic_s,
+                        arrival_s=arrival_s,
+                        loss_phase_exit=self.last_output.phase in LOSS_STAIR_PHASES,
+                    )
                     self.last_bundle_monotonic_s = arrival_s
                 self.last_source_stamp_ns = new_source_stamp_ns
 
@@ -1625,12 +1740,25 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.arm_view_intent_seq = max(self.arm_view_intent_seq, sequence + 1)
 
         def _publish(self, linear_x: float, angular_z: float) -> None:
+            if not rclpy.ok():
+                return
             message = TwistStamped()
             message.header.stamp = self.get_clock().now().to_msg()
             message.header.frame_id = "base_link"
             message.twist.linear.x = float(linear_x)
             message.twist.angular.z = float(angular_z)
-            self.publisher.publish(message)
+            try:
+                self.publisher.publish(message)
+            except Exception:  # noqa: BLE001
+                # A stop/restart can tear the rcl context down between the
+                # rclpy.ok() gate above and this publish, raising RCLError
+                # ("publisher's context is invalid", publisher.c:423).  That is a
+                # normal shutdown race, not a command fault: swallow it so the
+                # teardown path never crash-loops mid-approach and settles on the
+                # transport watchdog stop.  A still-valid context means a genuine
+                # fault -- re-raise it rather than hiding it.
+                if rclpy.ok():
+                    raise
 
         def _write_status(self, state: str | None = None, *, running: bool = True) -> None:
             target = self.core.target
@@ -1746,24 +1874,22 @@ def _run_ros(args: argparse.Namespace) -> int:
             }
             _atomic_json(args.status_file, document)
             now_s = time.monotonic()
+            # A parked/terminal servo changes slowly (1 Hz floor); active motion
+            # is sampled at 5 Hz so diagnostics keep their true cadence instead
+            # of a >=1 s/row throttle manufacturing a phantom 1 Hz rate.
+            trace_terminal = (
+                self.handoff_latched_output is not None or self.last_output.done
+            )
             if args.trace_file is not None and (
                 self.last_output.phase != self.last_trace_phase
-                or now_s - self.last_trace_s >= 1.0
+                or now_s - self.last_trace_s
+                >= _trace_min_interval_s(terminal=trace_terminal)
             ):
-                _append_jsonl(args.trace_file, {
-                    "schema": "z_manip.depth_servo_trace.v1",
-                    "updated_unix_ns": document["updated_unix_ns"],
-                    "mode": settings.mode,
-                    "phase": document["phase"],
-                    "tracking": self.tracking,
-                    "target": document["target"],
-                    "source_stamp_ns": self.last_source_stamp_ns,
-                    "output": document["output"],
-                    "filter": document["filter"],
-                    "posture_status": document["posture_status"],
-                    "arm_view_status": document["arm_view_status"],
-                    "whole_body": document["whole_body"],
-                })
+                _append_jsonl(args.trace_file, _trace_row(
+                    document,
+                    view_update_period_s=self.view_update_period_s,
+                    bundle_count=self.bundle_count,
+                ))
                 self.last_trace_phase = self.last_output.phase
                 self.last_trace_s = now_s
 
@@ -2001,6 +2127,14 @@ def _run_ros(args: argparse.Namespace) -> int:
             )
 
         def _tick(self) -> None:
+            # A timer tick after the stop was latched or the rcl context began
+            # tearing down must no-op: publishing here would crash-loop teardown
+            # instead of settling on the transport watchdog stop.
+            if _tick_should_skip(
+                stop_requested=self.stop_event.is_set(),
+                ros_ok=rclpy.ok(),
+            ):
+                return
             # Handoff is one-way for this process.  Keep publishing a hard zero
             # and preserve the terminal status until the 5 Hz supervisor has
             # stopped this launcher and opened the fresh grasp transaction.
@@ -2072,6 +2206,9 @@ def _run_ros(args: argparse.Namespace) -> int:
 
     def request_stop(_signum: int, _frame: object) -> None:
         stopped.set()
+        # Latch the node-level stop so any in-flight/queued timer tick no-ops
+        # instead of racing the shutdown below.
+        node.stop_event.set()
         # Publish the final zero while the ROS context is still valid.  Calling
         # shutdown first made the finally block raise and could leave the
         # transport relying only on its watchdog stop.
