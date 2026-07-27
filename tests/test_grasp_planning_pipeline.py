@@ -4,6 +4,7 @@ import pytest
 from z_manip.kinematics.robust_ik import IKFailure, IKSolution
 from z_manip.models.grasp_source import GraspCandidates
 from z_manip.models.planner import JointTrajectory, PlanningError
+import z_manip.planning.grasp_pipeline as grasp_pipeline_module
 from z_manip.planning.grasp_pipeline import (
     GraspPlanConfig,
     GraspPlanGenerator,
@@ -892,3 +893,108 @@ def test_bounded_refinement_selects_better_complete_plan():
     assert planner.path_costs[1] < planner.path_costs[0]
     assert planner.segment_calls == 8
     assert result.candidate_index == 1
+
+
+# ---------------------------------------------------------------------------
+# WS-E hygiene: symmetry max_tilt config plumbing, warm-start reset per plan(),
+# and the advisory-ranker exception counter.
+# ---------------------------------------------------------------------------
+class ResettableIK(FakeIK):
+    def __init__(self, reject_x=()):
+        super().__init__(reject_x=reject_x)
+        self.reset_calls = 0
+
+    def reset_warm_start(self):
+        self.reset_calls += 1
+
+
+def test_symmetry_max_tilt_deg_defaults_unchanged_and_validates():
+    assert GraspPlanConfig().symmetry_max_tilt_deg == 25.0
+    for bad in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="symmetry_max_tilt_deg"):
+            GraspPlanConfig(symmetry_max_tilt_deg=bad)
+
+
+def test_symmetry_max_tilt_deg_is_plumbed_into_expand_symmetry(monkeypatch):
+    seen: list[float] = []
+    real_expand = grasp_pipeline_module.expand_symmetry
+
+    def spy(grasp, *, n_about_axis, max_tilt_deg):
+        seen.append(max_tilt_deg)
+        return real_expand(
+            grasp, n_about_axis=n_about_axis, max_tilt_deg=max_tilt_deg,
+        )
+
+    monkeypatch.setattr(grasp_pipeline_module, "expand_symmetry", spy)
+    generator = GraspPlanGenerator(
+        FakeIK(),
+        FakePlanner(),
+        GraspPlanConfig(
+            approach_steps=3,
+            lift_steps=3,
+            symmetry_samples=2,
+            symmetry_max_tilt_deg=12.5,
+        ),
+    )
+    generator.plan(
+        _candidates((_pose((0.6, 0.0, 0.25)),), widths=(0.04,)),
+        current_joints=np.zeros(2),
+    )
+    assert seen and all(value == pytest.approx(12.5) for value in seen)
+
+
+def test_plan_resets_warm_start_when_backend_supports_it():
+    ik = ResettableIK()
+    generator = GraspPlanGenerator(
+        ik,
+        FakePlanner(),
+        GraspPlanConfig(approach_steps=3, lift_steps=3, symmetry_samples=1),
+    )
+    candidates = _candidates((_pose((0.6, 0.0, 0.25)),), widths=(0.04,))
+
+    generator.plan(candidates, current_joints=np.zeros(2))
+    generator.plan(candidates, current_joints=np.zeros(2))
+
+    assert ik.reset_calls == 2
+
+
+def test_plan_without_reset_capability_is_a_noop():
+    generator = GraspPlanGenerator(
+        FakeIK(),
+        FakePlanner(),
+        GraspPlanConfig(approach_steps=3, lift_steps=3, symmetry_samples=1),
+    )
+    assert generator._ik_reset_warm_start is None
+    # Must plan without error even though the backend exposes no reset hook.
+    generator.plan(
+        _candidates((_pose((0.6, 0.0, 0.25)),), widths=(0.04,)),
+        current_joints=np.zeros(2),
+    )
+
+
+def test_ranker_exceptions_are_counted_not_swallowed_silently():
+    def exploding_ranker(target, *, control=None):
+        raise RuntimeError("advisory ranker failed")
+
+    generator = GraspPlanGenerator(
+        FakeIK(),
+        FakePlanner(),
+        GraspPlanConfig(
+            approach_steps=3,
+            lift_steps=3,
+            symmetry_samples=2,
+            max_feasible_plans=1,
+        ),
+    )
+    assert generator.ranker_exceptions == 0
+
+    generator.plan(
+        _candidates(
+            (_pose((0.6, 0.0, 0.25)), _pose((0.5, 0.0, 0.25))),
+            widths=(0.04, 0.04),
+        ),
+        current_joints=np.zeros(2),
+        pose_ranker=exploding_ranker,
+    )
+
+    assert generator.ranker_exceptions > 0

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections import deque
+import threading
+from collections import OrderedDict, deque
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,105 @@ from .robust_ik import (
 
 class PinocchioUnavailable(RuntimeError):
     """The selected runtime does not provide the Pinocchio Python bindings."""
+
+
+# Process-resident cache of reduced Pinocchio models.  The reduced-model build
+# (URDF parse via ``buildModelFromUrdf`` plus joint locking via
+# ``buildReducedModel``) is the dominant solver-construction cost (~0.49 s cold
+# vs ~0.003 s warm) and depends ONLY on the URDF bytes and which joints stay
+# active -- it is invariant to IKConfig and every grasp-planner tunable.  The
+# resident planning worker rebuilds ``OnlinePlanner`` (and therefore this
+# solver) whenever an unrelated per-request tunable changes the single-entry
+# planner-level cache key, which forced a fresh model build on ~26% of plans.
+# Keying this cache on the URDF file identity collapses those rebuilds to a
+# dictionary lookup while a genuine URDF edit (new mtime/size) still forces a
+# fresh, bit-identical build.  A reduced model is immutable after construction
+# and every solver owns a private ``createData`` workspace, so one instance is
+# safe to share across solvers with numerically identical results.
+_REDUCED_MODEL_CACHE: "OrderedDict[tuple[object, ...], object]" = OrderedDict()
+_REDUCED_MODEL_CACHE_CAPACITY = 8
+_REDUCED_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _reduced_model_cache_key(
+    urdf_path: str | Path,
+    chain: KinematicChain,
+) -> tuple[object, ...]:
+    """Identity of a reduced model: URDF bytes plus the retained joint set.
+
+    The ``(resolved path, mtime_ns, size)`` stat identity mirrors the planning
+    worker's own file-identity convention, so editing the URDF changes the key
+    and forces a rebuild, while an unchanged file keeps returning the resident
+    model.  The active joint-name tuple is included because the same URDF can
+    back different arm chains.
+    """
+
+    resolved = Path(urdf_path).expanduser().resolve()
+    stat = resolved.stat()
+    return (
+        str(resolved),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+        tuple(chain.joint_names),
+    )
+
+
+def _build_reduced_model(
+    pin: object,
+    urdf_path: str | Path,
+    chain: KinematicChain,
+) -> object:
+    """Parse the URDF and lock every joint outside the requested arm chain.
+
+    This is the historical inline ``__init__`` build, unchanged, factored out so
+    the resident cache can memoize its result.
+    """
+
+    full_model = pin.buildModelFromUrdf(str(urdf_path))
+    active_names = set(chain.joint_names)
+    missing = active_names - set(full_model.names)
+    if missing:
+        raise ValueError(
+            f"Pinocchio URDF is missing arm joints: {sorted(missing)}",
+        )
+    locked_joint_ids = [
+        joint_id
+        for joint_id, name in enumerate(full_model.names)
+        if joint_id and name not in active_names
+    ]
+    return pin.buildReducedModel(
+        full_model,
+        locked_joint_ids,
+        pin.neutral(full_model),
+    )
+
+
+def _reduced_model_for(
+    pin: object,
+    urdf_path: str | Path,
+    chain: KinematicChain,
+) -> tuple[object, bool]:
+    """Return ``(reduced_model, cache_hit)`` from the resident model cache."""
+
+    key = _reduced_model_cache_key(urdf_path, chain)
+    with _REDUCED_MODEL_CACHE_LOCK:
+        cached = _REDUCED_MODEL_CACHE.get(key)
+        if cached is not None:
+            _REDUCED_MODEL_CACHE.move_to_end(key)
+            return cached, True
+    # Build outside the lock: a slow URDF parse must not serialize peer solvers,
+    # and a concurrent duplicate build is simply discarded for the first winner
+    # (the result is identical either way).
+    model = _build_reduced_model(pin, urdf_path, chain)
+    with _REDUCED_MODEL_CACHE_LOCK:
+        existing = _REDUCED_MODEL_CACHE.get(key)
+        if existing is not None:
+            _REDUCED_MODEL_CACHE.move_to_end(key)
+            return existing, True
+        _REDUCED_MODEL_CACHE[key] = model
+        while len(_REDUCED_MODEL_CACHE) > _REDUCED_MODEL_CACHE_CAPACITY:
+            _REDUCED_MODEL_CACHE.popitem(last=False)
+    return model, False
 
 
 class PinocchioIKSolver:
@@ -65,22 +165,13 @@ class PinocchioIKSolver:
         self.chain = chain
         self.config = config or IKConfig()
         self.urdf_path = Path(urdf_path).expanduser().resolve()
-        full_model = pin.buildModelFromUrdf(str(self.urdf_path))
-        active_names = set(chain.joint_names)
-        missing = active_names - set(full_model.names)
-        if missing:
-            raise ValueError(
-                f"Pinocchio URDF is missing arm joints: {sorted(missing)}",
-            )
-        locked_joint_ids = [
-            joint_id
-            for joint_id, name in enumerate(full_model.names)
-            if joint_id and name not in active_names
-        ]
-        self.model = pin.buildReducedModel(
-            full_model,
-            locked_joint_ids,
-            pin.neutral(full_model),
+        # Resolve the reduced model through the resident cache.  On a cold
+        # process this performs the historical build; on the far more common
+        # planner rebuild (same URDF, churned grasp tunable) it is a lookup.
+        self.model, self.reduced_model_cache_hit = _reduced_model_for(
+            pin,
+            self.urdf_path,
+            chain,
         )
         reduced_names = tuple(self.model.names[1:])
         if reduced_names != chain.joint_names or self.model.nq != chain.dof:
@@ -161,6 +252,19 @@ class PinocchioIKSolver:
 
     def _remember_warm_start(self, goal: np.ndarray, joints: np.ndarray) -> None:
         self._warm_starts.append((goal[:3, 3].copy(), joints.copy()))
+
+    def reset_warm_start(self) -> None:
+        """Drop accumulated warm-start seeds while keeping the radius floor.
+
+        Warm starts are an intra-plan continuity optimisation: within one grasp
+        ``plan()`` the previous symmetry's configuration is a strong seed for the
+        next.  Across independent plans they are stale -- a resident worker that
+        reuses this solver would otherwise let one plan's seeds bias the first
+        solve of the next.  The documented 0.20 m acceptance radius
+        (``_WARM_START_RADIUS_M``) is untouched; only the remembered poses clear.
+        """
+
+        self._warm_starts.clear()
 
     def make_seed_pose_ranker(
         self,

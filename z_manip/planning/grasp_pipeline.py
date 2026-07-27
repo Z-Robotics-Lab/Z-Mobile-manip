@@ -82,6 +82,11 @@ class GraspPlanConfig:
     fallback_lift_vertical_m: float = 0.045
     fallback_lift_retreat_m: float = 0.025
     symmetry_samples: int = 2
+    # Half-width (degrees) of the approach-axis relaxed-rigidity band sampled by
+    # ``expand_symmetry``.  Read-only plumbing so deployments can inspect/tune
+    # the family spread from config; the default matches ``expand_symmetry`` so
+    # the sampled family is bit-identical to the historical hard-coded value.
+    symmetry_max_tilt_deg: float = 25.0
     min_width_m: float = 0.008
     max_width_m: float = 0.075
     planning_timeout_s: float = 4.0
@@ -119,6 +124,8 @@ class GraspPlanConfig:
             or self.max_hypotheses < 1
         ):
             raise ValueError("grasp family and candidate counts must be positive")
+        if not np.isfinite(self.symmetry_max_tilt_deg) or self.symmetry_max_tilt_deg < 0.0:
+            raise ValueError("symmetry_max_tilt_deg must be finite and non-negative")
         if not 0.0 <= self.min_width_m < self.max_width_m:
             raise ValueError("invalid gripper aperture range")
         if not (
@@ -350,6 +357,16 @@ class GraspPlanGenerator:
             )
         self.ik_solver = ik_solver
         self.joint_planner = joint_planner
+        # Observability counter for advisory-ranker failures.  Ranker exceptions
+        # are deliberately swallowed (the ranker only orders work and must never
+        # abort a plan), but counting them exposes a silently degrading ranker.
+        self.ranker_exceptions = 0
+        # Stateful IK backends (Pinocchio warm starts) expose an optional reset
+        # so each plan() starts from clean seeds; stateless backends omit it.
+        reset_warm_start = getattr(self.ik_solver, "reset_warm_start", None)
+        self._ik_reset_warm_start = (
+            reset_warm_start if callable(reset_warm_start) else None
+        )
         sentinel = object()
         self._ik_accepts_control = _accepts_control_keyword(
             self.ik_solver.solve,
@@ -480,6 +497,7 @@ class GraspPlanGenerator:
                 family = expand_symmetry(
                     grasps[candidate_index],
                     n_about_axis=self.config.symmetry_samples,
+                    max_tilt_deg=self.config.symmetry_max_tilt_deg,
                 )
                 best = float("inf")
                 for symmetry_index, grasp in enumerate(family):
@@ -495,6 +513,7 @@ class GraspPlanGenerator:
                     except PlanningAborted:
                         raise
                     except Exception:
+                        self.ranker_exceptions += 1
                         cost = float("inf")
                     costs[(candidate_index, symmetry_index)] = cost
                     if np.isfinite(cost):
@@ -847,6 +866,10 @@ class GraspPlanGenerator:
         control: PlanningControl | None = None,
     ) -> PlannedGrasp:
         checkpoint(control, "grasp candidate planning")
+        # Independent plans must not inherit warm-start seeds from a prior plan
+        # on a reused (resident-worker) solver; clear them before any IK runs.
+        if self._ik_reset_warm_start is not None:
+            self._ik_reset_warm_start()
         grasps = np.asarray(candidates.grasps, dtype=float)
         scores = np.asarray(candidates.scores, dtype=float)
         if grasps.ndim != 3 or grasps.shape[1:] != (4, 4):
@@ -937,7 +960,11 @@ class GraspPlanGenerator:
                 continue
             raw_grasp = grasps[candidate_index]
             try:
-                family = expand_symmetry(raw_grasp, n_about_axis=self.config.symmetry_samples)
+                family = expand_symmetry(
+                    raw_grasp,
+                    n_about_axis=self.config.symmetry_samples,
+                    max_tilt_deg=self.config.symmetry_max_tilt_deg,
+                )
             except ValueError as error:
                 failures.append(CandidateFailure(
                     int(candidate_index), None, "geometry", str(error),
@@ -975,6 +1002,7 @@ class GraspPlanGenerator:
                         except PlanningAborted:
                             raise
                         except Exception:
+                            self.ranker_exceptions += 1
                             cost = float("inf")
                     else:
                         cost = cached_cost
@@ -1083,7 +1111,7 @@ class GraspPlanGenerator:
                 except PlanningAborted:
                     raise
                 except Exception:
-                    pass
+                    self.ranker_exceptions += 1
             try:
                 hypothesis_control = active_control.limited_to(
                     self.config.hypothesis_timeout_s,
