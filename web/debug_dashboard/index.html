@@ -359,6 +359,16 @@
     .speed-input { width: 58px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--elev); color: var(--text); padding: 5px 6px; font: 600 12px var(--mono); }
     .speed-input:focus-visible { border-color: var(--line-3); outline: none; }
     .speed-note { color: var(--faint); font: 9px var(--mono); overflow-wrap: anywhere; }
+    .combo-row {
+      display: flex; align-items: center; gap: 8px; min-width: 0;
+      color: var(--dim); font: 10px var(--sans); letter-spacing: .04em; text-transform: uppercase;
+    }
+    .combo-select {
+      flex: 1 1 auto; min-width: 0; border: 1px solid var(--line-2); border-radius: 5px; background: var(--elev); color: var(--text);
+      padding: 7px 8px; font: 600 12px var(--mono);
+    }
+    .combo-select:focus-visible { border-color: var(--line-3); outline: none; }
+    .combo-select:disabled { color: var(--dim); cursor: not-allowed; }
 
     /* Mobile find -> grasp readouts */
     .approach-readout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
@@ -678,6 +688,13 @@
 
         <div class="cblock" aria-label="Mobile find to grasp controls">
           <div class="cblock-head"><svg class="hdr-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="22" y1="12" x2="18" y2="12"/><line x1="6" y1="12" x2="2" y2="12"/><line x1="12" y1="6" x2="12" y2="2"/><line x1="12" y1="22" x2="12" y2="18"/></svg><span class="eyebrow">Mobile find → grasp</span></div>
+          <label class="combo-row" for="task-combo">Task
+            <select class="combo-select" id="task-combo" data-testid="task-combo" aria-describedby="task-combo-note">
+              <option value="place_back" selected>Pick → hold → place back</option>
+              <option value="pick_only">Pick only</option>
+              <option value="place_back_hold">Pick → 10s hold → place back</option>
+            </select>
+          </label>
           <div class="approach-progress" id="approach-progress" aria-label="Mobile grasp workflow progress">
             <span class="approach-phase" data-approach-phase="detect">Detect</span>
             <span class="approach-phase" data-approach-phase="search">Search</span>
@@ -694,6 +711,7 @@
             <button class="btn" id="approach-shadow" type="button" disabled>Shadow check</button>
             <button class="btn danger" id="approach-stop" type="button">Stop</button>
           </div>
+          <span class="speed-note" id="task-combo-note">Find + grasp runs the selected task cycle.</span>
           <div class="session-state" id="approach-session-state" aria-live="polite">Enter the target description, then run the complete mobile grasp.</div>
           <div class="approach-readout">
             <div class="approach-metric wide"><span>Target x / y / z</span><strong id="approach-target">—</strong></div>
@@ -2612,7 +2630,6 @@
         zbuf.fill(Infinity);
         const framing = this.framing || this._fit();
         if (framing && this.xyz && this.count) {
-          const data = image.data;
           const ratio = this.viewport.ratio;
           const scale = Math.min(pixelWidth, pixelHeight) * 0.8 / framing.span * this.orbit.zoom;
           const cyaw = Math.cos(this.orbit.yaw), syaw = Math.sin(this.orbit.yaw);
@@ -2632,7 +2649,10 @@
             const sx = (ox + x1 * scale) | 0;
             const sy = (oy - y2 * scale) | 0;
             if (sx < 0 || sy < 0 || sx >= pixelWidth || sy >= pixelHeight) continue;
-            const r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
+            // Same little-endian RGBA packing as the background fill above and
+            // as the sibling rasterizer in runtime_scene.js: one store per
+            // pixel instead of four, byte-identical output.
+            const pixel = (255 << 24) | (rgb[i * 3 + 2] << 16) | (rgb[i * 3 + 1] << 8) | rgb[i * 3];
             for (let dy = 0; dy < size; dy++) {
               const py = sy + dy;
               if (py >= pixelHeight) break;
@@ -2643,8 +2663,7 @@
                 const idx = rowBase + px;
                 if (z2 < zbuf[idx]) {
                   zbuf[idx] = z2;
-                  const o = idx * 4;
-                  data[o] = r; data[o + 1] = g; data[o + 2] = b; data[o + 3] = 255;
+                  u32[idx] = pixel;
                 }
               }
             }
@@ -2820,6 +2839,64 @@
       const input = byId("motion-speed");
       const speed = Number.parseInt(input.value, 10);
       return Number.isInteger(speed) && speed >= 1 && speed <= 50 ? speed : null;
+    }
+
+    // Live task combination.  Each entry is nothing but the pair of arguments
+    // the approach API already accepts and validates (place_back, and the
+    // 0..10 s Home dwell before the place-back leg); no combo carries a speed
+    // field, so #motion-speed above stays the single motion-speed authority.
+    // The default combo sends NO override keys at all, so its request body is
+    // byte-identical to the one the dashboard has always sent.
+    const TASK_COMBOS = Object.freeze({
+      place_back: Object.freeze({ placeBack: true, holdSeconds: 2, options: Object.freeze({}) }),
+      pick_only: Object.freeze({
+        placeBack: false, holdSeconds: 0,
+        options: Object.freeze({ place_back: false, hold_seconds: 0 })
+      }),
+      place_back_hold: Object.freeze({
+        placeBack: true, holdSeconds: 10,
+        options: Object.freeze({ place_back: true, hold_seconds: 10 })
+      })
+    });
+    const DEFAULT_TASK_COMBO = "place_back";
+
+    function describeTaskCycle(placeBack, holdSeconds) {
+      return placeBack
+        ? `pick, carry Home, hold ${holdSeconds}s, place back at the original grasp pose, return Home`
+        : "pick, then return Home still holding the object — no place-back leg";
+    }
+
+    function selectedTaskCombo() {
+      const select = byId("task-combo");
+      const key = select && Object.prototype.hasOwnProperty.call(TASK_COMBOS, select.value)
+        ? select.value
+        : DEFAULT_TASK_COMBO;
+      return Object.assign({ key }, TASK_COMBOS[key]);
+    }
+
+    // A page reload mid-run must show the cycle that is ACTUALLY executing, so
+    // the workflow the server echoes wins over the local selection while the
+    // approach runs, and the note is written from those numbers rather than
+    // from the matched option — an unmatched pair still reads truthfully.
+    function renderTaskCombo() {
+      const select = byId("task-combo");
+      const note = byId("task-combo-note");
+      if (!select || !note) return;
+      const running = state.approach?.running === true;
+      const workflow = state.approach?.workflow;
+      select.disabled = running;
+      if (running && workflow && typeof workflow === "object") {
+        const placeBack = workflow.place_back !== false;
+        const holdSeconds = finiteNumber(workflow.hold_seconds) ? workflow.hold_seconds : 0;
+        const match = Object.keys(TASK_COMBOS).find(key => (
+          TASK_COMBOS[key].placeBack === placeBack && TASK_COMBOS[key].holdSeconds === holdSeconds
+        ));
+        if (match) select.value = match;
+        note.textContent = `Running: ${describeTaskCycle(placeBack, holdSeconds)}.`;
+        return;
+      }
+      const combo = selectedTaskCombo();
+      note.textContent = `Find + grasp runs: ${describeTaskCycle(combo.placeBack, combo.holdSeconds)}.`;
     }
 
     function renderHomeStatus(home = state.home) {
@@ -3104,6 +3181,7 @@
         && targetDescription.length <= 160
         && !running
         && !otherBusy;
+      renderTaskCombo();
       byId("approach-auto").disabled = !canAutoStart;
       byId("approach-only").disabled = !canAutoStart;
       byId("approach-shadow").disabled = !canStart;
@@ -3351,17 +3429,22 @@
     async function startApproachAndGrasp() {
       const target = byId("perception-target").value.trim();
       if (target.length < 1 || target.length > 160) return;
+      // The selected cycle is named in the confirmation: an operator must never
+      // start a place-back cycle believing it is a pick-and-hold, or the reverse.
+      const combo = selectedTaskCombo();
       if (!window.confirm(
-        `Approach and grasp “${target}”?\n\nThe Go2W will detect and track the target, approach using ground-plane range, adapt body/wrist-camera posture when needed, then stop for a fresh arm-workspace and IK handoff before grasping. Keep Full stop and the physical emergency stop within reach.`
+        `Approach and grasp “${target}”?\n\nTask cycle: ${describeTaskCycle(combo.placeBack, combo.holdSeconds)}.\n\nThe Go2W will detect and track the target, approach using ground-plane range, adapt body/wrist-camera posture when needed, then stop for a fresh arm-workspace and IK handoff before grasping. Keep Full stop and the physical emergency stop within reach.`
       )) return;
       state.approachWorkflow = { active: true, phase: "detecting", target };
       renderApproachStatus(state.approach);
       const speed = selectedSpeedPercent() || 5;
       if (!await startApproach("live", false, {
+        ...combo.options,
         target,
         acquire_target: true,
         auto_handoff: true,
         operator_present: true,
+        // Spread FIRST so no combo can ever shadow the one speed authority.
         speed_percent: speed
       })) state.approachWorkflow = null;
     }
@@ -3909,6 +3992,8 @@
       byId("session-go-home").addEventListener("click", startHomeAction);
       byId("session-perform-grasp").addEventListener("click", () => startGraspAction());
       byId("session-perform-selected").addEventListener("click", startSelectedGraspAction);
+      byId("task-combo").addEventListener("change", renderTaskCombo);
+      renderTaskCombo();
       byId("approach-auto").addEventListener("click", startApproachAndGrasp);
       byId("approach-only").addEventListener("click", startApproachOnly);
       byId("approach-shadow").addEventListener("click", () => startApproach("shadow"));

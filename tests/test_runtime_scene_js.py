@@ -356,7 +356,12 @@ console.log(JSON.stringify({{before,beforeLabels,after,afterLabels}}));
     assert "capsule nearest" in result["afterLabels"]
 
 
-def _live_harness(assertions: str, *, with_document: bool = True) -> str:
+def _live_harness(
+    assertions: str,
+    *,
+    with_document: bool = True,
+    device_pixel_ratio: int = 1,
+) -> str:
     assertions = assertions.replace("{{", "{").replace("}}", "}")
     document = (
         r"""
@@ -379,7 +384,7 @@ global.document = {
 const fs = require('fs');
 const vm = require('vm');
 global.window = global;
-global.devicePixelRatio = 1;
+global.devicePixelRatio = {device_pixel_ratio};
 global.HTMLCanvasElement = function() {{}};
 global.matchMedia = () => ({{ matches: true }});
 {document}
@@ -1039,6 +1044,298 @@ def test_dashboard_hands_bundle_to_scene_when_session_mode_engages_late():
     # Definition plus BOTH per-tick session paths (syncGeometryView + drawScene).
     assert html.count("ensureSessionScene(") >= 3
     assert "if (contextWasActive !== contextActive) drawScene();" in html
+
+
+def test_colored_cloud_buffer_stays_css_sized_while_the_composite_is_unchanged():
+    # Render cost: the splat cloud covers a few percent of the canvas, so its
+    # off-screen buffer is rasterized (and cleared) at CSS resolution while the
+    # MAIN context keeps the full device ratio.  On a HiDPI display that is a
+    # measured 2.1 ms -> 0.7 ms per scene render with a 22.4 MB -> 5.6 MB drop in
+    # per-frame buffer traffic, and the composite rectangle is byte-identical:
+    # the drawImage destination, the setTransform and every vector op below are
+    # exactly what a DPR-1 display already draws today.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+scene.setLiveCameraPose(cameraPose);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+operations.length = 0;
+scene.flush();
+const composite = operations
+  .filter(operation => operation[0] === 'drawImage')
+  .map(operation => operation.slice(2));
+const transform = operations.filter(operation => operation[0] === 'setTransform').map(op => op.slice(1));
+console.log(JSON.stringify({{
+  viewport: scene.resize(false),
+  mainCanvas: [canvas.width, canvas.height],
+  cloudBuffer: [scene._cloudCanvas.width, scene._cloudCanvas.height],
+  zbufferLength: scene._cloudZ.length,
+  composite, transform,
+  painted: Array.from(scene._cloudU32).filter(value => value !== 0).length
+}}));
+""", device_pixel_ratio=2))
+
+    # The vector overlays (and every fillText that carries measurement meaning)
+    # still render into a full device-resolution backing store.
+    assert result["viewport"] == {"width": 640, "height": 480, "ratio": 2}
+    assert result["mainCanvas"] == [1280, 960]
+    assert result["transform"] == [[2, 0, 0, 2, 0, 0]]
+    # ...while the cloud buffer and its z-buffer are CSS-sized.
+    assert result["cloudBuffer"] == [640, 480]
+    assert result["zbufferLength"] == 640 * 480
+    # The composite destination rectangle is unchanged: still the whole viewport
+    # in CSS units, drawn through the DPR-2 transform above.
+    assert result["composite"] == [[0, 0, 640, 480]]
+    # Points still land in the buffer at the lower resolution.
+    assert result["painted"] > 0
+
+
+def test_identical_live_pushes_stop_redrawing_an_unchanged_scene():
+    # Dead-time regression: /api/runtime re-publishes a bit-identical camera
+    # pose and kinematic chain on every 200 ms tick, and each push used to force
+    # a full scene raster.  Identical pushes must be ACCEPTED (return values are
+    # unchanged) but must not redraw; any real motion must still redraw
+    # immediately, because the whole-world cloud re-anchors from the camera pose
+    # at draw time.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+scene.setLiveCameraPose(cameraPose);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.flush();
+const framed = scene.getState();
+const baseline = framed.renderCount;
+// Ten idle ticks: freshly parsed but numerically identical geometry.
+const accepted = [];
+for (let tick = 0; tick < 10; tick += 1) {{
+  accepted.push(scene.setLiveCameraPose(cameraPose.map(row => row.slice())));
+  accepted.push(scene.setLiveRobot({{
+    frame: 'piper_base_link',
+    links_xyz_m: links.map(pair => pair.map(item => item.slice()))
+  }}));
+}}
+// reducedMotion renders synchronously inside _scheduleRender, so renderCount is
+// read directly — an explicit flush() would render unconditionally and hide the
+// very thing under test.
+const idleRenders = scene.getState().renderCount - baseline;
+// The arm moves: one millimetre is a real change and must redraw.
+const movedLinks = links.map(pair => pair.map(item => [item[0] + 0.001, item[1], item[2]]));
+const movedAccepted = scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: movedLinks}});
+const afterArmMove = scene.getState().renderCount - baseline;
+// The base moves: the cloud anchor changes and must redraw.
+const movedPose = cameraPose.map(row => row.slice());
+movedPose[0][3] += 0.001;
+const poseAccepted = scene.setLiveCameraPose(movedPose);
+const afterBaseMove = scene.getState().renderCount - baseline;
+const idleState = scene.getState();
+console.log(JSON.stringify({{
+  framed, accepted, idleRenders, movedAccepted, afterArmMove, poseAccepted,
+  afterBaseMove, idleState
+}}));
+"""))
+
+    # Every push is still accepted — the guard skips the REDRAW, never the push.
+    assert result["accepted"] == [True] * 20
+    assert result["movedAccepted"] is True
+    assert result["poseAccepted"] is True
+    # Twenty identical pushes: zero renders.
+    assert result["idleRenders"] == 0
+    # A millimetre of real motion redraws on the very next flush, each time.
+    assert result["afterArmMove"] == 1
+    assert result["afterBaseMove"] == 2
+    # Nothing was dropped from the model by holding the render back.
+    assert result["idleState"]["counts"]["actualLinks"] == 3
+    assert result["idleState"]["counts"]["coloredCloudPoints"] == 4
+    assert result["idleState"]["framing"] == result["framed"]["framing"]
+
+
+def test_live_re_entry_redraws_the_frustum_even_when_the_anchor_pose_repeats():
+    # The identity guard's trap: leaving session evidence for the live view
+    # rebuilds an empty model but deliberately CARRIES the cloud anchor pose
+    # forward.  A guard that compared only the anchor would then treat the next
+    # identical pose push as a no-op and leave the wrist-camera frustum
+    # permanently undrawn, so it must also see that the model does not hold that
+    # pose yet.
+    result = _node(_live_harness(r"""
+const canvas = new Canvas();
+const scene = window.ZManipScene.create(canvas, {{autoResize:false,interactive:false,reducedMotion:true}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+scene.setLiveCameraPose(cameraPose);
+scene.setLiveRobot({{frame:'piper_base_link', links_xyz_m: links}});
+scene.setLiveColoredCloud(cloudXyz, cloudRgb, 4);
+scene.flush();
+// Session evidence is displayed (the anchor keeps updating, the frustum does
+// not), then the operator returns to the live view and the SAME camera pose is
+// republished by the next observer tick.
+scene.setBundle({{
+  schema: 'z_manip.debug_bundle.v1',
+  frames: {{ perception: 'camera', planning: 'piper_base_link' }},
+  visualization: {{
+    frame: 'piper_base_link', robot_overlay_allowed: true,
+    scene_cloud: {{ frame: 'piper_base_link', points_xyz_m: [[.2,.1,0],[.3,-.1,.02]] }},
+    reference_axes: [{{ name: 'base', frame: 'piper_base_link', pose: [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]] }}]
+  }}
+}});
+scene.enterLiveMode({{frame:'piper_base_link', overlayAllowed:true, cloudExpected:true}});
+const anchorCarried = scene._cloudPose !== null;
+const modelClearedFrustum = scene.model.cameraPose === null;
+const republished = scene.setLiveCameraPose(cameraPose.map(row => row.slice()));
+console.log(JSON.stringify({{
+  anchorCarried, modelClearedFrustum, republished,
+  frustumRestored: scene.model.cameraPose !== null,
+  frustumOrigin: scene.model.cameraPose ? scene.model.cameraPose[0][3] : null,
+  coloredCloudPoints: scene.getState().counts.coloredCloudPoints
+}}));
+"""))
+
+    assert result["anchorCarried"] is True
+    assert result["modelClearedFrustum"] is True
+    assert result["republished"] is True
+    assert result["frustumRestored"] is True
+    assert result["frustumOrigin"] == 0.1
+    # The held cloud is never lost by the re-entry.
+    assert result["coloredCloudPoints"] == 4
+
+
+def test_cloud_tile_rasterizer_packs_one_uint32_per_pixel():
+    # The tile already held a uint32 view of its own image buffer while writing
+    # four separate bytes per pixel.  Little-endian packing is already assumed by
+    # the background fill on the line above, so this is the same bytes with one
+    # store; verified byte-identical against the previous rasterizer over a live
+    # 17,277-point frame.
+    html = (ROOT / "web/debug_dashboard/index.html").read_text(encoding="utf-8")
+    assert "u32[idx] = pixel;" in html
+    assert "data[o] = r; data[o + 1] = g; data[o + 2] = b; data[o + 3] = 255;" not in html
+
+
+def _task_combo_harness(assertions: str) -> str:
+    # Runs the dashboard's real task-combo source (sliced out of index.html)
+    # against a minimal DOM so the combo -> request-body mapping is exercised,
+    # not just asserted as a substring.
+    html = (ROOT / "web/debug_dashboard/index.html").read_text(encoding="utf-8")
+    start = html.index("    const TASK_COMBOS = Object.freeze({")
+    end = html.index("    function renderHomeStatus(", start)
+    source = html[start:end]
+    assertions = assertions.replace("{{", "{").replace("}}", "}")
+    return rf"""
+const nodes = {{
+  "task-combo": {{ value: "place_back", disabled: false }},
+  "task-combo-note": {{ textContent: "" }}
+}};
+const byId = id => nodes[id] || null;
+const finiteNumber = value => typeof value === "number" && Number.isFinite(value);
+const state = {{ approach: {{}} }};
+{source}
+{assertions}
+"""
+
+
+def test_task_combo_selector_maps_each_option_to_the_validated_approach_arguments():
+    # Operator feature: choose the task combination live.  The DEFAULT must send
+    # no override keys at all, so the request body stays exactly what the
+    # dashboard has always posted; every other combo must stay inside the
+    # arguments the approach API already validates (place_back boolean, 0..10 s
+    # hold), and NO combo may ever carry a speed field — #motion-speed is the
+    # single motion-speed authority.
+    result = _node(_task_combo_harness(r"""
+const bodies = {{}};
+const notes = {{}};
+for (const key of Object.keys(TASK_COMBOS)) {{
+  nodes["task-combo"].value = key;
+  const combo = selectedTaskCombo();
+  bodies[key] = Object.assign({{}}, combo.options);
+  renderTaskCombo();
+  notes[key] = nodes["task-combo-note"].textContent;
+}}
+// An unknown value (stale markup, tampered DOM) falls back to the default.
+nodes["task-combo"].value = "not-a-combo";
+const fallback = selectedTaskCombo();
+console.log(JSON.stringify({{
+  keys: Object.keys(TASK_COMBOS), bodies, notes,
+  fallbackKey: fallback.key, fallbackBody: Object.assign({{}}, fallback.options),
+  defaultKey: DEFAULT_TASK_COMBO
+}}));
+"""))
+
+    assert result["defaultKey"] == "place_back"
+    assert set(result["keys"]) == {"place_back", "pick_only", "place_back_hold"}
+    # The default combo posts the byte-identical body the dashboard sent before
+    # the selector existed: the server's own place_back / hold defaults apply.
+    assert result["bodies"]["place_back"] == {}
+    assert result["bodies"]["pick_only"] == {"place_back": False, "hold_seconds": 0}
+    assert result["bodies"]["place_back_hold"] == {"place_back": True, "hold_seconds": 10}
+    # Server-side validation is 0 <= hold_seconds <= 10.0, so no combo can
+    # produce a rejection the operator cannot interpret.
+    for body in result["bodies"].values():
+        assert set(body).issubset({"place_back", "hold_seconds"})
+        if "hold_seconds" in body:
+            assert 0 <= body["hold_seconds"] <= 10
+    assert result["fallbackKey"] == "place_back"
+    assert result["fallbackBody"] == {}
+    # The two cycles read differently, so the note can never describe the wrong one.
+    assert "place back" in result["notes"]["place_back"]
+    assert "no place-back leg" in result["notes"]["pick_only"]
+    assert "hold 10s" in result["notes"]["place_back_hold"]
+
+
+def test_task_combo_readout_follows_the_running_workflow_not_the_local_selection():
+    # A page reload mid-run must show the cycle that is ACTUALLY executing.  The
+    # server echoes place_back / hold_seconds in /api/approach/status.workflow,
+    # and those numbers — not the local <select> — write the readout, so a pair
+    # this UI cannot offer still reads truthfully instead of silently rendering
+    # as the default.
+    result = _node(_task_combo_harness(r"""
+const observed = [];
+const sample = (approach, label) => {{
+  state.approach = approach;
+  renderTaskCombo();
+  observed.push({{
+    label,
+    note: nodes["task-combo-note"].textContent,
+    value: nodes["task-combo"].value,
+    disabled: nodes["task-combo"].disabled
+  }});
+}};
+nodes["task-combo"].value = "place_back";
+sample({{ running: true, workflow: {{ active: true, place_back: false, hold_seconds: 0 }} }}, "running-pick-only");
+nodes["task-combo"].value = "place_back";
+sample({{ running: true, workflow: {{ active: true, place_back: true, hold_seconds: 5 }} }}, "running-unoffered");
+sample({{ running: false }}, "idle");
+console.log(JSON.stringify({{ observed }}));
+"""))
+
+    running_pick_only, running_unoffered, idle = result["observed"]
+    # The running workflow overrides a stale local selection, both in the
+    # readout and in the control itself.
+    assert running_pick_only["value"] == "pick_only"
+    assert "no place-back leg" in running_pick_only["note"]
+    assert running_pick_only["disabled"] is True
+    # A hold this UI does not offer is still described from the real numbers.
+    assert "hold 5s" in running_unoffered["note"]
+    assert "place back" in running_unoffered["note"]
+    assert running_unoffered["disabled"] is True
+    # Idle returns to describing what the operator has selected.
+    assert idle["disabled"] is False
+    assert idle["note"].startswith("Find + grasp runs:")
+
+
+def test_dashboard_names_the_selected_task_cycle_before_starting_it():
+    # An operator must never start a place-back cycle believing it is a
+    # pick-and-hold: the combo is spread into the SAME start request and named
+    # in the confirmation that authorises it.
+    html = (ROOT / "web/debug_dashboard/index.html").read_text(encoding="utf-8")
+    assert 'id="task-combo"' in html
+    assert 'data-testid="task-combo"' in html
+    assert "Task cycle: ${describeTaskCycle(combo.placeBack, combo.holdSeconds)}" in html
+    assert "...combo.options" in html
+    # The selector is a pure argument change on the existing route; it must not
+    # introduce a second speed authority.
+    combo_source = html[html.index("const TASK_COMBOS"):html.index("function renderHomeStatus(")]
+    assert "speed" not in combo_source.lower()
 
 
 def test_javascript_syntax_is_valid():

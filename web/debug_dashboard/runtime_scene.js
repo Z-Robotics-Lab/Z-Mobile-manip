@@ -59,6 +59,13 @@
   const LIVE_WORK_RADIUS_M = 1.3;
   const LIVE_ARM_MIN_FRAC = 0.28;
   const LIVE_FWD_BIAS = 0.22;
+  // Device-pixel ratio of the OFF-SCREEN colored-cloud buffer only.  The splat
+  // field covers a few percent of the canvas, so rasterizing (and clearing) it
+  // at HiDPI costs ~10x for detail no measurement depends on; the main context
+  // keeps its full device ratio, so every vector overlay, axis label and
+  // fillText stays crisp.  Value 1 makes a HiDPI display render the cloud layer
+  // exactly as a DPR-1 display already does.
+  const CLOUD_BUFFER_RATIO = 1;
 
   function finite(value) {
     return typeof value === "number" && Number.isFinite(value);
@@ -91,6 +98,57 @@
 
   function origin(matrix) {
     return matrix ? [matrix[0][3], matrix[1][3], matrix[2][3]] : null;
+  }
+
+  // Strict numeric equality over the twelve significant coefficients.  Used ONLY
+  // to skip a redraw of an already-drawn value: it must never answer "same" for
+  // a pose that differs by any amount, because the colored cloud re-anchors from
+  // this pose at draw time.
+  function samePose(left, right) {
+    if (left === right) return true;
+    if (!left || !right) return false;
+    for (let row = 0; row < 3; row += 1) {
+      for (let column = 0; column < 4; column += 1) {
+        if (left[row][column] !== right[row][column]) return false;
+      }
+    }
+    return true;
+  }
+
+  function sameNumbers(left, right) {
+    if (left === right) return true;
+    if (!left || !right || left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return false;
+    }
+    return true;
+  }
+
+  function samePoints(left, right) {
+    if (left === right) return true;
+    if (!left || !right || left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      if (!sameNumbers(left[index], right[index])) return false;
+    }
+    return true;
+  }
+
+  // Same strictness as samePose, over every normalized field a robot overlay
+  // carries — not just the drawn links — so a redraw is skipped only when the
+  // model already holds this exact chain.
+  function sameRobot(left, right) {
+    if (left === right) return true;
+    if (!left || !right) return false;
+    if (left.frame !== right.frame) return false;
+    if (left.gripper !== right.gripper) return false;
+    if (left.poseSource !== right.poseSource) return false;
+    if (!sameNumbers(left.jointPositions, right.jointPositions)) return false;
+    if (!samePoints(left.joints, right.joints)) return false;
+    if (left.links.length !== right.links.length) return false;
+    for (let index = 0; index < left.links.length; index += 1) {
+      if (!samePoints(left.links[index], right.links[index])) return false;
+    }
+    return true;
   }
 
   function transformPoint(matrix, value) {
@@ -742,6 +800,16 @@
       }
       const robot = this._robot(value, "live.robot", true);
       if (!robot) return false;
+      // Identity guard: the observer re-pushes a bit-identical kinematic chain
+      // every tick while the arm is still, and each push costs a full scene
+      // raster.  Skip only the REDRAW of a value the model already holds — the
+      // push itself is never skipped, and any difference at all still renders.
+      if (sameRobot(this.model.actualRobot, robot)) {
+        const framing = this._framing;
+        this._ensureLiveFraming();
+        if (this._framing !== framing) this._scheduleRender();
+        return true;
+      }
       this.model.actualRobot = robot;
       this._ensureLiveFraming();
       this._scheduleRender();
@@ -758,6 +826,21 @@
       if (value !== null && !matrix) {
         this._diagnose("INVALID_POSE", "live camera pose is not a finite transform", "live.cameraPose");
         return false;
+      }
+      // Identity guard: /api/runtime re-pushes a bit-identical camera->base
+      // transform every tick while the base is still.  The extra
+      // model.cameraPose check keeps a live re-entry (which empties the model
+      // but carries the anchor pose forward) from skipping the frustum it has
+      // not drawn yet.
+      const held = this._cloudPose;
+      if (
+        samePose(held, matrix)
+        && (!this.live || samePose(this.model.cameraPose, matrix))
+      ) {
+        const framing = this._framing;
+        this._ensureLiveFraming();
+        if (this._framing !== framing) this._scheduleRender();
+        return Boolean(matrix);
       }
       this._cloudPose = matrix;
       if (this.live) this.model.cameraPose = matrix;
@@ -918,8 +1001,11 @@
           : null;
       }
       if (!this._cloudCtx || typeof this._cloudCtx.createImageData !== "function") return null;
-      const pixelWidth = this.canvas.width;
-      const pixelHeight = this.canvas.height;
+      // CSS-pixel sized: the composite below draws this buffer into the
+      // viewport rectangle, so its resolution is independent of the main
+      // context's device ratio and the composite call is unchanged.
+      const pixelWidth = Math.round(this._viewport.width * CLOUD_BUFFER_RATIO);
+      const pixelHeight = Math.round(this._viewport.height * CLOUD_BUFFER_RATIO);
       if (!(pixelWidth >= 1) || !(pixelHeight >= 1)) return null;
       if (
         this._cloudCanvas.width !== pixelWidth
@@ -950,7 +1036,9 @@
       const zbuf = this._cloudZ;
       u32.fill(0);
       zbuf.fill(Infinity);
-      const ratio = this._viewport.ratio;
+      // Projection ratio must match the buffer the points are written into, not
+      // the main context's device ratio.
+      const ratio = CLOUD_BUFFER_RATIO;
       const center = view.center;
       const scale = Math.min(this._viewport.width, this._viewport.height) * 0.80 / view.span * this.orbit.zoom;
       const cyaw = Math.cos(this.orbit.yaw);
