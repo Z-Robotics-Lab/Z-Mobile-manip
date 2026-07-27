@@ -16,13 +16,17 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
 
-def test_fixed_views_change_only_j4_j5_and_stay_in_limits():
+def test_fixed_views_change_only_j1_j5_and_stay_in_limits():
+    # J1 (base yaw) pans the camera with the horizon level; J5 pitches it.  The
+    # sweep used to run on J4, which rotates about the forearm and rolled the
+    # picture instead of panning it.  J1 moves the WHOLE arm, so the limit
+    # check below deliberately covers all six joints.
     home = np.asarray(json.loads((ROOT / "configs/piper_home.example.json").read_text())["joint_radians"])
     targets = MODULE.fixed_view_targets(home)
     assert len(targets) > 5
     for target in targets:
         changed = set(np.flatnonzero(np.abs(target - home) > 1e-9))
-        assert changed.issubset({3, 4})
+        assert changed.issubset({0, 4})
         assert np.all(target >= MODULE.executor.JOINT_LIMITS_RAD[:, 0])
         assert np.all(target <= MODULE.executor.JOINT_LIMITS_RAD[:, 1])
 
