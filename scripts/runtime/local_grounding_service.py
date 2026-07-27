@@ -116,7 +116,9 @@ _EN_POSITIONAL_FILLER: frozenset[str] = frozenset(
 )
 # The operator often appends a clarifying clause; everything after the first
 # separator explains what to avoid or why, and never names the target noun.
-_SENTENCE_SEPARATORS: str = "，,。;；\n"
+# Newlines are absent by construction: _parse_instruction collapses all
+# whitespace before _before_separator runs, so listing "\n" here would be dead.
+_SENTENCE_SEPARATORS: str = "，,。;；"
 
 # Position qualifiers. The longest key wins at the same offset, so "左边" is
 # matched ahead of the bare "左".
@@ -239,10 +241,33 @@ def _en_support_split(query: str) -> tuple[str, str] | None:
 
 
 def _spatial_relation(text: str) -> str | None:
-    """Return the position qualifier carried by ``text``, or None."""
+    """Return the position qualifier carried by ``text``, or None.
 
-    match = _earliest_token(text, _SPATIAL_RELATIONS)
-    return None if match is None else _SPATIAL_RELATIONS[match[1]]
+    Presence alone is not intent. Several English position words are ordinary
+    attributive parts of an object's own name -- "the left handle", "center
+    punch", "the near field probe", "a distant object" -- and whole-word
+    matching cannot tell those apart from a real qualifier. An ASCII position
+    word therefore only counts when it HEADS A TRAILING POSITIONAL PHRASE, i.e.
+    everything from it to the end of the segment is positional filler ("the
+    bottle on the left", "the charger in the middle"). Anything following it
+    that names an object makes it attributive, not locative.
+
+    CJK position words in this lexicon (左边/右侧/中间/远处/...) are unambiguous
+    locatives and have no such compound-noun collision, so they keep the plain
+    substring rule; scoping to the target segment already stops a qualifier that
+    describes the support ("远处箱子上白色充电器") from moving to the target.
+    """
+
+    candidates = sorted(
+        (index, -len(token), token)
+        for token in _SPATIAL_RELATIONS
+        if (index := _token_index(text, token)) >= 0
+    )
+    for index, _, token in candidates:
+        if token.isascii() and not _is_positional_phrase(text[index:]):
+            continue
+        return _SPATIAL_RELATIONS[token]
+    return None
 
 
 def _parse_instruction(instruction: str) -> tuple[tuple[str, ...], str | None]:
@@ -279,9 +304,17 @@ def _parse_instruction(instruction: str) -> tuple[tuple[str, ...], str | None]:
     if noun is not None:
         primary = f"{color} {noun}" if color else noun
         prompts = [primary]
-        # Repeating the same noun around a support relation means the requested
-        # target is the smaller item on the support, not the support itself.
-        if support is not None and noun in {"box", "block"}:
+        # Naming a support relation at all means the requested target is the
+        # smaller item on/inside the support, not the support itself. A phrase
+        # that OPENS with the particle elides the support ("上面的黑色盒子" -
+        # "the black box on top"), so _zh_support_split returns None for it and
+        # the split alone must not disarm the alias: without "small black box"
+        # and its 0.12 per-label area cap, a large storage box outscores the
+        # small box it carries and the arm is sent to the support.
+        if noun in {"box", "block"} and (
+            support is not None
+            or _earliest_token(query, _ZH_SUPPORT_PARTICLES) is not None
+        ):
             prompts.append(f"small {primary}")
         for alias in _EQUIVALENT_PROMPTS.get(noun, ()):
             candidate = f"{color} {alias}" if color else alias
@@ -423,13 +456,24 @@ def merge_detection_lists(
     return merged_boxes, merged_scores, merged_labels
 
 
+# SHIPPED DARK, ON PURPOSE. Parsing the position qualifier and reporting it is
+# a strict gain: it is new information the response did not carry before, and a
+# later tier can consume it. LETTING IT REORDER DETECTIONS IS NOT, YET. All 51
+# qualifier-carrying sessions in the recorded corpus already resolve to the
+# correct instance under plain confidence-argmax and their prompt tuples are
+# unchanged, so the reorder has zero demonstrated benefit there while it can
+# invert a wide confidence gap: on the recorded '黑色箱子上右边的白色充电器'
+# geometry, argmax picks the 0.80 charger and the reorder picks a 0.49 false
+# positive further right. That decides which physical object the arm grasps, so
+# it stays off until it has been observed against real YOLOE score
+# distributions on live frames. Enabling it is this one line.
+SPATIAL_REORDER_ENABLED = False
 # A position qualifier may only reorder detections the detector already rates
 # as comparable, so an incidental relation word cannot promote a weak box.
 SPATIAL_PEER_CONFIDENCE_RATIO = 0.6
 # ...and only when the qualified boxes are actually separated along the axis
-# the qualifier names, in normalized frame units / relative area.
+# the qualifier names, in normalized frame units.
 SPATIAL_MINIMUM_CENTROID_SPREAD = 0.05
-SPATIAL_MINIMUM_AREA_SPREAD = 1.25
 
 
 def _confidence(candidate: Mapping[str, object]) -> float:
@@ -445,34 +489,31 @@ def _apply_spatial_preference(
     candidates: list[dict[str, object]],
     preference: str,
 ) -> dict[str, object] | None:
-    """Pick the instance the operator's position qualifier names, or None."""
+    """Pick the instance a lateral position qualifier names, or None.
 
-    if len(candidates) < 2:
+    Only left/right/middle are geometrically decidable from one frame. There is
+    deliberately NO near/far branch: apparent box area is the only depth cue a
+    single 2-D frame carries, and ranking "far" onto the smallest area selects
+    exactly the tiny fragments YOLOE emits as noise -- measured on the recorded
+    '远处彩色瓶子' geometry it swapped a 0.70-confidence bottle for a 0.43
+    sliver. A near/far qualifier is parsed and reported but never reorders.
+    """
+
+    if len(candidates) < 2 or preference not in {"left", "right", "middle"}:
         return None
-    if preference in {"left", "right", "middle"}:
-        centres = [(_centre_x(candidate), candidate) for candidate in candidates]
-        offsets = sorted(centre for centre, _ in centres)
-        if offsets[-1] - offsets[0] < SPATIAL_MINIMUM_CENTROID_SPREAD:
-            return None
-        if preference == "left":
-            return min(centres, key=lambda item: (item[0], -_confidence(item[1])))[1]
-        if preference == "right":
-            return max(centres, key=lambda item: (item[0], _confidence(item[1])))[1]
-        middle = (offsets[(len(offsets) - 1) // 2] + offsets[len(offsets) // 2]) / 2.0
-        return min(
-            centres,
-            key=lambda item: (abs(item[0] - middle), -_confidence(item[1])),
-        )[1]
-    # Apparent size is the only depth cue a single 2-D frame carries, so a
-    # near/far qualifier ranks on box area.
-    areas = [(float(candidate["area_ratio"]), candidate) for candidate in candidates]
-    smallest = min(area for area, _ in areas)
-    largest = max(area for area, _ in areas)
-    if smallest <= 0.0 or largest < smallest * SPATIAL_MINIMUM_AREA_SPREAD:
+    centres = [(_centre_x(candidate), candidate) for candidate in candidates]
+    offsets = sorted(centre for centre, _ in centres)
+    if offsets[-1] - offsets[0] < SPATIAL_MINIMUM_CENTROID_SPREAD:
         return None
-    if preference == "near":
-        return max(areas, key=lambda item: (item[0], _confidence(item[1])))[1]
-    return min(areas, key=lambda item: (item[0], -_confidence(item[1])))[1]
+    if preference == "left":
+        return min(centres, key=lambda item: (item[0], -_confidence(item[1])))[1]
+    if preference == "right":
+        return max(centres, key=lambda item: (item[0], _confidence(item[1])))[1]
+    middle = (offsets[(len(offsets) - 1) // 2] + offsets[len(offsets) // 2]) / 2.0
+    return min(
+        centres,
+        key=lambda item: (abs(item[0] - middle), -_confidence(item[1])),
+    )[1]
 
 
 def select_detection(
@@ -496,9 +537,9 @@ def select_detection(
     geometrically meaningless mask, so reject them before confidence ranking.
 
     ``spatial_preference`` names which of several comparable instances the
-    operator asked for. Every class phrase in one request denotes the same
-    category by construction, so any qualified detection is a plausible
-    instance and may be reordered by position.
+    operator asked for. It only reorders anything when
+    ``SPATIAL_REORDER_ENABLED`` is set; with the shipped default the selection
+    is plain confidence-argmax and the qualifier is carried, not acted on.
     """
 
     if width <= 0 or height <= 0:
@@ -570,7 +611,7 @@ def select_detection(
         return None
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     best = candidates[0][2]
-    if spatial_preference is None:
+    if spatial_preference is None or not SPATIAL_REORDER_ENABLED:
         return best
     peers = [
         result

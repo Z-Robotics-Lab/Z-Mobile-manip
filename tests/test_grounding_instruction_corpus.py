@@ -72,6 +72,20 @@ def test_corpus_target_identity_and_relation_retention():
     assert retained == 51
 
 
+def test_the_corpus_cannot_justify_reordering_on_the_relation():
+    # This is the whole evidentiary basis for SPATIAL_REORDER_ENABLED shipping
+    # False. Every qualifier-carrying session already grounds the correct target
+    # under plain confidence-argmax and its prompt tuple is unchanged, so the
+    # geometric reorder has no demonstrated benefit anywhere in the recording
+    # while it can invert a wide confidence gap. Flipping the flag needs
+    # evidence this corpus does not contain; delete this test when you have it.
+    relational = [record for record in INSTRUCTIONS if record["expected_spatial"]]
+    assert relational
+    for record in relational:
+        assert _primary(record["instruction"]) == record["expected_prompt"]
+    assert SERVICE.SPATIAL_REORDER_ENABLED is False
+
+
 def test_no_instruction_invents_a_relation():
     for record in INSTRUCTIONS:
         if record["expected_spatial"] is None:
@@ -129,11 +143,25 @@ _GOLDEN_PROMPTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("黑色箱上面右边的小白色充电器", _WHITE_CHARGER),
     ("箱子上的白色充电器", _WHITE_CHARGER),
     ("远处箱子上的白色充电器", _WHITE_CHARGER),
+    ("黑色箱子上右边的白色小充电器", _WHITE_CHARGER),
     ("红色瓶子", ("red bottle",)),
-    ("黑色盒子", ("black box",)),
-    ("黑色箱子上的黑色盒子", ("black box", "small black box")),
     ("红色可乐", ("red soda bottle",)),
     ("彩色瓶子", ("bottle",)),
+    ("黑色箱子上左边的瓶子", ("bottle",)),
+    # Every recorded phrase whose noun is box/block, i.e. every phrase the
+    # small-variant alias trigger can move. Pinning the whole tuple here is what
+    # makes a change to that trigger a visible, reviewable diff instead of a
+    # silent change to which physical object the arm is sent to.
+    ("黑色盒子", ("black box",)),
+    ("黑色箱子", ("black box",)),
+    ("黑色相机盒子", ("black box",)),
+    ("远处小白色方块", ("white block",)),
+    ("黑色箱子上的黑色盒子", ("black box", "small black box")),
+    ("远处黑色箱子上的黑色盒子", ("black box", "small black box")),
+    ("地上的黑色盒子", ("black box", "small black box")),
+    ("远处地上的白色方块", ("white block", "small white block")),
+    ("黑色台子上小白色方块", ("white block", "small white block")),
+    ("the  tissue box  on  black box", ("tissue box",)),
 )
 
 
