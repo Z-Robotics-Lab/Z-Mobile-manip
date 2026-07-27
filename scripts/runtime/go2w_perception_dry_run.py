@@ -46,7 +46,10 @@ from z_manip.perception.tracked_reuse import (
     parse_tracking_reuse_contract,
 )
 from z_manip.perception.seed_gate import BundleGateConfig, min_points_for_depth
-from z_manip.verification.passive_capture import validate_passive_capture
+from z_manip.verification.passive_capture import (
+    PassiveCaptureWindow,
+    validate_passive_capture,
+)
 
 
 def _cloud_median_z(cloud_message: object) -> float | None:
@@ -168,6 +171,36 @@ DEFAULT_NO_SEED_TIMEOUT_S = 8.0
 # EdgeTAM is initialising/tracking.  Reaching either disables the no-seed
 # fast-fail so the full wait serves the depth-dropout coast.
 SEED_ACCEPTED_PHASES = frozenset({"waiting_tracker", "tracking"})
+
+
+def _widest_passive_overlap_margin_s(
+    supported: Sequence[int],
+    capture: PassiveCaptureWindow,
+) -> float | None:
+    """Widest -- i.e. most negative -- stamp-overlap margin of a rejection.
+
+    The overlap gate is the reason a request waits for another fixed passive
+    observation period, but a rejection leaves no trace in the selected report:
+    the corpus only ever records the offset of a bundle that was *accepted*, so
+    both edges look safe exactly because every censored sample is missing.
+
+    This is only ever called once every supported bundle has been rejected, so
+    every margin here is negative and ``-margin`` is how much extra tolerance
+    that bundle would have needed.  Report the WORST of them.  The purpose is to
+    let a later wave size the tolerance from uncensored data, and a fail-closed
+    gate is sized from the worst miss it must still cover -- recording the
+    closest near-miss instead would systematically under-state it.  Reporting
+    changes nothing about which bundle is admitted.
+    """
+
+    margins = [
+        min(
+            stamp - capture.start_unix_ns + 250_000_000,
+            capture.end_unix_ns + 250_000_000 - stamp,
+        )
+        for stamp in supported
+    ]
+    return round(min(margins) * 1e-9, 6) if margins else None
 
 
 def _status_indicates_seed(
@@ -663,6 +696,9 @@ def main(
     smallest_effective_min = args.min_bundle_target_points
     selected_passive_report: dict[str, object] | None = None
     passive_window_error = "waiting for first passive capture window"
+    supported_bundle_at: float | None = None
+    passive_window_rejections = 0
+    widest_rejected_margin_s: float | None = None
     while time.monotonic() < deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
         if perception_failure:
@@ -737,6 +773,8 @@ def main(
                         f"{smallest_effective_min} points)"
                     )
                     continue
+                if supported_bundle_at is None:
+                    supported_bundle_at = time.monotonic()
                 if args.passive_window is None:
                     selected_stamp = max(supported)
                     selected_stamp_median_z = _cloud_median_z(clouds[selected_stamp])
@@ -773,6 +811,13 @@ def main(
                         )
                         selected_passive_report = candidate_report
                         break
+                    passive_window_rejections += 1
+                    margin_s = _widest_passive_overlap_margin_s(supported, capture)
+                    if margin_s is not None and (
+                        widest_rejected_margin_s is None
+                        or margin_s < widest_rejected_margin_s
+                    ):
+                        widest_rejected_margin_s = margin_s
                     passive_window_error = (
                         "no exact perception bundle overlaps the latest passive window"
                     )
@@ -789,6 +834,11 @@ def main(
             time.monotonic() - bundle_wait_started,
             6,
         )
+        if supported_bundle_at is not None:
+            stage_timings["passive_window_wait_s"] = round(
+                time.monotonic() - supported_bundle_at,
+                6,
+            )
         report = {
             "read_only": True,
             "request_id": request_id,
@@ -811,6 +861,8 @@ def main(
             ],
             "passive_window_required": args.passive_window is not None,
             "passive_window_error": passive_window_error,
+            "passive_window_rejections": passive_window_rejections,
+            "widest_rejected_overlap_margin_s": widest_rejected_margin_s,
             "perception_failure": perception_failure or None,
             "seed_accepted": seed_ever_accepted,
             "no_seed_fast_fail": no_seed_fast_fail,
@@ -851,6 +903,14 @@ def main(
         selected_at - bundle_wait_started,
         6,
     )
+    if supported_bundle_at is not None:
+        # Time spent holding a depth-supported bundle while waiting only for
+        # zero-TX evidence: the wait the passive gate costs, isolated from the
+        # grounding and acquisition it is otherwise conflated with.
+        stage_timings["passive_window_wait_s"] = round(
+            selected_at - supported_bundle_at,
+            6,
+        )
     counts_at_selection = dict(message_counts)
     freshness_samples_s = [
         max(0, max(infos) - selected_stamp) * 1e-9,
@@ -1119,6 +1179,12 @@ def main(
         "result_freshness": _freshness_summary(freshness_samples_s),
         "max_observed_result_lag_s": args.max_observed_result_lag,
         "passive_capture": passive_capture_summary,
+        # One shape on both reports.  These used to be top-level on the failure
+        # report but nested as ``passive_capture.rejections`` on the success
+        # report, so no single query could read them across a corpus -- which
+        # defeats the point of recording them.
+        "passive_window_rejections": passive_window_rejections,
+        "widest_rejected_overlap_margin_s": widest_rejected_margin_s,
         "timings": stage_timings,
     }
     if args.soak_duration > 0.0:

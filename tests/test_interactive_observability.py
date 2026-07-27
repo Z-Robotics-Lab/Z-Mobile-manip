@@ -4,10 +4,17 @@
       the perception process died without a structured report;
   (b) the rc=70 fingerprint self-heal count and cumulative cost are persisted;
   (c) the VLM reuse hit-ratio (how often a fresh YOLOE+VLM grounding was
-      avoided by tracking reuse) is persisted.
+      avoided by tracking reuse) is persisted;
+  (d) the passive-window supervision granularity, the selected-evidence gate
+      that decides whether another remote observation period is opened, and the
+      fail-closed shape of the predicate that may cut one short.
 
-All three run only on cold paths (a completed/failed attempt or a self-heal),
-so they add no I/O or subprocess cost to the hot success path.
+(a)-(c) run only on cold paths (a completed/failed attempt or a self-heal), so
+they add no I/O or subprocess cost to the hot success path.
+
+(d) guards a safety property at the source level: the zero-TX probe attests
+that a nominally read-only request never saw the arm transmit, so no latency
+optimisation may be able to destroy a window's verdict.
 """
 
 from __future__ import annotations
@@ -179,6 +186,97 @@ def test_reuse_hit_ratio_scores_reused_as_a_vlm_avoided_hit():
     assert third["vlm_avoided_reuse_hits"] == 2
     assert third["grounding_requests_scored"] == 4
     assert third["vlm_reuse_hit_ratio"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# (d) passive-window supervision granularity
+# ---------------------------------------------------------------------------
+
+def test_supervision_granularity_is_far_below_the_observation_period():
+    # The request must return on the perception worker's clock, not on the
+    # boundary of a fixed remote observation period it no longer needs.
+    assert MODULE.PASSIVE_CAPTURE_POLL_SECONDS > 0.0
+    assert MODULE.PASSIVE_CAPTURE_POLL_SECONDS < float(
+        MODULE.PASSIVE_CAPTURE_SECONDS,
+    ) / 10.0
+
+
+def test_selected_evidence_gate_admits_only_a_complete_zero_tx_report(tmp_path):
+    backend = MODULE.FixedReadOnlyBackend
+    output = tmp_path / "selected"
+    output.mkdir()
+    selected = output / "selected_passive_joint_report.json"
+
+    assert backend._selected_passive_report_valid(output) is False
+
+    selected.write_text(json.dumps({
+        "schema": "z_manip.piper_passive_joint_report.v1",
+        "read_only": True,
+        "complete_joint_feedback": True,
+        "zero_transmit_verified": False,
+        "interface_tx_packet_delta": 3,
+    }), encoding="utf-8")
+    assert backend._selected_passive_report_valid(output) is False
+
+    selected.write_text(json.dumps({
+        "schema": "z_manip.piper_passive_joint_report.v1",
+        "read_only": True,
+        "complete_joint_feedback": True,
+        "zero_transmit_verified": True,
+        "interface_tx_packet_delta": 0,
+    }), encoding="utf-8")
+    assert backend._selected_passive_report_valid(output) is True
+
+
+def test_selected_evidence_gate_rejects_a_symlinked_report(tmp_path):
+    output = tmp_path / "symlinked"
+    output.mkdir()
+    real = tmp_path / "real_report.json"
+    real.write_text(json.dumps({
+        "schema": "z_manip.piper_passive_joint_report.v1",
+        "read_only": True,
+        "complete_joint_feedback": True,
+        "zero_transmit_verified": True,
+        "interface_tx_packet_delta": 0,
+    }), encoding="utf-8")
+    (output / "selected_passive_joint_report.json").symlink_to(real)
+
+    assert MODULE.FixedReadOnlyBackend._selected_passive_report_valid(
+        output,
+    ) is False
+
+
+def test_the_stop_predicate_never_keys_on_worker_liveness_alone():
+    """Source-level guard on the fail-closed shape of the abandon predicate.
+
+    The supervision loop is ``while perception_worker_running()``, so its only
+    exit is the worker going away.  If that is also sufficient for stop(), then
+    the probe in flight at that moment always satisfies stop() and the final
+    passive window of every attempt is abandoned by construction -- taking its
+    zero-TX verdict with it.  Abandoning must require a positive proof of
+    redundancy established BEFORE the window was opened.
+    """
+
+    source = Path(MODULE.__file__).read_text(encoding="utf-8")
+    predicate = source.split("def passive_window_unneeded()")[1]
+    predicate = predicate.split("return")[1].split("\n\n")[0]
+    assert "window_redundant_at_open" in predicate
+    # Never "the worker is gone, therefore throw the observation away".
+    assert "not perception_worker_running() or" not in predicate
+
+
+def test_structural_completeness_is_a_distinct_predicate_from_the_zero_tx_gate():
+    # Two different questions, two different functions.  Conflating them is
+    # what let a completed report of an ACTUAL transmission be deleted and the
+    # request reported as a success.
+    backend = MODULE.FixedReadOnlyBackend
+    assert backend._passive_report_valid is not (
+        backend._passive_report_structurally_complete
+    )
+    source = Path(MODULE.__file__).read_text(encoding="utf-8")
+    # The discard path must consult completeness, never the verdict.
+    discard = source.split("if abandoned and not ")[1].split(":")[0]
+    assert discard == "structurally_complete"
 
 
 def test_reuse_hit_ratio_survives_object_new_backend_without_init():
