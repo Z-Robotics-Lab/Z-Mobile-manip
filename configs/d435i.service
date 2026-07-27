@@ -10,14 +10,18 @@ Type=simple
 # stabilized source.  The temporal delta preserves prompt response at depth
 # discontinuities while smoothing millimetre-scale stationary-camera jitter.
 #
-# Color and depth stream at 640x480x30 (D435i-native).  The perception node now
-# keeps the depth median off the mask critical path, so the extra frames raise
-# the effective mask update rate above the old 15fps ceiling.
-# RISK: 30fps roughly doubles compressedDepth/compressed color bandwidth and
-# NUC encode CPU versus 15fps.  If the NUC saturates (dropped frames, publisher
-# lag, thermal), ROLL BACK by changing both profiles below to 640x480x15 and
-# `sudo systemctl restart d435i` (color+depth must stay at the same rate so the
-# node's exact-time RGB-D synchronizer keeps joining stamps).
+# Color and depth both stream at 640x480x15.  Color ran at 30fps while depth
+# stayed at 15, so half the color frames could never join a depth frame in the
+# exact-time RGB-D synchronizer yet still cost full Wi-Fi air time: measured
+# 2.64 MB/s of compressed color against 948 KB/s of compressedDepth.  The NUC
+# rides the robot, so every byte crosses wlp7s0 (RTT avg 16ms, max 119ms), and
+# air-time contention there also drives the jitter on the SSH control path.
+# 15fps keeps color and depth at the SAME rate, which is what the synchronizer
+# needs, and stays well clear of the slowest consumer (the EdgeTAM mask chain,
+# measured 7.5-8.1 Hz) and the dashboard tile (sampled 12.5 Hz).
+# ROLL BACK by restoring rgb_camera.color_profile:=640x480x30 and
+# `systemctl --user restart d435i` (color+depth must stay at the same rate so
+# the node's exact-time RGB-D synchronizer keeps joining stamps).
 #
 # infra1(left)+infra2(right) Y8 640x480x30 are enabled as the RAW, rectified,
 # unfiltered stereo pair consumed by the optional Fast-FoundationStereo depth
@@ -28,7 +32,7 @@ Type=simple
 # unless the FFS node runs.  The spatial/temporal filters below apply to the
 # DEPTH stream only; the IR pair stays raw (what the learned matcher wants).
 # ROLL BACK by removing the enable_infra1/2 + depth_module.infra_profile args.
-ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh && exec ros2 launch realsense2_camera rs_launch.py camera_namespace:=/nuc camera_name:=camera enable_sync:=true align_depth.enable:=true rgb_camera.color_profile:=640x480x30 depth_module.depth_profile:=640x480x15 enable_infra1:=true enable_infra2:=true depth_module.infra_profile:=640x480x15 spatial_filter.enable:=true spatial_filter.filter_magnitude:=2 spatial_filter.filter_smooth_alpha:=0.5 spatial_filter.filter_smooth_delta:=20 spatial_filter.holes_fill:=0 temporal_filter.enable:=true temporal_filter.filter_smooth_alpha:=0.4 temporal_filter.filter_smooth_delta:=20 temporal_filter.holes_fill:=3'
+ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh && exec ros2 launch realsense2_camera rs_launch.py camera_namespace:=/nuc camera_name:=camera enable_sync:=true align_depth.enable:=true rgb_camera.color_profile:=640x480x15 depth_module.depth_profile:=640x480x15 enable_infra1:=true enable_infra2:=true depth_module.infra_profile:=640x480x15 spatial_filter.enable:=true spatial_filter.filter_magnitude:=2 spatial_filter.filter_smooth_alpha:=0.5 spatial_filter.filter_smooth_delta:=20 spatial_filter.holes_fill:=0 temporal_filter.enable:=true temporal_filter.filter_smooth_alpha:=0.4 temporal_filter.filter_smooth_delta:=20 temporal_filter.holes_fill:=3'
 # ros2 launch can exit successfully even when its child node failed during an
 # early-boot network race, so retry regardless of the launcher's exit status.
 Restart=always
