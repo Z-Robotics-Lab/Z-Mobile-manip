@@ -48,7 +48,12 @@ ip link set "$interface" down
 ip link set "$interface" type can bitrate 1000000
 tx_before="$(<"/sys/class/net/$interface/statistics/tx_packets")"
 ip link set "$interface" up
-sleep 1
+# SocketCAN bring-up settle before the probe's bind().  GNU coreutils sleep takes
+# fractional seconds, but POSIX only mandates whole ones, so fall back to a full
+# second rather than let the settle silently degrade to nothing on a host whose
+# sleep is integer-only.  Losing the settle would surface as a spurious
+# fail-closed bus-down report, never as an unsafe pass.
+sleep 0.5 2>/dev/null || sleep 1
 tx_after_up="$(<"/sys/class/net/$interface/statistics/tx_packets")"
 if [[ "$tx_after_up" -ne "$tx_before" ]]; then
   echo "host TX counter changed during passive interface bring-up" >&2
