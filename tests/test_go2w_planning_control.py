@@ -28,6 +28,26 @@ HTML = ROOT / "web" / "debug_dashboard" / "index.html"
 SERVICE = ROOT / "configs" / "z-manip-planning-workbench.service"
 
 
+def _patch_calling_thread_sleep(monkeypatch, replacement):
+    """Replace ``time.sleep`` for the calling thread only.
+
+    Several tests in this module leave bounded ``_watch_mobile_handoff``
+    observer threads polling with ``time.sleep``; a process-wide no-op turns
+    them into hot spins that both pollute the recorded sleeps and starve the
+    thread under test.
+    """
+    caller = threading.get_ident()
+    real_sleep = time.sleep
+
+    def sleep(seconds):
+        if threading.get_ident() != caller:
+            real_sleep(seconds)
+            return
+        replacement(seconds)
+
+    monkeypatch.setattr(CONTROL.time, "sleep", sleep)
+
+
 def _executor_start_evidence() -> dict[str, object]:
     return {
         "schema": "z_manip.piper_executor_start_receipt.v1",
@@ -2586,7 +2606,7 @@ def test_mobile_handoff_joint_wait_polls_quickly_without_relaxing_epoch(tmp_path
             }
 
     sleeps = []
-    monkeypatch.setattr(CONTROL.time, "sleep", sleeps.append)
+    _patch_calling_thread_sleep(monkeypatch, sleeps.append)
     runner = object.__new__(CONTROL.PiperGraspRunner)
     runner.log_path = tmp_path / "grasp.log"
     runner.home_verifier = DelayedFreshJoints()
@@ -3832,6 +3852,7 @@ def _place_back_runner(tmp_path, *, base_lock=None, sessions=None, leg=None):
     the place-back cycle must never fall through to the plain full-grasp path.
     """
     runner = object.__new__(CONTROL.PiperGraspRunner)
+    runner.script = tmp_path / "scripts" / "runtime" / "piper_full_grasp_remote.py"
     runner.log_path = tmp_path / "grasp.log"
     runner.receipt_root = tmp_path / "receipts"
     runner.receipt_root.mkdir(exist_ok=True)
@@ -3890,6 +3911,7 @@ def _recording_leg(record, *, fail_phase=None):
         speed_percent,
         planning_session_id,
         prior_receipt_dir,
+        staged=None,
     ):
         record.append((
             workflow_phase,
@@ -3946,7 +3968,7 @@ def test_mobile_handoff_place_back_runs_pick_carry_hold_place_in_order(tmp_path)
 def test_mobile_handoff_place_back_hold_duration_is_honored(tmp_path, monkeypatch):
     record = []
     slept = []
-    monkeypatch.setattr(CONTROL.time, "sleep", lambda seconds: slept.append(seconds))
+    _patch_calling_thread_sleep(monkeypatch, slept.append)
     runner = _place_back_runner(tmp_path, leg=_recording_leg(record))
 
     runner._run_mobile_handoff(
@@ -3954,9 +3976,11 @@ def test_mobile_handoff_place_back_hold_duration_is_honored(tmp_path, monkeypatc
         place_back=True, hold_seconds=2.0,
     )
 
-    # The hold dwell is a single 2.0s wait, taken between carry-home and
-    # place-back (after two legs, before the third).
-    assert slept == [2.0]
+    # The hold dwell is a single wait, taken between carry-home and place-back
+    # (after two legs, before the third), covering the whole 2.0s less only the
+    # place-back staging the dwell has already absorbed.
+    assert len(slept) == 1
+    assert 1.9 <= slept[0] <= 2.0
     action_dir = next(iter(runner.receipt_root.glob("mobile-handoff-grasp-*")))
     hold_receipt = json.loads((action_dir / "hold-receipt.json").read_text())
     assert hold_receipt["requested_hold_s"] == 2.0
@@ -3965,6 +3989,131 @@ def test_mobile_handoff_place_back_hold_duration_is_honored(tmp_path, monkeypatc
     assert status["timings_s"]["handoff_hold_at_home"] >= 0.0
     # The place-back leg only runs after the hold receipt exists.
     assert [r[0] for r in record] == ["pick-hold", "return-home-holding", "place-back"]
+
+
+def test_mobile_handoff_hold_is_never_shortened_by_concurrent_staging(tmp_path):
+    record = []
+    runner = _place_back_runner(tmp_path, leg=_recording_leg(record))
+
+    def stage(**_kwargs):
+        time.sleep(0.05)
+        return {"workflow_phase": "place-back"}
+
+    runner._stage_workflow_leg = stage
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=0.20,
+    )
+
+    # Staging overlaps the dwell, so the operator's requested hold is still
+    # delivered in full: the receipt may only ever round up.
+    action_dir = next(iter(runner.receipt_root.glob("mobile-handoff-grasp-*")))
+    hold_receipt = json.loads((action_dir / "hold-receipt.json").read_text())
+    assert hold_receipt["requested_hold_s"] == 0.2
+    assert hold_receipt["actual_hold_s"] >= hold_receipt["requested_hold_s"]
+    assert [r[0] for r in record] == ["pick-hold", "return-home-holding", "place-back"]
+
+
+def test_mobile_handoff_place_back_executor_waits_for_the_whole_hold(tmp_path, monkeypatch):
+    clock = {"now": 1_000.0}
+    staging_started = threading.Event()
+    timeline = []
+
+    def fake_sleep(seconds):
+        # Force the interleaving under test -- staging first, dwell second --
+        # instead of leaving it to the scheduler.
+        assert staging_started.wait(5.0)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(CONTROL.time, "monotonic", lambda: clock["now"])
+    _patch_calling_thread_sleep(monkeypatch, fake_sleep)
+
+    def stage(**_kwargs):
+        timeline.append(("stage", clock["now"]))
+        staging_started.set()
+        return {"workflow_phase": "place-back"}
+
+    def leg(*, workflow_phase, **_kwargs):
+        timeline.append(("leg", workflow_phase, clock["now"]))
+        return _executor_start_evidence()
+
+    runner = _place_back_runner(tmp_path, leg=leg)
+    runner._stage_workflow_leg = stage
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=2.0,
+    )
+
+    # Staging runs at the head of the dwell, but the place-back executor is not
+    # invoked until the full 2.0s has elapsed on the clock -- the arm never
+    # moves a millisecond early.
+    assert timeline == [
+        ("leg", "pick-hold", 1_000.0),
+        ("leg", "return-home-holding", 1_000.0),
+        ("stage", 1_000.0),
+        ("leg", "place-back", 1_002.0),
+    ]
+
+
+def test_mobile_handoff_hold_staging_failure_blocks_with_the_object_held(tmp_path):
+    record = []
+    base_lock = _FakeBaseLock()
+    runner = _place_back_runner(tmp_path, base_lock=base_lock, leg=_recording_leg(record))
+
+    def stage(**_kwargs):
+        raise RuntimeError("planned-grasp archive vanished before place-back")
+
+    runner._stage_workflow_leg = stage
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=0.05,
+    )
+
+    # A staging failure on the dwell's worker thread must surface as a leg
+    # failure, never be swallowed: the place-back leg does not run, the object
+    # stays HELD at Home for the recovery buttons, and the base is released.
+    assert [r[0] for r in record] == ["pick-hold", "return-home-holding"]
+    assert runner._workflow["phase"] == "holding_at_home"
+    assert runner._workflow["holding_object"] is True
+    assert runner._workflow["at_home"] is True
+    status = runner.status()
+    assert status["outcome"] == "blocked"
+    assert "could not be staged" in status["message"]
+    assert "HELD" in status["message"]
+    assert "archive vanished" in status["message"]
+    # The dwell that did happen is still documented.
+    action_dir = next(iter(runner.receipt_root.glob("mobile-handoff-grasp-*")))
+    assert (action_dir / "hold-receipt.json").is_file()
+    assert base_lock.calls[-1] == ("unlock", "mobile_handoff_grasp")
+
+
+def test_mobile_handoff_staged_place_back_replays_the_unstaged_wrapper_call(tmp_path):
+    invocations = []
+
+    def leg(*, staged=None, **kwargs):
+        invocations.append((kwargs, staged))
+        return _executor_start_evidence()
+
+    runner = _place_back_runner(tmp_path, leg=leg)
+    runner._run_mobile_handoff(
+        "floor bottle", 9, "20260722-115900", 1_800_000_000_000_000_000,
+        place_back=True, hold_seconds=0.05,
+    )
+
+    # The three legs and their prior-receipt chain are unchanged by staging,
+    # and the staged place-back invocation is byte-identical to the one the
+    # unstaged path would have built at the top of the leg.
+    assert [call["workflow_phase"] for call, _ in invocations] == [
+        "pick-hold", "return-home-holding", "place-back",
+    ]
+    assert [call["prior_receipt_dir"] for call, _ in invocations] == [
+        None,
+        invocations[0][0]["receipt_dir"],
+        invocations[1][0]["receipt_dir"],
+    ]
+    assert [staged for _, staged in invocations[:2]] == [None, None]
+    place_back_call, place_back_staged = invocations[2]
+    assert place_back_staged == runner._stage_workflow_leg(**place_back_call)
 
 
 def test_mobile_handoff_place_back_default_speed_two_honored_end_to_end(tmp_path):
