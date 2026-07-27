@@ -97,7 +97,17 @@ CLOUD_SOURCE_NAMES = {0: "d435_raw", 1: "ffs"}
 DEFAULT_POLL_INTERVAL_MS = 200
 HOME_FAST_VERIFY_TOLERANCE_RAD = math.radians(1.0)
 SERVO_ACQUISITION_GRACE_S = 5.0
-MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 2.0
+# One post-stop passive-joint window.  Widened 2.0 -> 3.5 s: the recorded
+# PASSIVE_JOINT_GATE aborts were transient publisher hiccups where a strictly
+# post-stop sample arrived just after the old 2.0 s cap, not genuine loss.  A
+# single bounded re-wait (below) recovers one more window without ever relaxing
+# the not_before_unix_ns ordering gate -- every poll still demands a sample
+# strictly newer than the base stop.
+MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S = 3.5
+# Bounded re-waits after the first window times out.  Strictly one: the joint
+# capture waits at most 1 + this many windows before failing closed, so the
+# worst-case wait stays small and can never loop unboundedly.
+MOBILE_HANDOFF_JOINT_READY_REWAITS = 1
 # The passive observer publishes at 20 Hz, while recorded delivery can lag its
 # source stamp by about 0.2 s.  Poll frequently enough to avoid adding another
 # full observer period after a strictly post-stop sample has actually arrived.
@@ -112,6 +122,17 @@ MOBILE_HANDOFF_JOINT_READY_POLL_S = 0.01
 # only shortens detection latency; the freshness/epoch gates are unchanged.
 APPROACH_JOINT_FEEDBACK_POLL_S = 0.1
 MOBILE_HANDOFF_CAPTURE_MAX_SKEW_S = 1.0
+# Perception error codes that are transient process/camera races rather than a
+# deterministic property of the frozen close-range scene.  During the mobile
+# handoff -- with the base already stopped and locked -- these get exactly one
+# fresh receive-only recapture.  Geometry (GRASP_GEOMETRY_FAILED) and grounding
+# (PERCEPTION_TARGET_NOT_FOUND / PERCEPTION_TRACKER_LOST) failures are
+# deterministic for the frozen frame and are never retried here: they fail
+# closed unchanged.
+MOBILE_HANDOFF_PERCEPTION_RETRY_CODES = frozenset({
+    "PERCEPTION_PROCESS_FAILED",
+    "PERCEPTION_CAMERA_FRAME_TIMEOUT",
+})
 MAX_HANDOFF_EVIDENCE_BYTES = 512 * 1024
 # Default dwell at Home while holding the object between the carry-home and
 # place-back legs of the mobile pick->hold->place-back cycle.  The dwell is a
@@ -3405,63 +3426,22 @@ class PiperGraspRunner:
                 "perception_finished_unix_ns": time.time_ns(),
                 "perception_finished_monotonic_ns": time.monotonic_ns(),
             })
-            if perception.get("status") != "succeeded":
-                error = perception.get("error")
-                detail = error.get("message") if isinstance(error, dict) else None
-                raise RuntimeError(detail or "fresh close-range perception failed")
-            fresh_perception_session_id = validate_session_id(
-                perception.get("session_id"),
-            )
-            if fresh_perception_session_id == superseded_perception_session_id:
-                raise RuntimeError(
-                    "close-range capture reused the pre-servo perception session",
-                )
-
-            capture_evidence = None
-            for recapture in range(2):
-                try:
-                    capture_evidence = self._validate_mobile_handoff_capture_evidence(
-                        perception_session_id=fresh_perception_session_id,
-                        target=target,
-                        base_stopped_unix_ns=base_stopped_unix_ns,
-                        joint_evidence=joint_evidence,
-                    )
-                    break
-                except RuntimeError as error:
-                    if (
-                        recapture > 0
-                        or "not strictly post-stop and ordered" not in str(error)
-                    ):
-                        raise
-                    # The passive evidence window brackets the selected camera
-                    # frame by a fixed rolling span, so a frame taken within
-                    # that span of the stop boundary straddles it and is
-                    # correctly rejected.  A later frame satisfies the same
-                    # strict gate; retry the capture once instead of failing
-                    # the whole grasp.
-                    self._update(
-                        phase="handoff_capture_retry",
-                        message=(
-                            "Passive window straddled the stop boundary; "
-                            "capturing a later close-range frame."
-                        ),
-                    )
-                    retry_started = time.monotonic()
-                    perception = self.session_service.start_perception(target)
-                    timings["handoff_perception_retry"] = round(
-                        time.monotonic() - retry_started,
-                        6,
-                    )
-                    if perception.get("status") != "succeeded":
-                        retry_error = perception.get("error")
-                        detail = (
-                            retry_error.get("message")
-                            if isinstance(retry_error, dict)
-                            else None
-                        )
-                        raise RuntimeError(
-                            detail or "fresh close-range perception failed",
-                        )
+            # One shared retry budget covers the whole fresh close-range
+            # capture.  It is consumed by EITHER a transient
+            # perception-process/camera race (start_perception returned a
+            # PERCEPTION_PROCESS_FAILED / PERCEPTION_CAMERA_FRAME_TIMEOUT
+            # attempt) OR a passive-window straddle of the stop boundary --
+            # never both.  This keeps recaptures strictly capped at 1x while the
+            # base stays stopped and locked (the lock spans this whole block).
+            # Geometry/grounding/identity failures set no retry trigger and fail
+            # closed immediately, exactly as before.
+            capture_evidence: dict[str, Any] | None = None
+            handoff_capture_retry_used = False
+            fresh_perception_session_id = ""
+            while capture_evidence is None:
+                retry_trigger: str | None = None
+                pending_error: BaseException | None = None
+                if perception.get("status") == "succeeded":
                     fresh_perception_session_id = validate_session_id(
                         perception.get("session_id"),
                     )
@@ -3469,8 +3449,65 @@ class PiperGraspRunner:
                         raise RuntimeError(
                             "close-range capture reused the pre-servo perception session",
                         )
-            if capture_evidence is None:
-                raise RuntimeError("handoff capture evidence unavailable after retry")
+                    try:
+                        capture_evidence = (
+                            self._validate_mobile_handoff_capture_evidence(
+                                perception_session_id=fresh_perception_session_id,
+                                target=target,
+                                base_stopped_unix_ns=base_stopped_unix_ns,
+                                joint_evidence=joint_evidence,
+                            )
+                        )
+                    except RuntimeError as error:
+                        pending_error = error
+                        # The passive evidence window brackets the selected
+                        # camera frame by a fixed rolling span, so a frame taken
+                        # within that span of the stop boundary straddles it and
+                        # is correctly rejected.  A later frame satisfies the
+                        # same strict gate; this is the only validation failure
+                        # a recapture can recover.
+                        if "not strictly post-stop and ordered" in str(error):
+                            retry_trigger = "handoff_capture_straddle"
+                else:
+                    error_info = perception.get("error")
+                    error_code = (
+                        error_info.get("code")
+                        if isinstance(error_info, dict)
+                        else None
+                    )
+                    detail = (
+                        error_info.get("message")
+                        if isinstance(error_info, dict)
+                        else None
+                    )
+                    pending_error = RuntimeError(
+                        detail or "fresh close-range perception failed",
+                    )
+                    if error_code in MOBILE_HANDOFF_PERCEPTION_RETRY_CODES:
+                        retry_trigger = "handoff_perception_transient"
+                if capture_evidence is not None:
+                    break
+                if retry_trigger is None or handoff_capture_retry_used:
+                    assert pending_error is not None
+                    raise pending_error
+                handoff_capture_retry_used = True
+                self._update(
+                    phase="handoff_capture_retry",
+                    handoff_capture_retry_trigger=retry_trigger,
+                    message=(
+                        "Recapturing one fresh close-range frame after a "
+                        "transient perception process/camera fault."
+                        if retry_trigger == "handoff_perception_transient"
+                        else "Passive window straddled the stop boundary; "
+                        "capturing a later close-range frame."
+                    ),
+                )
+                retry_started = time.monotonic()
+                perception = self.session_service.start_perception(target)
+                timings["handoff_perception_retry"] = round(
+                    time.monotonic() - retry_started,
+                    6,
+                )
 
             self._update(
                 phase="handoff_planning",
@@ -3681,37 +3718,55 @@ class PiperGraspRunner:
         *,
         not_before_unix_ns: int,
         timeout_s: float = MOBILE_HANDOFF_JOINT_READY_TIMEOUT_S,
+        max_rewaits: int = MOBILE_HANDOFF_JOINT_READY_REWAITS,
     ) -> dict[str, Any]:
-        """Wait a bounded time for measured joints newer than base stop."""
+        """Wait a bounded time for measured joints newer than base stop.
+
+        The wait runs at most ``1 + max_rewaits`` fixed windows.  The
+        ``not_before_unix_ns`` ordering gate is passed unchanged to every poll
+        in every window, so a re-wait never accepts a sample that is not
+        strictly newer than the base stop -- it only grants one more bounded
+        chance for the 20 Hz passive stream to deliver such a sample before the
+        whole handoff fails closed.
+        """
 
         if self.home_verifier is None:
             raise RuntimeError(
                 "fresh passive-joint verifier is unavailable at mobile handoff",
             )
-        deadline = time.monotonic() + timeout_s
+        windows = 1 + max(0, int(max_rewaits))
         last_detail = "no passive joint sample received"
         last_evidence: dict[str, Any] = {}
-        while True:
-            ready, last_detail, last_evidence = (
-                self.home_verifier.current_joint_snapshot(
-                    not_before_unix_ns=not_before_unix_ns,
+        for window in range(windows):
+            deadline = time.monotonic() + timeout_s
+            while True:
+                ready, last_detail, last_evidence = (
+                    self.home_verifier.current_joint_snapshot(
+                        not_before_unix_ns=not_before_unix_ns,
+                    )
                 )
-            )
-            if ready:
+                if ready:
+                    with self.log_path.open("a", encoding="utf-8") as log:
+                        log.write(
+                            "Mobile handoff joint readiness passed: "
+                            f"sequence={last_evidence.get('sequence')} "
+                            f"source_timestamp_ns={last_evidence.get('source_timestamp_ns')}\n"
+                        )
+                    return last_evidence
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(MOBILE_HANDOFF_JOINT_READY_POLL_S)
+            if window + 1 < windows:
                 with self.log_path.open("a", encoding="utf-8") as log:
                     log.write(
-                        "Mobile handoff joint readiness passed: "
-                        f"sequence={last_evidence.get('sequence')} "
-                        f"source_timestamp_ns={last_evidence.get('source_timestamp_ns')}\n"
+                        "Mobile handoff joint readiness re-waiting one bounded "
+                        f"window after {timeout_s:.1f}s: {last_detail}\n"
                     )
-                return last_evidence
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "fresh passive joints were not observed after base stop "
-                    f"within {timeout_s:.1f}s: {last_detail}; "
-                    f"evidence={last_evidence}",
-                )
-            time.sleep(MOBILE_HANDOFF_JOINT_READY_POLL_S)
+        raise RuntimeError(
+            "fresh passive joints were not observed after base stop "
+            f"within {timeout_s:.1f}s x {windows} windows: {last_detail}; "
+            f"evidence={last_evidence}",
+        )
 
     def _run(self, target: str, speed_percent: int) -> None:
         action_dir = self.receipt_root / f"grasp-{time.time_ns()}"

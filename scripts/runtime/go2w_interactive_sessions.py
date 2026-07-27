@@ -93,6 +93,11 @@ PLANNING_RUNNER_SCRATCH_TTL_S = 24 * 60 * 60
 MAX_PLANNER_ERROR_CHARS = 600
 MAX_PERCEPTION_REPORT_BYTES = 256 * 1024
 MAX_PERCEPTION_ERROR_CHARS = 600
+# Bounded suffix of the worker log persisted into a failed attempt when the
+# process died without a structured report.  Small and fixed, so the failure
+# path never reads an unbounded log.
+MAX_WORKER_STDERR_TAIL_BYTES = 16 * 1024
+MAX_WORKER_STDERR_TAIL_LINES = 8
 MAX_REJECTIONS_TO_SUMMARIZE = 4096
 MAX_WORKER_REQUEST_BYTES = 64 * 1024
 MAX_WORKER_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -626,6 +631,18 @@ class FixedReadOnlyBackend:
         runtime: ServerRuntimeConfig | None = None,
     ) -> None:
         self.runtime = runtime or ServerRuntimeConfig.from_server_environment()
+        # Cross-request observability counters on the resident backend.  These
+        # are incremented only on cold paths (a completed perception attempt or
+        # a rc=70 self-heal) and read back into the per-request timing record,
+        # so they add no cost to the hot success path.
+        #   * grounding reuse "hit" ratio: reused-tracking requests skip a fresh
+        #     YOLOE+VLM grounding, so the ratio measures how often the VLM was
+        #     avoided.
+        #   * rc=70 fingerprint self-heal count and cumulative wall-clock cost.
+        self._grounding_reuse_hits = 0
+        self._grounding_requests_scored = 0
+        self._fingerprint_selfheal_count = 0
+        self._fingerprint_selfheal_cost_s = 0.0
 
     @staticmethod
     def _ssh_prefix() -> tuple[str, ...]:
@@ -855,17 +872,56 @@ class FixedReadOnlyBackend:
         return detail
 
     @classmethod
+    def _worker_stderr_tail(cls, log_path: Path | None) -> str:
+        """Return a bounded printable tail of the worker's stdout/stderr log.
+
+        The perception worker writes its combined stdout/stderr to the action
+        log.  When the process dies without a structured report, that tail is
+        the only diagnostic; persist it into the failed attempt so the failure
+        is inspectable without shelling into the host.  Reads at most a small
+        fixed suffix, so there is no unbounded I/O even for large logs.
+        """
+
+        if log_path is None:
+            return ""
+        try:
+            if log_path.is_symlink() or not log_path.is_file():
+                return ""
+            size = log_path.stat().st_size
+            with log_path.open("rb") as handle:
+                if size > MAX_WORKER_STDERR_TAIL_BYTES:
+                    handle.seek(size - MAX_WORKER_STDERR_TAIL_BYTES)
+                raw = handle.read(MAX_WORKER_STDERR_TAIL_BYTES)
+        except OSError:
+            return ""
+        text = raw.decode("utf-8", errors="replace")
+        # Drop the structured timing markers the worker emits; keep only the
+        # human-readable diagnostic lines for the tail.
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("{")
+        ]
+        return cls._bounded_perception_detail(" | ".join(lines[-MAX_WORKER_STDERR_TAIL_LINES:]))
+
+    @classmethod
     def _perception_failure_result(
         cls,
         output_dir: Path,
         return_code: int,
+        *,
+        log_path: Path | None = None,
     ) -> BackendResult:
         report = cls._perception_report(output_dir)
         if report is None:
+            message = "read-only perception process failed without a valid report"
+            tail = cls._worker_stderr_tail(log_path)
+            if tail:
+                message = f"{message}; worker stderr tail: {tail}"
             return BackendResult(
                 return_code,
                 "PERCEPTION_PROCESS_FAILED",
-                "read-only perception process failed without a valid report",
+                message,
             )
         failure = cls._bounded_perception_detail(report.get("perception_failure"))
         grasp_error = cls._bounded_perception_detail(
@@ -1052,14 +1108,82 @@ class FixedReadOnlyBackend:
         )
         if not fingerprint_mismatch:
             return result
+        # rc=70 self-heal cost: measure the restart+retry wall clock and persist
+        # a running total on this cold path so the fingerprint-mismatch tax is
+        # observable without touching the hot success path.
+        selfheal_started = time.monotonic()
         if not self._heal_stale_perception_worker(log_path):
+            self._persist_fingerprint_selfheal_cost(
+                log_path,
+                cost_s=time.monotonic() - selfheal_started,
+                healed=False,
+                healed_return_code=None,
+            )
             return result
         healed, _mismatch_again = self._run_perception_once(
             target=target,
             output_dir=output_dir,
             log_path=log_path,
         )
+        self._persist_fingerprint_selfheal_cost(
+            log_path,
+            cost_s=time.monotonic() - selfheal_started,
+            healed=True,
+            healed_return_code=healed.exit_code,
+        )
         return healed
+
+    def _persist_fingerprint_selfheal_cost(
+        self,
+        log_path: Path,
+        *,
+        cost_s: float,
+        healed: bool,
+        healed_return_code: int | None,
+    ) -> None:
+        """Record the running rc=70 self-heal count and cumulative cost."""
+
+        self._fingerprint_selfheal_count = (
+            getattr(self, "_fingerprint_selfheal_count", 0) + 1
+        )
+        self._fingerprint_selfheal_cost_s = round(
+            getattr(self, "_fingerprint_selfheal_cost_s", 0.0) + max(0.0, cost_s),
+            6,
+        )
+        _append_timing(
+            log_path,
+            "perception_fingerprint_selfheal_cost",
+            cost_s,
+            trigger="resident_worker_fingerprint_mismatch",
+            selfheal_count=self._fingerprint_selfheal_count,
+            selfheal_cost_total_s=self._fingerprint_selfheal_cost_s,
+            healed=healed,
+            healed_return_code=healed_return_code,
+        )
+
+    def _grounding_observability(self, reused: bool) -> dict[str, object]:
+        """Score one completed grounding and return the VLM hit-ratio fields.
+
+        A reused-tracking request is a "hit" that skipped a fresh YOLOE+VLM
+        grounding, so the ratio measures how often the VLM was avoided.  Scored
+        once per attempt that produced a report; a rc=70 transport failure has
+        no report and is never scored here, so a self-heal cannot double-count.
+        """
+
+        self._grounding_requests_scored = (
+            getattr(self, "_grounding_requests_scored", 0) + 1
+        )
+        if reused:
+            self._grounding_reuse_hits = (
+                getattr(self, "_grounding_reuse_hits", 0) + 1
+            )
+        scored = self._grounding_requests_scored
+        hits = getattr(self, "_grounding_reuse_hits", 0)
+        return {
+            "vlm_avoided_reuse_hits": hits,
+            "grounding_requests_scored": scored,
+            "vlm_reuse_hit_ratio": round(hits / scored, 6) if scored else 0.0,
+        }
 
     def _run_perception_once(
         self,
@@ -1384,11 +1508,11 @@ class FixedReadOnlyBackend:
                 6,
             )
         if report is not None:
+            reused = report.get("grounding_reused") is True
             timing_fields["grounding_mode"] = (
-                "reused_tracking"
-                if report.get("grounding_reused") is True
-                else "fresh_grounding"
+                "reused_tracking" if reused else "fresh_grounding"
             )
+            timing_fields.update(self._grounding_observability(reused))
         _append_timing(
             log_path,
             "perception_total",
@@ -1404,7 +1528,9 @@ class FixedReadOnlyBackend:
         if return_code == 0:
             return BackendResult(0), fingerprint_mismatch
         return (
-            self._perception_failure_result(output_dir, return_code),
+            self._perception_failure_result(
+                output_dir, return_code, log_path=log_path,
+            ),
             fingerprint_mismatch,
         )
 

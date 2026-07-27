@@ -157,6 +157,67 @@ def _freshness_summary(samples_s: list[float]) -> dict[str, float | int | None]:
     }
 
 
+# Default bounded budget to accept the first segmentation seed before failing
+# fast with PERCEPTION_TARGET_NOT_FOUND.  Measured request-to-first-bundle is
+# ~6.2 s p95 and grounding reaches WAITING_TRACKER/TRACKING well before that, so
+# 8 s clears a genuinely slow-but-real seed while collapsing the p95=15 s no-seed
+# tail.  0 disables the fast-fail (full timeout is used).
+DEFAULT_NO_SEED_TIMEOUT_S = 8.0
+# Perception-contract phases (published as the DiagnosticStatus message) that
+# prove a segmentation seed was accepted: grounding has produced a box and
+# EdgeTAM is initialising/tracking.  Reaching either disables the no-seed
+# fast-fail so the full wait serves the depth-dropout coast.
+SEED_ACCEPTED_PHASES = frozenset({"waiting_tracker", "tracking"})
+
+
+def _status_indicates_seed(
+    *,
+    phase: object,
+    valid_field: object,
+    track_id: object,
+) -> bool:
+    """Return whether a perception status proves a seed was accepted.
+
+    A seed-bearing phase (grounding produced a box and EdgeTAM is
+    initialising/tracking), a public-valid bundle, or a live track id each
+    prove the fresh grounding produced a segmentation seed.
+    """
+
+    return (
+        str(phase).strip().lower() in SEED_ACCEPTED_PHASES
+        or str(valid_field).strip().lower() == "true"
+        or bool(str(track_id).strip())
+    )
+
+
+def _no_seed_fastfail_reason(
+    *,
+    seed_accepted: bool,
+    status_observed: bool,
+    elapsed_s: float,
+    budget_s: float,
+) -> str | None:
+    """Return a legible no-seed abort reason, or None to keep waiting.
+
+    The fresh bundle wait fails fast only when the perception stack is alive
+    (``status_observed``) yet no segmentation seed has been accepted within
+    ``budget_s``.  Once a seed is accepted (``seed_accepted``) the full wait is
+    preserved: that is the EdgeTAM depth-dropout coast, not a no-seed miss.  The
+    reason string is prefixed ``grounding_failed`` so the session layer maps it
+    to PERCEPTION_TARGET_NOT_FOUND.
+    """
+
+    if seed_accepted or not status_observed or budget_s <= 0.0:
+        return None
+    if elapsed_s < budget_s:
+        return None
+    return (
+        "grounding_failed: no segmentation seed was accepted within "
+        f"{budget_s:.1f}s; YOLOE returned nothing and the VLM fallback "
+        "admitted no seed"
+    )
+
+
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--instruction", required=True)
@@ -172,6 +233,17 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="immutable copy of the passive report matched to the selected bundle",
     )
     parser.add_argument("--timeout", type=float, default=105.0)
+    parser.add_argument(
+        "--no-seed-timeout",
+        type=float,
+        default=DEFAULT_NO_SEED_TIMEOUT_S,
+        help=(
+            "bounded budget to accept the first segmentation seed before "
+            "failing fast with PERCEPTION_TARGET_NOT_FOUND; the full --timeout "
+            "wait is kept once a seed is accepted (the depth-dropout coast); "
+            "0 disables the fast-fail"
+        ),
+    )
     parser.add_argument(
         "--min-bundle-target-points",
         type=int,
@@ -294,6 +366,8 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         or not 1.0 <= args.fallback_contact_angle_deg <= 89.0
         or not math.isfinite(args.target_exclusion_radius_m)
         or args.target_exclusion_radius_m <= 0.0
+        or not math.isfinite(args.no_seed_timeout)
+        or args.no_seed_timeout < 0.0
     ):
         parser.error(
             "instruction must be non-empty; timeouts must exceed 5 s; "
@@ -302,7 +376,8 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "positive; tracking reuse probe timeout must be in [0, 0.25] s; "
             "tracking reuse max age must be in (0, 5] s; "
             "fallback contact angle must be in [1, 89] degrees; "
-            "and target exclusion radius must be positive"
+            "target exclusion radius must be positive; "
+            "and no-seed timeout must be finite and non-negative"
         )
     if (args.passive_window is None) != (args.selected_passive_window is None):
         parser.error("passive-window and selected-passive-window must be provided together")
@@ -352,10 +427,17 @@ def main(
     rejected_reuse_bundle_stamps: set[int] = set()
     accepted_source_request_id = ""
     reused_source_request_id = ""
+    # A seed is "accepted" once the perception contract reaches a
+    # tracking-bearing phase or publishes any public-valid bundle.  Latched so a
+    # later depth dropout (valid -> False) never re-arms the no-seed fast-fail.
+    seed_ever_accepted = False
+    no_seed_fast_fail = False
 
     def valid_callback(message: Bool) -> None:
-        nonlocal valid
+        nonlocal valid, seed_ever_accepted
         value = bool(message.data)
+        if value:
+            seed_ever_accepted = True
         if value != valid:
             valid = value
             valid_transitions.append((time.monotonic(), value))
@@ -389,7 +471,7 @@ def main(
     def status_callback(message: DiagnosticArray) -> None:
         nonlocal perception_failure
         nonlocal matching_tracking_request_id, matching_tracking_valid
-        nonlocal tracking_status_observed, reuse_contract
+        nonlocal tracking_status_observed, reuse_contract, seed_ever_accepted
         message_counts["status"] += 1
         for status in message.status:
             values = {item.key: item.value for item in status.values}
@@ -425,6 +507,17 @@ def main(
                 accepted_source_request_id
                 and status_request_id == accepted_source_request_id
             )
+            # Latch seed acceptance for our exact request identity (direct match
+            # or the same-instruction reuse contract).  A seed-bearing phase, a
+            # public-valid bundle, or a live track id all prove grounding
+            # produced a seed, which disables the no-seed fast-fail even before
+            # the /perception/valid Bool has flipped for the first time.
+            if (failure_matches or matching_tracking_valid) and _status_indicates_seed(
+                phase=getattr(status, "message", ""),
+                valid_field=values.get("valid", ""),
+                track_id=values.get("track_id", ""),
+            ):
+                seed_ever_accepted = True
             if failure_matches and status.level == DiagnosticStatus.ERROR and failure:
                 detail = values.get("failure_detail", "").strip()
                 perception_failure = failure + (f": {detail}" if detail else "")
@@ -561,6 +654,9 @@ def main(
         floor_points=int(args.bundle_gate_floor_points),
     )
     bundle_wait_started = time.monotonic()
+    # Fail fast when no segmentation seed is accepted; keep the full --timeout
+    # wait once a seed exists so the EdgeTAM depth-dropout coast is unaffected.
+    no_seed_budget = min(args.no_seed_timeout, args.timeout)
     selected_stamp: int | None = None
     selected_stamp_median_z: float | None = None
     selected_stamp_effective_min = args.min_bundle_target_points
@@ -570,6 +666,16 @@ def main(
     while time.monotonic() < deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
         if perception_failure:
+            break
+        no_seed_reason = _no_seed_fastfail_reason(
+            seed_accepted=seed_ever_accepted,
+            status_observed=tracking_status_observed,
+            elapsed_s=time.monotonic() - bundle_wait_started,
+            budget_s=no_seed_budget,
+        )
+        if no_seed_reason is not None:
+            perception_failure = no_seed_reason
+            no_seed_fast_fail = True
             break
         if valid:
             common = (
@@ -706,6 +812,9 @@ def main(
             "passive_window_required": args.passive_window is not None,
             "passive_window_error": passive_window_error,
             "perception_failure": perception_failure or None,
+            "seed_accepted": seed_ever_accepted,
+            "no_seed_fast_fail": no_seed_fast_fail,
+            "no_seed_timeout_s": no_seed_budget,
             "minimum_bundle_target_points": args.min_bundle_target_points,
             "largest_bundle_target_points": largest_bundle_target_points,
             "distance_aware_bundle_gate": bundle_gate_cfg.enabled,
