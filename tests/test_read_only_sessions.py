@@ -42,14 +42,53 @@ def _integration_module():
     return module
 
 
-def _passive_report():
-    return {
+def _passive_report(**overrides):
+    """A faithful receive-only probe document (shape of a real recorded one).
+
+    Carries every field ``piper_passive_probe.py`` emits that the zero-TX
+    verdict or the stamp-overlap gate is computed from, so a test can build a
+    document that is *structurally complete* yet reports a violation -- the case
+    the abandon path must never silently delete.
+    """
+
+    document = {
         "schema": "z_manip.piper_passive_joint_report.v1",
         "read_only": True,
         "complete_joint_feedback": True,
         "zero_transmit_verified": True,
         "interface_tx_packet_delta": 0,
+        "observation_start_unix_ns": 1785125303795263743,
+        "observation_end_unix_ns": 1785125304049370967,
+        "joint_positions_rad": [0.0265, 0.0371, -0.0433, 0.0214, 0.2265, 0.0],
+        "joint_ranges_rad": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "max_joint_range_rad": 0.0,
+        "joint_snapshot_span_s": 0.00485224,
     }
+    document.update(overrides)
+    return document
+
+
+class _FakePassiveProbe:
+    """Stand-in for the receive-only NUC probe subprocess."""
+
+    def __init__(self, returncode, alive_polls=0):
+        self._returncode = returncode
+        self._alive_polls = alive_polls
+        self.terminated = False
+
+    def poll(self):
+        if self._alive_polls > 0:
+            self._alive_polls -= 1
+            return None
+        return self._returncode
+
+    def wait(self, timeout=None):
+        self._alive_polls = 0
+        return self._returncode
+
+    def terminate(self):
+        self.terminated = True
+        self._alive_polls = 0
 
 
 def _write_perception_success(output: Path, target: str) -> None:
@@ -542,15 +581,12 @@ def test_passive_capture_uses_probe_stdout_without_second_ssh_fetch(
     log = tmp_path / "capture.log"
     calls = []
 
-    class Completed:
-        returncode = 0
-
-    def fake_run(argv, **kwargs):
+    def fake_popen(argv, **kwargs):
         calls.append(tuple(argv))
         kwargs["stdout"].write(
             (json.dumps(_passive_report()) + "\n").encode("utf-8"),
         )
-        return Completed()
+        return _FakePassiveProbe(0)
 
     backend = module.FixedReadOnlyBackend(
         module.ServerRuntimeConfig.from_server_environment({}),
@@ -560,7 +596,7 @@ def test_passive_capture_uses_probe_stdout_without_second_ssh_fetch(
         "_ssh_prefix",
         lambda: ("/usr/bin/ssh", "fixed-nuc"),
     )
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
 
     result = backend._capture_passive_window(output, log, {})
 
@@ -571,6 +607,461 @@ def test_passive_capture_uses_probe_stdout_without_second_ssh_fetch(
     assert backend._passive_report_valid(
         output / "live_passive_joint_report.json",
     )
+
+
+def test_passive_capture_abandons_a_window_nobody_can_still_consume(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    output = tmp_path / "abandoned"
+    output.mkdir()
+    log = tmp_path / "abandoned.log"
+    probes = []
+
+    def fake_popen(argv, **kwargs):
+        # A terminated probe leaves a truncated document behind; that is an
+        # abandoned window, not missing zero-TX evidence.
+        kwargs["stdout"].write(b'{"schema": "z_manip.piper_pass')
+        probe = _FakePassiveProbe(1, alive_polls=8)
+        probes.append(probe)
+        return probe
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_ssh_prefix",
+        lambda: ("/usr/bin/ssh", "fixed-nuc"),
+    )
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    result = backend._capture_passive_window(
+        output,
+        log,
+        {},
+        stop=lambda: True,
+    )
+
+    # An abandoned window is not a failed zero-TX gate: the request that would
+    # have consumed it is already finished.
+    assert result.exit_code == 0
+    assert result.error_code is None
+    assert probes[0].terminated is True
+    # Nothing may survive the call: the session layer hashes the whole output
+    # tree into the immutable artifact manifest as soon as the action returns.
+    assert not (output / "live_passive_joint_report.json").exists()
+    assert list(output.iterdir()) == []
+
+
+def test_passive_capture_keeps_a_window_that_completed_as_it_was_abandoned(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    output = tmp_path / "raced"
+    output.mkdir()
+    log = tmp_path / "raced.log"
+
+    def fake_popen(argv, **kwargs):
+        kwargs["stdout"].write(
+            (json.dumps(_passive_report()) + "\n").encode("utf-8"),
+        )
+        return _FakePassiveProbe(0, alive_polls=1)
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_ssh_prefix",
+        lambda: ("/usr/bin/ssh", "fixed-nuc"),
+    )
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    result = backend._capture_passive_window(output, log, {}, stop=lambda: True)
+
+    # The probe finished on its own before the stop landed, so its evidence is
+    # complete and is published rather than discarded.
+    assert result.exit_code == 0
+    assert backend._passive_report_valid(
+        output / "live_passive_joint_report.json",
+    )
+    assert not (output / ".passive_joint_report.inflight").exists()
+
+
+def test_a_probe_that_failed_on_its_own_is_still_a_failed_gate(
+    tmp_path,
+    monkeypatch,
+):
+    """Only a signal WE sent may be discounted in favour of the document.
+
+    Discounting the exit status whenever a complete document exists would let a
+    probe that died on its own -- SSH dropped, remote error -- publish whatever
+    it had already flushed as valid zero-TX evidence.  Nobody abandoned this
+    window, so its non-zero status fails the gate exactly as it always did.
+    """
+
+    module = _integration_module()
+    output = tmp_path / "self-failed"
+    output.mkdir()
+    log = tmp_path / "self-failed.log"
+
+    def fake_popen(argv, **kwargs):
+        # A complete, clean-looking document AND a non-zero exit of its own.
+        kwargs["stdout"].write(
+            (json.dumps(_passive_report()) + "\n").encode("utf-8"),
+        )
+        return _FakePassiveProbe(3)
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_ssh_prefix",
+        lambda: ("/usr/bin/ssh", "fixed-nuc"),
+    )
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    result = backend._capture_passive_window(output, log, {}, stop=lambda: False)
+
+    assert result.exit_code == 3
+    assert result.error_code == "PASSIVE_JOINT_GATE_FAILED"
+    assert not (output / "live_passive_joint_report.json").exists()
+    assert list(output.iterdir()) == []
+
+
+def test_an_unkillable_probe_cannot_strand_the_inflight_report(
+    tmp_path,
+    monkeypatch,
+):
+    """DEFECT 6: ``_stop_process`` runs inside the perception request path.
+
+    Its ``wait`` after ``kill()`` used to be unguarded, so ``TimeoutExpired``
+    would propagate out of ``_capture_passive_window`` -- still inside the open
+    ``.passive_joint_report.inflight`` handle -- and leave that scratch file in
+    ``output_dir``, invalidating the artifact manifest hashed on return.
+    """
+
+    module = _integration_module()
+    output = tmp_path / "unkillable"
+    output.mkdir()
+    log = tmp_path / "unkillable.log"
+
+    class _Unkillable:
+        def __init__(self):
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                raise AssertionError("teardown must never wait unbounded")
+            raise module.subprocess.TimeoutExpired("probe", timeout)
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    probe = _Unkillable()
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_ssh_prefix",
+        lambda: ("/usr/bin/ssh", "fixed-nuc"),
+    )
+    monkeypatch.setattr(module.subprocess, "Popen", lambda argv, **kw: probe)
+
+    result = backend._capture_passive_window(output, log, {}, stop=lambda: True)
+
+    assert probe.killed is True
+    # Fails closed rather than raising, and leaves nothing behind.
+    assert result.exit_code == 0
+    assert list(output.iterdir()) == []
+    assert not (output / ".passive_joint_report.inflight").exists()
+
+
+def test_passive_capture_still_reports_a_failed_zero_tx_gate(
+    tmp_path,
+    monkeypatch,
+):
+    module = _integration_module()
+    output = tmp_path / "gate-failed"
+    output.mkdir()
+    log = tmp_path / "gate-failed.log"
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_ssh_prefix",
+        lambda: ("/usr/bin/ssh", "fixed-nuc"),
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda argv, **_kwargs: _FakePassiveProbe(2),
+    )
+
+    result = backend._capture_passive_window(output, log, {}, stop=lambda: False)
+
+    assert result.exit_code == 2
+    assert result.error_code == "PASSIVE_JOINT_GATE_FAILED"
+    assert list(output.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed regressions for the passive-window latency work.
+#
+# The zero-TX probe exists to attest that a nominally read-only perception
+# request never saw the arm transmit on CAN.  Cutting an observation short is a
+# latency optimisation; it must never be able to convert a detected
+# transmission into a reported success.
+# ---------------------------------------------------------------------------
+
+def test_a_completed_window_reporting_transmission_fails_and_is_not_discarded(
+    tmp_path,
+    monkeypatch,
+):
+    """DEFECT 1: the zero-TX gate is a verdict, not a truncation check.
+
+    A probe that ran to completion and AFFIRMATIVELY DETECTED the arm
+    transmitting produces a well-formed document that the zero-TX gate rejects.
+    Deciding what to discard with that same gate deletes exactly this document
+    and reports the request as a success -- fail-open.  A structurally complete
+    document must always reach the gate and fail the request, even when the stop
+    predicate fires on the very first poll.
+    """
+
+    module = _integration_module()
+    output = tmp_path / "transmitting"
+    output.mkdir()
+    log = tmp_path / "transmitting.log"
+    violation = _passive_report(
+        zero_transmit_verified=False,
+        interface_tx_packet_delta=7,
+    )
+
+    def fake_popen(argv, **kwargs):
+        # Complete document, written before the stop lands: the probe finished
+        # observing and is reporting what it saw.
+        kwargs["stdout"].write((json.dumps(violation) + "\n").encode("utf-8"))
+        return _FakePassiveProbe(-15, alive_polls=4)
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_ssh_prefix",
+        lambda: ("/usr/bin/ssh", "fixed-nuc"),
+    )
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    result = backend._capture_passive_window(output, log, {}, stop=lambda: True)
+
+    # Never reported as success, and never mistaken for a truncated write.
+    assert result.exit_code != 0
+    assert result.error_code == "PASSIVE_JOINT_REPORT_INVALID"
+    # A violating document is never published as usable zero-TX evidence, and
+    # no inflight scratch is stranded in the hashed artifact tree.
+    assert not (output / "live_passive_joint_report.json").exists()
+    assert list(output.iterdir()) == []
+
+
+def test_structural_completeness_is_not_the_zero_tx_gate(tmp_path):
+    module = _integration_module()
+    backend = module.FixedReadOnlyBackend
+    complete_but_violating = tmp_path / "violating.json"
+    complete_but_violating.write_text(json.dumps(_passive_report(
+        zero_transmit_verified=False,
+        interface_tx_packet_delta=7,
+    )), encoding="utf-8")
+
+    # Complete document, failed verdict: kept, and fails the request.
+    assert backend._passive_report_structurally_complete(
+        complete_but_violating,
+    ) is True
+    assert backend._passive_report_valid(complete_but_violating) is False
+
+    # Killed mid-write: unparseable, so genuinely discardable.
+    truncated = tmp_path / "truncated.json"
+    truncated.write_text('{"schema": "z_manip.piper_pass', encoding="utf-8")
+    assert backend._passive_report_structurally_complete(truncated) is False
+    assert backend._passive_report_valid(truncated) is False
+
+    # Parseable and correctly schema'd but missing the fields the verdict is
+    # computed from: the probe did not finish writing it.
+    partial = tmp_path / "partial.json"
+    partial.write_text(json.dumps({
+        "schema": "z_manip.piper_passive_joint_report.v1",
+        "read_only": True,
+    }), encoding="utf-8")
+    assert backend._passive_report_structurally_complete(partial) is False
+
+    # Empty file (terminated before the probe emitted anything).
+    empty = tmp_path / "empty.json"
+    empty.write_bytes(b"")
+    assert backend._passive_report_structurally_complete(empty) is False
+
+    # A clean document passes both.
+    clean = tmp_path / "clean.json"
+    clean.write_text(json.dumps(_passive_report()), encoding="utf-8")
+    assert backend._passive_report_structurally_complete(clean) is True
+    assert backend._passive_report_valid(clean) is True
+
+
+def test_the_final_window_of_an_attempt_is_never_abandoned_by_construction(
+    tmp_path,
+    monkeypatch,
+):
+    """DEFECT 2: the worker exiting must not, on its own, abandon a window.
+
+    The supervision loop is ``while perception_worker_running()``.  If the stop
+    predicate also fires on ``not perception_worker_running()`` then its only
+    exit is also a stop condition, so the probe in flight at that moment ALWAYS
+    satisfies stop() -- the final window of every attempt is abandoned by
+    construction and its verdict destroyed.  The stamp-overlap gate admits a
+    sensor stamp up to 250 ms past observation_end (92 of 610 recorded real
+    sessions do exactly that), and the in-flight window is the only observation
+    of that trailing region.
+
+    Here the fake capture spins on stop() while the worker exits underneath it,
+    with no evidence ever selected.  stop() must stay False.
+    """
+
+    module = _integration_module()
+    key = tmp_path / "server-key"
+    key.write_text("test", encoding="utf-8")
+    monkeypatch.setattr(module, "NUC_KEY", key)
+    output = tmp_path / "final-window"
+    output.mkdir()
+    log = tmp_path / "final-window.log"
+    observed = {}
+
+    class FakeProcess:
+        """A worker that exits while the passive window is still open."""
+
+        def __init__(self):
+            self.polls = iter((None, None))
+
+        def poll(self):
+            return next(self.polls, 0)
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            return None
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda argv, **kw: FakeProcess())
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
+        # Spin the way a real probe does for the rest of its observation
+        # period, watching the worker disappear underneath it.
+        samples = [stop()]
+        for _ in range(6):
+            samples.append(stop())
+        observed["stop_samples"] = samples
+        # This window observed the arm transmitting.  It is the attempt's last
+        # one; if it were abandoned this verdict would never be produced.
+        return module.BackendResult(
+            1,
+            "PASSIVE_JOINT_REPORT_INVALID",
+            "passive joint report lacks zero-TX evidence",
+        )
+
+    monkeypatch.setattr(backend, "_capture_passive_window", fake_capture)
+
+    result = backend.run_perception(
+        target="white adapter",
+        output_dir=output,
+        log_path=log,
+    )
+
+    # The worker going away never abandons a window on its own.
+    assert observed["stop_samples"] == [False] * 7
+    # And the final window's verdict reaches the caller instead of the request
+    # being reported as a success.
+    assert result.exit_code != 0
+    assert result.error_code == "PASSIVE_JOINT_REPORT_INVALID"
+
+
+def test_perception_keeps_the_window_in_flight_when_evidence_is_selected(
+    tmp_path,
+    monkeypatch,
+):
+    """The trailing-region attestation survives evidence selection.
+
+    Selection alone must not cut the in-flight observation short: that window is
+    the only one covering the up-to-250 ms of stamp tolerance past the selected
+    window's observation_end.
+    """
+
+    module = _integration_module()
+    key = tmp_path / "server-key"
+    key.write_text("test", encoding="utf-8")
+    monkeypatch.setattr(module, "NUC_KEY", key)
+    output = tmp_path / "supervised"
+    output.mkdir()
+    log = tmp_path / "supervised.log"
+    _write_perception_success(output, "white adapter")
+    observed = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.polls = iter((None, None, None, None, 0))
+
+        def poll(self):
+            return next(self.polls, 0)
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            return None
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda argv, **kw: FakeProcess())
+
+    backend = module.FixedReadOnlyBackend(
+        module.ServerRuntimeConfig.from_server_environment({}),
+    )
+
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
+        # The window is still open here, exactly as it is on the wire for the
+        # remainder of the fixed observation period.
+        observed["stop_before_selection"] = stop()
+        payload = json.dumps(_passive_report())
+        (output_dir / "live_passive_joint_report.json").write_text(payload)
+        (output_dir / "selected_passive_joint_report.json").write_text(payload)
+        observed["stop_after_selection"] = stop()
+        return module.BackendResult(0)
+
+    monkeypatch.setattr(backend, "_capture_passive_window", fake_capture)
+
+    result = backend.run_perception(
+        target="white adapter",
+        output_dir=output,
+        log_path=log,
+    )
+
+    assert result.exit_code == 0
+    assert observed["stop_before_selection"] is False
+    # Selection does NOT abandon the observation that attests the trailing
+    # tolerance region for the evidence just selected.
+    assert observed["stop_after_selection"] is False
 
 
 def test_perception_passes_immutable_output_and_captures_synchronized_joints(
@@ -610,7 +1101,7 @@ def test_perception_passes_immutable_output_and_captures_synchronized_joints(
         module.ServerRuntimeConfig.from_server_environment({}),
     )
 
-    def fake_capture(output_dir, _log_path, _environment):
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
         captured["passive_calls"] = captured.get("passive_calls", 0) + 1
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
@@ -724,7 +1215,7 @@ def test_perception_uses_warm_runner_for_workspace_artifacts(tmp_path, monkeypat
         module.ServerRuntimeConfig.from_server_environment({}),
     )
 
-    def fake_capture(output_dir, _log_path, _environment):
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
         (output_dir / "selected_passive_joint_report.json").write_text(payload)
@@ -813,7 +1304,7 @@ def test_perception_calls_resident_worker_socket_without_client_process(
         module.ServerRuntimeConfig.from_server_environment({}),
     )
 
-    def fake_capture(output_dir, _log_path, _environment):
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
         (output_dir / "selected_passive_joint_report.json").write_text(payload)
@@ -922,7 +1413,7 @@ def test_perception_selfheals_once_on_resident_fingerprint_mismatch(
         module.ServerRuntimeConfig.from_server_environment({}),
     )
 
-    def fake_capture(output_dir, _log_path, _environment):
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
         (output_dir / "selected_passive_joint_report.json").write_text(payload)
@@ -1000,7 +1491,7 @@ def test_perception_fingerprint_selfheal_is_capped_and_fails_closed(
         module.ServerRuntimeConfig.from_server_environment({}),
     )
 
-    def fake_capture(output_dir, _log_path, _environment):
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
         (output_dir / "selected_passive_joint_report.json").write_text(payload)
@@ -1067,7 +1558,7 @@ def test_perception_retries_one_geometric_mask_failure(tmp_path, monkeypatch):
         module.ServerRuntimeConfig.from_server_environment({}),
     )
 
-    def fake_capture(output_dir, _log_path, _environment):
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
         (output_dir / "selected_passive_joint_report.json").write_text(payload)
@@ -1132,7 +1623,7 @@ def test_perception_retries_one_explicit_tracker_failure(tmp_path, monkeypatch):
 
     backend = module.FixedReadOnlyBackend()
 
-    def fake_capture(output_dir, _log_path, _environment):
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
         (output_dir / "selected_passive_joint_report.json").write_text(payload)
@@ -2080,7 +2571,7 @@ def test_perception_does_not_retry_grasp_geometry_failure_with_valid_seed(
         module.ServerRuntimeConfig.from_server_environment({}),
     )
 
-    def fake_capture(output_dir, _log_path, _environment):
+    def fake_capture(output_dir, _log_path, _environment, *, stop=None):
         payload = json.dumps(_passive_report())
         (output_dir / "live_passive_joint_report.json").write_text(payload)
         (output_dir / "selected_passive_joint_report.json").write_text(payload)

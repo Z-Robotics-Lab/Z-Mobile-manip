@@ -28,7 +28,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -82,7 +82,30 @@ NUC_HOST = "yusenzlabnuc@192.168.3.8"
 NUC_KEY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".ssh" / "id_ed25519_codex_nuc"
 REMOTE_PASSIVE_REPORT = "/tmp/z-manip-passive-live.json"
 REMOTE_PASSIVE_PROBE = "/usr/local/libexec/z-manip/piper_passive_probe.py"
+# The remote probe rejects anything below 0.25 s and must observe all three
+# joint-feedback frames inside the window, so this is already its floor and is
+# not a latency knob.
 PASSIVE_CAPTURE_SECONDS = "0.25"
+# Supervision granularity for the perception worker and its in-flight passive
+# window.  Small enough that the request returns on the worker's own clock
+# instead of the fixed observation period's.
+PASSIVE_CAPTURE_POLL_SECONDS = 0.01
+PASSIVE_REPORT_SCHEMA = "z_manip.piper_passive_joint_report.v1"
+# Every field the zero-TX verdict and the stamp-overlap gate are computed from.
+# Used for a *presence* check only: it answers "did the probe finish writing
+# this document", never "does the document attest zero transmit".
+PASSIVE_REPORT_REQUIRED_FIELDS = (
+    "read_only",
+    "complete_joint_feedback",
+    "zero_transmit_verified",
+    "interface_tx_packet_delta",
+    "observation_start_unix_ns",
+    "observation_end_unix_ns",
+    "joint_positions_rad",
+    "joint_ranges_rad",
+    "max_joint_range_rad",
+    "joint_snapshot_span_s",
+)
 PERCEPTION_ATTEMPTS = 2
 MAX_PASSIVE_REPORT_BYTES = 1024 * 1024
 MAX_SESSION_GATE_REPORT_BYTES = 256 * 1024
@@ -670,18 +693,64 @@ class FixedReadOnlyBackend:
 
     @staticmethod
     def _passive_report_valid(path: Path) -> bool:
+        """THE ZERO-TX GATE: does this document attest the arm never transmitted?
+
+        This is a *verdict*, not a completeness check.  It is False both for a
+        document that was killed mid-write and for a complete, well-formed
+        document that affirmatively recorded the arm transmitting on CAN.  Those
+        two cases must never be conflated on a discard path -- see
+        ``_passive_report_structurally_complete``.
+        """
+
         try:
             document: Any = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return False
         return bool(
             isinstance(document, dict)
-            and document.get("schema")
-            == "z_manip.piper_passive_joint_report.v1"
+            and document.get("schema") == PASSIVE_REPORT_SCHEMA
             and document.get("read_only") is True
             and document.get("complete_joint_feedback") is True
             and document.get("zero_transmit_verified") is True
             and document.get("interface_tx_packet_delta") == 0
+        )
+
+    @staticmethod
+    def _passive_report_structurally_complete(path: Path) -> bool:
+        """Did the probe FINISH WRITING this document?  Not: is the arm quiet.
+
+        The abandon path needs to separate "this document never finished being
+        written" from "this document is complete and says the arm transmitted".
+        ``_passive_report_valid`` cannot make that distinction -- it returns
+        False for both -- so using it to decide what may be deleted silently
+        discards an affirmative zero-TX violation and reports the request as a
+        success.  That is fail-open, and it is exactly what this predicate
+        exists to prevent.
+
+        Structural completeness is deliberately value-blind: parseable JSON, a
+        bounded non-empty file, the right schema string, and every field the
+        verdict is computed from present.  A document carrying
+        ``zero_transmit_verified: false`` / ``interface_tx_packet_delta: 7`` is
+        structurally complete, is therefore never deleted, and must reach the
+        gate above so the request fails closed.
+        """
+
+        try:
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or not 1 <= path.stat().st_size <= MAX_PASSIVE_REPORT_BYTES
+            ):
+                return False
+            document: Any = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        return bool(
+            isinstance(document, dict)
+            and document.get("schema") == PASSIVE_REPORT_SCHEMA
+            and all(
+                field in document for field in PASSIVE_REPORT_REQUIRED_FIELDS
+            )
         )
 
     @staticmethod
@@ -759,12 +828,28 @@ class FixedReadOnlyBackend:
         output_dir: Path,
         log_path: Path,
         environment: dict[str, str],
+        *,
+        stop: Callable[[], bool] | None = None,
     ) -> BackendResult:
         # The probe atomically writes the remote report and prints the exact
         # same JSON document to stdout. Capture that stdout directly into the
         # local inflight file: a second SSH ``cat`` round-trip used to dominate
         # the warm-track UI path even though it added no safety evidence.
         # stderr remains in the action log for actionable SSH/probe failures.
+        #
+        # ``stop`` is polled while the probe runs and cuts short a window the
+        # caller has proven redundant.  The capture must never outlive this
+        # call: the session layer hashes every file under ``output_dir`` into
+        # the immutable artifact manifest as soon as the action returns, so a
+        # background write would invalidate that manifest.  The remote scratch
+        # report is rewritten by every probe run and its only other reader
+        # (go2w_planning_session.sh) writes it immediately before reading it.
+        #
+        # Cutting a window short may only ever throw away a document that never
+        # finished being written.  A probe that ran to completion and recorded a
+        # transmission has produced the single most important result this whole
+        # mechanism exists to obtain, and it fails the request whether or not
+        # anybody was still waiting for it.
         passive_command = self._ssh_prefix() + (
             "/usr/bin/python3",
             REMOTE_PASSIVE_PROBE,
@@ -778,20 +863,51 @@ class FixedReadOnlyBackend:
         live_report = output_dir / "live_passive_joint_report.json"
         temporary_report = output_dir / ".passive_joint_report.inflight"
         temporary_report.unlink(missing_ok=True)
-        with temporary_report.open("xb") as report_output, log_path.open("ab") as log:
-            passive = subprocess.run(
-                passive_command,
-                stdin=subprocess.DEVNULL,
-                stdout=report_output,
-                stderr=log,
-                env=environment,
-                shell=False,
-                check=False,
-            )
-        if passive.returncode != 0:
+        abandoned = False
+        try:
+            with temporary_report.open("xb") as report_output, log_path.open("ab") as log:
+                passive = subprocess.Popen(
+                    passive_command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=report_output,
+                    stderr=log,
+                    env=environment,
+                    shell=False,
+                )
+                try:
+                    while passive.poll() is None:
+                        if stop is not None and stop():
+                            abandoned = True
+                            break
+                        time.sleep(PASSIVE_CAPTURE_POLL_SECONDS)
+                finally:
+                    if abandoned:
+                        self._stop_process(passive)
+                    returncode = self._reap_process(passive)
+        except BaseException:
+            # Nothing may survive this call under any exit path: a leftover
+            # ``.passive_joint_report.inflight`` in ``output_dir`` invalidates
+            # the immutable artifact manifest hashed the instant we return.
+            temporary_report.unlink(missing_ok=True)
+            raise
+        structurally_complete = self._passive_report_structurally_complete(
+            temporary_report,
+        )
+        if abandoned and not structurally_complete:
+            # ONLY a document that never finished being written is discarded.
+            # A window cut short before the probe emitted anything is not a
+            # failed gate and not missing evidence: the request that would have
+            # consumed it already holds the zero-TX report it is judged on.
+            temporary_report.unlink(missing_ok=True)
+            return BackendResult(0)
+        if returncode != 0 and not abandoned:
+            # A probe that failed on its own is a failed gate, exactly as before,
+            # whatever it managed to write.  Only a non-zero status caused by the
+            # signal WE sent is discounted -- and then the document, not the exit
+            # code, carries the verdict and is evaluated below.
             temporary_report.unlink(missing_ok=True)
             return BackendResult(
-                passive.returncode,
+                returncode,
                 "PASSIVE_JOINT_GATE_FAILED",
                 "fixed receive-only passive joint gate failed",
             )
@@ -810,14 +926,54 @@ class FixedReadOnlyBackend:
 
     @staticmethod
     def _stop_process(process: subprocess.Popen[bytes]) -> None:
+        """Best-effort teardown that never raises.
+
+        This runs inside the ``finally:`` of ``_capture_passive_window``, still
+        inside the open ``.passive_joint_report.inflight`` handle and on the
+        perception request path.  An unguarded ``wait`` after ``kill()`` would
+        propagate ``TimeoutExpired`` out of that path and strand the inflight
+        file in ``output_dir``, invalidating the immutable artifact manifest.
+        An unreapable child is left to the OS instead.
+        """
+
         if process.poll() is not None:
             return
-        process.terminate()
         try:
-            process.wait(timeout=5)
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return
+
+    @staticmethod
+    def _reap_process(process: subprocess.Popen[bytes]) -> int:
+        """Collect an exit status without being able to block forever.
+
+        ``_stop_process`` above is best-effort, so a pathological child can
+        still be running here.  Report a non-zero status rather than hanging the
+        request: the caller treats that as a failed gate unless the probe left a
+        structurally complete document behind.
+        """
+
+        try:
+            return process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            return 1
+
+    @staticmethod
+    def _selected_passive_report_valid(output_dir: Path) -> bool:
+        """Return whether the dry run already selected its zero-TX evidence."""
+
+        selected = output_dir / "selected_passive_joint_report.json"
+        return bool(
+            selected.is_file()
+            and not selected.is_symlink()
+            and selected.stat().st_size <= MAX_PASSIVE_REPORT_BYTES
+            and FixedReadOnlyBackend._passive_report_valid(selected)
+        )
 
     @staticmethod
     def _perception_outputs_valid(output_dir: Path, target: str) -> bool:
@@ -1395,35 +1551,58 @@ class FixedReadOnlyBackend:
             process_launch_s = time.monotonic() - process_launch_started
             passive_capture_s = 0.0
             passive_capture_count = 0
+
+            def perception_worker_running() -> bool:
+                if worker_thread is not None:
+                    return worker_thread.is_alive()
+                return process is not None and process.poll() is None
+
+            # Set immediately before each capture is opened.  A window opened
+            # while the request already holds selected zero-TX evidence cannot
+            # be the attestation for that evidence, and is the only kind of
+            # window that may be cut short.
+            window_redundant_at_open = False
+
+            def passive_window_unneeded() -> bool:
+                # Fail-closed rule for cutting an observation short.
+                #
+                # "The worker is gone" must NEVER on its own abandon a window.
+                # The supervision loop's only exit is the worker going away, so
+                # a probe in flight at that moment always satisfies such a
+                # predicate -- which abandoned the final window of every single
+                # attempt (measured: 373/373 recorded attempts overshot the
+                # worker's own completion, so a window was always in flight).
+                #
+                # Nor may selection alone abandon it.  The stamp-overlap gate
+                # admits a sensor stamp up to 250 ms AFTER observation_end, and
+                # on the recorded corpus 92 of 610 sessions (15.1%) select
+                # exactly such a stamp.  The only probe that ever observes that
+                # trailing region is the one already in flight when the dry run
+                # selects, so that window is the request's trailing attestation
+                # and must produce a verdict.
+                #
+                # What is left is genuinely redundant: a window that was already
+                # superfluous when it opened.  The guard below normally stops
+                # one being opened at all, but it reads a report the dry run
+                # writes non-atomically, so an extra window can still slip out
+                # just after selection.  That one -- and only that one -- may be
+                # cut short.
+                return window_redundant_at_open and not perception_worker_running()
+
             try:
-                while (
-                    worker_thread.is_alive()
-                    if worker_thread is not None
-                    else process is not None and process.poll() is None
-                ):
-                    selected_passive = (
-                        output_dir / "selected_passive_joint_report.json"
-                    )
-                    if (
-                        selected_passive.is_file()
-                        and not selected_passive.is_symlink()
-                        and selected_passive.stat().st_size
-                        <= MAX_PASSIVE_REPORT_BYTES
-                        and self._passive_report_valid(selected_passive)
-                    ):
-                        # The dry-run atomically selected this exact zero-TX
-                        # evidence. Repeating SSH capture after selection adds
-                        # latency but cannot strengthen this immutable request.
-                        if worker_thread is not None:
-                            worker_thread.join(timeout=0.01)
-                        else:
-                            time.sleep(0.01)
+                while perception_worker_running():
+                    if self._selected_passive_report_valid(output_dir):
+                        time.sleep(PASSIVE_CAPTURE_POLL_SECONDS)
                         continue
+                    window_redundant_at_open = (
+                        self._selected_passive_report_valid(output_dir)
+                    )
                     passive_capture_started = time.monotonic()
                     passive = self._capture_passive_window(
                         output_dir,
                         log_path,
                         environment,
+                        stop=passive_window_unneeded,
                     )
                     capture_elapsed = time.monotonic() - passive_capture_started
                     passive_capture_s += capture_elapsed

@@ -26,6 +26,17 @@ _Offset = tuple[float, float, float]
 FrameProvider = Callable[[np.ndarray], Mapping[str, np.ndarray]]
 SelfCollisionChecker = Callable[[np.ndarray], "CollisionResult"]
 
+# Element-wise forms of the ``numpy.allclose``/``numpy.isclose`` predicates used
+# to validate a frame-provider transform.  ``allclose(a, b, atol=t)`` accepts
+# when ``|a - b| <= t + rtol * |b|`` with the numpy default ``rtol = 1e-5``, so
+# these tolerance tables reproduce that comparison exactly while letting the
+# per-state check run as one vectorised pass over every requested frame.
+_HOMOGENEOUS_ROW = np.asarray((0.0, 0.0, 0.0, 1.0))
+_HOMOGENEOUS_ROW_TOLERANCE = 1e-7 + 1e-5 * np.abs(_HOMOGENEOUS_ROW)
+_ROTATION_IDENTITY = np.eye(3)
+_ROTATION_GRAM_TOLERANCE = 1e-5 + 1e-5 * np.abs(_ROTATION_IDENTITY)
+_ROTATION_DETERMINANT_TOLERANCE = 1e-5 + 1e-5 * abs(1.0)
+
 
 def _validate_offset(value: object, label: str) -> None:
     offset = np.asarray(value, dtype=float)
@@ -430,6 +441,33 @@ class PointCloudCollisionChecker:
         if unknown:
             raise ValueError(f"capsules reference frames outside the kinematic chain: {sorted(unknown)}")
         self._self_pairs = self._resolve_self_pairs()
+        # Per-state loop invariants derived from the immutable collision model.
+        self._requested_frames = tuple(sorted(requested_frames))
+        self._capsule_offsets = tuple(
+            (np.asarray(capsule.start_offset), np.asarray(capsule.end_offset))
+            for capsule in model.capsules
+        )
+        capsule_order = {
+            capsule.name: index for index, capsule in enumerate(model.capsules)
+        }
+        # ``_check_self_collision`` only ever receives ``_world_capsules``
+        # output, which is built in model order, so pairs index it directly.
+        self._self_pair_indices = tuple(
+            (capsule_order[first], capsule_order[second])
+            for first, second in self._self_pairs
+        )
+        self._self_pair_radius_sum = np.asarray([
+            model.capsules[first].radius + model.capsules[second].radius
+            for first, second in self._self_pair_indices
+        ], dtype=float)
+        self._self_pair_first = np.asarray(
+            [pair[0] for pair in self._self_pair_indices],
+            dtype=np.intp,
+        )
+        self._self_pair_second = np.asarray(
+            [pair[1] for pair in self._self_pair_indices],
+            dtype=np.intp,
+        )
 
     def _resolve_self_pairs(self) -> tuple[_Pair, ...]:
         names = tuple(capsule.name for capsule in self.model.capsules)
@@ -882,34 +920,73 @@ class PointCloudCollisionChecker:
                 "frame provider did not return a frame mapping",
                 kind="kinematics",
             )
-        requested = {
-            frame
-            for capsule in self.model.capsules
-            for frame in (capsule.start_frame, capsule.end_frame)
-        }
-        missing = requested - set(frames)
+        requested = self._requested_frames
+        missing = set(requested) - set(frames)
         if missing:
             return None, CollisionResult(
                 False,
                 f"frame provider omitted links: {sorted(missing)}",
                 kind="kinematics",
             )
-        for frame in requested:
-            if not self._valid_transform(frames[frame]):
-                return None, CollisionResult(
-                    False,
-                    f"frame provider returned an invalid transform for {frame!r}",
-                    kind="kinematics",
-                )
+        transforms = self._validated_transforms(frames)
+        if transforms is None:
+            for frame in requested:
+                if not self._valid_transform(frames[frame]):
+                    return None, CollisionResult(
+                        False,
+                        f"frame provider returned an invalid transform for {frame!r}",
+                        kind="kinematics",
+                    )
+            return None, CollisionResult(
+                False,
+                "frame provider returned an invalid transform set",
+                kind="kinematics",
+            )
 
         world_capsules = []
-        for capsule in self.model.capsules:
-            start_transform = np.asarray(frames[capsule.start_frame], dtype=float)
-            end_transform = np.asarray(frames[capsule.end_frame], dtype=float)
-            start = start_transform[:3, :3] @ np.asarray(capsule.start_offset) + start_transform[:3, 3]
-            end = end_transform[:3, :3] @ np.asarray(capsule.end_offset) + end_transform[:3, 3]
+        for capsule, (start_offset, end_offset) in zip(
+            self.model.capsules,
+            self._capsule_offsets,
+        ):
+            start_transform = transforms[capsule.start_frame]
+            end_transform = transforms[capsule.end_frame]
+            start = start_transform[:3, :3] @ start_offset + start_transform[:3, 3]
+            end = end_transform[:3, :3] @ end_offset + end_transform[:3, 3]
             world_capsules.append(_WorldCapsule(capsule, start, end))
         return tuple(world_capsules), None
+
+    def _validated_transforms(
+        self,
+        frames: Mapping[str, np.ndarray],
+    ) -> dict[str, np.ndarray] | None:
+        """Validate every requested frame in one pass, or return ``None``.
+
+        ``None`` means at least one transform failed; the caller re-runs the
+        per-frame check to name it.  The accepted set is exactly the one
+        ``_valid_transform`` accepts.
+        """
+
+        requested = self._requested_frames
+        try:
+            stacked = np.asarray([frames[frame] for frame in requested], dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if stacked.shape != (len(requested), 4, 4) or not np.all(np.isfinite(stacked)):
+            return None
+        if not np.all(
+            np.abs(stacked[:, 3, :] - _HOMOGENEOUS_ROW) <= _HOMOGENEOUS_ROW_TOLERANCE
+        ):
+            return None
+        rotations = stacked[:, :3, :3]
+        gram = np.transpose(rotations, (0, 2, 1)) @ rotations
+        if not np.all(np.abs(gram - _ROTATION_IDENTITY) <= _ROTATION_GRAM_TOLERANCE):
+            return None
+        determinants = np.linalg.det(rotations)
+        if not np.all(
+            np.abs(determinants - 1.0) <= _ROTATION_DETERMINANT_TOLERANCE
+        ):
+            return None
+        return dict(zip(requested, stacked))
 
     @staticmethod
     def _is_finger_capsule(spec: CapsuleSpec) -> bool:
@@ -1174,9 +1251,13 @@ class PointCloudCollisionChecker:
         *,
         supplemental_only: bool = False,
     ) -> CollisionResult | None:
-        by_name = {capsule.spec.name: capsule for capsule in capsules}
-        for first_name, second_name in self._self_pairs:
-            first, second = by_name[first_name], by_name[second_name]
+        separable = self._separable_pairs(capsules)
+        for pair_index, (first_index, second_index) in enumerate(
+            self._self_pair_indices
+        ):
+            if separable[pair_index]:
+                continue
+            first, second = capsules[first_index], capsules[second_index]
             if supplemental_only and not (
                 first.spec.supplemental_self_collision
                 or second.spec.supplemental_self_collision
@@ -1185,6 +1266,7 @@ class PointCloudCollisionChecker:
             distance = _segment_distance(first.start, first.end, second.start, second.end)
             threshold = first.spec.radius + second.spec.radius + self.config.clearance
             if distance <= threshold:
+                first_name, second_name = self._self_pairs[pair_index]
                 return CollisionResult(
                     False,
                     f"capsules {first_name!r} and {second_name!r} self-collide",
@@ -1194,6 +1276,29 @@ class PointCloudCollisionChecker:
                     threshold=threshold,
                 )
         return None
+
+    def _separable_pairs(
+        self,
+        capsules: tuple[_WorldCapsule, ...],
+    ) -> np.ndarray:
+        """Flag pairs whose exact segment distance provably exceeds threshold.
+
+        Every point of a segment lies within its half-length of its midpoint, so
+        ``|c_a - c_b| - h_a - h_b`` is a lower bound on the exact segment
+        distance.  Pairs whose bound already exceeds the acceptance threshold
+        cannot collide, and their exact distance is never reported, so skipping
+        them leaves the returned result identical.
+        """
+
+        starts = np.asarray([capsule.start for capsule in capsules], dtype=float)
+        ends = np.asarray([capsule.end for capsule in capsules], dtype=float)
+        centers = 0.5 * (starts + ends)
+        half_lengths = 0.5 * np.linalg.norm(ends - starts, axis=1)
+        first = self._self_pair_first
+        second = self._self_pair_second
+        center_distance = np.linalg.norm(centers[first] - centers[second], axis=1)
+        bound = center_distance - half_lengths[first] - half_lengths[second]
+        return bound > self._self_pair_radius_sum + self.config.clearance
 
     def check_state(self, joints: object) -> CollisionResult:
         """Return a diagnostic state result; missing perception is invalid."""
