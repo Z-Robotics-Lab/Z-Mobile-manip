@@ -208,10 +208,17 @@ def _verify_holding_object(
         guard,
         force_n=gripper_force_n,
     )
+    # Mirror the pick-path calls: force alone cannot prove a hold (a true soft
+    # hold measured -0.114N, below the 0.20N default this call silently
+    # inherited, failing every carry/place-back continuation leg), so rely on
+    # the stall-gap discriminator against the commanded close width instead.
     stage_executor.verify_nonempty_grasp(
         feedback,
         artifact.required_width_m,
-        commanded_close_target_m=None,
+        minimum_force_n=0.0,
+        commanded_close_target_m=stage_executor.close_target_m(
+            artifact.required_width_m,
+        ),
     )
 
 
