@@ -23,6 +23,28 @@ Type=simple
 # `systemctl --user restart d435i` (color+depth must stay at the same rate so
 # the node's exact-time RGB-D synchronizer keeps joining stamps).
 #
+# Every sensor stream publishes SENSOR_DATA (BEST_EFFORT) rather than the
+# SYSTEM_DEFAULT (RELIABLE) the wrapper otherwise picks.  This is not a
+# preference, it is the fix for a permanent-stall class: CycloneDDS derives its
+# fragment-reassembly drop policy from the PROXY WRITER's reliability, not the
+# reader's (ddsi_proxy_endpoint.c:233).  A RELIABLE writer forces
+# NN_DEFRAG_DROP_LATEST with DefragReliableMaxSamples=16, which discards the
+# NEWEST arriving sample once full -- and for a monotonic camera stream the
+# newest sample is always the incoming frame, so 16 consecutive incomplete
+# samples latch the topic dead forever.  Both eviction paths are unreachable
+# when the writer is RELIABLE and every reader is BEST_EFFORT (the readers here
+# already request rmw_qos_profile_sensor_data): the heartbeat flush returns
+# early at q_receive.c:1294 while n_reliable_readers==0, and a BEST_EFFORT
+# reader never NACKs, so no GAP ever arrives.  That combination killed
+# /camera/color/image_raw for 750 s on 2026-07-27; only a bridge restart cured
+# it.  A BEST_EFFORT writer gets DROP_OLDEST instead, which always admits the
+# newest sample and is structurally self-healing.
+# The overrides live in configs/realsense_qos.yaml and arrive via `config_file:=`
+# because rs_launch.py silently drops launch arguments outside its fixed
+# configurable_parameters list -- a bare `color_qos:=SENSOR_DATA` prints a
+# warning and does nothing.
+# ROLL BACK by removing the config_file argument (QoS reverts to SYSTEM_DEFAULT).
+#
 # infra1(left)+infra2(right) Y8 640x480x30 are enabled as the RAW, rectified,
 # unfiltered stereo pair consumed by the optional Fast-FoundationStereo depth
 # node (docker/ffs_service) on the 4090 PC.  They share the hardware-synced frame
@@ -32,7 +54,7 @@ Type=simple
 # unless the FFS node runs.  The spatial/temporal filters below apply to the
 # DEPTH stream only; the IR pair stays raw (what the learned matcher wants).
 # ROLL BACK by removing the enable_infra1/2 + depth_module.infra_profile args.
-ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh && exec ros2 launch realsense2_camera rs_launch.py camera_namespace:=/nuc camera_name:=camera enable_sync:=true align_depth.enable:=true rgb_camera.color_profile:=640x480x15 depth_module.depth_profile:=640x480x15 enable_infra1:=true enable_infra2:=true depth_module.infra_profile:=640x480x15 spatial_filter.enable:=true spatial_filter.filter_magnitude:=2 spatial_filter.filter_smooth_alpha:=0.5 spatial_filter.filter_smooth_delta:=20 spatial_filter.holes_fill:=0 temporal_filter.enable:=true temporal_filter.filter_smooth_alpha:=0.4 temporal_filter.filter_smooth_delta:=20 temporal_filter.holes_fill:=3'
+ExecStart=/bin/bash -c 'source %h/go2w-nuc/bringup/ros_env.sh && exec ros2 launch realsense2_camera rs_launch.py camera_namespace:=/nuc camera_name:=camera enable_sync:=true align_depth.enable:=true config_file:=%h/.config/z-manip/realsense_qos.yaml rgb_camera.color_profile:=640x480x15 depth_module.depth_profile:=640x480x15 enable_infra1:=true enable_infra2:=true depth_module.infra_profile:=640x480x15 spatial_filter.enable:=true spatial_filter.filter_magnitude:=2 spatial_filter.filter_smooth_alpha:=0.5 spatial_filter.filter_smooth_delta:=20 spatial_filter.holes_fill:=0 temporal_filter.enable:=true temporal_filter.filter_smooth_alpha:=0.4 temporal_filter.filter_smooth_delta:=20 temporal_filter.holes_fill:=3'
 # ros2 launch can exit successfully even when its child node failed during an
 # early-boot network race, so retry regardless of the launcher's exit status.
 Restart=always

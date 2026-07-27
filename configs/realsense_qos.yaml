@@ -1,0 +1,21 @@
+# Publisher QoS overrides for the NUC wrist D435, loaded via rs_launch.py's
+# `config_file:=` argument.  It has to come through this file rather than a
+# `color_qos:=` launch argument: rs_launch.py validates launch arguments against
+# a fixed `configurable_parameters` list and merely PRINTS a warning for names
+# outside it, so `color_qos:=SENSOR_DATA` is silently dropped.  Config-file keys
+# take the same warning but are still forwarded to the node
+# (`parameters=[params, params_from_file]`), and the node does declare these.
+#
+# Keys are flat, not the usual `/node: ros__parameters:` nesting, because launch
+# passes this mapping straight through as node parameters.
+#
+# SENSOR_DATA is BEST_EFFORT.  The default SYSTEM_DEFAULT is RELIABLE, which is
+# what latched /camera/color/image_raw dead for 750 s on 2026-07-27: CycloneDDS
+# takes its fragment-reassembly drop policy from the proxy WRITER's reliability,
+# so a RELIABLE publisher forces NN_DEFRAG_DROP_LATEST on every receiver, and
+# that mode discards the newest arriving sample once its 16-slot buffer fills.
+# For a monotonic camera stream the newest sample is always the incoming frame.
+color_qos: SENSOR_DATA
+depth_qos: SENSOR_DATA
+infra1_qos: SENSOR_DATA
+infra2_qos: SENSOR_DATA
