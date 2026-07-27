@@ -1056,7 +1056,7 @@ def _load_planner(args: argparse.Namespace) -> tuple[object, object, bool]:
     """Return a process-local immutable planner template and cache evidence."""
 
     from z_manip.configuration import load_stack_config
-    from z_manip_task.planning import OnlinePlanner
+    from z_manip.planning.online_planner import OnlinePlanner
 
     environment = dict(os.environ)
     environment["Z_MANIP_ROBOT_URDF"] = str(args.urdf.expanduser().resolve())
