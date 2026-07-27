@@ -10,16 +10,23 @@ different robot configuration.  ``plan_holding_return`` is what closes that.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from z_manip.kinematics.chain import KinematicChain
 from z_manip.planning.online_planner import (
-    CARRY_MIN_CLEARANCE_ABOVE_GRASP_M,
+    CARRY_MAX_DIP_BELOW_REPLAY_M,
     HoldingReturnPlan,
     OnlinePlanner,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+URDF = ROOT.parent / "go2W_Sim" / "assets" / "urdf" / "go2w_sensored.urdf"
 
 
 # The last joint doubles as the tool height under ``_Chain`` below, so each
@@ -138,17 +145,24 @@ def test_the_carry_bottoms_out_above_the_pose_the_object_was_picked_from():
     assert heights["non_increasing"] is True
     assert heights["lift_top_m"] > heights["pregrasp_m"] > heights["grasp_m"]
     assert heights["minimum_m"] == pytest.approx(heights["pregrasp_m"])
-    assert heights["minimum_above_grasp_m"] > CARRY_MIN_CLEARANCE_ABOVE_GRASP_M
+    assert heights["replay_floor_m"] == pytest.approx(heights["grasp_m"])
+    assert heights["minimum_above_replay_floor_m"] > CARRY_MAX_DIP_BELOW_REPLAY_M
     assert plan.carry_rejection_reason == ""
     assert plan.carry_valid is True
 
 
-def test_a_carry_that_would_lower_the_object_back_onto_its_support_is_refused():
-    """A "carry" that descends to the grasp height is a put-down.
+def test_a_pregrasp_below_the_grasp_does_not_cost_the_operator_the_carry():
+    """A lateral pick whose pregrasp sits BELOW the object still carries.
 
-    That is precisely the behaviour this replaces, so it is rejected on
-    geometry even when the collision checker is happy, and the executor falls
-    back to the (separately checked) reverse-lift corridor.
+    The fallback for a refused carry is the reverse-lift + reverse-approach
+    replay, which sets the object down ON the pick spot and then travels out to
+    that same below-grasp pregrasp.  Refusing the carry here would buy nothing
+    and cost the operator exactly the put-down this change deletes, so the
+    contract is measured against the floor of the replay, not against the grasp
+    height on its own.
+
+    Measured on the recorded fleet: 3 of 172 plans have a pregrasp 2.3-27.0 mm
+    below their grasp; an absolute "stay above the grasp" rule refused all 3.
     """
 
     planner, _calls = _planner(DESCENDING)
@@ -159,8 +173,45 @@ def test_a_carry_that_would_lower_the_object_back_onto_its_support_is_refused():
         approach_raw=np.vstack((Q_PRE_BELOW_GRASP, Q_GRASP)),
     )
 
+    heights = plan.carry_tip_height
+    assert heights["pregrasp_m"] < heights["grasp_m"]
+    # The replay would reach that same pregrasp anyway, so its floor is there.
+    assert heights["replay_floor_m"] == pytest.approx(heights["pregrasp_m"])
+    assert plan.carry_rejection_reason == ""
+    assert plan.carry_valid is True
+
+
+def test_a_carry_that_dips_below_the_replay_it_replaces_is_refused():
+    """A "carry" that dives under both endpoints is a put-down.
+
+    That is precisely the behaviour this replaces, so it is rejected on
+    geometry even when the collision checker is happy, and the executor falls
+    back to the (separately checked) reverse-lift corridor.
+    """
+
+    # The chord from the lift top to the pregrasp is straight in JOINT space,
+    # so a tool height that is a quadratic of the joints bows below both of its
+    # endpoints along the way.  This one is pinned to zero at both ends (the
+    # lift top's first joint is 0.04 and the pregrasp's is 0.03) and dives
+    # 200 mm at the midpoint, well under the 110 mm grasp height.
+    planner, _calls = _planner(DESCENDING)
+    chain = planner.chain
+    straight = chain.forward
+
+    def bowed(joints):
+        pose = straight(joints)
+        first = float(np.asarray(joints, dtype=float)[0])
+        pose[2, 3] -= 8000.0 * (first - 0.03) * (0.04 - first)
+        return pose
+
+    chain.forward = bowed
+
+    plan = _plan(planner)
+
+    heights = plan.carry_tip_height
+    assert heights["minimum_m"] < heights["replay_floor_m"]
     assert plan.carry_valid is False
-    assert plan.carry_rejection_reason == "carry_descends_to_the_grasp_height"
+    assert plan.carry_rejection_reason == "carry_dips_below_the_replay_it_replaces"
     # The corridors that remain are still reported honestly.
     assert plan.legacy_corridor_valid is True
     assert plan.return_transit_valid is True
@@ -233,3 +284,101 @@ def test_the_plan_is_immutable_evidence():
     assert isinstance(plan, HoldingReturnPlan)
     with pytest.raises(Exception):
         plan.segments = {}
+
+
+# ---------------------------------------------------------------------------
+# Replay of recorded plans.
+#
+# The joint polylines below are the transit_raw/approach_raw/lift_raw arrays
+# lifted verbatim out of planned_grasp.npz for six real
+# artifacts/go2w_real/interactive_sessions/planning runs, driven through the
+# real PiPER chain and the shipped grasp_plan.tool_from_tip.  The three dated
+# 20260724-014422 / -063625 / -064414 are the plans on which an absolute
+# "the carry must bottom out above the grasp" rule refused the carry and handed
+# the operator the put-down back.
+# ---------------------------------------------------------------------------
+
+RECORDED_PLANS = ROOT / "tests" / "data" / "holding_return_recorded_plans.npz"
+# Measured tip heights (mm) of pregrasp minus grasp on each recorded plan.
+RECORDED_PREGRASP_ABOVE_GRASP_MM = {
+    "20260723-042644": 50.1,
+    "20260724-014422": 2.3,
+    "20260724-041614": 13.8,
+    "20260724-063625": -27.0,
+    "20260724-064414": -22.6,
+    "20260727-085157": 31.6,
+}
+
+
+@pytest.fixture(scope="module")
+def recorded_planner():
+    if not URDF.exists():
+        pytest.skip(f"PiPER URDF unavailable: {URDF}")
+    if not RECORDED_PLANS.exists():
+        pytest.skip("recorded holding-return plans unavailable")
+    chain = KinematicChain.from_urdf(URDF, "piper_base_link", "piper_gripper_base")
+    tool_from_tip = np.asarray(
+        json.loads((ROOT / "configs/go2w_piper.json").read_text(encoding="utf-8"))[
+            "grasp_plan"
+        ]["tool_from_tip"],
+        dtype=float,
+    )
+    planner = OnlinePlanner.__new__(OnlinePlanner)
+    planner.chain = chain
+    planner.config = SimpleNamespace(
+        grasp_plan=SimpleNamespace(tool_from_tip=tool_from_tip),
+    )
+    # Collision is checked in its own tests and needs a live scene; this replay
+    # is about the behavioural height contract laid over the collision verdict.
+    planner.validate_path = lambda *_a, **_k: True
+    return planner
+
+
+@pytest.mark.parametrize("session", sorted(RECORDED_PREGRASP_ABOVE_GRASP_MM))
+def test_every_recorded_plan_keeps_its_carry(recorded_planner, session):
+    """No recorded plan loses the carry to the height contract.
+
+    Losing it means the arm sets the object back down on its pick spot on the
+    way Home, which is exactly what the operator asked to delete.  Three of
+    these six (and 3 of all 172 recorded plans) have a pregrasp BELOW the grasp
+    pose -- an in-reach lateral pick -- and an absolute contract refused all
+    three, sending them to a replay that reaches that identical low pose after
+    first putting the object down.
+    """
+
+    archive = np.load(RECORDED_PLANS)
+    plan = recorded_planner.plan_holding_return(
+        transit_raw=archive[f"{session}/transit_raw"],
+        approach_raw=archive[f"{session}/approach_raw"],
+        lift_raw=archive[f"{session}/lift_raw"],
+        scene_points=np.zeros((3, 3)),
+        target_points=np.zeros((3, 3)),
+        stamp_s=0.0,
+        required_width_m=0.04,
+    )
+
+    heights = plan.carry_tip_height
+    measured_mm = (heights["pregrasp_m"] - heights["grasp_m"]) * 1000.0
+    assert measured_mm == pytest.approx(
+        RECORDED_PREGRASP_ABOVE_GRASP_MM[session], abs=0.15,
+    ), "the recorded geometry moved; re-measure before trusting this contract"
+    assert plan.carry_rejection_reason == ""
+    assert plan.carry_valid is True
+    # And the carry is never lower than the replay it replaces -- which is the
+    # whole content of the contract.
+    assert heights["minimum_above_replay_floor_m"] >= -CARRY_MAX_DIP_BELOW_REPLAY_M
+
+
+def test_the_recorded_below_grasp_plans_are_the_ones_an_absolute_rule_refused():
+    """Pin the regression these three sessions encode.
+
+    If a future edit reinstates "the carry must bottom out above the grasp",
+    these are the plans it silently hands the put-down back to.
+    """
+
+    below = {
+        session
+        for session, value in RECORDED_PREGRASP_ABOVE_GRASP_MM.items()
+        if value <= 5.0
+    }
+    assert below == {"20260724-014422", "20260724-063625", "20260724-064414"}

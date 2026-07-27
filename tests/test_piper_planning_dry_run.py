@@ -521,3 +521,63 @@ def test_a_carried_payload_is_checked_against_the_platform_fixtures():
     assert OnlinePlanner._collision_model_for_carried_payload(
         OnlinePlanner.__new__(OnlinePlanner), loaded,
     ) is loaded
+
+
+# The five robot-mounted fixtures a carried object can reach on the way Home.
+SHIPPED_PLATFORM_FIXTURES = (
+    "platform_head",
+    "platform_head_lower",
+    "go2w_chassis",
+    "mid360",
+    "nuc",
+)
+
+
+def test_the_shipped_capsule_config_arms_the_payload_check():
+    """Bind the gate to the file whose contents actually decide it.
+
+    ``_collision_model_for_carried_payload`` flips ``check_target`` only for
+    capsules marked ``supplemental_self_collision``.  That flag lives in
+    ``configs/piper_collision_capsules.json``, which the gate never names, and
+    the flag's documented meaning is about self-collision PAIRING -- so a
+    future edit that drops it from ``mid360`` is entirely plausible and would
+    silently turn the payload-vs-lidar check back off with the suite green.
+    This is the failure this project keeps shipping: the value that decides a
+    gate lives in a file the gate does not reference.
+    """
+
+    from z_manip.collision.pointcloud import RobotCollisionModel
+    from z_manip.planning.online_planner import OnlinePlanner
+
+    shipped = RobotCollisionModel.from_mapping(
+        json.loads(
+            (ROOT / "configs/piper_collision_capsules.json").read_text(
+                encoding="utf-8",
+            ),
+        ),
+    )
+    by_name = {capsule.name: capsule for capsule in shipped.capsules}
+    for name in SHIPPED_PLATFORM_FIXTURES:
+        assert name in by_name, f"{name} vanished from the shipped capsule set"
+        assert by_name[name].check_target is False, (
+            f"{name} no longer ships as check_target=False; either the payload "
+            "gate is now redundant for it or the config changed meaning"
+        )
+
+    loaded = OnlinePlanner._collision_model_for_carried_payload(
+        OnlinePlanner.__new__(OnlinePlanner),
+        shipped,
+    )
+
+    armed = {capsule.name: capsule for capsule in loaded.capsules}
+    for name in SHIPPED_PLATFORM_FIXTURES:
+        assert armed[name].check_target is True, (
+            f"a carried payload is not checked against {name}: the shipped "
+            "capsule config no longer arms the platform-fixture gate"
+        )
+        # Scene semantics are untouched -- these are not scene obstacles.
+        assert armed[name].check_scene == by_name[name].check_scene
+    # Nothing else in the shipped set changes verdict.
+    for name, capsule in armed.items():
+        if name not in SHIPPED_PLATFORM_FIXTURES:
+            assert capsule == by_name[name]

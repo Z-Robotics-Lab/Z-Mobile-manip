@@ -1403,7 +1403,7 @@ def test_carry_path_refuses_an_unvalidated_shortcut():
         report={
             "holding_return": holding_return_block(
                 segments={"carry": False},
-                carry_rejection_reason="carry_descends_to_the_grasp_height",
+                carry_rejection_reason="carry_dips_below_the_replay_it_replaces",
             ),
         },
     )

@@ -222,6 +222,40 @@ def _verify_holding_object(
     )
 
 
+def _place_back_from_home_route(
+    evidence: stage_executor.HoldingReturnEvidence,
+) -> str | None:
+    """Which corridor can set the object down again once it is Home?
+
+    Both routes begin with the loaded run back out along the transit, so
+    ``return_transit`` is mandatory for either.  After that:
+
+    ``approach``  descend pregrasp -> grasp directly.  That edge sweeps exactly
+                  the states ``reverse_approach`` attests (a joint-space edge
+                  covers the same configurations whichever way it is driven).
+    ``carry``     retrace the direct carry edge back to the lift top, then
+                  lower down the lift column.  Those are the states ``carry``
+                  and ``lift`` attest.
+
+    Both end at the grasp pose with the fingers still shut, which is where the
+    release happens.  ``None`` means the object cannot be put down at Home at
+    all, which is the one state the workflow must never enter: there is no
+    gripper-open endpoint anywhere in the operator's control surface, and
+    ``piper_reverse_home_recovery`` only opens the gripper when the arm matches
+    an ``approach``/``lift`` waypoint -- at Home it matches ``transit`` and
+    keeps holding.  An arm that reaches Home without this is torqued shut on
+    the object with no software action able to release it.
+    """
+
+    if not evidence.return_transit_valid:
+        return None
+    if evidence.segments.get("reverse_approach"):
+        return "approach"
+    if evidence.carry_valid and evidence.segments.get("lift"):
+        return "carry"
+    return None
+
+
 def _checked_holding_return(
     artifact: stage_executor.PlanningArtifact,
 ) -> np.ndarray | None:
@@ -245,7 +279,13 @@ def _checked_holding_return(
       since it is the known-good recovery corridor -- but only once it has
       passed the LOADED check, never as an unchecked default;
     * if neither corridor is proven, no motion is commanded at all and the
-      object stays where it is, for the operator's existing recovery actions.
+      object stays where it is, for the operator's existing recovery actions;
+    * and the arm never commits to Home unless a place-back corridor is proven
+      TOO.  Going Home is one half of a round trip: the durable phase becomes
+      ``holding_at_home``, from which the only way to release the object is
+      Place Back.  Authorizing the outbound half on evidence the inbound half
+      will reject strands the object held at Home with no software action able
+      to set it down.
 
     Returns the carry polyline to drive, or ``None`` to drive the checked
     legacy replay.
@@ -257,37 +297,56 @@ def _checked_holding_return(
             "the run Home was rejected with the object attached; refusing to "
             "carry it back along an unvalidated corridor",
         )
+    if not evidence.carry_valid and not evidence.legacy_corridor_valid:
+        raise stage_executor.SafetyError(
+            "no return corridor is valid with the object attached "
+            f"(carry rejected: {evidence.carry_rejection_reason or 'collision'}); "
+            "leaving the object held for operator recovery",
+        )
+    if _place_back_from_home_route(evidence) is None:
+        raise stage_executor.SafetyError(
+            "no place-back corridor from Home is valid with the object "
+            "attached; refusing to carry it to a pose it could not be set "
+            "down from (leaving the object held for operator recovery)",
+        )
     if evidence.carry_valid:
         assert evidence.carry_raw is not None
         return stage_executor.coalesce_collinear_execution_path(evidence.carry_raw)
-    if evidence.legacy_corridor_valid:
-        return None
-    raise stage_executor.SafetyError(
-        "no return corridor is valid with the object attached "
-        f"(carry rejected: {evidence.carry_rejection_reason or 'collision'}); "
-        "leaving the object held for operator recovery",
-    )
+    return None
 
 
-def _require_loaded_place_back(artifact: stage_executor.PlanningArtifact) -> None:
-    """Gate the place-back legs that are driven with the object still held.
+def _checked_place_back_from_home(
+    artifact: stage_executor.PlanningArtifact,
+) -> np.ndarray | None:
+    """Authorize and choose the place-back legs driven with the object held.
 
-    From ``holding_at_home`` the arm carries the object out to the pregrasp
-    and down onto the grasp pose before it releases.  Those are the same two
-    corridors as the return, traversed the other way, and a joint-space edge
-    sweeps the same states in either direction -- so the same evidence
-    applies.  From ``holding_at_lift`` the only loaded motion is the reverse
-    lift, which the planner already checks with the payload attached; that
-    limb is deliberately not gated here so a failed Return Home can always put
-    the object back down.
+    From ``holding_at_home`` the arm runs back out along the transit and then
+    lowers the object onto the grasp pose before it releases.  Every one of
+    those legs is loaded, so every one needs an attached-object verdict.  Two
+    descents are authorized -- see ``_place_back_from_home_route`` -- and
+    whichever is proven is driven, so the evidence that permits going Home is
+    exactly the evidence that permits coming back.
+
+    From ``holding_at_lift`` the only loaded motion is the reverse lift, which
+    the planner already checks with the payload attached; that limb is
+    deliberately not gated here so a failed Return Home can always put the
+    object back down.
+
+    Returns the carry polyline to retrace (lift-top descent), or ``None`` to
+    descend the approach directly.
     """
 
     evidence = stage_executor.holding_return_evidence(artifact)
-    if not evidence.return_transit_valid or not evidence.legacy_corridor_valid:
+    route = _place_back_from_home_route(evidence)
+    if route is None:
         raise stage_executor.SafetyError(
-            "place-back from Home requires the outbound corridor to be valid "
+            "place-back from Home requires a descent corridor that is valid "
             "with the object attached",
         )
+    if route == "approach":
+        return None
+    assert evidence.carry_raw is not None
+    return stage_executor.coalesce_collinear_execution_path(evidence.carry_raw)
 
 
 def _require_carry_start(
@@ -592,10 +651,11 @@ def execute_workflow_phase(
         # anything.  An artifact whose while-holding legs were never checked
         # with the object attached must not reach a single move_j.
         carry: np.ndarray | None = None
+        place_back_carry: np.ndarray | None = None
         if workflow_phase == "return-home-holding":
             carry = _checked_holding_return(artifact)
         elif prior_state["phase"] == "holding_at_home":
-            _require_loaded_place_back(artifact)
+            place_back_carry = _checked_place_back_from_home(artifact)
         guard = stage_executor.CommandGuard()
         try:
             _verify_holding_object(
@@ -667,12 +727,40 @@ def execute_workflow_phase(
                         start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
                         feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
                     )
-                    final = stage_executor.execute_joint_path(
-                        robot, approach_path, guard, speed_percent=speed_percent,
-                        segment_timeout_s=segment_timeout_s,
-                        start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
-                        feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
-                    )
+                    if place_back_carry is not None:
+                        # The reverse-approach descent was not proven with the
+                        # object attached, but the carry corridor the arm came
+                        # home on was.  Retrace it -- pregrasp -> lift top --
+                        # and lower down the (also checked) lift column.  This
+                        # is what makes the return a round trip: the object can
+                        # always be set back down from Home on the same
+                        # evidence that let it be carried there.
+                        final = stage_executor.execute_joint_path(
+                            robot,
+                            np.asarray(place_back_carry[::-1], dtype=float),
+                            guard, speed_percent=speed_percent,
+                            segment_timeout_s=segment_timeout_s,
+                            start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
+                            feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
+                        )
+                        reverse_lift_times_s = (
+                            float(lift_times_s[-1]) - lift_times_s[::-1]
+                        )
+                        final = stage_executor.execute_timed_joint_path(
+                            robot, np.asarray(timed_lift[::-1], dtype=float),
+                            np.asarray(reverse_lift_times_s, dtype=float), guard,
+                            speed_percent=speed_percent,
+                            segment_timeout_s=segment_timeout_s,
+                            start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
+                            feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
+                        )
+                    else:
+                        final = stage_executor.execute_joint_path(
+                            robot, approach_path, guard, speed_percent=speed_percent,
+                            segment_timeout_s=segment_timeout_s,
+                            start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
+                            feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
+                        )
                 guard.path_motion_started = False
                 _open_gripper(robot, effector, guard, gripper_force_n=gripper_force_n)
                 final = stage_executor.execute_joint_path(

@@ -80,13 +80,22 @@ ATTACHED_PAYLOAD_SEGMENTS = (
 CLOSED_GRIPPER_PAYLOAD_SEGMENTS = ('lift', 'lifted_retreat', 'holding_transit')
 # Forward-kinematics samples used to profile the direct carry edge.
 CARRY_PROFILE_SAMPLES = 201
-# Numerical tolerance on "the payload never rises along the carry".  A joint
-# space chord through a revolute arm wobbles by a few tens of microns; the
-# largest rise measured over 172 recorded sessions was 0.13 mm.
+# Numerical tolerance on the tip-height profile of the carry.  A joint space
+# chord through a revolute arm wobbles by a few tens of microns; the largest
+# rise measured over 172 recorded sessions was 0.13 mm.
 CARRY_TIP_RISE_TOLERANCE_M = 5.0e-4
-# The carry must end strictly higher than the pose the object was picked from,
-# otherwise it is a put-down and not a carry.
-CARRY_MIN_CLEARANCE_ABOVE_GRASP_M = 5.0e-3
+# How far below the reverse-lift + reverse-approach replay the carry is allowed
+# to take the payload before it is refused as a put-down.  The contract is
+# RELATIVE to the corridor the refusal falls back to, not to the grasp height:
+# the replay descends all the way to the grasp pose AND then travels out to the
+# same pregrasp the carry ends at, so its floor is min(grasp, pregrasp).  An
+# absolute "stay above the grasp" rule refused the carry on 3 of 172 recorded
+# plans whose pregrasp legitimately sits 2-27 mm BELOW the grasp (in-reach
+# lateral picks), and the fallback then reached that identical low pose having
+# also set the object down on its pick spot on the way.  Refusing a route for a
+# height the alternative also reaches, at the cost of an extra put-down, is
+# strictly worse for the operator.
+CARRY_MAX_DIP_BELOW_REPLAY_M = 5.0e-4
 
 
 @dataclass(frozen=True)
@@ -1227,7 +1236,12 @@ class OnlinePlanner:
                     departure_direction_base=departure_direction,
                 )
                 return all(
-                    checker.is_segment_valid(first, second)
+                    # Forward the caller's budget: a dense payload-vs-scene
+                    # sweep along a 53-waypoint transit over a 28k-point cloud
+                    # is the single most expensive thing in this function, and
+                    # without this it runs to completion no matter what
+                    # deadline the caller set.
+                    checker.is_segment_valid(first, second, control=control)
                     for first, second in zip(positions, positions[1:])
                 )
             if segment_name == 'place_approach':
@@ -1448,27 +1462,41 @@ class OnlinePlanner:
         )
         heights = np.asarray([_tip_z(joints) for joints in samples], dtype=float)
         grasp_height = _tip_z(grasp_joints)
+        # The corridor a refused carry falls back to is the reverse-lift +
+        # reverse-approach replay, which lowers the payload onto the grasp pose
+        # and then travels out to the same pregrasp the carry ends at.  Its
+        # floor is therefore the lower of those two heights, and that -- not
+        # the grasp height alone -- is what the carry has to beat to be an
+        # improvement.
+        replay_floor = min(grasp_height, float(heights[-1]))
         profile = {
             'lift_top_m': float(heights[0]),
             'pregrasp_m': float(heights[-1]),
             'grasp_m': grasp_height,
             'minimum_m': float(np.min(heights)),
             'minimum_above_grasp_m': float(np.min(heights) - grasp_height),
+            'replay_floor_m': replay_floor,
+            'minimum_above_replay_floor_m': float(np.min(heights) - replay_floor),
             'maximum_rise_m': float(np.max(np.diff(heights), initial=0.0)),
             'non_increasing': bool(
                 np.all(np.diff(heights) <= CARRY_TIP_RISE_TOLERANCE_M)
             ),
         }
-        # Refuse a "carry" that would lower the payload to or below the height
-        # it was picked from.  Such an edge is a put-down by another name and
-        # is exactly the behaviour this replaces.  Collision remains the
-        # authority for safety; this is the behavioural contract on top.
+        # Refuse a "carry" that would dip the payload BELOW the floor of the
+        # replay it replaces.  Such an edge is a put-down by another name and
+        # is exactly the behaviour this deletes.  Collision remains the
+        # authority for safety; this is the behavioural contract on top, and it
+        # is deliberately relative so that refusing the carry always leaves the
+        # operator with a route that keeps the object at least as high.  A rise
+        # along the way is not refused: lifting the payload higher cannot make
+        # it a put-down, and the collision verdict on 'lifted_retreat' already
+        # owns whether the higher route is safe.
         if not segments['carry']:
             carry_reason = 'collision'
-        elif not profile['non_increasing']:
-            carry_reason = 'tip_height_rises_along_carry'
-        elif profile['minimum_above_grasp_m'] <= CARRY_MIN_CLEARANCE_ABOVE_GRASP_M:
-            carry_reason = 'carry_descends_to_the_grasp_height'
+        elif (
+            profile['minimum_above_replay_floor_m'] < -CARRY_MAX_DIP_BELOW_REPLAY_M
+        ):
+            carry_reason = 'carry_dips_below_the_replay_it_replaces'
         else:
             carry_reason = ''
         if carry_reason:

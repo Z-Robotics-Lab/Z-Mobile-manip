@@ -453,9 +453,78 @@ def test_place_back_opens_only_at_original_grasp_then_reverses_home(
     ).hexdigest()
 
 
-def test_place_back_from_home_needs_the_loaded_corridor(tmp_path, monkeypatch):
-    # Carrying the object back OUT to the grasp pose drives the same two
-    # corridors as the return, the other way round, still loaded.
+def test_place_back_from_home_descends_the_carry_when_the_approach_is_not_proven(
+    tmp_path,
+    monkeypatch,
+):
+    """The evidence that takes the object Home also brings it back down.
+
+    A picked object wider than the empty-gripper corridor it was reached
+    through fails ``reverse_approach`` while the over-the-top carry passes.
+    That plan still goes Home on the carry, so Place Back must be able to
+    retrace it: pregrasp -> lift top along the carry edge, then down the lift
+    column.  Both legs carry an attached-object verdict.  Without this limb the
+    arm reaches Home holding an object it can never release -- there is no
+    gripper-open endpoint anywhere else in the operator's control surface, and
+    the reverse-home recovery only opens at an approach/lift waypoint.
+    """
+
+    prior = tmp_path / "home-holding"
+    write_workflow(prior, phase="holding_at_home")
+    events: list[tuple[str, np.ndarray]] = []
+    patch_paths(monkeypatch, events)
+    monkeypatch.setattr(
+        EXECUTOR,
+        "_open_gripper",
+        lambda *_a, **_k: events.append(("open", np.empty((0, 6)))),
+    )
+
+    EXECUTOR.execute_workflow_phase(
+        object(),
+        object(),
+        artifact(report={"holding_return": holding_return(reverse_approach=False)}),
+        workflow_phase="place-back",
+        planning_session_id=SESSION_ID,
+        receipt_dir=tmp_path / "placed",
+        prior_receipt_dir=prior,
+        speed_percent=5,
+        segment_timeout_s=12.0,
+        gripper_force_n=1.0,
+    )
+
+    assert [name for name, _path in events] == [
+        "joint", "joint", "timed", "open", "joint", "joint",
+    ]
+    np.testing.assert_allclose(events[0][1], [Q_HOME, Q_PRE])
+    np.testing.assert_allclose(events[1][1], [Q_PRE, Q_LIFT])
+    # The release still happens at the original grasp pose and nowhere else.
+    np.testing.assert_allclose(events[2][1], [Q_LIFT, Q_GRASP])
+    np.testing.assert_allclose(events[4][1], [Q_GRASP, Q_PRE])
+    np.testing.assert_allclose(events[5][1], [Q_PRE, Q_HOME])
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        # No descent at all: neither the reverse approach nor the carry+lift.
+        holding_return(
+            reverse_approach=False,
+            carry=False,
+            lift=False,
+            carry_rejection_reason="collision",
+        ),
+        holding_return(reverse_approach=False, lift=False),
+        # The loaded run back OUT along the transit is mandatory either way.
+        holding_return(return_transit=False),
+    ],
+)
+def test_place_back_from_home_needs_the_loaded_corridor(
+    tmp_path,
+    monkeypatch,
+    report,
+):
+    # Carrying the object back OUT to the grasp pose drives the same corridors
+    # as the return, the other way round, still loaded.
     prior = tmp_path / "home-holding"
     write_workflow(prior, phase="holding_at_home")
     events: list[tuple[str, np.ndarray]] = []
@@ -470,9 +539,7 @@ def test_place_back_from_home_needs_the_loaded_corridor(tmp_path, monkeypatch):
         EXECUTOR.execute_workflow_phase(
             object(),
             object(),
-            artifact(
-                report={"holding_return": holding_return(reverse_approach=False)},
-            ),
+            artifact(report={"holding_return": report}),
             workflow_phase="place-back",
             planning_session_id=SESSION_ID,
             receipt_dir=tmp_path / "placed",
@@ -483,6 +550,81 @@ def test_place_back_from_home_needs_the_loaded_corridor(tmp_path, monkeypatch):
         )
 
     assert events == []
+
+
+def test_return_home_holding_refuses_a_carry_it_could_never_come_back_from(
+    tmp_path,
+    monkeypatch,
+):
+    """Going Home is half a round trip; refuse the half without the other.
+
+    ``holding_at_home`` is a durable phase whose only release action is Place
+    Back.  A plan whose carry validates but whose lift column and reverse
+    approach do not has a legal route to Home and NO legal route down again,
+    so the arm would end torqued shut on the object at Home with no software
+    action able to open it.  Refuse before the transport is touched.
+    """
+
+    events: list[tuple[str, np.ndarray]] = []
+    prior = tmp_path / "pick"
+    write_workflow(prior, phase="holding_at_lift")
+    patch_paths(monkeypatch, events)
+    monkeypatch.setattr(
+        EXECUTOR,
+        "_verify_holding_object",
+        lambda *_a, **_k: pytest.fail("the arm was touched before authorization"),
+    )
+
+    with pytest.raises(STAGE.SafetyError, match="no place-back corridor from Home"):
+        EXECUTOR.execute_workflow_phase(
+            object(),
+            object(),
+            artifact(
+                report={
+                    "holding_return": holding_return(
+                        lift=False,
+                        reverse_approach=False,
+                    ),
+                },
+            ),
+            workflow_phase="return-home-holding",
+            planning_session_id=SESSION_ID,
+            receipt_dir=tmp_path / "return",
+            prior_receipt_dir=prior,
+            speed_percent=5,
+            segment_timeout_s=12.0,
+            gripper_force_n=1.0,
+        )
+
+    assert events == []
+
+
+def test_return_home_holding_still_carries_when_only_the_carry_route_is_proven(
+    tmp_path,
+    monkeypatch,
+):
+    """The wide-object case keeps the win: carry Home, carry back down.
+
+    ``reverse_approach`` fails (the object no longer fits the corridor it was
+    reached through) but the over-the-top carry and the lift column both pass.
+    That is a complete round trip, so the operator still gets the direct carry
+    -- refusing it here would hand the put-down back for no safety gain.
+    """
+
+    events: list[tuple[str, np.ndarray]] = []
+    _prior_path, result = _return_home(
+        tmp_path,
+        monkeypatch,
+        events,
+        plan=artifact(
+            report={"holding_return": holding_return(reverse_approach=False)},
+        ),
+    )
+
+    assert [name for name, _path in events] == ["joint", "joint"]
+    np.testing.assert_allclose(events[0][1], [Q_LIFT, Q_PRE])
+    np.testing.assert_allclose(events[1][1], [Q_PRE, Q_HOME])
+    assert result["workflow"]["phase"] == "holding_at_home"
 
 
 @pytest.mark.parametrize(
