@@ -222,6 +222,88 @@ def _verify_holding_object(
     )
 
 
+def _checked_holding_return(
+    artifact: stage_executor.PlanningArtifact,
+) -> np.ndarray | None:
+    """Authorize the loaded return Home and choose which corridor to drive.
+
+    The outbound transit and approach are collision-checked with an EMPTY
+    gripper: the object is an obstacle to avoid, not a payload bolted to the
+    tool.  Driving those arrays backwards while HOLDING the object sweeps a
+    strictly larger volume -- the object itself, out beyond the fingers --
+    across the Go2W platform on the way back to Home.  Reversing a path is not
+    revalidating it, so that return was being commanded on evidence collected
+    for a different robot configuration.
+
+    Nothing here is executed on unproven geometry:
+
+    * the run Home (pregrasp -> Home) is driven on every route, so its
+      attached-object verdict is mandatory;
+    * the direct carry is preferred when it validated, because it also deletes
+      the put-down;
+    * the reverse-lift + reverse-approach replay is retained as the fallback,
+      since it is the known-good recovery corridor -- but only once it has
+      passed the LOADED check, never as an unchecked default;
+    * if neither corridor is proven, no motion is commanded at all and the
+      object stays where it is, for the operator's existing recovery actions.
+
+    Returns the carry polyline to drive, or ``None`` to drive the checked
+    legacy replay.
+    """
+
+    evidence = stage_executor.holding_return_evidence(artifact)
+    if not evidence.return_transit_valid:
+        raise stage_executor.SafetyError(
+            "the run Home was rejected with the object attached; refusing to "
+            "carry it back along an unvalidated corridor",
+        )
+    if evidence.carry_valid:
+        assert evidence.carry_raw is not None
+        return stage_executor.coalesce_collinear_execution_path(evidence.carry_raw)
+    if evidence.legacy_corridor_valid:
+        return None
+    raise stage_executor.SafetyError(
+        "no return corridor is valid with the object attached "
+        f"(carry rejected: {evidence.carry_rejection_reason or 'collision'}); "
+        "leaving the object held for operator recovery",
+    )
+
+
+def _require_loaded_place_back(artifact: stage_executor.PlanningArtifact) -> None:
+    """Gate the place-back legs that are driven with the object still held.
+
+    From ``holding_at_home`` the arm carries the object out to the pregrasp
+    and down onto the grasp pose before it releases.  Those are the same two
+    corridors as the return, traversed the other way, and a joint-space edge
+    sweeps the same states in either direction -- so the same evidence
+    applies.  From ``holding_at_lift`` the only loaded motion is the reverse
+    lift, which the planner already checks with the payload attached; that
+    limb is deliberately not gated here so a failed Return Home can always put
+    the object back down.
+    """
+
+    evidence = stage_executor.holding_return_evidence(artifact)
+    if not evidence.return_transit_valid or not evidence.legacy_corridor_valid:
+        raise stage_executor.SafetyError(
+            "place-back from Home requires the outbound corridor to be valid "
+            "with the object attached",
+        )
+
+
+def _require_carry_start(
+    prior_state: dict[str, object],
+    carry: np.ndarray,
+) -> None:
+    """Prove the arm physically ended the lift where the carry starts."""
+
+    recorded = np.asarray(prior_state["final_joints_rad"], dtype=float)
+    error = float(np.max(np.abs(recorded - np.asarray(carry, dtype=float)[0])))
+    if error > stage_executor.DEFAULT_START_TOLERANCE_RAD:
+        raise stage_executor.SafetyError(
+            "recorded lift top does not match the planned carry start",
+        )
+
+
 def execute_full_grasp(
     robot: object,
     effector: object,
@@ -506,28 +588,51 @@ def execute_workflow_phase(
         pregrasp_path = stage_executor.validate_stage_context(artifact, "pregrasp", None)
         approach_path = np.asarray(artifact.arrays["approach_raw"], dtype=float)
         timed_lift, lift_times_s = stage_executor.timed_stage_path(artifact, "lift")
+        # Authorize the loaded corridor BEFORE the transport is asked for
+        # anything.  An artifact whose while-holding legs were never checked
+        # with the object attached must not reach a single move_j.
+        carry: np.ndarray | None = None
+        if workflow_phase == "return-home-holding":
+            carry = _checked_holding_return(artifact)
+        elif prior_state["phase"] == "holding_at_home":
+            _require_loaded_place_back(artifact)
         guard = stage_executor.CommandGuard()
         try:
             _verify_holding_object(
                 robot, effector, guard, artifact, gripper_force_n=gripper_force_n,
             )
             if workflow_phase == "return-home-holding":
-                reverse_lift_times_s = float(lift_times_s[-1]) - lift_times_s[::-1]
-                final = stage_executor.execute_timed_joint_path(
-                    robot, np.asarray(timed_lift[::-1], dtype=float),
-                    np.asarray(reverse_lift_times_s, dtype=float), guard,
-                    speed_percent=speed_percent,
-                    segment_timeout_s=segment_timeout_s,
-                    start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
-                    feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
-                )
-                guard.path_motion_started = False
-                final = stage_executor.execute_joint_path(
-                    robot, np.asarray(approach_path[::-1], dtype=float), guard,
-                    speed_percent=speed_percent, segment_timeout_s=segment_timeout_s,
-                    start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
-                    feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
-                )
+                if carry is not None:
+                    # One continuous move_j from the lift top straight to the
+                    # pregrasp.  The reverse lift it replaces existed only so
+                    # the reverse approach could start at the grasp pose, and
+                    # its whole visible effect was to put the object back down
+                    # on the spot it was picked from before carrying it home.
+                    _require_carry_start(prior_state, carry)
+                    final = stage_executor.execute_joint_path(
+                        robot, np.asarray(carry, dtype=float), guard,
+                        speed_percent=speed_percent,
+                        segment_timeout_s=segment_timeout_s,
+                        start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
+                        feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
+                    )
+                else:
+                    reverse_lift_times_s = float(lift_times_s[-1]) - lift_times_s[::-1]
+                    final = stage_executor.execute_timed_joint_path(
+                        robot, np.asarray(timed_lift[::-1], dtype=float),
+                        np.asarray(reverse_lift_times_s, dtype=float), guard,
+                        speed_percent=speed_percent,
+                        segment_timeout_s=segment_timeout_s,
+                        start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
+                        feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
+                    )
+                    guard.path_motion_started = False
+                    final = stage_executor.execute_joint_path(
+                        robot, np.asarray(approach_path[::-1], dtype=float), guard,
+                        speed_percent=speed_percent, segment_timeout_s=segment_timeout_s,
+                        start_tolerance_rad=stage_executor.DEFAULT_START_TOLERANCE_RAD,
+                        feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
+                    )
                 final = stage_executor.execute_joint_path(
                     robot, np.asarray(pregrasp_path[::-1], dtype=float), guard,
                     speed_percent=speed_percent, segment_timeout_s=segment_timeout_s,

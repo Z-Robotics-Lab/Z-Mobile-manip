@@ -1251,3 +1251,195 @@ def test_real_sdk_import_is_deferred_and_no_subprocess_transport_exists():
     assert source.count("effector.move_gripper_m(") == 6
     assert "robot.electronic_emergency_stop()" in source
     assert "--execute" in source and "--confirm" in source
+
+
+# ---------------------------------------------------------------------------
+# Attached-object validation of every leg driven while the object is held.
+#
+# The outbound transit and approach are collision-checked with an EMPTY
+# gripper: the object is an obstacle to steer around, not a payload bolted to
+# the tool.  The workflow then replays those arrays in reverse while HOLDING
+# the object.  Reversing a path does not revalidate it and the payload changes
+# the swept volume, so the executor now refuses to command any of them unless
+# the plan carries an explicit loaded-configuration verdict for each.
+# ---------------------------------------------------------------------------
+
+
+Q_CARRY = np.vstack((Q_LIFT, Q_PRE))
+
+
+def holding_return_block(**overrides):
+    block = {
+        "schema": EXECUTOR.HOLDING_RETURN_SCHEMA,
+        "collision_model": "closed_on_object_with_platform_fixtures",
+        "attached_at": "grasp",
+        "segments": {
+            "lift": True,
+            "reverse_approach": True,
+            "carry": True,
+            "return_transit": True,
+        },
+        "carry_raw_waypoints": 2,
+        "carry_tip_height_m": {"minimum_above_grasp_m": 0.047},
+        "carry_rejection_reason": "",
+    }
+    segments = overrides.pop("segments", None)
+    if segments is not None:
+        block["segments"] = {**block["segments"], **segments}
+    block.update(overrides)
+    return block
+
+
+def carry_artifact(report=None, arrays=None):
+    base_arrays = {
+        "transit_raw": np.vstack((Q_START, Q_PRE)),
+        "approach_raw": np.vstack((Q_PRE, Q_GRASP)),
+        "lift_raw": np.vstack((Q_GRASP, Q_LIFT)),
+        "carry_raw": Q_CARRY.copy(),
+    }
+    if arrays is not None:
+        base_arrays.update(arrays)
+        base_arrays = {k: v for k, v in base_arrays.items() if v is not None}
+    return SimpleNamespace(
+        report={"holding_return": holding_return_block()} if report is None else report,
+        arrays=base_arrays,
+    )
+
+
+def test_holding_return_evidence_reads_every_leg_verdict():
+    evidence = EXECUTOR.holding_return_evidence(carry_artifact())
+
+    assert evidence.segments == {
+        "lift": True,
+        "reverse_approach": True,
+        "carry": True,
+        "return_transit": True,
+    }
+    assert evidence.carry_valid is True
+    assert evidence.legacy_corridor_valid is True
+    assert evidence.return_transit_valid is True
+    assert evidence.collision_model == "closed_on_object_with_platform_fixtures"
+    np.testing.assert_allclose(evidence.carry_raw, Q_CARRY)
+
+
+def test_holding_return_evidence_fails_closed_on_a_plan_that_was_never_checked_loaded():
+    # Every artifact planned before this validation existed lands here.  It is
+    # the actual defect: those return legs carry only empty-gripper evidence.
+    with pytest.raises(EXECUTOR.SafetyError, match="no holding_return validation"):
+        EXECUTOR.holding_return_evidence(carry_artifact(report={}))
+
+
+@pytest.mark.parametrize(
+    ("report", "arrays", "message"),
+    [
+        ({"holding_return": {"schema": "wrong"}}, None, "unsupported holding_return schema"),
+        ({"holding_return": []}, None, "must be one JSON object"),
+        (
+            {"holding_return": holding_return_block(attached_at="pregrasp")},
+            None,
+            "attach the payload at the grasp pose",
+        ),
+        (
+            {"holding_return": holding_return_block(collision_model="")},
+            None,
+            "does not name its collision model",
+        ),
+        ({"holding_return": holding_return_block(segments=None) | {"segments": 5}},
+         None, "segments must be one JSON object"),
+        (
+            {"holding_return": holding_return_block(segments={"carry": "yes"})},
+            None,
+            "segments.carry must be exactly true or false",
+        ),
+        (
+            {"holding_return": holding_return_block(segments={"return_transit": None})},
+            None,
+            "segments.return_transit must be exactly true or false",
+        ),
+        (None, {"carry_raw": None}, "claims a valid carry but the NPZ has none"),
+        (
+            {"holding_return": holding_return_block(carry_raw_waypoints=3)},
+            None,
+            "carry_raw_waypoints does not match",
+        ),
+        (
+            {"holding_return": holding_return_block(carry_rejection_reason="collision")},
+            None,
+            "valid carry cannot also carry a rejection reason",
+        ),
+        (None, {"carry_raw": np.vstack((Q_GRASP, Q_PRE))}, "does not start at the planned lift top"),
+        (None, {"carry_raw": np.vstack((Q_LIFT, Q_GRASP))}, "does not end at the planned pregrasp"),
+        (None, {"carry_raw": np.vstack((Q_LIFT, Q_PRE))[:1]}, "at least two 6-axis waypoints"),
+        (
+            None,
+            {"carry_raw": np.vstack((Q_LIFT, np.full(6, np.nan)))},
+            "contains non-finite values",
+        ),
+        (
+            None,
+            {"carry_raw": np.vstack((Q_LIFT, np.full(6, 9.0)))},
+            "outside PiPER joint limits",
+        ),
+    ],
+)
+def test_holding_return_evidence_rejects_malformed_or_inconsistent_claims(
+    report,
+    arrays,
+    message,
+):
+    with pytest.raises(EXECUTOR.SafetyError, match=message):
+        EXECUTOR.holding_return_evidence(carry_artifact(report=report, arrays=arrays))
+
+
+def test_carry_path_is_exactly_one_continuous_move_j_edge():
+    path = EXECUTOR.carry_path(carry_artifact())
+
+    assert path.shape == (2, 6)
+    np.testing.assert_allclose(path, Q_CARRY)
+
+
+def test_carry_path_refuses_an_unvalidated_shortcut():
+    plan = carry_artifact(
+        report={
+            "holding_return": holding_return_block(
+                segments={"carry": False},
+                carry_rejection_reason="carry_descends_to_the_grasp_height",
+            ),
+        },
+    )
+    with pytest.raises(EXECUTOR.SafetyError, match="no collision-validated carry edge"):
+        EXECUTOR.carry_path(plan)
+
+
+def test_a_rejected_carry_still_reports_the_usable_corridors():
+    plan = carry_artifact(
+        report={
+            "holding_return": holding_return_block(
+                segments={"carry": False},
+                carry_rejection_reason="collision",
+            ),
+        },
+    )
+    evidence = EXECUTOR.holding_return_evidence(plan)
+
+    assert evidence.carry_valid is False
+    assert evidence.carry_rejection_reason == "collision"
+    assert evidence.legacy_corridor_valid is True
+    assert evidence.return_transit_valid is True
+
+
+def test_extra_npz_keys_do_not_disturb_the_existing_stage_loader(tmp_path):
+    # carry_raw rides the existing planned_grasp.npz digest; the loader must
+    # keep accepting an archive that carries it.
+    report_path, npz_path, digest = make_artifact(tmp_path)
+    arrays = dict(np.load(npz_path, allow_pickle=False))
+    arrays["carry_raw"] = Q_CARRY
+    np.savez_compressed(npz_path, **arrays)
+    document = json.loads(report_path.read_text(encoding="utf-8"))
+    document["planned_grasp_sha256"] = _sha256(npz_path)
+    document["holding_return"] = holding_return_block()
+    report_path.write_text(json.dumps(document), encoding="utf-8")
+
+    artifact = load_artifact(report_path, npz_path)
+
+    np.testing.assert_allclose(EXECUTOR.carry_path(artifact), Q_CARRY)

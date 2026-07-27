@@ -443,3 +443,81 @@ def test_planning_dry_run_has_no_ros_or_transport_calls():
     assert '"selected_global_rank": int(planned.selected_global_rank)' in source
     assert 'planned.higher_rank_rejection_count' in source
     assert '"transit_duration_s"' in source
+
+
+def test_the_planner_emits_and_gates_the_loaded_return_corridor():
+    """The dry run must produce the attached-object evidence, not just paths.
+
+    Without this block every artifact it writes is one the executor refuses to
+    drive home while holding, which is the intended fail-closed default for
+    plans whose return legs were only ever checked with an empty gripper.
+    """
+
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "planner.plan_holding_return(" in source
+    assert '"holding_return": holding_return.document()' in source
+    # The carry edge ships only when it validated attached.
+    assert "if holding_return.carry_valid" in source
+    assert "**carry_arrays," in source
+    assert '"carry_raw": np.asarray(holding_return.carry_raw' in source
+
+
+def test_holding_return_validation_uses_the_loaded_collision_model():
+    from z_manip.planning import online_planner as planner_module
+
+    assert "lifted_retreat" in planner_module.ATTACHED_PAYLOAD_SEGMENTS
+    assert "holding_transit" in planner_module.ATTACHED_PAYLOAD_SEGMENTS
+    assert "lifted_retreat" in planner_module.CLOSED_GRIPPER_PAYLOAD_SEGMENTS
+    assert "holding_transit" in planner_module.CLOSED_GRIPPER_PAYLOAD_SEGMENTS
+    # The pre-existing ROS place segments keep the wider open-gripper model.
+    assert "carry" not in planner_module.CLOSED_GRIPPER_PAYLOAD_SEGMENTS
+    assert "place_transit" not in planner_module.CLOSED_GRIPPER_PAYLOAD_SEGMENTS
+
+
+def test_a_carried_payload_is_checked_against_the_platform_fixtures():
+    """The Mid-360, chassis, head and NUC must be obstacles for the payload.
+
+    They ship as ``check_target=False`` because an unheld target sits out in
+    the scene, far from the base.  The moment the object is attached to the
+    tool that exemption becomes a fail-open: the payload rides all the way
+    back to Home across exactly that geometry with nothing checking it.  This
+    is derived from the configured capsule set, so a corrected fixture pose or
+    a newly modelled bracket is picked up without touching this code.
+    """
+
+    from z_manip.collision.pointcloud import CapsuleSpec, RobotCollisionModel
+    from z_manip.planning.online_planner import OnlinePlanner
+
+    model = RobotCollisionModel(capsules=(
+        CapsuleSpec(
+            name="mid360",
+            start_frame="base",
+            end_frame="base",
+            radius=0.0325,
+            check_scene=False,
+            check_target=False,
+            supplemental_self_collision=True,
+        ),
+        CapsuleSpec(
+            name="palm",
+            start_frame="tip",
+            end_frame="tip",
+            radius=0.03,
+        ),
+    ))
+    loaded = OnlinePlanner._collision_model_for_carried_payload(
+        OnlinePlanner.__new__(OnlinePlanner),
+        model,
+    )
+
+    by_name = {capsule.name: capsule for capsule in loaded.capsules}
+    assert by_name["mid360"].check_target is True, (
+        "a carried payload is not being checked against the lidar"
+    )
+    assert by_name["mid360"].check_scene is False, "scene semantics must not change"
+    assert by_name["palm"] == model.capsules[1]
+    # Unchanged models are returned untouched, so nothing is copied needlessly.
+    assert OnlinePlanner._collision_model_for_carried_payload(
+        OnlinePlanner.__new__(OnlinePlanner), loaded,
+    ) is loaded
