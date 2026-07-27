@@ -87,6 +87,94 @@ class TargetObservation:
     score: float = 1.0
 
 
+def _camera_points(
+    columns: np.ndarray,
+    rows: np.ndarray,
+    depths_m: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+) -> np.ndarray:
+    """Single pinhole back-projection shared by every observed cloud we build.
+
+    A second copy of this arithmetic would drift silently against the hand-eye
+    calibration that was solved against this one.
+    """
+
+    return np.column_stack((
+        (columns - cx) * depths_m / fx,
+        (rows - cy) * depths_m / fy,
+        depths_m,
+    ))
+
+
+def _target_from_camera(transform: object) -> np.ndarray:
+    matrix = np.asarray(transform, dtype=float)
+    if (
+        matrix.shape != (4, 4)
+        or not np.all(np.isfinite(matrix))
+        or not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-7)
+    ):
+        raise ValueError("point-cloud transform must be a finite homogeneous matrix")
+    return matrix
+
+
+def _to_target_frame(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    return points @ transform[:3, :3].T + transform[:3, 3]
+
+
+def backproject_depth(
+    depth_m: object,
+    camera_matrix: object,
+    transform_target_from_camera: object,
+    *,
+    min_depth_m: float,
+    max_depth_m: float,
+) -> np.ndarray:
+    """Back-project aligned metric depth into an organized ``(H, W, 3)`` cloud.
+
+    Depth is in METRES here; :func:`depth_to_pointcloud` consumes the raw 16UC1
+    millimetre image instead.  Both route through one pinhole kernel.  Pixels
+    with no measurement, and pixels outside the depth interval, stay ``NaN`` so
+    the image lattice survives; a caller can then map a normalized image region
+    onto metric geometry without an unsafe nearest-neighbour guess.
+    """
+
+    depth = np.asarray(depth_m, dtype=float)
+    matrix = np.asarray(camera_matrix, dtype=float)
+    transform = _target_from_camera(transform_target_from_camera)
+    if depth.ndim != 2:
+        raise ValueError(f"expected HxW metric depth image, got {depth.shape}")
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("camera matrix must be a finite 3x3 array")
+    fx, fy, cx, cy = matrix[0, 0], matrix[1, 1], matrix[0, 2], matrix[1, 2]
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError("camera focal lengths must be positive")
+    if not (
+        math.isfinite(min_depth_m)
+        and math.isfinite(max_depth_m)
+        and 0.0 <= min_depth_m < max_depth_m
+    ):
+        raise ValueError("invalid organized point-cloud depth interval")
+    rows, columns = np.indices(depth.shape)
+    valid = np.isfinite(depth) & (depth >= min_depth_m) & (depth <= max_depth_m)
+    organized = np.full((*depth.shape, 3), np.nan, dtype=float)
+    organized[valid] = _to_target_frame(
+        _camera_points(
+            columns[valid].astype(float),
+            rows[valid].astype(float),
+            depth[valid],
+            fx,
+            fy,
+            cx,
+            cy,
+        ),
+        transform,
+    )
+    return organized
+
+
 def _validate_rgbd_shapes(image: np.ndarray, depth_mm: np.ndarray) -> None:
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"expected HxWx3 RGB image, got {image.shape}")
@@ -191,24 +279,17 @@ def depth_to_pointcloud(
     )
     if target_mask is not None:
         valid &= target_mask[np.ix_(rows, columns)]
-    z = sampled[valid]
-    x = (u[valid] - intrinsics.cx) * z / intrinsics.fx
-    y = (v[valid] - intrinsics.cy) * z / intrinsics.fy
-    points = np.column_stack((x, y, z))
+    points = _camera_points(
+        u[valid].astype(np.float64),
+        v[valid].astype(np.float64),
+        sampled[valid],
+        intrinsics.fx,
+        intrinsics.fy,
+        intrinsics.cx,
+        intrinsics.cy,
+    )
     if transform is not None:
-        target_from_camera = np.asarray(transform, dtype=float)
-        if (
-            target_from_camera.shape != (4, 4)
-            or not np.all(np.isfinite(target_from_camera))
-            or not np.allclose(
-                target_from_camera[3], (0.0, 0.0, 0.0, 1.0), atol=1e-7,
-            )
-        ):
-            raise ValueError("point-cloud transform must be a finite homogeneous matrix")
-        points = (
-            points @ target_from_camera[:3, :3].T
-            + target_from_camera[:3, 3]
-        )
+        points = _to_target_frame(points, _target_from_camera(transform))
     return points.astype(np.float32, copy=False)
 
 
