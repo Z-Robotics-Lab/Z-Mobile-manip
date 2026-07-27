@@ -45,6 +45,7 @@ from .work_pose import (
 )
 
 __all__ = [
+    "GraspCompletionProgram",
     "GraspPlanConfig",
     "GraspPlanGenerator",
     "GraspStage",
@@ -52,18 +53,24 @@ __all__ = [
     "GraspTrajectoryTarget",
     "JointSpaceRRTConnect",
     "BoundedSE2WorkPoseOptimizer",
+    "MotionProgram",
     "NormalizedPlacementRegion",
+    "OnlinePlanner",
     "ObservedPlacementConfig",
     "ObservedPlacementInput",
     "ObservedPlacementPlanner",
+    "PerceptionObservation",
     "PlacementCandidate",
     "PlacementConstraints",
     "PlacementMotionEvaluation",
     "PlannedGrasp",
     "PlannedPlacement",
+    "PregraspTransitProgram",
+    "ProspectiveWorkPose",
     "RRTConnectConfig",
     "ReachabilityStandoffConfig",
     "ReachabilityStandoffOptimizer",
+    "SemanticPointSelection",
     "StandoffChoice",
     "SidePreference",
     "StagedGraspRequest",
@@ -81,4 +88,26 @@ __all__ = [
     "WorkPoseObservation",
     "WorkPoseOptimizationError",
     "retime_path",
+    "select_semantic_target_points",
 ]
+
+_ONLINE_PLANNER_EXPORTS = frozenset({
+    "GraspCompletionProgram",
+    "MotionProgram",
+    "OnlinePlanner",
+    "PerceptionObservation",
+    "PregraspTransitProgram",
+    "ProspectiveWorkPose",
+    "SemanticPointSelection",
+    "select_semantic_target_points",
+})
+
+
+def __getattr__(name: str) -> object:
+    # Resolved on demand because online_planner imports z_manip.configuration,
+    # which imports this package: an eager import here would be circular.
+    if name in _ONLINE_PLANNER_EXPORTS:
+        from . import online_planner
+
+        return getattr(online_planner, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

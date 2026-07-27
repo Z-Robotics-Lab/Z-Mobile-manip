@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +17,7 @@ SPEC = importlib.util.spec_from_file_location("piper_planning_dry_run", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 DRY_RUN = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DRY_RUN)
+ROS_PLANNING_ALIAS = ROOT / "ros2/z_manip_task/z_manip_task/planning.py"
 
 
 def test_mobile_grasp_config_prefers_side_entries_and_penalizes_overhead():
@@ -373,6 +376,28 @@ def test_real_planning_rejects_synthetic_or_failed_quality_calibration(tmp_path)
             joints=np.zeros(6),
             source_frame="camera_color_optical_frame",
         )
+
+
+def test_planner_loads_from_the_hot_reloaded_library_behind_a_ros_alias():
+    """The ros2 tree is baked into an image, so the old path must stay importable."""
+
+    spec = importlib.util.spec_from_file_location(
+        "z_manip_task.planning", ROS_PLANNING_ALIAS
+    )
+    assert spec is not None and spec.loader is not None
+    saved = sys.modules.get("z_manip_task.planning")
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    try:
+        aliased = sys.modules["z_manip_task.planning"]
+    finally:
+        if saved is None:
+            sys.modules.pop("z_manip_task.planning", None)
+        else:
+            sys.modules["z_manip_task.planning"] = saved
+
+    online_planner = importlib.import_module("z_manip.planning.online_planner")
+    assert aliased is online_planner
+    assert "z_manip_task" not in SCRIPT.read_text(encoding="utf-8")
 
 
 def test_planning_dry_run_has_no_ros_or_transport_calls():
