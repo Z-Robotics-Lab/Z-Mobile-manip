@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gzip
 import http.client
 import importlib.util
 import json
@@ -568,3 +569,97 @@ def test_launcher_contains_no_remote_or_actuator_commands():
     assert "go2w_debug_safety_gate.py" in source
     assert "--artifact-root" in source
     assert "--output" in source
+
+
+def test_accept_encoding_negotiation_is_explicit_and_quality_aware():
+    assert DEBUG_UI.accepts_gzip("gzip") is True
+    assert DEBUG_UI.accepts_gzip("gzip, deflate, br") is True
+    assert DEBUG_UI.accepts_gzip("deflate, GZIP;q=0.5") is True
+    assert DEBUG_UI.accepts_gzip("*") is True
+    assert DEBUG_UI.accepts_gzip(None) is False
+    assert DEBUG_UI.accepts_gzip("") is False
+    assert DEBUG_UI.accepts_gzip("deflate, br") is False
+    # A client that explicitly refuses gzip must never be sent gzip.
+    assert DEBUG_UI.accepts_gzip("gzip;q=0") is False
+    assert DEBUG_UI.accepts_gzip("gzip;q=nonsense") is False
+    # Only text-shaped media is compressed; already-compressed tiles are not.
+    assert DEBUG_UI.compressible("application/json; charset=utf-8") is True
+    assert DEBUG_UI.compressible("text/html; charset=utf-8") is True
+    assert DEBUG_UI.compressible("image/jpeg") is False
+    assert DEBUG_UI.compressible("application/octet-stream") is False
+
+
+def test_json_status_is_conditional_and_gzip_is_opt_in_per_request(tmp_path):
+    class FakeControl:
+        def __init__(self):
+            self.status_calls = 0
+
+        def status(self):
+            self.status_calls += 1
+            return {
+                "available": True,
+                "running": False,
+                "state": "idle",
+                "message": "Ready.",
+                "log_tail": "tail line\n" * 200,
+            }
+
+        def log_tail(self):
+            return "full tail\n" * 400
+
+    control = FakeControl()
+    server = DEBUG_UI.create_server(
+        _write_bundle(tmp_path),
+        port=0,
+        index_path=HTML,
+        control_backend=control,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        # No Accept-Encoding => byte-identical uncompressed body, as before.
+        connection.request("GET", "/api/control")
+        response = connection.getresponse()
+        plain = response.read()
+        etag = response.getheader("ETag")
+        assert response.status == 200
+        assert response.getheader("Content-Encoding") is None
+        assert response.getheader("Vary") == "Accept-Encoding"
+        assert etag is not None
+        assert json.loads(plain)["available"] is True
+
+        # Same body, gzip negotiated: fewer bytes, identical decoded payload,
+        # and the SAME validator so 304 semantics do not fork per encoding.
+        connection.request("GET", "/api/control", headers={"Accept-Encoding": "gzip"})
+        response = connection.getresponse()
+        compressed = response.read()
+        assert response.status == 200
+        assert response.getheader("Content-Encoding") == "gzip"
+        assert response.getheader("ETag") == etag
+        assert int(response.getheader("Content-Length")) == len(compressed)
+        assert len(compressed) < len(plain)
+        assert gzip.decompress(compressed) == plain
+
+        # Unchanged body revalidates to an empty 304 in both encodings.
+        for headers in ({}, {"Accept-Encoding": "gzip"}):
+            connection.request(
+                "GET",
+                "/api/control",
+                headers={"If-None-Match": etag, **headers},
+            )
+            response = connection.getresponse()
+            assert response.status == 304
+            assert response.getheader("ETag") == etag
+            assert response.read() == b""
+
+        # The untruncated tail stays reachable on demand.
+        connection.request("GET", "/api/control/log")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["text"] == "full tail\n" * 400
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import gzip
 from http import HTTPStatus
 import hashlib
 import json
@@ -61,6 +62,12 @@ from z_manip.read_only_sessions import (
 
 
 MAX_LOG_TAIL_BYTES = 12_000
+# Tail embedded in the 1 Hz /api/control status document.  The dashboard only
+# ever assigns it to a hover title attribute (and only when `message` is empty,
+# which it never is), so the full MAX_LOG_TAIL_BYTES tail was 93% of that
+# endpoint's body for no rendered pixel.  The untruncated tail stays reachable
+# on demand at /api/control/log.
+CONTROL_LOG_TAIL_BYTES = 2_000
 # RUNTIME_SCHEMA and the MAX_RUNTIME_* content-limit constants used by the
 # runtime-state validator now live in go2w_runtime_state and are re-imported
 # above (Stage 1 extraction).  MAX_RUNTIME_STATE_BYTES stays here because a test
@@ -68,6 +75,23 @@ MAX_LOG_TAIL_BYTES = 12_000
 MAX_RUNTIME_STATE_BYTES = 8 * 1024 * 1024
 RUNTIME_STALE_AFTER_S = 1.0
 MAX_RUNTIME_FUTURE_S = 0.25
+# Opt-in conditional-GET mode for /api/runtime.  The default validator covers
+# `sequence` and the timestamps, which advance at the producer rate whether or
+# not anything renderable moved, so it returns a fresh 200 on every poll (40/40
+# measured while the rendered geometry changed 0/39 times).  The geometry mode
+# drops exactly those clocks from the validator.  It is OPT-IN because a 304
+# carries no body: a client that renders `age_s`/`sequence` out of the payload
+# must switch to the X-Z-Manip-Runtime-{State,Age-Ms,Sequence} response headers,
+# which are emitted on the 304 as well, or it will freeze its freshness badge
+# and its producer-rate readout at the last 200.
+RUNTIME_ETAG_MODE_HEADER = "X-Z-Manip-Runtime-Etag"
+RUNTIME_GEOMETRY_ETAG_MODE = "geometry"
+RUNTIME_ETAG_VOLATILE_FIELDS = frozenset({
+    "sequence",
+    "source_timestamp_ns",
+    "received_timestamp_ns",
+    "age_s",
+})
 MAX_CAMERA_JPEG_BYTES = 512 * 1024
 CAMERA_STALE_AFTER_S = 2.0
 # Real-time RGB tile.  The observer writes at the camera rate (30 Hz); this is
@@ -144,6 +168,26 @@ MAX_HANDOFF_EVIDENCE_BYTES = 512 * 1024
 # mistaken large value can never strand a held object for minutes.
 MOBILE_HANDOFF_HOLD_SECONDS = 2.0
 MOBILE_HANDOFF_MAX_HOLD_SECONDS = 10.0
+# Stable names for option combinations the approach API already accepts and
+# validates.  A combo is only a naming layer: it supplies defaults for
+# place_back/hold_seconds and introduces no workflow semantics of its own, and
+# an explicit place_back/hold_seconds in the same request always wins.  Every
+# value here must stay inside the validated 0..MOBILE_HANDOFF_MAX_HOLD_SECONDS
+# range so the UI can never produce an INVALID_HOLD_SECONDS rejection.  A combo
+# must never carry a speed field: #motion-speed stays the single speed
+# authority.
+APPROACH_TASK_COMBOS: dict[str, dict[str, Any]] = {
+    "pick_place_back": {"place_back": True, "hold_seconds": MOBILE_HANDOFF_HOLD_SECONDS},
+    "pick_and_hold": {"place_back": False, "hold_seconds": 0.0},
+    "pick_hold_long": {"place_back": True, "hold_seconds": MOBILE_HANDOFF_MAX_HOLD_SECONDS},
+}
+# TTL for the memoized `go2w_component_manager.sh status all` shell.  That shell
+# was measured at 1.43-2.94 s per call while the dashboard polls it every 0.5-3 s,
+# i.e. it was the only endpoint slower than its own poll period.  Component
+# state is coarse container health, and every action that can change it
+# (restart/bringup) invalidates the memo explicitly, so a genuine change still
+# surfaces on the next poll rather than after the TTL.
+COMPONENT_STATUS_TTL_S = 3.0
 MAX_CAMERA_FUTURE_S = 0.25
 MAX_INTERACTIVE_REQUEST_BYTES = 512
 MAX_INTERACTIVE_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -241,6 +285,42 @@ def _empty_display_bundle() -> dict[str, Any]:
         "visualization": {"frame": None, "images": {}},
         "display": {"cleared": True, "history_retained": True},
     }
+
+
+def resolve_approach_combo(document: dict[str, Any]) -> tuple[bool, Any, str | None]:
+    """Expand an optional combo slug into the approach options it names.
+
+    The slug only supplies defaults: an explicit ``place_back``/``hold_seconds``
+    in the same request always wins, so every existing caller keeps its exact
+    behaviour and the slug adds no workflow semantics of its own.  The returned
+    ``hold_seconds`` is passed through unvalidated for the runner's own
+    0..MOBILE_HANDOFF_MAX_HOLD_SECONDS check.
+    """
+
+    slug = document.get("combo")
+    named = APPROACH_TASK_COMBOS.get(slug, {}) if isinstance(slug, str) else {}
+    return (
+        document.get("place_back", named.get("place_back", True)) is not False,
+        document.get("hold_seconds", named.get("hold_seconds", MOBILE_HANDOFF_HOLD_SECONDS)),
+        slug if isinstance(slug, str) and slug in APPROACH_TASK_COMBOS else None,
+    )
+
+
+def runtime_geometry_etag(document: dict[str, Any]) -> str:
+    """Validator over a runtime snapshot with only its clocks removed.
+
+    `status` and `error` stay inside the hash, so the live -> stale flip and
+    every offline reason still force a 200; only a snapshot whose renderable
+    content AND freshness class are unchanged can produce a 304.
+    """
+
+    geometry = {
+        key: value
+        for key, value in document.items()
+        if key not in RUNTIME_ETAG_VOLATILE_FIELDS
+    }
+    payload = json.dumps(geometry, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return '"runtime-geometry-' + hashlib.sha256(payload).hexdigest()[:20] + '"'
 
 
 class RuntimeStateReader:
@@ -621,6 +701,28 @@ class CloudSnapshotReader:
         self._etag: str | None = None
         self._source: str | None = None
         self._count: int = 0
+        self._compressed: bytes | None = None
+        self._compressed_key: str | None = None
+
+    def compressed(self, etag: str) -> bytes | None:
+        """gzip the current frame once, lazily, keyed by its own ETag.
+
+        Returns None when ``etag`` is not the frame this reader currently holds,
+        so a caller can never pair one frame's bytes with another frame's
+        validator.
+        """
+
+        with self._lock:
+            if self._payload is None or self._etag is None or self._etag != etag:
+                return None
+            if self._compressed_key != etag:
+                self._compressed = gzip.compress(
+                    self._payload,
+                    go2w_debug_ui.GZIP_LEVEL,
+                    mtime=0,
+                )
+                self._compressed_key = etag
+            return self._compressed
 
     def snapshot(
         self,
@@ -1009,10 +1111,15 @@ class PlanningOnlyRunner:
         except FileNotFoundError:
             return ""
 
+    def log_tail(self) -> str:
+        """Untruncated bounded tail for the on-demand /api/control/log route."""
+
+        return self._log_tail()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             result = dict(self._status)
-        result["log_tail"] = self._log_tail()
+        result["log_tail"] = self._log_tail()[-CONTROL_LOG_TAIL_BYTES:]
         latest = self.run_root / "latest" / "debug_bundle.json"
         result["latest_bundle_available"] = latest.is_file()
         if latest.is_file():
@@ -1171,6 +1278,7 @@ class DepthServoRunner:
             "speed_percent": 5,
             "place_back": True,
             "hold_seconds": MOBILE_HANDOFF_HOLD_SECONDS,
+            "combo": None,
             "reacquisition_attempts": 0,
             "last_reacquisition": None,
             "failure": None,
@@ -1304,6 +1412,7 @@ class DepthServoRunner:
         speed_percent: int = 5,
         place_back: bool = True,
         hold_seconds: float = MOBILE_HANDOFF_HOLD_SECONDS,
+        combo: str | None = None,
     ) -> dict[str, Any]:
         if mode not in {"shadow", "live"}:
             return {
@@ -1397,6 +1506,9 @@ class DepthServoRunner:
                 "speed_percent": speed_percent,
                 "place_back": place_back,
                 "hold_seconds": hold_seconds,
+                # Echoed only so /api/approach/status.workflow can name the
+                # combination an operator selected; nothing reads it back.
+                "combo": combo if combo in APPROACH_TASK_COMBOS else None,
                 "reacquisition_attempts": 0,
                 "last_reacquisition": None,
                 "failure": None,
@@ -3992,6 +4104,11 @@ class VisualComponentManager:
         self._thread: threading.Thread | None = None
         self._active_component: str | None = None
         self._last_result: dict[str, Any] | None = None
+        self._states_lock = threading.Lock()
+        self._states_refresh = threading.Lock()
+        self._states: tuple[dict[str, dict[str, str]], str | None] | None = None
+        self._states_at: float | None = None
+        self._states_generation = 0
 
     def _shell(self, *arguments: str, timeout: float) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -4025,16 +4142,72 @@ class VisualComponentManager:
             }
         return components
 
-    def status(self) -> dict[str, Any]:
-        error: str | None = None
-        components: dict[str, dict[str, str]] = {}
+    def _cached_states(self) -> tuple[dict[str, dict[str, str]], str | None] | None:
+        with self._states_lock:
+            if self._states is None or self._states_at is None:
+                return None
+            if time.monotonic() - self._states_at >= COMPONENT_STATUS_TTL_S:
+                return None
+            return self._states
+
+    def _invalidate_states(self) -> None:
+        """Force the next status read to re-run the shell.
+
+        Called whenever this process starts or finishes an action that can move
+        a component between healthy/degraded/offline, so the memo can never hide
+        a state change the operator just caused.
+        """
+
+        with self._states_lock:
+            self._states_at = None
+            self._states_generation += 1
+
+    def _component_states(self) -> tuple[dict[str, dict[str, str]], str | None]:
+        fresh = self._cached_states()
+        if fresh is not None:
+            return fresh
+        with self._states_lock:
+            stale = self._states
+        # One shell at a time.  A poll that loses the race is served the previous
+        # reading instead of forking a second 1.5-2.9 s status run.
+        if stale is not None and not self._states_refresh.acquire(blocking=False):
+            served = self._cached_states()
+            return stale if served is None else served
+        if stale is None:
+            # Nothing truthful to serve yet, so wait for the one in-flight read.
+            self._states_refresh.acquire()
         try:
-            completed = self._shell("status", "all", timeout=6.0)
-            components = self._parse_status(completed.stdout)
-            if completed.returncode != 0:
-                error = f"component status exited {completed.returncode}"
-        except (OSError, subprocess.SubprocessError) as exc:
-            error = f"component status unavailable: {exc}"
+            fresh = self._cached_states()
+            if fresh is not None:
+                return fresh
+            with self._states_lock:
+                generation = self._states_generation
+            error: str | None = None
+            components: dict[str, dict[str, str]] = {}
+            try:
+                completed = self._shell("status", "all", timeout=6.0)
+                components = self._parse_status(completed.stdout)
+                if completed.returncode != 0:
+                    error = f"component status exited {completed.returncode}"
+            except (OSError, subprocess.SubprocessError) as exc:
+                error = f"component status unavailable: {exc}"
+            with self._states_lock:
+                # A reading that started before a restart/bringup invalidated the
+                # memo describes the pre-action world; serve it to this caller
+                # but never cache it, or it would mask the action for a full TTL.
+                if generation == self._states_generation:
+                    self._states = (components, error)
+                    self._states_at = time.monotonic()
+            return components, error
+        finally:
+            self._states_refresh.release()
+
+    def status(self) -> dict[str, Any]:
+        # Only the shell reading is memoized.  busy/active_component/last_result
+        # are owned by this process and are always recomputed, so an in-flight
+        # restart is never reported through a stale cache.
+        components, error = self._component_states()
+        components = dict(components)
         with self._lock:
             running = self._thread is not None and self._thread.is_alive()
             active = self._active_component if running else None
@@ -4088,6 +4261,7 @@ class VisualComponentManager:
         with self._lock:
             self._last_result = result
             self._active_component = None
+        self._invalidate_states()
 
     def _run_bringup(self) -> None:
         started_ns = time.time_ns()
@@ -4112,6 +4286,7 @@ class VisualComponentManager:
         with self._lock:
             self._last_result = result
             self._active_component = None
+        self._invalidate_states()
 
     def restart(self, component: str) -> dict[str, Any]:
         if component not in VISUAL_COMPONENTS or component == "ui":
@@ -4131,6 +4306,7 @@ class VisualComponentManager:
                 daemon=True,
             )
             self._thread.start()
+        self._invalidate_states()
         return {
             "started": True,
             "component": component,
@@ -4152,6 +4328,7 @@ class VisualComponentManager:
                 daemon=True,
             )
             self._thread.start()
+        self._invalidate_states()
         return {
             "started": True,
             "component": "bringup",
@@ -4333,6 +4510,7 @@ def _runtime_handler(
                 valid_fields = "mode" in document and set(document).issubset({
                     "mode", "target", "acquire_target", "auto_handoff",
                     "operator_present", "speed_percent", "place_back", "hold_seconds",
+                    "combo",
                 })
             elif action in (GRASP_ACTION, PICK_HOLD_ACTION):
                 valid_fields = "target" in document and set(document).issubset(
@@ -4352,7 +4530,7 @@ def _runtime_handler(
                 elif action in (GRASP_ACTION, PICK_HOLD_ACTION):
                     field_message = "grasp accepts a required target and an optional speed_percent"
                 elif action == APPROACH_START_ACTION:
-                    field_message = "approach requires mode and accepts target, acquire_target, auto_handoff, operator_present, speed_percent, place_back, and hold_seconds"
+                    field_message = "approach requires mode and accepts target, acquire_target, auto_handoff, operator_present, speed_percent, place_back, hold_seconds, and combo"
                 elif optional:
                     field_message = f"{action} accepts only an optional speed_percent"
                 else:
@@ -4380,6 +4558,17 @@ def _runtime_handler(
                 )
                 return None
             if action == APPROACH_START_ACTION:
+                if "combo" in document and (
+                    not isinstance(document["combo"], str)
+                    or document["combo"] not in APPROACH_TASK_COMBOS
+                ):
+                    self._interactive_error(
+                        "INVALID_COMBO",
+                        "combo must name a supported task combination: "
+                        + ", ".join(sorted(APPROACH_TASK_COMBOS)),
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return None
                 for field in ("acquire_target", "auto_handoff", "operator_present", "place_back"):
                     if field in document and not isinstance(document[field], bool):
                         self._interactive_error(
@@ -4457,7 +4646,11 @@ def _runtime_handler(
             if not self._interactive_host_valid(include_body=include_body):
                 return True
             if is_status:
-                self._json(component_manager.status(), include_body=include_body)
+                self._json(
+                    component_manager.status(),
+                    include_body=include_body,
+                    etag_tag="components",
+                )
                 return True
             component = route.path.removeprefix(COMPONENT_LOG_ROUTE_PREFIX)
             if component not in LOG_COMPONENTS or "/" in component:
@@ -4502,7 +4695,11 @@ def _runtime_handler(
                 return True
             try:
                 if route.path == INTERACTIVE_STATUS_ROUTE:
-                    self._json(session_service.status(), include_body=include_body)
+                    self._json(
+                        session_service.status(),
+                        include_body=include_body,
+                        etag_tag="sessions",
+                    )
                     return True
                 if route.path in INTERACTIVE_PERCEPTION_ARTIFACTS:
                     payload = session_artifacts.perception_png(
@@ -4594,7 +4791,7 @@ def _runtime_handler(
                 return True
             if not self._interactive_host_valid(include_body=include_body):
                 return True
-            self._json(home_runner.status(), include_body=include_body)
+            self._json(home_runner.status(), include_body=include_body, etag_tag="home")
             return True
 
         def _approach_get_route(self, *, include_body: bool) -> bool:
@@ -4613,7 +4810,7 @@ def _runtime_handler(
                 return True
             if not self._interactive_host_valid(include_body=include_body):
                 return True
-            self._json(approach_runner.status(), include_body=include_body)
+            self._json(approach_runner.status(), include_body=include_body, etag_tag="approach")
             return True
 
         def _approach_post_route(self) -> bool:
@@ -4680,6 +4877,12 @@ def _runtime_handler(
                     status=HTTPStatus.CONFLICT,
                 )
                 return True
+            # place_back defaults TRUE (the operator's pick -> hold ->
+            # place-back demo cycle); only an explicit False opts out to the
+            # plain grasp-and-home behaviour.  An optional combo slug names one
+            # of those already-validated option sets and never overrides an
+            # explicit field.
+            place_back, hold_seconds, combo = resolve_approach_combo(document)
             result = approach_runner.start(
                 str(document["mode"]),
                 target=document.get("target"),
@@ -4687,11 +4890,9 @@ def _runtime_handler(
                 auto_handoff=document.get("auto_handoff") is True,
                 operator_present=document.get("operator_present") is True,
                 speed_percent=int(document.get("speed_percent", 5)),
-                # place_back defaults TRUE (the operator's pick -> hold ->
-                # place-back demo cycle); only an explicit False opts out to the
-                # plain grasp-and-home behaviour.
-                place_back=document.get("place_back", True) is not False,
-                hold_seconds=document.get("hold_seconds", MOBILE_HANDOFF_HOLD_SECONDS),
+                place_back=place_back,
+                hold_seconds=hold_seconds,
+                combo=combo,
             )
             self._json(
                 result,
@@ -4716,7 +4917,7 @@ def _runtime_handler(
                 return True
             if not self._interactive_host_valid(include_body=include_body):
                 return True
-            self._json(grasp_runner.status(), include_body=include_body)
+            self._json(grasp_runner.status(), include_body=include_body, etag_tag="grasp")
             return True
 
         def _home_post_route(self) -> bool:
@@ -5326,6 +5527,7 @@ def _runtime_handler(
             source: str | None = None,
             count: int | None = None,
             poll_interval_ms: int = CLOUD_POLL_INTERVAL_MS,
+            content_encoding: str | None = None,
         ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -5333,6 +5535,9 @@ def _runtime_handler(
             self.send_header("Cache-Control", "no-store")
             if etag is not None:
                 self.send_header("ETag", etag)
+            if content_encoding is not None:
+                self.send_header("Content-Encoding", content_encoding)
+            self.send_header("Vary", "Accept-Encoding")
             self.send_header("X-Z-Manip-Cloud-State", cloud_state)
             if source is not None:
                 self.send_header("X-Z-Manip-Cloud-Source", source)
@@ -5378,18 +5583,29 @@ def _runtime_handler(
                         count=count,
                     )
                     return True
+                # The ETag stays the digest of the RAW ZMPC bytes in both
+                # encodings, so conditional-GET semantics are identical whether
+                # or not the client negotiated gzip.
+                body = payload
+                encoding: str | None = None
+                if go2w_debug_ui.accepts_gzip(self.headers.get("Accept-Encoding")):
+                    deflated = cloud_reader.compressed(etag)
+                    if deflated is not None:
+                        body = deflated
+                        encoding = "gzip"
                 self._cloud_headers(
                     HTTPStatus.OK,
                     content_type="application/octet-stream",
-                    length=len(payload),
+                    length=len(body),
                     cloud_state="live",
                     age_s=age_s,
                     etag=etag,
                     source=source,
                     count=count,
+                    content_encoding=encoding,
                 )
                 if include_body:
-                    self.wfile.write(payload)
+                    self.wfile.write(body)
                 return True
             error_payload = (json.dumps({"error": message}, separators=(",", ":")) + "\n").encode("utf-8")
             http_status = {
@@ -5526,6 +5742,46 @@ def _runtime_handler(
                 self.wfile.write(error_payload)
             return True
 
+        def _runtime_headers(
+            self,
+            status: HTTPStatus,
+            *,
+            length: int,
+            etag: str,
+            document: dict[str, Any],
+            content_type: str | None = None,
+            content_encoding: str | None = None,
+        ) -> None:
+            self.send_response(status)
+            if content_type is not None:
+                self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("ETag", etag)
+            if content_encoding is not None:
+                self.send_header("Content-Encoding", content_encoding)
+            self.send_header("Vary", "Accept-Encoding")
+            # Freshness rides on EVERY response, including the bodyless 304, so
+            # a conditional client can keep its staleness badge and producer-rate
+            # readout truthful without the payload.
+            self.send_header("X-Z-Manip-Runtime-State", str(document.get("status", "offline")))
+            age_s = document.get("age_s")
+            if isinstance(age_s, (int, float)) and math.isfinite(float(age_s)):
+                self.send_header(
+                    "X-Z-Manip-Runtime-Age-Ms",
+                    str(max(0, round(float(age_s) * 1000))),
+                )
+            sequence = document.get("sequence")
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                self.send_header("X-Z-Manip-Runtime-Sequence", str(sequence))
+            self.send_header("X-Z-Manip-Poll-Interval-Ms", "200")
+            self.send_header("Content-Security-Policy", go2w_debug_ui.SECURITY_POLICY)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.end_headers()
+
         def _runtime_route(self, *, include_body: bool) -> bool:
             route = urlsplit(self.path)
             if route.path != "/api/runtime":
@@ -5538,34 +5794,35 @@ def _runtime_handler(
                 )
                 return True
             document, etag = reader.snapshot()
+            if self.headers.get(RUNTIME_ETAG_MODE_HEADER) == RUNTIME_GEOMETRY_ETAG_MODE:
+                etag = runtime_geometry_etag(document)
             if self.headers.get("If-None-Match") == etag:
-                self.send_response(HTTPStatus.NOT_MODIFIED)
-                self.send_header("Content-Length", "0")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("ETag", etag)
-                self.send_header("X-Z-Manip-Poll-Interval-Ms", "200")
-                self.send_header("Content-Security-Policy", go2w_debug_ui.SECURITY_POLICY)
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("X-Frame-Options", "DENY")
-                self.send_header("Referrer-Policy", "no-referrer")
-                self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-                self.end_headers()
+                self._runtime_headers(
+                    HTTPStatus.NOT_MODIFIED,
+                    length=0,
+                    etag=etag,
+                    document=document,
+                )
                 return True
             payload = (json.dumps(document, separators=(",", ":")) + "\n").encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("ETag", etag)
-            self.send_header("X-Z-Manip-Poll-Interval-Ms", "200")
-            self.send_header("Content-Security-Policy", go2w_debug_ui.SECURITY_POLICY)
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-            self.end_headers()
+            body = payload
+            encoding: str | None = None
+            if (
+                go2w_debug_ui.GZIP_MIN_BYTES <= len(payload) <= go2w_debug_ui.GZIP_MAX_BYTES
+                and go2w_debug_ui.accepts_gzip(self.headers.get("Accept-Encoding"))
+            ):
+                body = gzip.compress(payload, go2w_debug_ui.GZIP_LEVEL, mtime=0)
+                encoding = "gzip"
+            self._runtime_headers(
+                HTTPStatus.OK,
+                length=len(body),
+                etag=etag,
+                document=document,
+                content_type="application/json; charset=utf-8",
+                content_encoding=encoding,
+            )
             if include_body:
-                self.wfile.write(payload)
+                self.wfile.write(body)
             return True
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract

@@ -9,6 +9,8 @@ network listener is an HTTP server fixed to the IPv4 loopback address.
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -22,6 +24,17 @@ SCHEMA = "z_manip.debug_bundle.v1"
 LOOPBACK = "127.0.0.1"
 MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+# Level 1, not the gzip default: the dashboard payloads were measured at 2.7 ms
+# per cloud frame at level 1 against 4.3 ms at level 6 for 1.5% more ratio, and
+# this compression runs inline on the polling request thread.
+GZIP_LEVEL = 1
+GZIP_MIN_BYTES = 1024
+GZIP_MAX_BYTES = 4 * 1024 * 1024
+GZIP_CONTENT_TYPES = frozenset({
+    "application/json",
+    "text/html",
+    "text/javascript",
+})
 SECURITY_POLICY = (
     "default-src 'self'; img-src 'self' data:; "
     "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
@@ -34,6 +47,41 @@ CONTROL_ACTION_VALUE = "planning-only"
 
 class BundleError(ValueError):
     """A bundle cannot be safely interpreted by this dashboard."""
+
+
+def accepts_gzip(header: str | None) -> bool:
+    """True only when the client explicitly offers gzip at a non-zero quality."""
+
+    if not header:
+        return False
+    for element in header.split(","):
+        fields = element.split(";")
+        if fields[0].strip().lower() not in {"gzip", "x-gzip", "*"}:
+            continue
+        quality = 1.0
+        for parameter in fields[1:]:
+            name, _, value = parameter.partition("=")
+            if name.strip().lower() != "q":
+                continue
+            try:
+                quality = float(value.strip())
+            except ValueError:
+                quality = 0.0
+        if quality > 0.0:
+            return True
+    return False
+
+
+def compressible(content_type: str) -> bool:
+    """True for the text-shaped media types this dashboard is allowed to gzip."""
+
+    return content_type.split(";", 1)[0].strip().lower() in GZIP_CONTENT_TYPES
+
+
+def body_etag(tag: str, payload: bytes) -> str:
+    """Strong validator over the exact uncompressed bytes of one response."""
+
+    return '"' + tag + "-" + hashlib.sha256(payload).hexdigest()[:24] + '"'
 
 
 def load_bundle(path: Path) -> dict[str, Any]:
@@ -109,11 +157,26 @@ def make_handler(
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "ZManipArtifactDashboard/1"
 
-        def _headers(self, status: HTTPStatus, content_type: str, length: int) -> None:
+        def _headers(
+            self,
+            status: HTTPStatus,
+            content_type: str,
+            length: int,
+            *,
+            etag: str | None = None,
+            content_encoding: str | None = None,
+            vary_encoding: bool = False,
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(length))
             self.send_header("Cache-Control", "no-store")
+            if etag is not None:
+                self.send_header("ETag", etag)
+            if content_encoding is not None:
+                self.send_header("Content-Encoding", content_encoding)
+            if vary_encoding:
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Security-Policy", SECURITY_POLICY)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
@@ -128,10 +191,45 @@ def make_handler(
             *,
             status: HTTPStatus = HTTPStatus.OK,
             include_body: bool,
+            etag: str | None = None,
         ) -> None:
-            self._headers(status, content_type, len(payload))
+            negotiable = compressible(content_type)
+            # The validator is always computed over the UNCOMPRESSED bytes, so a
+            # client that negotiates gzip and one that does not share the same
+            # 304 semantics.
+            if (
+                etag is not None
+                and status == HTTPStatus.OK
+                and self.headers.get("If-None-Match") == etag
+            ):
+                self._headers(
+                    HTTPStatus.NOT_MODIFIED,
+                    content_type,
+                    0,
+                    etag=etag,
+                    vary_encoding=negotiable,
+                )
+                return
+            body = payload
+            encoding: str | None = None
+            if (
+                status == HTTPStatus.OK
+                and negotiable
+                and GZIP_MIN_BYTES <= len(payload) <= GZIP_MAX_BYTES
+                and accepts_gzip(self.headers.get("Accept-Encoding"))
+            ):
+                body = gzip.compress(payload, GZIP_LEVEL, mtime=0)
+                encoding = "gzip"
+            self._headers(
+                status,
+                content_type,
+                len(body),
+                etag=etag,
+                content_encoding=encoding,
+                vary_encoding=negotiable,
+            )
             if include_body:
-                self.wfile.write(payload)
+                self.wfile.write(body)
 
         def _json(
             self,
@@ -139,6 +237,7 @@ def make_handler(
             *,
             status: HTTPStatus = HTTPStatus.OK,
             include_body: bool,
+            etag_tag: str | None = None,
         ) -> None:
             payload = (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
             self._bytes(
@@ -146,6 +245,11 @@ def make_handler(
                 "application/json; charset=utf-8",
                 status=status,
                 include_body=include_body,
+                etag=(
+                    None
+                    if etag_tag is None or status != HTTPStatus.OK
+                    else body_etag(etag_tag, payload)
+                ),
             )
 
         def _route(self, *, include_body: bool) -> None:
@@ -206,7 +310,34 @@ def make_handler(
                         include_body=include_body,
                     )
                     return
-                self._json(status, include_body=include_body)
+                self._json(status, include_body=include_body, etag_tag="control")
+                return
+            if route.path == "/api/control/log":
+                # /api/control carries only a tooltip-sized tail so the 1 Hz
+                # poll stays small; the untruncated tail lives here and is
+                # fetched on demand.
+                tail = getattr(control_backend, "log_tail", None)
+                if control_backend is None or tail is None:
+                    self._json(
+                        {"error": "planning-only control log is not enabled"},
+                        status=HTTPStatus.NOT_FOUND,
+                        include_body=include_body,
+                    )
+                    return
+                try:
+                    text = tail()
+                except Exception as error:  # pragma: no cover - defensive server boundary
+                    self._json(
+                        {"error": f"control log unavailable: {error}"},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        include_body=include_body,
+                    )
+                    return
+                self._json(
+                    {"schema": "z_manip.planning_control_log.v1", "ok": True, "text": text},
+                    include_body=include_body,
+                    etag_tag="control-log",
+                )
                 return
             if route.path == "/api/bundle":
                 try:
