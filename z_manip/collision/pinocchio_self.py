@@ -20,6 +20,22 @@ class PinocchioSelfCollisionChecker:
     usual SRDF "adjacent/never" policy and avoiding designed-in overlap around
     bearings, the wrist flange, and the parallel fingers.  Every remaining
     pair is checked with the actual collision meshes rather than arm capsules.
+
+    THIS CHECKER SEES THE ARM ONLY -- IT NEVER SEES THE GO2-W BODY OR HEAD.
+    ``buildReducedModel`` below locks every joint outside ``chain.joint_names``
+    (``piper_joint1..6``), so every link fixed to ``base`` -- ``Head_upper``,
+    ``Head_lower``, ``mid360_link``, ``mid360_bracket_link``, ``mount_plate``,
+    ``nuc_weight``, ``regulator`` and all 28 leg links -- ends up supported by
+    ``universe`` and is discarded by the frame/joint filter in ``__init__``.
+    On go2w_sensored.urdf that leaves 11 geometries, all of them arm links.
+
+    Editing <collision> geometry on any of those body links therefore CANNOT
+    affect planning.  Commit e4be019 ("enlarge envelope") did exactly that and
+    had zero runtime effect; a8ecd46 then shrank the only enforced
+    representation -- the ``mid360`` capsule in
+    ``configs/piper_collision_capsules.json`` -- and nobody noticed.  Change
+    body/head keep-outs THERE, not here.  ``tests/test_lidar_keepout.py`` pins
+    the capsule file to the URDF so the two cannot drift again.
     """
 
     def __init__(self, urdf_path: str | Path, chain: KinematicChain) -> None:
