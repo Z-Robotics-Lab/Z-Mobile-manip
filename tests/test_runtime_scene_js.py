@@ -1223,7 +1223,7 @@ def _task_combo_harness(assertions: str) -> str:
     assertions = assertions.replace("{{", "{").replace("}}", "}")
     return rf"""
 const nodes = {{
-  "task-combo": {{ value: "place_back", disabled: false }},
+  "task-combo": {{ value: "pick_place_back", disabled: false }},
   "task-combo-note": {{ textContent: "" }}
 }};
 const byId = id => nodes[id] || null;
@@ -1235,12 +1235,10 @@ const state = {{ approach: {{}} }};
 
 
 def test_task_combo_selector_maps_each_option_to_the_validated_approach_arguments():
-    # Operator feature: choose the task combination live.  The DEFAULT must send
-    # no override keys at all, so the request body stays exactly what the
-    # dashboard has always posted; every other combo must stay inside the
-    # arguments the approach API already validates (place_back boolean, 0..10 s
-    # hold), and NO combo may ever carry a speed field — #motion-speed is the
-    # single motion-speed authority.
+    # Operator feature: choose the task combination live.  Every combo must stay
+    # inside the arguments the approach API already validates (an accepted combo
+    # slug, a place_back boolean, and a 0..10 s hold), and NO combo may ever
+    # carry a speed field — #motion-speed is the single motion-speed authority.
     result = _node(_task_combo_harness(r"""
 const bodies = {{}};
 const notes = {{}};
@@ -1261,25 +1259,75 @@ console.log(JSON.stringify({{
 }}));
 """))
 
-    assert result["defaultKey"] == "place_back"
-    assert set(result["keys"]) == {"place_back", "pick_only", "place_back_hold"}
-    # The default combo posts the byte-identical body the dashboard sent before
-    # the selector existed: the server's own place_back / hold defaults apply.
-    assert result["bodies"]["place_back"] == {}
-    assert result["bodies"]["pick_only"] == {"place_back": False, "hold_seconds": 0}
-    assert result["bodies"]["place_back_hold"] == {"place_back": True, "hold_seconds": 10}
+    assert result["defaultKey"] == "pick_place_back"
+    assert set(result["keys"]) == {"pick_place_back", "pick_and_hold", "pick_hold_long"}
+    # Each combo names itself AND pins the two arguments it stands for.  The
+    # server lets an explicit place_back / hold_seconds win over the slug, so
+    # sending both means a retuned slug table can never silently change the
+    # cycle the operator just authorised in the confirmation dialog.
+    assert result["bodies"]["pick_place_back"] == {
+        "combo": "pick_place_back", "place_back": True, "hold_seconds": 2}
+    assert result["bodies"]["pick_and_hold"] == {
+        "combo": "pick_and_hold", "place_back": False, "hold_seconds": 0}
+    assert result["bodies"]["pick_hold_long"] == {
+        "combo": "pick_hold_long", "place_back": True, "hold_seconds": 10}
     # Server-side validation is 0 <= hold_seconds <= 10.0, so no combo can
     # produce a rejection the operator cannot interpret.
-    for body in result["bodies"].values():
-        assert set(body).issubset({"place_back", "hold_seconds"})
-        if "hold_seconds" in body:
-            assert 0 <= body["hold_seconds"] <= 10
-    assert result["fallbackKey"] == "place_back"
-    assert result["fallbackBody"] == {}
+    for key, body in result["bodies"].items():
+        assert set(body) == {"combo", "place_back", "hold_seconds"}
+        assert body["combo"] == key
+        assert 0 <= body["hold_seconds"] <= 10
+    # A tampered/stale option value must still post a slug the API accepts, never
+    # `combo: null` (which the API rejects with 400 INVALID_COMBO).
+    assert result["fallbackKey"] == "pick_place_back"
+    assert result["fallbackBody"]["combo"] == "pick_place_back"
     # The two cycles read differently, so the note can never describe the wrong one.
-    assert "place back" in result["notes"]["place_back"]
-    assert "no place-back leg" in result["notes"]["pick_only"]
-    assert "hold 10s" in result["notes"]["place_back_hold"]
+    assert "place back" in result["notes"]["pick_place_back"]
+    assert "no place-back leg" in result["notes"]["pick_and_hold"]
+    assert "hold 10s" in result["notes"]["pick_hold_long"]
+
+
+def test_task_combo_slugs_are_exactly_the_set_the_server_accepts():
+    # The dashboard posts `combo` straight through to POST /api/approach/start,
+    # which rejects anything outside APPROACH_TASK_COMBOS with 400 INVALID_COMBO.
+    # Reading the server's own table instead of restating it means a rename on
+    # either side fails HERE rather than at the operator's next live run.
+    import importlib.util
+    import re
+    import sys
+
+    script = ROOT / "scripts" / "runtime" / "go2w_planning_control.py"
+    sys.path.insert(0, str(script.parent))
+    spec = importlib.util.spec_from_file_location("go2w_planning_control_combos", script)
+    assert spec is not None and spec.loader is not None
+    control = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(control)
+    server = dict(control.APPROACH_TASK_COMBOS)
+
+    html = (ROOT / "web/debug_dashboard/index.html").read_text(encoding="utf-8")
+    markup = html[html.index('<select class="combo-select" id="task-combo"'):]
+    markup = markup[:markup.index("</select>")]
+    option_values = re.findall(r'<option value="([^"]+)"', markup)
+
+    result = _node(_task_combo_harness(r"""
+const table = {{}};
+for (const key of Object.keys(TASK_COMBOS)) {{
+  table[key] = {{ place_back: TASK_COMBOS[key].placeBack,
+                 hold_seconds: TASK_COMBOS[key].holdSeconds }};
+}}
+console.log(JSON.stringify({{ table, defaultKey: DEFAULT_TASK_COMBO }}));
+"""))
+
+    # Every slug the operator can select is one the server accepts, and the UI
+    # offers the full set — no unreachable server combo, no rejected UI option.
+    assert set(result["table"]) == set(server)
+    assert set(option_values) == set(server)
+    assert result["defaultKey"] in server
+    # ...and each slug means the same cycle on both sides, so the confirmation
+    # dialog describes what the server will actually execute.
+    for slug, expected in server.items():
+        assert result["table"][slug]["place_back"] is expected["place_back"]
+        assert result["table"][slug]["hold_seconds"] == expected["hold_seconds"]
 
 
 def test_task_combo_readout_follows_the_running_workflow_not_the_local_selection():
@@ -1287,7 +1335,8 @@ def test_task_combo_readout_follows_the_running_workflow_not_the_local_selection
     # server echoes place_back / hold_seconds in /api/approach/status.workflow,
     # and those numbers — not the local <select> — write the readout, so a pair
     # this UI cannot offer still reads truthfully instead of silently rendering
-    # as the default.
+    # as the default.  The readout is TEXT ONLY: see the regression tests below,
+    # the operator's <select> is never rewritten to match the server.
     result = _node(_task_combo_harness(r"""
 const observed = [];
 const sample = (approach, label) => {{
@@ -1300,27 +1349,111 @@ const sample = (approach, label) => {{
     disabled: nodes["task-combo"].disabled
   }});
 }};
-nodes["task-combo"].value = "place_back";
-sample({{ running: true, workflow: {{ active: true, place_back: false, hold_seconds: 0 }} }}, "running-pick-only");
-nodes["task-combo"].value = "place_back";
-sample({{ running: true, workflow: {{ active: true, place_back: true, hold_seconds: 5 }} }}, "running-unoffered");
+nodes["task-combo"].value = "pick_place_back";
+sample({{ running: true, workflow: {{ active: true, auto_handoff: true, place_back: false, hold_seconds: 0 }} }}, "running-pick-only");
+sample({{ running: true, workflow: {{ active: true, auto_handoff: true, place_back: true, hold_seconds: 5 }} }}, "running-unoffered");
 sample({{ running: false }}, "idle");
 console.log(JSON.stringify({{ observed }}));
 """))
 
     running_pick_only, running_unoffered, idle = result["observed"]
-    # The running workflow overrides a stale local selection, both in the
-    # readout and in the control itself.
-    assert running_pick_only["value"] == "pick_only"
+    # The running cycle is described from the server's numbers...
     assert "no place-back leg" in running_pick_only["note"]
     assert running_pick_only["disabled"] is True
+    # ...but the operator's own selection is left standing in the control.
+    assert running_pick_only["value"] == "pick_place_back"
     # A hold this UI does not offer is still described from the real numbers.
     assert "hold 5s" in running_unoffered["note"]
     assert "place back" in running_unoffered["note"]
     assert running_unoffered["disabled"] is True
+    assert running_unoffered["value"] == "pick_place_back"
     # Idle returns to describing what the operator has selected.
     assert idle["disabled"] is False
     assert idle["note"].startswith("Find + grasp runs:")
+    assert idle["value"] == "pick_place_back"
+
+
+def test_a_run_that_stops_at_the_handoff_is_never_read_out_as_a_running_cycle():
+    # REGRESSION (defect 1): "Approach only" posts auto_handoff false and NO
+    # place_back / hold_seconds, so DepthServoRunner.start applies its own
+    # defaults and the echoed workflow carries place_back=true, hold_seconds=2.0
+    # even though the run stops at the manipulation handoff and never grasps.
+    # The readout used to key off place_back / hold_seconds alone and announced
+    # "Running: pick, carry Home, hold 2s, place back ..." — the exact opposite
+    # of what the robot was doing.  Only an ACTIVE workflow with auto_handoff
+    # true is a task cycle.
+    result = _node(_task_combo_harness(r"""
+const observed = {{}};
+const sample = (approach, label) => {{
+  state.approach = approach;
+  renderTaskCombo();
+  observed[label] = nodes["task-combo-note"].textContent;
+}};
+// The operator selected "Pick only", so ANY place-back wording in the readout
+// below can only have come from the server's inert defaults.
+nodes["task-combo"].value = "pick_and_hold";
+// Exactly the body "Approach only" produces, expanded by the server defaults.
+sample({{ running: true, mode: "live", workflow: {{
+  active: true, auto_handoff: false, place_back: true, hold_seconds: 2.0 }} }}, "approach_only");
+// Shadow check also posts auto_handoff false.
+sample({{ running: true, mode: "shadow", workflow: {{
+  active: false, auto_handoff: false, place_back: true, hold_seconds: 2.0 }} }}, "shadow");
+// A FINISHED find+grasp keeps its fields server-side with active flipped false;
+// it must not describe the approach-only run that starts next.
+sample({{ running: true, mode: "live", workflow: {{
+  active: false, auto_handoff: true, place_back: true, hold_seconds: 2.0 }} }}, "retained_finished");
+// The positive case still works: an active auto_handoff run IS a cycle.
+sample({{ running: true, mode: "live", workflow: {{
+  active: true, auto_handoff: true, place_back: true, hold_seconds: 2.0 }} }}, "real_cycle");
+console.log(JSON.stringify({{ observed }}));
+"""))
+
+    for label in ("approach_only", "shadow", "retained_finished"):
+        note = result["observed"][label]
+        assert not note.startswith("Running:"), (label, note)
+        assert "place back at the original grasp pose" not in note, (label, note)
+        assert "hold 2s" not in note, (label, note)
+    # The genuine cycle is still announced, so the gate did not simply mute it.
+    assert result["observed"]["real_cycle"].startswith("Running:")
+    assert "place back at the original grasp pose" in result["observed"]["real_cycle"]
+
+
+def test_operator_task_selection_survives_an_approach_only_run():
+    # REGRESSION (defect 2): renderTaskCombo used to reverse-match the running
+    # workflow onto an option and ASSIGN select.value.  Because the match ran
+    # against the SERVER'S DEFAULTS rather than anything the operator chose,
+    # pressing "Approach only" rewrote a "Pick only" selection to the place-back
+    # cycle, and nothing ever restored it — the next "Find -> approach -> grasp"
+    # then ran a place-back leg the operator never asked for.  The selection is
+    # the operator's input: no render may overwrite it, at any point in the run.
+    result = _node(_task_combo_harness(r"""
+const seen = [];
+const sample = (approach, label) => {{
+  state.approach = approach;
+  renderTaskCombo();
+  seen.push({{ label, value: nodes["task-combo"].value }});
+}};
+// The operator selects "Pick only" and presses "Approach only".
+nodes["task-combo"].value = "pick_and_hold";
+sample({{ running: false }}, "before");
+sample({{ running: true, mode: "live", phase: "starting", workflow: {{
+  active: true, auto_handoff: false, place_back: true, hold_seconds: 2.0 }} }}, "starting");
+sample({{ running: true, mode: "live", phase: "approach", workflow: {{
+  active: true, auto_handoff: false, place_back: true, hold_seconds: 2.0 }} }}, "running");
+// Run ends; the server keeps the workflow fields with active flipped false.
+sample({{ running: false, phase: "reached", workflow: {{
+  active: false, auto_handoff: false, place_back: true, hold_seconds: 2.0 }} }}, "after");
+const body = Object.assign({{}}, selectedTaskCombo().options);
+console.log(JSON.stringify({{ seen, key: selectedTaskCombo().key, body }}));
+"""))
+
+    # The selection the operator set is still there at every single step.
+    assert [step["value"] for step in result["seen"]] == ["pick_and_hold"] * 4
+    # ...so the NEXT find+grasp posts the cycle he actually chose, and the
+    # confirmation dialog that authorises it names that same cycle.
+    assert result["key"] == "pick_and_hold"
+    assert result["body"] == {
+        "combo": "pick_and_hold", "place_back": False, "hold_seconds": 0}
 
 
 def test_dashboard_names_the_selected_task_cycle_before_starting_it():
@@ -1336,6 +1469,21 @@ def test_dashboard_names_the_selected_task_cycle_before_starting_it():
     # introduce a second speed authority.
     combo_source = html[html.index("const TASK_COMBOS"):html.index("function renderHomeStatus(")]
     assert "speed" not in combo_source.lower()
+    # Nothing in the combo path may write back to the control the operator set.
+    assert "select.value =" not in combo_source
+
+
+def test_approach_only_omits_the_combo_key_because_a_null_combo_is_rejected():
+    # The server guard is `if "combo" in document and (not isinstance(...) or ...)`,
+    # so `{"combo": null}` is a 400 INVALID_COMBO.  "Approach only" runs no task
+    # cycle, so it must OMIT the key entirely rather than send null.
+    html = (ROOT / "web/debug_dashboard/index.html").read_text(encoding="utf-8")
+    body = html[html.index("async function startApproachOnly()"):]
+    body = body[:body.index("function renderGraspStatus(")]
+    assert "combo" not in body
+    assert "auto_handoff: false" in body
+    # Shadow check posts no options at all, so it cannot carry a combo either.
+    assert 'byId("approach-shadow").addEventListener("click", () => startApproach("shadow"));' in html
 
 
 def test_javascript_syntax_is_valid():
