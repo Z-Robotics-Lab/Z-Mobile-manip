@@ -1891,7 +1891,7 @@ class DepthServoRunner:
 
         last_reacquisition_s = 0.0
         servo_started_s = time.monotonic()
-        while not cancel.wait(0.20):
+        while not cancel.wait(0.05):
             with self._lock:
                 process = self._process
                 active = self._workflow.get("active") is True
@@ -2858,7 +2858,7 @@ class PiperGraspRunner:
             raise RuntimeError(f"full grasp stopped safely; inspect {wrapper_log}")
         return start_receipt
 
-    def _run_workflow_leg(
+    def _stage_workflow_leg(
         self,
         *,
         workflow_phase: str,
@@ -2869,24 +2869,14 @@ class PiperGraspRunner:
         planning_session_id: str,
         prior_receipt_dir: Path | None,
     ) -> dict[str, Any]:
-        """Run one held-object workflow leg on the NUC and validate its evidence.
+        """Prepare one leg's wrapper invocation and its identity expectations.
 
-        Drives the immutable receipt-bound full-grasp wrapper with an explicit
-        ``--workflow-phase`` (and ``--prior-receipt-dir`` for the holding
-        continuations) -- exactly the CLI the stationary Pick & Hold ->
-        Return-Home-Holding -> Place-Back buttons already use.  It validates the
-        transport-open evidence (identity-bound to this plan) and the phase's
-        ``workflow-state.json`` completion receipt, and preserves a per-leg
-        wrapper log next to the receipt directory for operator forensics.  On a
-        stop after the object is held it raises a legible held-object error
-        instead of advancing; the caller keeps the held-object workflow state so
-        the existing recovery buttons can finish or unwind the leg.
+        Host-side and motionless: no transport is opened, no NUC process is
+        spawned and no command reaches the arm, so this may run while the arm
+        is holding an object.  :meth:`_run_workflow_leg` consumes the result.
         """
 
         planning_session_id = validate_session_id(planning_session_id)
-        expected_report_sha256 = hashlib.sha256(report.read_bytes()).hexdigest()
-        expected_archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
-        expected_artifact_id = self._artifact_id(report, archive)
         arguments = [
             str(self.script),
             "--planning-report", str(report),
@@ -2905,9 +2895,66 @@ class PiperGraspRunner:
         receipt_dir.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as log:
             log.write(f"Mobile {workflow_phase} leg wrapper output: {wrapper_log}\n")
+        return {
+            "workflow_phase": workflow_phase,
+            "receipt_dir": receipt_dir,
+            "arguments": arguments,
+            "wrapper_log": wrapper_log,
+            "planning_session_id": planning_session_id,
+            "expected_artifact_id": self._artifact_id(report, archive),
+            "expected_report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+            "expected_archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        }
+
+    def _run_workflow_leg(
+        self,
+        *,
+        workflow_phase: str,
+        report: Path,
+        archive: Path,
+        receipt_dir: Path,
+        speed_percent: int,
+        planning_session_id: str,
+        prior_receipt_dir: Path | None,
+        staged: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run one held-object workflow leg on the NUC and validate its evidence.
+
+        Drives the immutable receipt-bound full-grasp wrapper with an explicit
+        ``--workflow-phase`` (and ``--prior-receipt-dir`` for the holding
+        continuations) -- exactly the CLI the stationary Pick & Hold ->
+        Return-Home-Holding -> Place-Back buttons already use.  It validates the
+        transport-open evidence (identity-bound to this plan) and the phase's
+        ``workflow-state.json`` completion receipt, and preserves a per-leg
+        wrapper log next to the receipt directory for operator forensics.  On a
+        stop after the object is held it raises a legible held-object error
+        instead of advancing; the caller keeps the held-object workflow state so
+        the existing recovery buttons can finish or unwind the leg.  ``staged``
+        accepts a :meth:`_stage_workflow_leg` result prepared earlier; the leg
+        it describes is bound to this call's phase and receipt directory.
+        """
+
+        if staged is None:
+            staged = self._stage_workflow_leg(
+                workflow_phase=workflow_phase,
+                report=report,
+                archive=archive,
+                receipt_dir=receipt_dir,
+                speed_percent=speed_percent,
+                planning_session_id=planning_session_id,
+                prior_receipt_dir=prior_receipt_dir,
+            )
+        elif (
+            staged.get("workflow_phase") != workflow_phase
+            or staged.get("receipt_dir") != receipt_dir
+        ):
+            raise RuntimeError(
+                f"mobile {workflow_phase} leg was handed staging for a different leg",
+            )
+        wrapper_log = staged["wrapper_log"]
         with wrapper_log.open("w", encoding="utf-8") as log:
             completed = subprocess.run(
-                arguments,
+                staged["arguments"],
                 cwd=self.script.parents[2],
                 stdin=subprocess.DEVNULL,
                 stdout=log,
@@ -2926,10 +2973,10 @@ class PiperGraspRunner:
             )
         start_receipt = self._validate_executor_start_receipt(
             start_receipt_path,
-            expected_artifact_id=expected_artifact_id,
-            expected_planning_report_sha256=expected_report_sha256,
-            expected_planned_grasp_sha256=expected_archive_sha256,
-            expected_planning_session_id=planning_session_id,
+            expected_artifact_id=staged["expected_artifact_id"],
+            expected_planning_report_sha256=staged["expected_report_sha256"],
+            expected_planned_grasp_sha256=staged["expected_archive_sha256"],
+            expected_planning_session_id=staged["planning_session_id"],
         )
         if completed.returncode != 0 or not (receipt_dir / "workflow-state.json").is_file():
             # After the close (pick-hold past approach) and for every holding
@@ -2986,19 +3033,42 @@ class PiperGraspRunner:
         hold_seconds: float,
         lifecycle: dict[str, Any],
         timings: dict[str, float],
-    ) -> None:
+        stage: Callable[[], Any] | None = None,
+    ) -> Any:
         """Dwell at Home while holding the object, then record the hold receipt.
 
         A pure orchestrator wait: the arm holds its last commanded joints and
         gripper force (the same held state the stationary Return-Home-Holding ->
         Place-Back gap relies on) so no executor invocation is needed here.
+
+        ``stage`` is host-side motionless preparation for the next leg.  It runs
+        on a worker thread for the dwell's own duration and only the remainder
+        of ``hold_seconds`` is slept, but the dwell still expires on
+        ``hold_seconds`` of wall clock and the worker is joined before returning,
+        so the operator's requested hold is never shortened and a staging failure
+        cannot be lost with the thread.
         """
         hold_seconds = max(0.0, min(float(hold_seconds), MOBILE_HANDOFF_MAX_HOLD_SECONDS))
         hold_started_unix_ns = time.time_ns()
         hold_started = time.monotonic()
         lifecycle["hold_started_unix_ns"] = hold_started_unix_ns
-        if hold_seconds > 0.0:
-            time.sleep(hold_seconds)
+        staging: dict[str, Any] = {}
+
+        def run_stage() -> None:
+            try:
+                staging["value"] = stage()
+            except BaseException as error:  # noqa: BLE001 - the dwell re-raises it
+                staging["error"] = error
+
+        worker = None
+        if stage is not None:
+            worker = threading.Thread(target=run_stage, name="handoff-hold-staging", daemon=True)
+            worker.start()
+        remaining = hold_seconds - (time.monotonic() - hold_started)
+        if remaining > 0.0:
+            time.sleep(remaining)
+        if worker is not None:
+            worker.join()
         actual_hold_s = round(time.monotonic() - hold_started, 6)
         hold_finished_unix_ns = time.time_ns()
         lifecycle["hold_finished_unix_ns"] = hold_finished_unix_ns
@@ -3011,6 +3081,14 @@ class PiperGraspRunner:
             hold_started_unix_ns=hold_started_unix_ns,
             hold_finished_unix_ns=hold_finished_unix_ns,
         )
+        if "error" in staging:
+            raise RuntimeError(
+                "mobile place-back leg could not be staged during the Home hold: "
+                f"{staging['error']} -- the object is still HELD in the gripper; "
+                "recover with Place Back or Return Home Holding and do not start "
+                "a new grasp",
+            ) from staging["error"]
+        return staging.get("value")
 
     def _run_mobile_place_back_cycle(
         self,
@@ -3106,11 +3184,21 @@ class PiperGraspRunner:
                 "placing it back."
             ),
         )
-        self._hold_at_home(
+        place_back_dir = action_dir / "place-back"
+        staged_place_back = self._hold_at_home(
             action_dir=action_dir,
             hold_seconds=hold_seconds,
             lifecycle=lifecycle,
             timings=timings,
+            stage=lambda: self._stage_workflow_leg(
+                workflow_phase="place-back",
+                report=report,
+                archive=archive,
+                receipt_dir=place_back_dir,
+                speed_percent=speed_percent,
+                planning_session_id=planning_session_id,
+                prior_receipt_dir=return_home_dir,
+            ),
         )
 
         # -- Leg 4: place back (forward corridor -> release -> retreat Home) --
@@ -3123,7 +3211,6 @@ class PiperGraspRunner:
                 "its grasp pose, then retreating Home."
             ),
         )
-        place_back_dir = action_dir / "place-back"
         leg_started = time.monotonic()
         self._run_workflow_leg(
             workflow_phase="place-back",
@@ -3133,6 +3220,7 @@ class PiperGraspRunner:
             speed_percent=speed_percent,
             planning_session_id=planning_session_id,
             prior_receipt_dir=return_home_dir,
+            staged=staged_place_back,
         )
         timings["handoff_place_back"] = round(time.monotonic() - leg_started, 6)
         lifecycle["place_back_finished_unix_ns"] = time.time_ns()
