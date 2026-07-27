@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import math
 from pathlib import Path
+import re
 import sys
 
 import numpy as np
@@ -896,6 +898,35 @@ def test_launcher_uses_fixed_cyclonedds_runtime_for_pc_to_nuc_commands():
     assert "configs/piper_collision_capsules.json" in launcher
     assert ":/robot/piper_collision_capsules.json:ro" in launcher
     assert "--whole-body-collision-model /robot/piper_collision_capsules.json" in launcher
+
+
+def test_launcher_loss_stair_matches_python_defaults():
+    """The launcher pins every servo knob explicitly, so widening the loss
+    stair defaults in go2w_depth_servo.py is silently negated unless the
+    launcher moves with it (this drift shipped once: defaults widened to
+    0.80/2.75 while the launcher still passed 0.55/1.25).  Tie them together
+    and re-check the settings validator's ordering at the launcher's values."""
+
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    def _flag(name: str) -> float:
+        match = re.search(rf"--{name} (\S+)", launcher)
+        assert match is not None, f"launcher no longer passes --{name}"
+        return float(match.group(1))
+
+    hold = _flag("tracking-hold-s")
+    grace = _flag("tracking-loss-grace-s")
+    target_timeout = _flag("target-timeout-s")
+
+    defaults = {
+        field.name: field.default
+        for field in dataclasses.fields(SERVO.DepthServoSettings)
+    }
+    assert hold == defaults["tracking_hold_s"]
+    assert grace == defaults["tracking_loss_grace_s"]
+
+    assert 0.0 <= hold < grace
+    assert grace >= target_timeout
 
 
 def test_stale_capture_data_is_rejected_even_when_received_fresh():

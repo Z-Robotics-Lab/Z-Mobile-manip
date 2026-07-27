@@ -157,7 +157,7 @@ docker run --rm \
   --yaw-deadband-deg 10 \
   --max-yaw-step-rps 0.015 \
   --target-timeout-s 0.40 \
-  --tracking-hold-s 0.55 \
-  --tracking-loss-grace-s 1.25 \
+  --tracking-hold-s 0.80 \
+  --tracking-loss-grace-s 2.75 \
   --handoff-settle-s 0.30 \
   --rate-hz 20
