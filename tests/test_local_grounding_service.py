@@ -294,6 +294,98 @@ def test_box_support_relation_adds_small_variant():
 @pytest.mark.parametrize(
     ("instruction", "expected"),
     (
+        # The particle OPENS the phrase, so the support side of the split is
+        # empty and _zh_support_split returns None. The relation is still named
+        # and the small-variant alias -- with the 0.12 per-label area cap it
+        # arms -- has to survive, or the support outscores the target again.
+        ("上面的黑色盒子", ("black box", "small black box")),
+        ("顶部的盒子", ("box", "small box")),
+        ("上边的盒子", ("box", "small box")),
+        ("顶上的方块", ("block", "small block")),
+        ("里面的盒子", ("box", "small box")),
+        # 里 is a recognised particle, so an explicit container arms it too.
+        ("黑色箱子里的黑色盒子", ("black box", "small black box")),
+        ("盒子里的方块", ("block", "small block")),
+        # No support relation named at all: no alias, no area cap.
+        ("盒子", ("box",)),
+        ("黑色盒子", ("black box",)),
+        ("黑色相机盒子", ("black box",)),
+        ("黑色箱子", ("black box",)),
+    ),
+)
+def test_support_relation_arms_the_small_alias_even_with_an_elided_support(
+    instruction, expected
+):
+    assert SERVICE.grounding_prompts(instruction) == expected
+
+
+class _NamedFakeResult:
+    def __init__(self, xyxy, conf, cls, names):
+        self.boxes = _RoiFakeBoxes(xyxy, conf, cls)
+        self.names = names
+
+
+class _SupportAndTargetModel:
+    """A large storage box with the small black box the operator wants on it.
+
+    YOLOE labels both instances with the small-variant class, so only the
+    per-label area cap that the alias arms can tell support from target.
+    """
+
+    def __init__(self):
+        self.model = self
+        self.classes = []
+
+    def get_text_pe(self, classes, *, cache_clip_model=False):
+        return ("embedding", *classes)
+
+    def set_classes(self, classes, embeddings=None):
+        self.classes.append(tuple(classes))
+
+    def predict(self, **kwargs):
+        return [
+            _NamedFakeResult(
+                [[80, 144, 560, 336], [300, 200, 378, 278]],
+                [0.80, 0.55],
+                [0, 0],
+                {0: "small black box"},
+            )
+        ]
+
+
+def test_support_initial_phrase_still_rejects_the_support_end_to_end():
+    runtime = SERVICE.GroundingRuntime(
+        model_id="fake.pt",
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+    )
+    runtime._model = _SupportAndTargetModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (640, 480), color=(90, 90, 90))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+
+    response = runtime.ground(encoded.getvalue(), "上面的黑色盒子")
+
+    assert runtime._model.classes == [("black box", "small black box")]
+    # 0.30 area ratio at 0.80 confidence is the storage box; without the alias
+    # there is no per-label cap and it wins the argmax outright.
+    assert response["target"]["confidence"] == pytest.approx(0.55)
+    assert response["target"]["area_ratio"] == pytest.approx(
+        (378 - 300) * (278 - 200) / (640 * 480)
+    )
+    assert response["target"]["label"] == "black box"
+
+
+def test_sentence_separators_carry_no_dead_newline():
+    # _parse_instruction collapses every run of whitespace before
+    # _before_separator runs, so a "\n" entry could never have matched.
+    assert "\n" not in SERVICE._SENTENCE_SEPARATORS
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    (
         ("远处箱子上白色充电器", True),
         ("远处小白色方块", True),
         ("small charger", True),
@@ -401,3 +493,389 @@ def test_roi_zoom_skipped_without_qualifier():
     with pytest.raises(LookupError):
         runtime.ground(encoded.getvalue(), "充电器")
     assert runtime._model.predict_sizes == [(640, 480)]
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    (
+        # The support noun precedes the target noun in _ZH_NOUNS, so tuple order
+        # alone grounded the thing the target rests on.
+        ("箱子上的瓶子", ("bottle",)),
+        ("盒子里的杯子", ("cup",)),
+        ("黑色箱子上的彩色瓶子", ("bottle",)),
+        ("黑色箱子上斜着的彩色瓶子", ("bottle",)),
+        ("黑色台子上的瓶子", ("bottle",)),
+        ("机器狗身上的小充电器", ("charger", "wall charger", "usb charger",
+                                  "power adapter", "electrical plug")),
+        # English names the target before the preposition, not after it.
+        ("the colourful bottle on the black box", ("colourful bottle",)),
+        ("small white charger on the black box in the middile", ("small white charger",)),
+        ("white charger on the shelf", ("white charger",)),
+        ("the  tissue box  on  black box", ("tissue box",)),
+    ),
+)
+def test_support_relation_grounds_the_target_not_the_support(instruction, expected):
+    assert SERVICE.grounding_prompts(instruction) == expected
+
+
+def test_support_colour_does_not_leak_onto_the_target():
+    # 黑色 describes the stand; the bottle has no stated colour.
+    assert SERVICE.grounding_prompts("黑色台子上的瓶子") == ("bottle",)
+    assert SERVICE.grounding_prompts("黑色箱子上的黑色盒子") == ("black box", "small black box")
+
+
+def test_trailing_clause_after_a_separator_never_supplies_the_noun():
+    assert SERVICE.grounding_prompts("黑色箱子上的瓶子，不要黑色盒子") == ("bottle",)
+    assert SERVICE.grounding_prompts(
+        "the colourful bottle on the black box， you need to search for it"
+    ) == ("colourful bottle",)
+
+
+def test_english_colour_reaches_an_ascii_noun_lexicon_entry():
+    assert SERVICE.grounding_prompts("the black airpods on the black box") == (
+        "black wireless earbuds",
+    )
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    (
+        ("黑色箱子上右边的白色充电器", "right"),
+        ("黑色箱上面右边的小白色充电器", "right"),
+        ("黑色箱上面的右边白色充电器", "right"),
+        ("黑色箱子上左边的瓶子", "left"),
+        ("远处彩色瓶子", "far"),
+        ("中间的瓶子", "middle"),
+        ("the bottle on the left", "left"),
+        ("the charger in the middle", "middle"),
+        # A qualifier that describes the support must not move to the target.
+        ("远处箱子上白色充电器", None),
+        ("远处地上的白色充电器", None),
+        ("small white charger on the black box in the middile", None),
+        ("白色充电器", None),
+        ("the farm charger", None),
+    ),
+)
+def test_spatial_preference_extraction(instruction, expected):
+    assert SERVICE.spatial_preference(instruction) == expected
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    (
+        # Whole-word matching stops "farm", but it cannot stop a position word
+        # that is a genuine attributive part of the object's own name. Each of
+        # these carries no spatial intent whatsoever.
+        "the left handle",
+        "center punch",
+        "the near field probe",
+        "a distant object",
+        "grab the left handle",
+        "the far side bottle",
+        "pick up the centre punch",
+        "the right angle bracket",
+    ),
+)
+def test_attributive_position_word_in_a_name_emits_no_preference(instruction):
+    assert SERVICE.spatial_preference(instruction) is None
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    (
+        # ...while a position word that heads a trailing positional phrase, or
+        # a CJK locative in the target segment, still qualifies the target.
+        ("the bottle on the left", "left"),
+        ("the charger in the middle", "middle"),
+        ("the charger on the right side", "right"),
+        ("黑色箱子上右边的白色充电器", "right"),
+        ("黑色箱上面右边的小白色充电器", "right"),
+        ("黑色箱上面的右边白色充电器", "right"),
+        ("黑色箱子上左边的瓶子", "left"),
+        ("远处彩色瓶子", "far"),
+        ("中间的瓶子", "middle"),
+    ),
+)
+def test_real_qualifier_phrasings_still_produce_a_preference(instruction, expected):
+    assert SERVICE.spatial_preference(instruction) == expected
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    (
+        "the bottle to the right of the box",
+        "the charger on the left of the shelf",
+    ),
+)
+def test_position_word_before_a_second_noun_is_a_deliberate_miss(instruction):
+    # An English position word followed by ANOTHER object name is genuinely
+    # ambiguous -- "left handle" and "left of the shelf" are the same shape --
+    # and nothing in the 756-session recording disambiguates it: all 51
+    # qualifier-carrying sessions are Chinese. Withholding the preference is
+    # the safe side of that ambiguity, and it is recorded here rather than
+    # discovered later. Revisit with recorded English relational sessions.
+    assert SERVICE.spatial_preference(instruction) is None
+
+
+def test_left_and_right_no_longer_produce_identical_requests():
+    left = "黑色箱子上左边的白色充电器"
+    right = "黑色箱子上右边的白色充电器"
+    assert SERVICE.grounding_prompts(left) == SERVICE.grounding_prompts(right)
+    assert SERVICE.spatial_preference(left) == "left"
+    assert SERVICE.spatial_preference(right) == "right"
+
+
+_TWO_INSTANCE_BOXES = ((100, 200, 160, 260), (400, 200, 460, 260))
+
+
+@pytest.fixture
+def spatial_reorder_enabled(monkeypatch):
+    """Reach the geometric path that ships dark."""
+
+    monkeypatch.setattr(SERVICE, "SPATIAL_REORDER_ENABLED", True)
+
+
+def test_spatial_reorder_ships_disabled():
+    # The qualifier is parsed, carried in the response and available to a later
+    # tier; it does NOT move the grasp target until the reorder has been
+    # observed against real YOLOE score distributions on live frames.
+    assert SERVICE.SPATIAL_REORDER_ENABLED is False
+
+
+@pytest.mark.parametrize("preference", ("left", "right", "middle", "near", "far"))
+def test_qualifier_leaves_the_selection_on_confidence_argmax_by_default(preference):
+    selected = SERVICE.select_detection(
+        _TWO_INSTANCE_BOXES,
+        (0.52, 0.61),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference=preference,
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.61)
+
+
+def test_recorded_right_qualifier_keeps_the_confident_charger():
+    # 黑色箱子上右边的白色充电器, 13 recorded sessions. The 0.80 box is the real
+    # charger; the 0.49 box further right is a weak false positive. A 0.6 peer
+    # ratio is loose enough to admit it, so the reorder would hand the grasp to
+    # the wrong physical object.
+    selected = SERVICE.select_detection(
+        ((280, 200, 340, 270), (500, 210, 540, 250)),
+        (0.80, 0.49),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+        spatial_preference="right",
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.80)
+
+
+@pytest.mark.parametrize("preference", ("far", "near"))
+@pytest.mark.parametrize("reorder_enabled", (False, True))
+def test_near_and_far_never_rank_on_apparent_size(
+    monkeypatch, preference, reorder_enabled
+):
+    # 远处彩色瓶子, 10 recorded sessions. Ranking "far" onto the smallest area
+    # actively selects the tiny fragments YOLOE emits as noise, so the depth
+    # proxy is gone outright -- not merely gated behind the flag.
+    monkeypatch.setattr(SERVICE, "SPATIAL_REORDER_ENABLED", reorder_enabled)
+    selected = SERVICE.select_detection(
+        ((100, 200, 130, 230), (400, 180, 480, 260)),
+        (0.43, 0.70),
+        ("bottle", "bottle"),
+        width=640,
+        height=480,
+        minimum_confidence=0.35,
+        maximum_area_ratio=0.45,
+        spatial_preference=preference,
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.70)
+    assert selected["area_ratio"] == pytest.approx(80 * 80 / (640 * 480))
+
+
+@pytest.mark.parametrize(
+    ("preference", "expected_x1"),
+    (("left", 100 / 640), ("right", 400 / 640)),
+)
+def test_enabled_reorder_uses_the_qualifier_to_disambiguate(
+    spatial_reorder_enabled, preference, expected_x1
+):
+    selected = SERVICE.select_detection(
+        _TWO_INSTANCE_BOXES,
+        (0.52, 0.61),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference=preference,
+    )
+
+    assert selected is not None
+    assert selected["bbox_xyxy"][0] == pytest.approx(expected_x1)
+
+
+def test_select_detection_without_qualifier_is_unchanged():
+    selected = SERVICE.select_detection(
+        _TWO_INSTANCE_BOXES,
+        (0.52, 0.61),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.61)
+
+
+def test_enabled_reorder_does_not_promote_a_much_weaker_detection(
+    spatial_reorder_enabled,
+):
+    selected = SERVICE.select_detection(
+        _TWO_INSTANCE_BOXES,
+        (0.18, 0.90),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference="left",
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.90)
+
+
+def test_enabled_reorder_is_ignored_when_boxes_are_not_separated(
+    spatial_reorder_enabled,
+):
+    selected = SERVICE.select_detection(
+        ((300, 200, 360, 260), (310, 205, 370, 265)),
+        (0.52, 0.61),
+        ("white charger", "white charger"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference="left",
+    )
+
+    assert selected is not None
+    assert selected["confidence"] == pytest.approx(0.61)
+
+
+def test_enabled_middle_qualifier_picks_the_central_instance(spatial_reorder_enabled):
+    selected = SERVICE.select_detection(
+        ((60, 200, 120, 260), (300, 200, 360, 260), (520, 200, 580, 260)),
+        (0.61, 0.52, 0.58),
+        ("bottle", "bottle", "bottle"),
+        width=640,
+        height=480,
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+        spatial_preference="middle",
+    )
+
+    assert selected is not None
+    assert selected["bbox_xyxy"][0] == pytest.approx(300 / 640)
+
+
+def test_select_detection_rejects_an_unsupported_qualifier():
+    with pytest.raises(ValueError):
+        SERVICE.select_detection(
+            _TWO_INSTANCE_BOXES,
+            (0.52, 0.61),
+            ("white charger", "white charger"),
+            width=640,
+            height=480,
+            minimum_confidence=0.15,
+            maximum_area_ratio=0.45,
+            spatial_preference="behind",
+        )
+
+
+class _TwoInstanceModel:
+    """Both instances of the requested class are visible in one frame."""
+
+    def __init__(self):
+        self.model = self
+
+    def get_text_pe(self, classes, *, cache_clip_model=False):
+        return ("embedding", *classes)
+
+    def set_classes(self, classes, embeddings=None):
+        pass
+
+    def predict(self, **kwargs):
+        return [
+            _RoiFakeResult(
+                [[100, 200, 160, 260], [400, 200, 460, 260]],
+                [0.52, 0.61],
+                [0, 0],
+            )
+        ]
+
+
+def _ground_two_instances(instruction):
+    runtime = SERVICE.GroundingRuntime(
+        model_id="fake.pt",
+        minimum_confidence=0.15,
+        maximum_area_ratio=0.45,
+    )
+    runtime._model = _TwoInstanceModel()
+    runtime._device = "cuda:0"
+    image = Image.new("RGB", (640, 480), color=(90, 90, 90))
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+    return runtime.ground(encoded.getvalue(), instruction)
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected_preference"),
+    (
+        ("黑色箱子上左边的白色充电器", "left"),
+        ("黑色箱子上右边的白色充电器", "right"),
+        ("黑色箱子上的白色充电器", None),
+    ),
+)
+def test_ground_reports_the_qualifier_without_moving_the_target(
+    instruction, expected_preference
+):
+    response = _ground_two_instances(instruction)
+
+    assert response["prompt"] == "white charger"
+    assert response["spatial_preference"] == expected_preference
+    # Shipped default: the relation is carried in the response for a later
+    # tier, and the box handed to the grasp pipeline is still the argmax.
+    assert response["target"]["bbox_xyxy"][0] == pytest.approx(400 / 640)
+    assert response["target"]["confidence"] == pytest.approx(0.61)
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected_x1"),
+    (
+        ("黑色箱子上左边的白色充电器", 100 / 640),
+        ("黑色箱子上右边的白色充电器", 400 / 640),
+        ("黑色箱子上的白色充电器", 400 / 640),
+    ),
+)
+def test_ground_applies_the_qualifier_end_to_end_once_enabled(
+    spatial_reorder_enabled, instruction, expected_x1
+):
+    response = _ground_two_instances(instruction)
+
+    assert response["prompt"] == "white charger"
+    assert response["target"]["bbox_xyxy"][0] == pytest.approx(expected_x1)

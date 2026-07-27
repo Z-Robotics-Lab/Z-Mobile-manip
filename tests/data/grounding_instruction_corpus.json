@@ -1,0 +1,602 @@
+{
+  "schema": "z_manip.grounding_instruction_corpus.v1",
+  "source": "artifacts/go2w_real/interactive_sessions/perception/*/attempt.json",
+  "session_count": 756,
+  "instructions": [
+    {
+      "instruction": "充电器",
+      "sessions": 111,
+      "expected_prompt": "charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "白色充电器",
+      "sessions": 103,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "彩色瓶子",
+      "sessions": 79,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "地上彩色瓶子",
+      "sessions": 26,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "small white charger on the black box in the middile",
+      "sessions": 21,
+      "expected_prompt": "small white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱子上的白色充电器",
+      "sessions": 20,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色台子上的白色充电器",
+      "sessions": 17,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处箱子上白色充电器",
+      "sessions": 17,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "地上的彩色瓶子",
+      "sessions": 16,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "竖立的白色充电器",
+      "sessions": 13,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处黑色箱子上的白色充电器",
+      "sessions": 13,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱子上右边的白色充电器",
+      "sessions": 13,
+      "expected_prompt": "white charger",
+      "expected_spatial": "right"
+    },
+    {
+      "instruction": "黑色箱上面右边的小白色充电器",
+      "sessions": 12,
+      "expected_prompt": "white charger",
+      "expected_spatial": "right"
+    },
+    {
+      "instruction": "黑色箱子上的彩色瓶子",
+      "sessions": 11,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色盒子",
+      "sessions": 10,
+      "expected_prompt": "black box",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处彩色瓶子",
+      "sessions": 10,
+      "expected_prompt": "bottle",
+      "expected_spatial": "far"
+    },
+    {
+      "instruction": "红色可乐",
+      "sessions": 9,
+      "expected_prompt": "red soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "箱子上的白色充电器",
+      "sessions": 9,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处箱子上的白色充电器",
+      "sessions": 9,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "small white charger on the black box",
+      "sessions": 9,
+      "expected_prompt": "small white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the  white small charger on the black box",
+      "sessions": 9,
+      "expected_prompt": "white small charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色airpods",
+      "sessions": 8,
+      "expected_prompt": "black wireless earbuds",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱子上的黑色盒子",
+      "sessions": 8,
+      "expected_prompt": "black box",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱子上斜着的彩色瓶子",
+      "sessions": 8,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "红色瓶子",
+      "sessions": 7,
+      "expected_prompt": "red bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱子上的小白色充电器",
+      "sessions": 7,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the colourful bottle on the black box",
+      "sessions": 6,
+      "expected_prompt": "colourful bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "red bottle",
+      "sessions": 6,
+      "expected_prompt": "red bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "彩色饮料瓶子",
+      "sessions": 5,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处小白色方块",
+      "sessions": 5,
+      "expected_prompt": "white block",
+      "expected_spatial": "far"
+    },
+    {
+      "instruction": "黑色箱子上右边的白色小充电器",
+      "sessions": 5,
+      "expected_prompt": "white charger",
+      "expected_spatial": "right"
+    },
+    {
+      "instruction": "the small white charger on the black box",
+      "sessions": 5,
+      "expected_prompt": "small white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the  colorful bottle on the black box",
+      "sessions": 5,
+      "expected_prompt": "colorful bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色耳机",
+      "sessions": 4,
+      "expected_prompt": "black headphones",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "white charger",
+      "sessions": 4,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "白充电器",
+      "sessions": 4,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色设备顶部的小型白色充电器",
+      "sessions": 4,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "白色小充电器",
+      "sessions": 4,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "在地上的彩色瓶子",
+      "sessions": 4,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "可乐瓶",
+      "sessions": 4,
+      "expected_prompt": "soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "white charger on the shelf",
+      "sessions": 4,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱上面的右边白色充电器",
+      "sessions": 4,
+      "expected_prompt": "white charger",
+      "expected_spatial": "right"
+    },
+    {
+      "instruction": "斜着的彩色瓶子",
+      "sessions": 4,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the black  airpods on the black box",
+      "sessions": 4,
+      "expected_prompt": "black wireless earbuds",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the black airpods on the black box",
+      "sessions": 4,
+      "expected_prompt": "black wireless earbuds",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "拿起桌上的那个白色东西",
+      "sessions": 3,
+      "expected_prompt": null,
+      "expected_spatial": null
+    },
+    {
+      "instruction": "可乐",
+      "sessions": 3,
+      "expected_prompt": "soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "小电器",
+      "sessions": 3,
+      "expected_prompt": "small appliance",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "在地上的红色红色可乐瓶",
+      "sessions": 3,
+      "expected_prompt": "red soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "红色可乐瓶",
+      "sessions": 3,
+      "expected_prompt": "red soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "瓶子",
+      "sessions": 3,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色台子上的瓶子",
+      "sessions": 3,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处地上的白色充电器",
+      "sessions": 3,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处地上的可乐",
+      "sessions": 3,
+      "expected_prompt": "soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处地上的白色方块",
+      "sessions": 3,
+      "expected_prompt": "white block",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "地上的白色充电器",
+      "sessions": 3,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "架子上的白色物体",
+      "sessions": 3,
+      "expected_prompt": null,
+      "expected_spatial": null
+    },
+    {
+      "instruction": "small white chargar on the blackbox",
+      "sessions": 3,
+      "expected_prompt": "small white chargar",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the  colorful bottle",
+      "sessions": 3,
+      "expected_prompt": "colorful bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "red bottle held by a  man",
+      "sessions": 3,
+      "expected_prompt": "red bottle held by a man",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "白色电源适配器",
+      "sessions": 2,
+      "expected_prompt": "white power adapter",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "地上的瓶子",
+      "sessions": 2,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "远处黑色箱子上的黑色盒子",
+      "sessions": 2,
+      "expected_prompt": "black box",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "地上小白色充电器",
+      "sessions": 2,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "彩色可乐瓶",
+      "sessions": 2,
+      "expected_prompt": "soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱上面的彩色瓶子",
+      "sessions": 2,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "地上的黑色盒子",
+      "sessions": 2,
+      "expected_prompt": "black box",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱子上左边的瓶子",
+      "sessions": 2,
+      "expected_prompt": "bottle",
+      "expected_spatial": "left"
+    },
+    {
+      "instruction": "the colourful bottle on the black box， you need to search for it",
+      "sessions": 2,
+      "expected_prompt": "colourful bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the  colorful bottle on  black box",
+      "sessions": 2,
+      "expected_prompt": "colorful bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "colorful bottle",
+      "sessions": 2,
+      "expected_prompt": "colorful bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "glue gun bar on the black box",
+      "sessions": 2,
+      "expected_prompt": "glue gun bar",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色box",
+      "sessions": 1,
+      "expected_prompt": null,
+      "expected_spatial": null
+    },
+    {
+      "instruction": "电源适配器",
+      "sessions": 1,
+      "expected_prompt": "power adapter",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "白色适配器",
+      "sessions": 1,
+      "expected_prompt": "white adapter",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "white power adapter",
+      "sessions": 1,
+      "expected_prompt": "white power adapter",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "power adapter",
+      "sessions": 1,
+      "expected_prompt": "power adapter",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色相机盒子",
+      "sessions": 1,
+      "expected_prompt": "black box",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "白小电器",
+      "sessions": 1,
+      "expected_prompt": "white small appliance",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "白电器",
+      "sessions": 1,
+      "expected_prompt": "white small appliance",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色设备顶部的小型白色充电器，不包含下面的黑色设备",
+      "sessions": 1,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "在地上的红黄色可乐",
+      "sessions": 1,
+      "expected_prompt": "red soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "地上彩色的瓶子",
+      "sessions": 1,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "地上彩色可乐",
+      "sessions": 1,
+      "expected_prompt": "soda bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "前面地上小充电器",
+      "sessions": 1,
+      "expected_prompt": "charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色台子上小白色充电器",
+      "sessions": 1,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色台子上小白色方块",
+      "sessions": 1,
+      "expected_prompt": "white block",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "架子上的绿色物体",
+      "sessions": 1,
+      "expected_prompt": null,
+      "expected_spatial": null
+    },
+    {
+      "instruction": "绿色物体",
+      "sessions": 1,
+      "expected_prompt": null,
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱子",
+      "sessions": 1,
+      "expected_prompt": "black box",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "黑色箱子上白色充电器",
+      "sessions": 1,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "桌上的橙色瓶子",
+      "sessions": 1,
+      "expected_prompt": "bottle",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "桌子上的灰色机器狗",
+      "sessions": 1,
+      "expected_prompt": null,
+      "expected_spatial": null
+    },
+    {
+      "instruction": "机器狗",
+      "sessions": 1,
+      "expected_prompt": null,
+      "expected_spatial": null
+    },
+    {
+      "instruction": "机器狗身上的小充电器",
+      "sessions": 1,
+      "expected_prompt": "charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the black airpods  on the black box",
+      "sessions": 1,
+      "expected_prompt": "black wireless earbuds",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the  white charger  on the black box",
+      "sessions": 1,
+      "expected_prompt": "white charger",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "the  tissue box  on  black box",
+      "sessions": 1,
+      "expected_prompt": "tissue box",
+      "expected_spatial": null
+    },
+    {
+      "instruction": "glue gun bar",
+      "sessions": 1,
+      "expected_prompt": "glue gun bar",
+      "expected_spatial": null
+    }
+  ],
+  "note": "expected_prompt is the operator's intended target as a normalized English YOLOE class; the noun lexicon deliberately normalizes brand names (airpods -> wireless earbuds)."
+}

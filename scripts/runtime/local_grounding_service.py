@@ -21,7 +21,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 
 MODEL_ID = "yoloe-11s-seg.pt"
@@ -34,11 +34,12 @@ DEFAULT_TEXT_EMBEDDING_CACHE_SIZE = 64
 DEFAULT_IMAGE_SIZE = 640
 
 # NOTE ON ORDER: the first entry whose Chinese key is a substring of the
-# instruction wins, so more specific / higher-priority targets must precede the
-# broader ones. In particular "充电器" (charger) contains the substring "电器",
-# so the generic appliance noun MUST sort after every charger/adapter entry or
-# "白色充电器" would degrade to "appliance". Support nouns like "箱子"/"盒子" sort
-# after "充电器" too, so "箱子上白色充电器" grounds the charger, not the box.
+# scanned segment wins, so more specific / higher-priority targets must precede
+# the broader ones. In particular "充电器" (charger) contains the substring
+# "电器", so the generic appliance noun MUST sort after every charger/adapter
+# entry or "白色充电器" would degrade to "appliance". Tuple order alone cannot
+# decide target-vs-support ("箱子" precedes "瓶子", so "箱子上的瓶子" would ground
+# the box); the support split below scopes the scan to the target segment first.
 _ZH_NOUNS: tuple[tuple[str, str], ...] = (
     ("电源适配器", "power adapter"),
     ("充电适配器", "charger"),
@@ -80,6 +81,9 @@ _ZH_COLORS: tuple[tuple[str, str], ...] = (
     ("紫色", "purple"),
     ("紫", "purple"),
 )
+_EN_COLORS: tuple[str, ...] = (
+    "white", "black", "red", "green", "blue", "yellow", "purple",
+)
 
 # YOLOE's open-vocabulary score is noticeably phrase-sensitive even when two
 # phrases name the same physical category.  Keep a deliberately small alias
@@ -94,6 +98,251 @@ _EQUIVALENT_PROMPTS: Mapping[str, tuple[str, ...]] = {
 }
 
 
+# A support relation names the thing the target rests on or sits inside.
+# Chinese puts the target AFTER the particle ("箱子上的瓶子" names the bottle)
+# while English puts it BEFORE the preposition ("the bottle on the box"), so the
+# two languages have to be split in opposite directions.
+_ZH_SUPPORT_PARTICLES: tuple[str, ...] = (
+    "上面", "上边", "顶部", "顶上", "里面", "里边", "上", "里", "内",
+)
+_EN_SUPPORT_PREPOSITIONS: tuple[str, ...] = (
+    "on top of", "inside", "atop", "above", "on", "in",
+)
+# Words that carry no object identity. A trailing English phrase built only from
+# these plus a position word qualifies the target itself ("the bottle on the
+# left") instead of naming a support.
+_EN_POSITIONAL_FILLER: frozenset[str] = frozenset(
+    {"the", "a", "an", "of", "its", "image", "frame", "picture", "scene", "view", "side"}
+)
+# The operator often appends a clarifying clause; everything after the first
+# separator explains what to avoid or why, and never names the target noun.
+# Newlines are absent by construction: _parse_instruction collapses all
+# whitespace before _before_separator runs, so listing "\n" here would be dead.
+_SENTENCE_SEPARATORS: str = "，,。;；"
+
+# Position qualifiers. The longest key wins at the same offset, so "左边" is
+# matched ahead of the bare "左".
+_SPATIAL_RELATIONS: Mapping[str, str] = {
+    "左边": "left", "左侧": "left", "左面": "left", "左": "left",
+    "右边": "right", "右侧": "right", "右面": "right", "右": "right",
+    "中间": "middle", "中央": "middle", "正中": "middle",
+    "远处": "far", "远端": "far", "远方": "far", "较远": "far", "最远": "far",
+    "近处": "near", "靠近": "near", "最近": "near",
+    "left": "left", "right": "right",
+    "middle": "middle", "center": "middle", "centre": "middle",
+    "far": "far", "distant": "far", "farthest": "far", "furthest": "far",
+    "near": "near", "nearest": "near", "closest": "near",
+}
+SPATIAL_PREFERENCES: frozenset[str] = frozenset(
+    {"left", "right", "middle", "near", "far"}
+)
+
+
+def _token_index(text: str, token: str) -> int:
+    """Earliest index of ``token`` in ``text``, or -1.
+
+    ASCII tokens must match a whole word so "far" never fires inside "farm" and
+    "in" never fires inside "tin". CJK tokens have no word boundaries, so a
+    substring match is the only available rule and is safe for this lexicon.
+    """
+
+    if not token.isascii():
+        return text.find(token)
+    lowered = text.lower()
+    index = lowered.find(token)
+    while index != -1:
+        before = lowered[index - 1] if index > 0 else " "
+        after = (
+            lowered[index + len(token)]
+            if index + len(token) < len(lowered)
+            else " "
+        )
+        if not before.isalpha() and not after.isalpha():
+            return index
+        index = lowered.find(token, index + 1)
+    return -1
+
+
+def _earliest_token(text: str, tokens: Iterable[str]) -> tuple[int, str] | None:
+    """(index, token) of the earliest match; the longest wins at equal offset."""
+
+    best: tuple[int, int, str] | None = None
+    for token in tokens:
+        index = _token_index(text, token)
+        if index < 0:
+            continue
+        candidate = (index, -len(token), token)
+        if best is None or candidate < best:
+            best = candidate
+    return (best[0], best[2]) if best is not None else None
+
+
+def _before_separator(text: str) -> str:
+    offsets = [text.find(character) for character in _SENTENCE_SEPARATORS]
+    index = min((offset for offset in offsets if offset >= 0), default=-1)
+    return text if index < 0 else text[:index]
+
+
+def _zh_noun(segment: str) -> str | None:
+    return next((english for chinese, english in _ZH_NOUNS if chinese in segment), None)
+
+
+def _color(segment: str) -> str | None:
+    """Colour modifier of a segment, in either language.
+
+    ``_ZH_NOUNS`` carries a few ASCII product names, so an all-English phrase
+    can still resolve through the noun lexicon and needs its colour read here.
+    """
+
+    chinese = next(
+        (english for chinese, english in _ZH_COLORS if chinese in segment), None
+    )
+    if chinese is not None:
+        return chinese
+    match = _earliest_token(segment, _EN_COLORS)
+    return None if match is None else match[1]
+
+
+def _zh_support_split(query: str) -> tuple[str, str] | None:
+    """(target, support) around the earliest support particle, or None."""
+
+    match = _earliest_token(query, _ZH_SUPPORT_PARTICLES)
+    if match is None:
+        return None
+    index, particle = match
+    support = query[:index]
+    target = query[index + len(particle):]
+    if not support.strip() or not target.strip():
+        return None
+    return target, support
+
+
+def _is_positional_phrase(text: str) -> bool:
+    words = text.split()
+    if not words:
+        return False
+    return all(
+        word in _EN_POSITIONAL_FILLER or word in _SPATIAL_RELATIONS for word in words
+    )
+
+
+def _en_support_split(query: str) -> tuple[str, str] | None:
+    """(target, support) around the earliest support preposition, or None."""
+
+    match = _earliest_token(query, _EN_SUPPORT_PREPOSITIONS)
+    if match is None:
+        return None
+    index, preposition = match
+    target = query[:index].strip()
+    support = query[index + len(preposition):].strip()
+    if not target or not support:
+        return None
+    return target, support
+
+
+def _spatial_relation(text: str) -> str | None:
+    """Return the position qualifier carried by ``text``, or None.
+
+    Presence alone is not intent. Several English position words are ordinary
+    attributive parts of an object's own name -- "the left handle", "center
+    punch", "the near field probe", "a distant object" -- and whole-word
+    matching cannot tell those apart from a real qualifier. An ASCII position
+    word therefore only counts when it HEADS A TRAILING POSITIONAL PHRASE, i.e.
+    everything from it to the end of the segment is positional filler ("the
+    bottle on the left", "the charger in the middle"). Anything following it
+    that names an object makes it attributive, not locative.
+
+    CJK position words in this lexicon (左边/右侧/中间/远处/...) are unambiguous
+    locatives and have no such compound-noun collision, so they keep the plain
+    substring rule; scoping to the target segment already stops a qualifier that
+    describes the support ("远处箱子上白色充电器") from moving to the target.
+    """
+
+    candidates = sorted(
+        (index, -len(token), token)
+        for token in _SPATIAL_RELATIONS
+        if (index := _token_index(text, token)) >= 0
+    )
+    for index, _, token in candidates:
+        if token.isascii() and not _is_positional_phrase(text[index:]):
+            continue
+        return _SPATIAL_RELATIONS[token]
+    return None
+
+
+def _parse_instruction(instruction: str) -> tuple[tuple[str, ...], str | None]:
+    """Return (YOLOE class phrases, position qualifier) for one instruction."""
+
+    query = " ".join(str(instruction).strip().lower().split())
+    if not query:
+        return (), None
+    # Most specific first: the segment naming the target under an explicit
+    # support relation, then the whole instruction. The first segment holding a
+    # known noun decides both the noun and its colour, so a support phrase can
+    # no longer supply either.
+    segments: list[tuple[str, str | None]] = []
+    zh_split = _zh_support_split(query)
+    if zh_split is not None:
+        zh_target, zh_support = zh_split
+        segments.append((_before_separator(zh_target), zh_support))
+        segments.append((zh_target, zh_support))
+    en_split = _en_support_split(query)
+    if en_split is not None and not _is_positional_phrase(en_split[1]):
+        segments.append(en_split)
+    segments.append((_before_separator(query), None))
+    segments.append((query, None))
+    target_text, support = next(
+        (
+            (segment, segment_support)
+            for segment, segment_support in segments
+            if _zh_noun(segment) is not None
+        ),
+        (query, None),
+    )
+    noun = _zh_noun(target_text)
+    color = _color(target_text)
+    if noun is not None:
+        primary = f"{color} {noun}" if color else noun
+        prompts = [primary]
+        # Naming a support relation at all means the requested target is the
+        # smaller item on/inside the support, not the support itself. A phrase
+        # that OPENS with the particle elides the support ("上面的黑色盒子" -
+        # "the black box on top"), so _zh_support_split returns None for it and
+        # the split alone must not disarm the alias: without "small black box"
+        # and its 0.12 per-label area cap, a large storage box outscores the
+        # small box it carries and the arm is sent to the support.
+        if noun in {"box", "block"} and (
+            support is not None
+            or _earliest_token(query, _ZH_SUPPORT_PARTICLES) is not None
+        ):
+            prompts.append(f"small {primary}")
+        for alias in _EQUIVALENT_PROMPTS.get(noun, ()):
+            candidate = f"{color} {alias}" if color else alias
+            if candidate not in prompts:
+                prompts.append(candidate)
+        return tuple(prompts), _spatial_relation(target_text)
+    if any("\u4e00" <= character <= "\u9fff" for character in query):
+        return (), None
+    cleaned = re.sub(r"[^a-z0-9\s_-]+", " ", query)
+    cleaned = " ".join(cleaned.split())
+    cleaned = re.sub(
+        r"^(?:please\s+)?(?:pick(?:\s+up)?|grasp|grab|find|track|locate|approach)\s+",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned)
+    if not cleaned:
+        return (), None
+    qualifier_text = cleaned
+    en_split = _en_support_split(cleaned)
+    if en_split is not None:
+        en_target, en_support = en_split
+        if not _is_positional_phrase(en_support):
+            qualifier_text = en_target
+        cleaned = en_target
+    return (cleaned,), _spatial_relation(qualifier_text)
+
+
 def grounding_prompts(instruction: str) -> tuple[str, ...]:
     """Return a bounded set of identity-preserving YOLOE class phrases.
 
@@ -104,34 +353,13 @@ def grounding_prompts(instruction: str) -> tuple[str, ...]:
     provider fallback when a semantically equivalent phrase scores better.
     """
 
-    query = " ".join(str(instruction).strip().lower().split())
-    if not query:
-        return ()
-    noun = next((english for chinese, english in _ZH_NOUNS if chinese in query), None)
-    color = next((english for chinese, english in _ZH_COLORS if chinese in query), None)
-    if noun is not None:
-        primary = f"{color} {noun}" if color else noun
-        prompts = [primary]
-        # Repeating the same noun around a support relation means the requested
-        # target is the smaller item on the support, not the support itself.
-        if ("上" in query or "顶部" in query) and noun in {"box", "block"}:
-            prompts.append(f"small {primary}")
-        for alias in _EQUIVALENT_PROMPTS.get(noun, ()):
-            candidate = f"{color} {alias}" if color else alias
-            if candidate not in prompts:
-                prompts.append(candidate)
-        return tuple(prompts)
-    if any("\u4e00" <= character <= "\u9fff" for character in query):
-        return ()
-    cleaned = re.sub(r"[^a-z0-9\s_-]+", " ", query)
-    cleaned = " ".join(cleaned.split())
-    cleaned = re.sub(
-        r"^(?:please\s+)?(?:pick(?:\s+up)?|grasp|grab|find|track|locate|approach)\s+",
-        "",
-        cleaned,
-    )
-    cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned)
-    return (cleaned,) if cleaned else ()
+    return _parse_instruction(instruction)[0]
+
+
+def spatial_preference(instruction: str) -> str | None:
+    """Return the position qualifier that disambiguates between instances."""
+
+    return _parse_instruction(instruction)[1]
 
 
 def grounding_prompt(instruction: str) -> str | None:
@@ -156,27 +384,7 @@ def roi_zoom_qualifier(instruction: str) -> bool:
     """True when the instruction marks the target as distant and/or small."""
 
     text = str(instruction)
-    lowered = text.lower()
-    for token in _ROI_QUALIFIER_TOKENS:
-        if not token.isascii():
-            # CJK qualifiers have no word boundaries; a substring match is safe.
-            if token in text:
-                return True
-            continue
-        # Latin qualifiers must match a whole word so "far" never fires on
-        # "farm" and "small" never fires inside an unrelated token.
-        index = lowered.find(token)
-        while index != -1:
-            before = lowered[index - 1] if index > 0 else " "
-            after = (
-                lowered[index + len(token)]
-                if index + len(token) < len(lowered)
-                else " "
-            )
-            if not before.isalpha() and not after.isalpha():
-                return True
-            index = lowered.find(token, index + 1)
-    return False
+    return any(_token_index(text, token) >= 0 for token in _ROI_QUALIFIER_TOKENS)
 
 
 def center_crop_region(width: int, height: int, fraction: float) -> tuple[int, int, int, int]:
@@ -248,6 +456,66 @@ def merge_detection_lists(
     return merged_boxes, merged_scores, merged_labels
 
 
+# SHIPPED DARK, ON PURPOSE. Parsing the position qualifier and reporting it is
+# a strict gain: it is new information the response did not carry before, and a
+# later tier can consume it. LETTING IT REORDER DETECTIONS IS NOT, YET. All 51
+# qualifier-carrying sessions in the recorded corpus already resolve to the
+# correct instance under plain confidence-argmax and their prompt tuples are
+# unchanged, so the reorder has zero demonstrated benefit there while it can
+# invert a wide confidence gap: on the recorded '黑色箱子上右边的白色充电器'
+# geometry, argmax picks the 0.80 charger and the reorder picks a 0.49 false
+# positive further right. That decides which physical object the arm grasps, so
+# it stays off until it has been observed against real YOLOE score
+# distributions on live frames. Enabling it is this one line.
+SPATIAL_REORDER_ENABLED = False
+# A position qualifier may only reorder detections the detector already rates
+# as comparable, so an incidental relation word cannot promote a weak box.
+SPATIAL_PEER_CONFIDENCE_RATIO = 0.6
+# ...and only when the qualified boxes are actually separated along the axis
+# the qualifier names, in normalized frame units.
+SPATIAL_MINIMUM_CENTROID_SPREAD = 0.05
+
+
+def _confidence(candidate: Mapping[str, object]) -> float:
+    return float(candidate["confidence"])
+
+
+def _centre_x(candidate: Mapping[str, object]) -> float:
+    box = candidate["bbox_xyxy"]
+    return (float(box[0]) + float(box[2])) / 2.0
+
+
+def _apply_spatial_preference(
+    candidates: list[dict[str, object]],
+    preference: str,
+) -> dict[str, object] | None:
+    """Pick the instance a lateral position qualifier names, or None.
+
+    Only left/right/middle are geometrically decidable from one frame. There is
+    deliberately NO near/far branch: apparent box area is the only depth cue a
+    single 2-D frame carries, and ranking "far" onto the smallest area selects
+    exactly the tiny fragments YOLOE emits as noise -- measured on the recorded
+    '远处彩色瓶子' geometry it swapped a 0.70-confidence bottle for a 0.43
+    sliver. A near/far qualifier is parsed and reported but never reorders.
+    """
+
+    if len(candidates) < 2 or preference not in {"left", "right", "middle"}:
+        return None
+    centres = [(_centre_x(candidate), candidate) for candidate in candidates]
+    offsets = sorted(centre for centre, _ in centres)
+    if offsets[-1] - offsets[0] < SPATIAL_MINIMUM_CENTROID_SPREAD:
+        return None
+    if preference == "left":
+        return min(centres, key=lambda item: (item[0], -_confidence(item[1])))[1]
+    if preference == "right":
+        return max(centres, key=lambda item: (item[0], _confidence(item[1])))[1]
+    middle = (offsets[(len(offsets) - 1) // 2] + offsets[len(offsets) // 2]) / 2.0
+    return min(
+        centres,
+        key=lambda item: (abs(item[0] - middle), -_confidence(item[1])),
+    )[1]
+
+
 def select_detection(
     boxes_xyxy: object,
     scores: object,
@@ -259,6 +527,7 @@ def select_detection(
     maximum_area_ratio: float,
     maximum_area_ratio_by_label: Mapping[str, float] | None = None,
     minimum_border_margin_ratio: float = 0.002,
+    spatial_preference: str | None = None,
 ) -> dict[str, object] | None:
     """Select the strongest complete, finite, object-scale detection.
 
@@ -266,6 +535,11 @@ def select_detection(
     an image edge are commonly the robot gripper, furniture, or another partial
     foreground object. Passing those boxes to the tracker creates a stable but
     geometrically meaningless mask, so reject them before confidence ranking.
+
+    ``spatial_preference`` names which of several comparable instances the
+    operator asked for. It only reorders anything when
+    ``SPATIAL_REORDER_ENABLED`` is set; with the shipped default the selection
+    is plain confidence-argmax and the qualifier is carried, not acted on.
     """
 
     if width <= 0 or height <= 0:
@@ -276,6 +550,8 @@ def select_detection(
         raise ValueError("maximum area ratio must be within (0, 1)")
     if not 0.0 <= minimum_border_margin_ratio < 0.5:
         raise ValueError("minimum border margin ratio must be within [0, 0.5)")
+    if spatial_preference is not None and spatial_preference not in SPATIAL_PREFERENCES:
+        raise ValueError("spatial preference is unsupported")
     area_limits = dict(maximum_area_ratio_by_label or {})
     if any(not 0.0 < limit < 1.0 for limit in area_limits.values()):
         raise ValueError("per-label maximum area ratios must be within (0, 1)")
@@ -334,7 +610,15 @@ def select_detection(
     if not candidates:
         return None
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return candidates[0][2]
+    best = candidates[0][2]
+    if spatial_preference is None or not SPATIAL_REORDER_ENABLED:
+        return best
+    peers = [
+        result
+        for confidence, _, result in candidates
+        if confidence >= float(best["confidence"]) * SPATIAL_PEER_CONFIDENCE_RATIO
+    ]
+    return _apply_spatial_preference(peers, spatial_preference) or best
 
 
 def _result_boxes(
@@ -434,7 +718,7 @@ class GroundingRuntime:
 
     def ground(self, image_bytes: bytes, instruction: str) -> dict[str, object]:
         request_started = time.perf_counter()
-        prompts = grounding_prompts(instruction)
+        prompts, preference = _parse_instruction(instruction)
         if not prompts:
             raise LookupError("instruction has no supported local noun phrase")
         prompt = prompts[0]
@@ -519,6 +803,7 @@ class GroundingRuntime:
                 for candidate in prompts
                 if candidate.startswith("small ")
             },
+            spatial_preference=preference,
         )
         if selected is None:
             raise LookupError("local detector produced no qualified object box")
@@ -531,6 +816,7 @@ class GroundingRuntime:
             "schema": RESPONSE_SCHEMA,
             "model": f"local/yoloe/{os.path.basename(self.model_id)}",
             "prompt": prompt,
+            "spatial_preference": preference,
             "target": selected,
             "latency_s": finished - request_started,
             "embedding_cache_hit": embedding_cache_hit,
