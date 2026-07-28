@@ -1355,12 +1355,31 @@ def encode_point_cloud(
         if depth_stamp is not None and color_stamp is not None
         else None
     )
+    # The FFS -> raw-D435 fallback is the stack's quietest dangerous moment: the
+    # tile keeps drawing a plausible cloud, so nothing on screen says the
+    # learned-stereo depth stack died.  But the same topic feeds EdgeTAM's
+    # exact-time sync, and with it gone /z_manip/perception/scene_pointcloud is
+    # never published at all -- the planner loses its obstacle geometry while
+    # this file still looks healthy.  Record the demotion explicitly and name
+    # the missing topic, so cloud-latest.json can never be read as "fine".
+    degraded = source != "ffs"
     manifest: dict[str, object] = {
         "schema": "z_manip.point_cloud_frame.v1",
         "version": CLOUD_VERSION,
         "source": source,
         "source_flag": source_flag,
         "source_topic": source_topic,
+        "expected_source": "ffs",
+        "expected_source_topic": FFS_DEPTH_TOPIC,
+        "degraded": degraded,
+        "degraded_reason": (
+            f"{FFS_DEPTH_TOPIC} is not publishing; this cloud fell back to raw "
+            "D435 aligned depth. EdgeTAM cannot sync without that topic, so "
+            "/z_manip/perception/scene_pointcloud is not being produced. "
+            "Recover with: manip component restart ffs"
+        )
+        if degraded
+        else None,
         "frame": frame_id(depth),
         "count": count,
         "stride": stride,

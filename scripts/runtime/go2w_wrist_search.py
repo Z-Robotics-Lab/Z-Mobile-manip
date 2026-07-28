@@ -229,8 +229,10 @@ class WristSearchCoordinator:
         self.motion = motion
         # The coordinator is only ever entered after the stationary flow already
         # checked the current (anchor) view with yoloe+VLM, so re-observing view
-        # 0 wastes a ~12 s remote command. Skip it by default; the anchor stays
-        # view 0 in the grid for the executor's post-search restore path.
+        # 0 wastes a whole remote command (~5.9 s since the passive-CAN gate
+        # collapsed from ~9.1 s to ~1.57 s; the superseded figure here was
+        # ~12 s). Skip it by default; the anchor stays view 0 in the grid for
+        # the executor's post-search restore path.
         self.config = replace(config or WristSearchConfig(), skip_anchor_view=skip_anchor_view)
         self.sleep = sleep
         self.clock = clock

@@ -135,7 +135,7 @@ def _grid_motion(config, motion_calls):
         motion_calls.append(view_index)
         view = grid.views[view_index]
         joints = np.zeros(6)
-        joints[config.yaw_joint_index] = view.yaw_offset_rad
+        joints[config.pan_joint_index] = view.pan_offset_rad
         joints[config.pitch_joint_index] = view.pitch_offset_rad
         return joints
 
@@ -148,8 +148,8 @@ def _small_grid(**overrides):
         detector_hz=20.0,
         observations_per_view=1,
         confirmations_required=1,
-        yaw_step_rad=0.1,
-        max_yaw_offset_rad=0.1,
+        pan_step_rad=0.1,
+        max_pan_offset_rad=0.1,
         pitch_step_rad=0.1,
         max_pitch_offset_rad=0.1,
     )

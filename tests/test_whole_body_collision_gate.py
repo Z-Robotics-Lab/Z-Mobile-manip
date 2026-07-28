@@ -22,7 +22,11 @@ def _guard() -> FixedSelfCollisionGuard:
 
 def test_recorded_mid360_entry_is_reduced_to_largest_safe_current_side_step():
     guard = _guard()
-    current = np.asarray([-0.049, 0.188, -0.009, -0.045, 0.331, 0.0])
+    # 2026-07-28: `current` re-recorded against the corrected Mid-360 geometry.
+    # The pose used here before is itself inside the sensor body, which would
+    # send the selector down the escape branch instead of the scale branch this
+    # test is about.  See tests/test_lidar_keepout.py.
+    current = np.asarray([-0.01715, 0.0658, -0.00315, -0.01575, 0.11585, 0.0])
     collision = np.asarray([-0.176, 0.775, 0.003, -0.196, 0.367, -0.096])
 
     selected = select_collision_safe_arm_step(
@@ -136,14 +140,20 @@ def test_existing_intrusion_only_admits_a_step_that_increases_clearance():
 
 def test_recorded_submillimetre_mid360_boundary_synthesizes_escape():
     guard = _guard()
+    # 2026-07-28: re-recorded on the corrected Mid-360 envelope.  This is the
+    # pose on the recorded strike approach that sits 0.17 mm inside the new
+    # boundary; the previous fixture was the 0.1 mm boundary of the superseded
+    # capsule and is now 37 mm deep, which is no longer a boundary case.  Do not
+    # weaken the assertions below to accommodate a stale pose -- move the pose.
     current = np.asarray([
-        -0.08126252997285598,
-        0.36140532821046584,
-        -0.01005309649148734,
-        -0.04991641660703782,
-        0.3155206221755349,
+        -0.032413,
+        0.124362,
+        -0.005954,
+        -0.029768,
+        0.218956,
         0.0,
     ])
+    assert -0.001 < guard.check_state(current).minimum_margin_m < 0.0
 
     selected = select_collision_safe_arm_step(
         current_joints=current,

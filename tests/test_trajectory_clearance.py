@@ -87,7 +87,10 @@ def test_continuous_sampling_finds_collision_between_safe_waypoints():
 
 
 def test_recorded_mid360_path_reports_global_and_per_segment_witnesses():
-    clear = np.asarray([-0.049, 0.188, -0.009, -0.045, 0.331, 0.0])
+    # 2026-07-28: `clear` re-recorded against the corrected Mid-360 geometry.
+    # The pose this test used before is itself inside the sensor body; see
+    # tests/test_lidar_keepout.py and tests/test_fixed_self_collision.py.
+    clear = np.asarray([-0.01715, 0.0658, -0.00315, -0.01575, 0.11585, 0.0])
     near = np.asarray([-0.139, 0.313, -0.009, -0.121, 0.358, 0.0])
     collision = np.asarray([-0.176, 0.775, 0.003, -0.196, 0.367, -0.096])
 
@@ -101,7 +104,9 @@ def test_recorded_mid360_path_reports_global_and_per_segment_witnesses():
     assert not evidence.valid
     assert len(evidence.segments) == 2
     assert evidence.minimum_margin_m < -0.05
-    assert "mid360" in evidence.witness.pair
+    # The Mid-360 keep-out is two capsules -- the puck and its mounting post --
+    # and either may own the deepest sample.
+    assert any(name.startswith("mid360") for name in evidence.witness.pair)
     assert evidence.minimum_segment_index == 1
     assert document["continuous_sampling"]["maximum_joint_step_rad"] == 0.01
     assert document["segments"][1]["minimum_margin_m"] < 0.0

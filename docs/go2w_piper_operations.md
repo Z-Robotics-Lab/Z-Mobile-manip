@@ -145,8 +145,64 @@ component has independent **Restart** and **Logs** controls:
 - `rgbd`: RGB-D decode bridge;
 - `grounding`: resident YOLOE-11S open-vocabulary detector;
 - `edgetam`: EdgeTAM service;
+- `ffs`: Fast-FoundationStereo depth stack (inference service + relay), CLI only;
 - `perception`: perception ROS container;
-- `perception-all`: observer + RGB-D + YOLOE + EdgeTAM + perception ROS.
+- `perception-all`: observer + RGB-D + YOLOE + FFS depth + EdgeTAM + perception ROS.
+
+### 4.1 `ffs` — the planner's only source of obstacle geometry
+
+`ffs` publishes `/camera/ffs_depth_aligned/image_raw`, the **sole** input to the
+chain that produces obstacle geometry:
+
+```
+/camera/ffs_depth_aligned/image_raw
+  -> EdgeTAM exact-time colour+depth+camera_info sync
+  -> /z_manip/perception/scene_pointcloud
+  -> scene_collision_points.npy -> the collision checker
+```
+
+EdgeTAM joins those three topics on an **exact** stamp match, so when this topic
+stops the synchroniser never fires and `scene_pointcloud` is never published at
+all. That is a hard stop, not a graceful degrade — and it used to be an
+invisible one, because perception simply looked like it was still "waiting".
+
+What is now supervised:
+
+- `manip status ffs` reports the **measured publish rate**, read from the relay's
+  own 10 s report, not just container liveness. A relay whose fail-closed
+  calibration guard has tripped is `running` while publishing nothing; that
+  reports `degraded`, never `healthy`.
+- `manip status perception-all` leads with FFS by name, and its summary is what
+  the **All perception** dashboard card displays verbatim. A dead depth stack
+  reads as `/camera/ffs_depth_aligned/image_raw is not flowing …`, not as a
+  generic perception wobble.
+- `manip bringup` and `manip component restart perception-all` both start FFS
+  **before** perception and fail closed if it does not come up, so a bringup
+  that reports healthy means the planner will really receive obstacle geometry.
+- `manip logs ffs` shows the relay (rate reports, calibration verdict) and the
+  inference service (model/CUDA faults).
+
+Health thresholds: the relay caps itself at 10 Hz but is bounded by Wi-Fi IR
+delivery from the NUC, and a healthy stack was measured swinging between **1.3
+and 7.7 fps** (2026-07-27, 5-minute window). The gate is therefore a *publishing
+floor* (`Z_MANIP_FFS_MIN_FPS`, default 0.5) — it answers "is depth arriving at
+all", not "is depth good". The measured rate is always printed so you can judge
+quality yourself. Do not raise this floor toward the 10 Hz cap: it would flag a
+perfectly healthy stack as degraded.
+
+**There is deliberately no crash-restart loop.** Recovery is operator-triggered
+(`manip component restart ffs`) plus the one fail-closed start during bringup.
+Docker's own `--restart unless-stopped` policy is the only automatic retry, and
+its restart count is printed in the status summary (`relay restarts=N`) so a
+stack quietly crash-looping back to "healthy" is visible instead of silent. A
+loop that kept restarting a genuinely broken stack while the operator believed
+it was healthy would be worse than no supervision at all.
+
+`ffs` is a CLI component only — it has no dashboard card of its own, because
+adding one requires `VISUAL_COMPONENTS` in
+`scripts/runtime/go2w_planning_control.py` plus card markup in
+`web/debug_dashboard/index.html`. Its alarm reaches the dashboard through the
+`perception-all` card.
 
 Restarts are refused while Home, perception, planning, or grasp execution is
 active. A vision restart clears the selected perception and plan context so an
@@ -330,6 +386,7 @@ environment variable unset and use only **Shadow check**.
 | UI unavailable after reboot | Run `go2w_component_manager.sh bringup`; if it fails, inspect `logs manager 100`, then `restart ui`. |
 | `NUC D435` says degraded/USB absent, or the camera endpoint returns HTTP 503 | Reseat the D435 USB/power connection on the NUC and confirm it appears in `lsusb`. Then run `manip component restart nuc-camera` followed by `manip component restart perception-all`, or run `manip bringup`. The manager now fails immediately while the USB device is absent instead of restarting a process that cannot publish frames. |
 | RGB is live but mask/candidates are stale or invalid | Use `restart edgetam`; if unresolved, use `restart perception-all`, then run a fresh perception. |
+| Perception seems stuck "waiting", or `All perception` names `/camera/ffs_depth_aligned/image_raw` | The FFS depth stack is down and `/z_manip/perception/scene_pointcloud` will never publish — the planner has no obstacle geometry. Check `manip status ffs` for the measured rate, `manip logs ffs` for the relay's calibration verdict, then `manip component restart ffs`. A `degraded` FFS whose containers are up but rate is `none`/`0.0` is usually the fail-closed calibration guard (camera replaced/recalibrated) or the NUC `ffs-ir-throttle.service` having stopped. |
 | Button cannot be clicked | Check whether Home/grasp/session/component status says `running`. Controls remain locked until the active fixed action finishes. Do not start a duplicate server. |
 | Old object or trajectory remains on screen | Click **Clear demo**. This clears active context without deleting evidence. |
 | Passive feedback is degraded after NUC reboot | Run `bringup`, then inspect `status passive-feedback` and `logs passive-feedback 100`. The manager only reports healthy after the service is active and `can0` is `ERROR-ACTIVE`. |

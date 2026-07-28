@@ -1340,6 +1340,15 @@ class PointCloudCollisionChecker:
                 self_problem = None
             if self_problem is not None:
                 return self_problem
+        # NOTE: _check_attached_target_scene compares the carried payload with
+        # the perceived SCENE cloud only -- no robot geometry enters it.  The
+        # capsule loop below, gated on ``check_target``, is the ONLY path that
+        # tests the object in the gripper against the robot's own fixtures
+        # (Go2W head, Mid-360, bracket).  A platform capsule with
+        # ``check_target: false`` means the payload may be driven straight
+        # through that fixture while this method reports "collision-free"; that
+        # is how the gripper carried an object into the Mid-360.  See
+        # configs/piper_collision_capsules.json and tests/test_lidar_keepout.py.
         attached_scene_collision = self._check_attached_target_scene(base_t_tip)
         if attached_scene_collision is not None:
             return attached_scene_collision

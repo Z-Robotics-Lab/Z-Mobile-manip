@@ -11,6 +11,13 @@ set -euo pipefail
 #   ffs_depth_stack.sh logs [service|relay] [lines]
 #   ffs_depth_stack.sh build    (re)build the ffs:infer image
 #
+# OPERATORS: prefer the component manager, which owns bringup ordering, the
+# restart lock and the health gate that this stack is now covered by:
+#   manip status ffs / manip component restart ffs / manip logs ffs
+# `manip bringup` starts this stack before perception, so a cold bringup can no
+# longer come up with a live-looking perception stack and no depth publisher.
+# This script stays the low-level escape hatch (build, down, per-container logs).
+#
 # Consumers switch via ros2/z_manip_edgetam/config/edgetam.yaml depth_topic
 # (requires go2w_perception_lab.sh build + component manager restart perception
 # because ros2/** and the yaml are baked into z-manip-runtime:pinocchio).
@@ -140,6 +147,17 @@ status() {
   done
   curl --silent http://127.0.0.1:8773/health 2>/dev/null && echo || echo "service /health unreachable"
   docker logs --tail 3 "$RELAY" 2>/dev/null | grep -E "pairs_in|calib" || true
+  # Same signal the component manager gates on: the relay's own report of what
+  # actually reached the topic.  A running container with no rate line here is
+  # a stack that is publishing nothing -- the failure that looks like health.
+  local rate
+  rate="$(docker logs --since 40s --tail 20 "$RELAY" 2>&1 \
+    | grep -oE 'rate~[0-9.]+fps' | tail -n 1 | grep -oE '[0-9.]+' || true)"
+  if [[ -n "$rate" ]]; then
+    echo "publishing /camera/ffs_depth_aligned/image_raw at ${rate} fps"
+  else
+    echo "NOT publishing /camera/ffs_depth_aligned/image_raw (no rate report in 40s)" >&2
+  fi
 }
 
 logs() {
