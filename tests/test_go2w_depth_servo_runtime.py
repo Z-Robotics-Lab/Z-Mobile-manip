@@ -1207,18 +1207,45 @@ def test_tick_and_teardown_wire_the_stop_event_and_context_guards():
 
 
 def test_publish_swallows_shutdown_race_but_reraises_a_live_fault():
-    """_publish gates on rclpy.ok() and only swallows a torn-down-context error.
+    """_publish_guarded gates on rclpy.ok() and only swallows a torn-down context.
 
     A still-valid context re-raises (fail-loud), matching the sibling passive
     joint-state bridge convention.
     """
 
     source = Path(SERVO.__file__).read_text(encoding="utf-8")
-    pub_marker = source.index("def _publish(self, linear_x: float, angular_z: float) -> None:")
-    pub_window = source[pub_marker:pub_marker + 1400]
+    pub_marker = source.index("def _publish_guarded(self, publisher: Any, message: Any) -> None:")
+    pub_window = source[pub_marker:pub_marker + 1600]
     assert "if not rclpy.ok():" in pub_window
-    assert "self.publisher.publish(message)" in pub_window
+    assert "publisher.publish(message)" in pub_window
     assert "except Exception:" in pub_window
     # Genuine faults on a live context are re-raised, not hidden.
     assert "if rclpy.ok():" in pub_window
     assert "raise" in pub_window
+
+
+def test_every_publisher_goes_through_the_shutdown_guard():
+    """The guard is worthless if a publisher can bypass it -- and one did.
+
+    Only the velocity publisher was guarded originally.  The posture-intent and
+    arm-view-intent publishers published raw, so an RCLError during teardown
+    ("publisher's context is invalid") propagated out of the timer callback and
+    killed the servo (live 2026-07-28: 5 crashes in one session).  The approach
+    died ~0.4 s after spawn, planning_control saw ``search_required`` with a
+    single bundle received, and burned its reacquisition budget on wrist
+    searches -- presenting as a perception failure it was not.
+
+    So assert the invariant on the WHOLE file: the only bare ``.publish(`` call
+    allowed is the one inside the guard itself.
+    """
+
+    source = Path(SERVO.__file__).read_text(encoding="utf-8")
+    bare = [
+        line.strip()
+        for line in source.splitlines()
+        if ".publish(" in line and "_publish_guarded(" not in line
+    ]
+    # The guard's own call site is the single permitted bare publish.
+    assert bare == ["publisher.publish(message)"], (
+        f"publisher(s) bypassing the shutdown guard: {bare}"
+    )

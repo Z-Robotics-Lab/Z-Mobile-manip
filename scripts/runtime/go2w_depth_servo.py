@@ -1692,7 +1692,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 separators=(",", ":"),
                 allow_nan=False,
             )
-            self.posture_intent_publisher.publish(message)
+            self._publish_guarded(self.posture_intent_publisher, message)
             self.last_posture_intent = target
             self.last_posture_intent_s = now_s
 
@@ -1735,9 +1735,39 @@ def _run_ros(args: argparse.Namespace) -> int:
             )
             message = String()
             message.data = json.dumps(document, separators=(",", ":"), allow_nan=False)
-            self.arm_view_intent_publisher.publish(message)
+            self._publish_guarded(self.arm_view_intent_publisher, message)
             self.last_arm_view_intent = document
             self.arm_view_intent_seq = max(self.arm_view_intent_seq, sequence + 1)
+
+        def _publish_guarded(self, publisher: Any, message: Any) -> None:
+            """Publish, tolerating ONLY the rcl-context teardown race.
+
+            A stop/restart can tear the rcl context down between the
+            ``rclpy.ok()`` gate and the publish itself, raising RCLError
+            ("publisher's context is invalid", publisher.c:423).  That is a
+            normal shutdown race, not a command fault: swallow it so teardown
+            never crash-loops mid-approach.  A still-valid context means a
+            genuine fault -- re-raise it rather than hiding it.
+
+            EVERY publisher on this node must go through here.  Only the
+            velocity publisher was guarded originally; the posture-intent and
+            arm-view-intent publishers published raw and took the whole servo
+            down during teardown (live 2026-07-28: 5 RCLError crashes in one
+            session -- 3 posture, 1 arm-view, 1 velocity).  Each crash killed
+            the approach ~0.4 s after spawn, so planning_control saw
+            ``search_required`` with one bundle received and spent its
+            reacquisition budget on wrist searches.  It presented as "detects
+            the target but will not drive to it", i.e. a perception fault, and
+            was nothing of the kind.
+            """
+
+            if not rclpy.ok():
+                return
+            try:
+                publisher.publish(message)
+            except Exception:  # noqa: BLE001
+                if rclpy.ok():
+                    raise
 
         def _publish(self, linear_x: float, angular_z: float) -> None:
             if not rclpy.ok():
@@ -1747,18 +1777,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             message.header.frame_id = "base_link"
             message.twist.linear.x = float(linear_x)
             message.twist.angular.z = float(angular_z)
-            try:
-                self.publisher.publish(message)
-            except Exception:  # noqa: BLE001
-                # A stop/restart can tear the rcl context down between the
-                # rclpy.ok() gate above and this publish, raising RCLError
-                # ("publisher's context is invalid", publisher.c:423).  That is a
-                # normal shutdown race, not a command fault: swallow it so the
-                # teardown path never crash-loops mid-approach and settles on the
-                # transport watchdog stop.  A still-valid context means a genuine
-                # fault -- re-raise it rather than hiding it.
-                if rclpy.ok():
-                    raise
+            self._publish_guarded(self.publisher, message)
 
         def _write_status(self, state: str | None = None, *, running: bool = True) -> None:
             target = self.core.target
