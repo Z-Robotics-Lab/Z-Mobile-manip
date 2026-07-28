@@ -1,4 +1,5 @@
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -86,7 +87,14 @@ def test_deployment_config_resolves_robot_path_and_builds_typed_settings():
     assert config.ik.position_tolerance_m == pytest.approx(0.006)
     assert config.ik.position_scale_m == pytest.approx(0.025)
     assert config.ik.orientation_tolerance_rad == pytest.approx(0.06)
-    assert config.ik.orientation_free_axis_tolerance_rad == pytest.approx(0.3490658504)
+    # Roll about the tool axis is only a FREE DOF when the grasp is symmetric
+    # about it, and that symmetry is already modelled explicitly by
+    # expand_symmetry.  Allowing a further 20 deg on top let the executed jaw
+    # line sit 20 deg off the one that was actually scored -- enough to miss
+    # the thin dimension of a small object like a charger.  Tightened to 10 deg
+    # on operator report 2026-07-28.
+    assert config.ik.orientation_free_axis_tolerance_rad == pytest.approx(0.1745329252)
+    assert math.degrees(config.ik.orientation_free_axis_tolerance_rad) == pytest.approx(10.0)
     assert tuple(config.ik.orientation_free_axis) == pytest.approx((0.0, 0.0, 1.0))
     # Derived from tool_geometry (tip_approach_axis * contact_tcp_z_m): the IK
     # position gate is enforced at the tool CONTACT point, so orientation
