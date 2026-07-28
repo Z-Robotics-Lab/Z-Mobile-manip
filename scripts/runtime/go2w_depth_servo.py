@@ -34,6 +34,12 @@ from z_manip.control.reactive_servo import (
     ReactiveTargetController,
     TargetGeometry,
 )
+from z_manip.control.go2w_posture import PosturePhase
+from z_manip.control.servo_phase import (
+    HANDOFF_TERMINAL_PHASES,
+    LOSS_STAIR_PHASES,
+    ServoPhase,
+)
 from z_manip.control.visual_servo import VisualServoConfig, VisualServoController
 from z_manip.control.whole_body_runtime import (
     WholeBodyRuntimeCommand,
@@ -50,12 +56,53 @@ ARM_STATUS_TIMEOUT_S = 0.50
 ARM_INTENT_TTL_NS = 250_000_000
 ARM_INTENT_SCHEMA = "z_manip.piper_reactive_view_intent.v1"
 ARM_STATUS_SCHEMA = "z_manip.piper_reactive_view_status.v1"
-# Read-only close-range IK feasibility channel.  A resident close-range
-# planning runner may certify grasp/pregrasp IK on this topic so the reactive
-# controller can declare HANDOFF_READY.  When no producer is present the probe
-# is unavailable (None) and the controller stays fail-closed in HANDOFF_PROBE.
+# Read-only close-range IK feasibility channel.
+#
+# THERE IS NO PRODUCER IN THIS REPOSITORY.  ``grep -rn "reactive/ik_probe"``
+# returns exactly two hits and both are in this file (this constant and the
+# subscription).  ``DepthServoCore._ik_feasible`` is therefore permanently
+# ``None``, so ``ReactivePhase.HANDOFF_READY``, ``DepthServoCore._done`` via
+# that branch, the ``reached`` presentation remap and the ``fallback.done``
+# arm of the whole-body settle branch are all unreachable in the deployed
+# configuration.
+#
+# THIS IS DELIBERATE AND IS KEPT, not deleted, because:
+#
+#   1. The gate is fail-closed by construction.  ``_ik_probe_state`` returns
+#      ``None`` on absence, staleness or a malformed payload, and both
+#      HANDOFF_READY sites require ``ik_feasible is True``.  Deleting the gate
+#      would mean declaring a manipulation handoff on distance and posture
+#      alone -- the exact fail-open this hardening programme exists to remove.
+#   2. The handoff is NOT dead: it terminates one level earlier, at
+#      HANDOFF_PROBE.  ``needs_ik_probe`` is set whenever the corridor is
+#      reached with ``ik_feasible is None``, and the supervisor's
+#      ``_runtime_requests_handoff`` accepts ``needs_ik_probe is True`` and
+#      ``reactive_phase in {handoff_probe, handoff_ready}``.  So the deployed
+#      terminal is HANDOFF_PROBE -> the supervisor stops the servo -> the
+#      close-range grasp transaction opens.  HANDOFF_READY is the *upgrade*
+#      path for when a certifier exists.
+#
+# TO MAKE HANDOFF_READY REACHABLE, a producer must publish
+# ``std_msgs/String`` JSON on ``/z_manip/reactive/ik_probe`` with
+# ``{"schema": IK_PROBE_SCHEMA, "feasible": <bool>}`` at better than
+# ``IK_PROBE_TIMEOUT_S`` (1.0 s), where ``feasible`` is a real pregrasp+grasp
+# IK solve against the CURRENT measured base/arm state.  The natural owner is
+# the resident close-range planning runner in
+# ``ros2/z_manip_place`` / the mobile-handoff grasp path, which already solves
+# that IK after the servo stops.  Publishing anything weaker (e.g. a reach
+# heuristic) would convert this fail-closed gate into a fail-open one.
 IK_PROBE_SCHEMA = "z_manip.reactive_ik_probe.v1"
 IK_PROBE_TIMEOUT_S = 1.0
+
+# Bounded life for the one-way handoff latch.  The latch is set by a SINGLE
+# tick and, before this bound, had no reset edge and no expiry: once set, the
+# node returned early from every subsequent ``_tick`` forever.  The contract is
+# that the 5 Hz supervisor observes the handoff within one loop iteration
+# (~50 ms) and stops this process.  20 s without that means nobody is watching,
+# so the latch escalates to an explicit ``handoff_abandoned`` terminal.  The
+# exit is ALWAYS a stop, never a resume: an un-latch that let the base drive
+# again mid-grasp would be a fail-open.
+HANDOFF_LATCH_TIMEOUT_S = 20.0
 
 
 # Measured PC-to-NUC NTP midpoint offset is ~0.31s (see the reactive-view
@@ -196,23 +243,22 @@ class DepthServoOutput:
     needs_ik_probe: bool = False
 
 
-HANDOFF_TERMINAL_PHASES = frozenset({"reached", "handoff_probe", "handoff_ready"})
+# ``HANDOFF_TERMINAL_PHASES`` and ``LOSS_STAIR_PHASES`` are imported from
+# ``z_manip.control.servo_phase``: they used to be hand-written here and
+# hand-written AGAIN in go2w_reactive_supervision.py and inline in the
+# whole-body branch below, with memberships that silently disagreed.
+# LOSS_STAIR_PHASES: phases in which the servo has lost or frozen its live
+# track.  A tracked-bundle arrival that immediately follows one of these is a
+# loss-phase exit: the inter-arrival interval spans the loss dwell and must not
+# feed the view-update damping EMA (a multi-second stall would otherwise poison
+# the arm-view period).
 
 
-# Phases in which the servo has lost or frozen its live track.  A tracked-bundle
-# arrival that immediately follows one of these is a loss-phase exit: the
-# inter-arrival interval spans the loss dwell and must not feed the view-update
-# damping EMA (a multi-second stall would otherwise poison the arm-view period).
-LOSS_STAIR_PHASES = frozenset({
-    "waiting_target",
-    "transform_unavailable",
-    "tracking_lost",
-    "reacquiring",
-    "posture_blocked",
-    "tracking_hold",
-    "view_recovery",
-    "search_required",
-})
+# ``reactive_phase`` sentinel for rows the whole-body branch owns.  It is
+# deliberately NOT a ``ServoPhase``: it never reaches the top-level ``phase``
+# field, and it exists so a consumer can tell "the reactive controller chose
+# this" from "the QP chose this".
+WHOLE_BODY_REACTIVE_PHASE = "whole_body"
 
 
 # The tracked-target bundle cadence is the measured FFS rate (~7.5-8.1 Hz, i.e.
@@ -259,6 +305,64 @@ def _latch_handoff_output(
         proposed_angular_z=0.0,
         published_linear_x=0.0,
         published_angular_z=0.0,
+    )
+
+
+def _handoff_latch_output(
+    latched: DepthServoOutput | None,
+    *,
+    latched_since_s: float | None,
+    now_s: float,
+    timeout_s: float = HANDOFF_LATCH_TIMEOUT_S,
+) -> DepthServoOutput | None:
+    """The explicit reset edge for the one-way handoff latch.
+
+    ``_latch_handoff_output`` is set by a single tick.  It had NO reset and NO
+    expiry, so a servo whose supervisor never stopped it republished the same
+    latched status at 20 Hz indefinitely, with ``needs_ik_probe`` still true --
+    an advancing heartbeat and a permanent request for a transaction nobody
+    was going to open.
+
+    The edge is deliberately ONE-WAY-TO-STOP.  Data-driven un-latching (say,
+    tracking recovering after a dropout) was rejected: the wrist camera is
+    routinely occluded by the arm during a close-range handoff, so that rule
+    would let the base drive again mid-grasp.  Expiry therefore produces
+    ``handoff_abandoned``: still exactly (0, 0), but with ``needs_ik_probe``
+    and ``reactive_phase`` CLEARED so ``_runtime_requests_handoff`` no longer
+    reads it as a request to open a grasp transaction, and with a phase whose
+    table row carries ``deadline_s = 0.0`` and ``on_expiry =
+    stop_and_degrade`` so the supervisor terminates it on first sight.
+    """
+
+    if latched is None:
+        return None
+    if latched.phase == ServoPhase.HANDOFF_ABANDONED.value:
+        return latched
+    if (
+        latched_since_s is None
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0.0
+        or not math.isfinite(now_s)
+    ):
+        return latched
+    held_s = now_s - latched_since_s
+    if held_s < timeout_s:
+        return latched
+    return replace(
+        latched,
+        phase=ServoPhase.HANDOFF_ABANDONED.value,
+        proposed_linear_x=0.0,
+        proposed_angular_z=0.0,
+        published_linear_x=0.0,
+        published_angular_z=0.0,
+        done=True,
+        needs_ik_probe=False,
+        reactive_phase=None,
+        reason=(
+            f"close-range handoff latched for {held_s:.1f}s without the "
+            f"supervisor stopping this servo (bound {timeout_s:.1f}s); the "
+            "base stays at zero and the supervisor must terminate or degrade"
+        ),
     )
 
 
@@ -536,10 +640,12 @@ def _posture_feedback_state(
         and capabilities.get("euler_state") == "SUPPORTED_OBSERVED"
     )
     euler_unavailable = _euler_body_unavailable(document)
+    # PosturePhase, NOT ServoPhase.  "stopping" has no PosturePhase member;
+    # it is a defensive spelling for an adapter mid-teardown.
     blocked = stop_latched or phase in {
-        "blocked",
-        "fault",
-        "stopped",
+        PosturePhase.BLOCKED.value,
+        PosturePhase.FAULT.value,
+        PosturePhase.STOPPED.value,
         "stopping",
     }
     feedback = document.get("feedback")
@@ -555,7 +661,10 @@ def _posture_feedback_state(
         )
     settled = (
         mode == "live"
-        and phase == "reached"
+        # PosturePhase, NOT ServoPhase: the posture adapter has its own
+        # vocabulary that happens to reuse the string "reached".  Naming the
+        # enum keeps the two namespaces from being confused again.
+        and phase == PosturePhase.REACHED.value
         and feedback_fresh
         and not stop_latched
         and euler_supported
@@ -922,7 +1031,7 @@ class DepthServoCore:
                 geometry=None,
                 reason=reason,
             )
-            output = self._zero("transform_unavailable", age_s)
+            output = self._zero(ServoPhase.TRANSFORM_UNAVAILABLE.value, age_s)
             return DepthServoOutput(
                 **{
                     **asdict(output),
@@ -933,7 +1042,7 @@ class DepthServoCore:
         if posture_blocked and self._last_decision is not None and (
             self._last_decision.phase is ReactivePhase.POSTURE_ADJUST
         ):
-            output = self._zero("posture_blocked", age_s)
+            output = self._zero(ServoPhase.POSTURE_BLOCKED.value, age_s)
             return DepthServoOutput(
                 **{
                     **asdict(output),
@@ -964,14 +1073,14 @@ class DepthServoCore:
         phase = decision.phase.value
         if decision.phase is ReactivePhase.HANDOFF_READY:
             self._done = True
-            phase = "reached"
+            phase = ServoPhase.REACHED.value
         elif decision.phase is ReactivePhase.BASE_APPROACH:
-            phase = "approach"
+            phase = ServoPhase.APPROACH.value
         elif (
             posture_shadow_verified
             and decision.phase is ReactivePhase.POSTURE_ADJUST
         ):
-            phase = "posture_shadow_verified"
+            phase = ServoPhase.POSTURE_SHADOW_VERIFIED.value
         linear_x = decision.base.linear_x_mps
         angular_z = decision.base.angular_z_rps
         live = self.settings.mode == "live"
@@ -1015,9 +1124,9 @@ class DepthServoCore:
     ) -> DepthServoOutput:
         now = float(now_s)
         if self._done:
-            return self._zero("reached", 0.0)
+            return self._zero(ServoPhase.REACHED.value, 0.0)
         if self._target is None or self._target_received_s is None:
-            return self._zero("waiting_target", None)
+            return self._zero(ServoPhase.WAITING_TARGET.value, None)
         age_s = max(0.0, now - self._target_received_s)
         if not self.settings.allow_legacy_optical_depth_for_tests:
             return self._reactive_tick(
@@ -1032,9 +1141,9 @@ class DepthServoCore:
             )
         if tracking is not True or age_s > self.settings.target_timeout_s:
             phase = (
-                "reacquiring"
+                ServoPhase.REACQUIRE.value
                 if age_s <= self.settings.tracking_loss_grace_s
-                else "tracking_lost"
+                else ServoPhase.TRACKING_LOST.value
             )
             return self._zero(phase, age_s)
         x_m, y_m, z_m = self._target
@@ -1051,7 +1160,7 @@ class DepthServoCore:
         ):
             self._done = True
             return DepthServoOutput(
-                phase="reached",
+                phase=ServoPhase.REACHED.value,
                 proposed_linear_x=0.0,
                 proposed_angular_z=0.0,
                 published_linear_x=0.0,
@@ -1074,12 +1183,12 @@ class DepthServoCore:
             linear_x = max(linear_x, self.settings.min_forward_mps)
         elif z_m <= self.settings.handoff_depth_m:
             linear_x = 0.0
-        phase = "approach"
+        phase = ServoPhase.APPROACH.value
         if command.converged:
             self._done = True
-            phase = "reached"
+            phase = ServoPhase.REACHED.value
         elif linear_x == 0.0 and command.angular_z == 0.0:
-            phase = "settling"
+            phase = ServoPhase.SETTLING.value
         live = self.settings.mode == "live"
         return DepthServoOutput(
             phase=phase,
@@ -1312,6 +1421,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.whole_body_handoff_settle_cycles = 0
             self.last_conditioned_yaw_rps = 0.0
             self.handoff_latched_output: DepthServoOutput | None = None
+            self.handoff_latched_since_s: float | None = None
             if args.whole_body == "casadi":
                 if (
                     args.whole_body_urdf is None
@@ -1370,7 +1480,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 qos,
             )
             self.create_timer(1.0 / args.rate_hz, self._tick)
-            self._write_status("starting")
+            self._write_status(ServoPhase.STARTING.value)
 
         @staticmethod
         def _matrix(transform_stamped: Any) -> np.ndarray:
@@ -1940,7 +2050,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             if self.whole_body is None:
                 if args.whole_body == "casadi":
                     return DepthServoOutput(
-                        phase="whole_body_blocked",
+                        phase=ServoPhase.WHOLE_BODY_BLOCKED.value,
                         proposed_linear_x=0.0,
                         proposed_angular_z=0.0,
                         published_linear_x=0.0,
@@ -1964,11 +2074,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 # kept the arm swinging through a 6s wifi stall (live
                 # 2026-07-24: raw_y swept +/-0.67m sinusoidally while the
                 # source stamp froze -- the arm was chasing its own motion).
-                or fallback.phase in {
-                    "transform_unavailable", "tracking_lost", "reacquiring",
-                    "waiting_target", "posture_blocked", "tracking_hold",
-                    "view_recovery", "search_required",
-                }
+                or fallback.phase in LOSS_STAIR_PHASES
                 # Belt and braces: never solve on a target older than the
                 # capture-freshness budget, whatever phase the core reports.
                 or (
@@ -2005,7 +2111,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             except Exception as error:
                 self.whole_body_error = f"whole-body solve failed: {error}"
                 return DepthServoOutput(
-                    phase="whole_body_blocked",
+                    phase=ServoPhase.WHOLE_BODY_BLOCKED.value,
                     proposed_linear_x=0.0,
                     proposed_angular_z=0.0,
                     published_linear_x=0.0,
@@ -2014,7 +2120,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     yaw_error_rad=geometry.base_bearing_rad,
                     target_age_s=fallback.target_age_s,
                     reason=self.whole_body_error,
-                    reactive_phase="whole_body",
+                    reactive_phase=WHOLE_BODY_REACTIVE_PHASE,
                 )
             self.whole_body_command = command
             self.whole_body_error = None
@@ -2049,7 +2155,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     if fallback.done:
                         self.whole_body.reset()
                         return DepthServoOutput(
-                            phase="reached",
+                            phase=ServoPhase.REACHED.value,
                             proposed_linear_x=0.0,
                             proposed_angular_z=0.0,
                             published_linear_x=0.0,
@@ -2065,14 +2171,14 @@ def _run_ros(args: argparse.Namespace) -> int:
                                 "measured Euler and PiPER view loops plus close-range "
                                 "IK handoff converged"
                             ),
-                            reactive_phase="handoff_ready",
+                            reactive_phase=ServoPhase.HANDOFF_READY.value,
                         )
 
                 return DepthServoOutput(
                     phase=(
-                        "whole_body_posture"
+                        ServoPhase.WHOLE_BODY_POSTURE.value
                         if command.executable
-                        else "whole_body_shadow"
+                        else ServoPhase.WHOLE_BODY_SHADOW.value
                     ),
                     proposed_linear_x=0.0,
                     proposed_angular_z=0.0,
@@ -2091,7 +2197,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                         if command.executable
                         else "whole-body posture intent gated by stale measured state"
                     ),
-                    reactive_phase="posture_adjust",
+                    reactive_phase=ServoPhase.POSTURE_ADJUST.value,
                 )
 
             self.whole_body_handoff_settle_cycles = 0
@@ -2129,7 +2235,11 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_conditioned_yaw_rps = yaw
             executable = command.executable
             return DepthServoOutput(
-                phase=("whole_body_approach" if executable else "whole_body_shadow"),
+                phase=(
+                    ServoPhase.WHOLE_BODY_APPROACH.value
+                    if executable
+                    else ServoPhase.WHOLE_BODY_SHADOW.value
+                ),
                 proposed_linear_x=linear,
                 proposed_angular_z=yaw,
                 published_linear_x=linear if executable else 0.0,
@@ -2142,7 +2252,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     if executable
                     else "Pinocchio/CasADi shadow intent; measured live gates not satisfied"
                 ),
-                reactive_phase="whole_body",
+                reactive_phase=WHOLE_BODY_REACTIVE_PHASE,
             )
 
         def _tick(self) -> None:
@@ -2158,6 +2268,13 @@ def _run_ros(args: argparse.Namespace) -> int:
             # and preserve the terminal status until the 5 Hz supervisor has
             # stopped this launcher and opened the fresh grasp transaction.
             if self.handoff_latched_output is not None:
+                # The latch has an explicit, bounded exit; see
+                # ``_handoff_latch_output``.  The exit is always a stop.
+                self.handoff_latched_output = _handoff_latch_output(
+                    self.handoff_latched_output,
+                    latched_since_s=self.handoff_latched_since_s,
+                    now_s=time.monotonic(),
+                )
                 self.last_output = self.handoff_latched_output
                 if settings.mode == "live":
                     self._publish(0.0, 0.0)
@@ -2185,6 +2302,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             handoff = _latch_handoff_output(None, candidate)
             if handoff is not None:
                 self.handoff_latched_output = handoff
+                self.handoff_latched_since_s = time.monotonic()
                 self.last_output = handoff
                 if settings.mode == "live":
                     self._publish(0.0, 0.0)
@@ -2201,7 +2319,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 )
             self._write_status()
 
-        def stop(self, phase: str = "stopped") -> None:
+        def stop(self, phase: str = ServoPhase.STOPPED.value) -> None:
             if settings.mode == "live":
                 for _ in range(3):
                     self._publish(0.0, 0.0)
@@ -2232,7 +2350,7 @@ def _run_ros(args: argparse.Namespace) -> int:
         # shutdown first made the finally block raise and could leave the
         # transport relying only on its watchdog stop.
         if not stop_published.is_set():
-            node.stop("stopped")
+            node.stop(ServoPhase.STOPPED.value)
             stop_published.set()
         if rclpy.ok():
             rclpy.shutdown()
@@ -2243,7 +2361,11 @@ def _run_ros(args: argparse.Namespace) -> int:
         rclpy.spin(node)
     finally:
         if not stop_published.is_set():
-            node.stop("stopped" if stopped.is_set() else "exited")
+            node.stop(
+                ServoPhase.STOPPED.value
+                if stopped.is_set()
+                else ServoPhase.EXITED.value
+            )
             stop_published.set()
         node.destroy_node()
         if rclpy.ok():

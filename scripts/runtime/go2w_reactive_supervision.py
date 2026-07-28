@@ -12,30 +12,65 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+import sys
 import time
 from typing import Any, Iterable, Mapping
 
+# systemd runs the workbench as ``python3 <abs path>/go2w_planning_control.py``
+# with no PYTHONPATH, so ``sys.path[0]`` is ``scripts/runtime`` and the repo
+# root is NOT importable by default.  ``go2w_interactive_sessions`` happens to
+# insert it, and happens to be imported one line earlier -- do not depend on
+# that: this module is also imported directly by ``go2w_reactive_replay.py``.
+# Mirrors the pattern in go2w_interactive_sessions.py.
+STACK_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(STACK_ROOT) not in sys.path:
+    sys.path.insert(0, str(STACK_ROOT))
 
-POSTURE_WAIT_PHASES = frozenset({
-    "posture_adjust",
-    "posture_shadow_verified",
-    "posture_blocked",
-})
+from z_manip.control.servo_phase import (  # noqa: E402
+    BaseOwner,
+    ExpiryAction,
+    ServoPhase,
+    is_known_phase,
+    phase_policy,
+)
+from z_manip.control.servo_phase import (  # noqa: E402
+    HANDOFF_PHASES,
+    HEARTBEAT_EXEMPT_PHASES,
+    POSTURE_WAIT_PHASES,
+    TERMINAL_PHASES,
+)
 
-# The child process is expected to rewrite its status document on every
-# control tick, including while it is waiting for a target or asking the
-# supervisor to reacquire/search.  A live PID is not evidence that this loop
-# is alive: a wedged ROS executor leaves the process running and the last
-# velocity command latched.  Only genuinely terminal, non-motion phases are
-# exempt from the state heartbeat contract.
-HEARTBEAT_EXEMPT_PHASES = frozenset({
-    "idle",
-    "stopped",
-    "blocked",
-    "degraded",
-    "grasp_started",
-})
-HANDOFF_PHASES = frozenset({"reached", "handoff_probe", "handoff_ready"})
+
+# NOTE: every phase set above is now DERIVED from the single
+# ``z_manip.control.servo_phase.PHASE_POLICY`` table and re-exported here only
+# so existing importers keep working.  Do not hand-write a phase set in this
+# module again.
+#
+# The previous design assigned ``deadline_s`` ONLY inside a three-member
+# ``POSTURE_WAIT_PHASES`` set whose strings ("posture_adjust",
+# "posture_shadow_verified", "posture_blocked") have ZERO occurrences in any
+# recorded corpus -- the deployed servo never emits them.  Every other phase,
+# including the ``whole_body_shadow`` phase that held the base at (0, 0) for a
+# recorded 23.1 s with tracking green, carried ``deadline_s = None`` and could
+# not time out.  ``HEARTBEAT_EXEMPT_PHASES`` did not help: the heartbeat only
+# checks that ``updated_unix_ns`` advances, which a servo publishing zeros at
+# 20 Hz satisfies forever.
+#
+# The table inverts that: EVERY phase carries a deadline and the exemptions
+# are the enumerated terminal states.
+__all__ = [
+    "HANDOFF_PHASES",
+    "HEARTBEAT_EXEMPT_PHASES",
+    "POSTURE_WAIT_PHASES",
+    "ReactivePhaseWatchdog",
+    "ReactiveWatchdogConfig",
+    "ReactiveWatchdogDecision",
+    "TERMINAL_PHASES",
+    "load_jsonl",
+    "ownership_snapshot",
+    "posture_feedback_snapshot",
+    "replay_trace",
+]
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -77,27 +112,60 @@ def posture_feedback_snapshot(runtime: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def base_command_magnitude(runtime: Mapping[str, Any]) -> float:
+    """Return the largest base command component the servo actually issued.
+
+    ``live`` mode is judged on the PUBLISHED command; every other mode is
+    judged on the PROPOSED command, because a shadow servo publishes zero by
+    construction (``published = value if live else 0.0``).  Judging shadow
+    mode on published values would report every healthy shadow run as a
+    stalled base.
+    """
+
+    output = _mapping(runtime.get("output"))
+    live = str(runtime.get("mode", "")) == "live"
+    linear_key = "published_linear_x" if live else "proposed_linear_x"
+    yaw_key = "published_angular_z" if live else "proposed_angular_z"
+    linear = _finite(output.get(linear_key)) or 0.0
+    yaw = _finite(output.get(yaw_key)) or 0.0
+    return max(abs(linear), abs(yaw))
+
+
 def ownership_snapshot(runtime: Mapping[str, Any]) -> dict[str, str]:
     """Return one inspectable owner per actuator group.
 
     Missing feedback is reported as ``unavailable``; an arm-view intent alone
     is deliberately labelled ``intent_only`` rather than pretending an arm
     executor accepted it.
+
+    ``base`` is derived from the MEASURED command only.  It used to
+    short-circuit on the phase term::
+
+        base_owner = "visual_servo" if (
+            phase in {"approach", "base_approach", "whole_body_approach"}
+            or abs(published_linear) > 1e-9
+            or abs(published_yaw) > 1e-9
+        ) else "zero_hold"
+
+    so any row whose phase was one of those three read ``visual_servo`` even
+    while publishing exactly (0, 0).  That is reachable in live mode:
+    ``_whole_body_output`` emits ``whole_body_approach`` whenever the QP
+    command is executable, and the forward clip can return 0.0 while the
+    yaw deadband zeroes the turn on the same tick -- a parked robot reported
+    as an actively servoing one.  The phase's CLAIM now lives in
+    ``PhasePolicy.expected_base_owner``; comparing it against this measured
+    owner is what detects the stall, instead of hiding it.
     """
 
-    phase = str(runtime.get("phase", "idle"))
     posture = posture_feedback_snapshot(runtime)
     reactive = _mapping(runtime.get("reactive"))
     arm_view = _mapping(reactive.get("arm_view"))
     arm_feedback = _mapping(runtime.get("arm_view_status"))
-    output = _mapping(runtime.get("output"))
-    published_linear = _finite(output.get("published_linear_x")) or 0.0
-    published_yaw = _finite(output.get("published_angular_z")) or 0.0
-    base_owner = "visual_servo" if (
-        phase in {"approach", "base_approach", "whole_body_approach"}
-        or abs(published_linear) > 1e-9
-        or abs(published_yaw) > 1e-9
-    ) else "zero_hold"
+    base_owner = (
+        BaseOwner.VISUAL_SERVO.value
+        if base_command_magnitude(runtime) > 1e-9
+        else BaseOwner.ZERO_HOLD.value
+    )
     arm_owner = str(arm_feedback.get("owner", ""))
     if not arm_owner:
         arm_owner = (
@@ -163,6 +231,20 @@ class ReactiveWatchdogDecision:
     heartbeat_age_s: float | None
     heartbeat_elapsed_s: float
     heartbeat_deadline_s: float | None
+    # --- phase-table fields -------------------------------------------
+    #: What the supervisor must DO when this decision reports ``timed_out``.
+    #: ``"none"`` only ever appears on a decision that has not timed out.
+    on_expiry: str = ExpiryAction.NONE.value
+    #: Who the phase CLAIMS is driving the base.
+    expected_base_owner: str = BaseOwner.ZERO_HOLD.value
+    #: True when the phase claims ``visual_servo`` but the measured command
+    #: is exactly zero.  This is the stall signature, and it is the reason
+    #: ``phase_elapsed_s`` is accumulating for a driving phase.
+    base_owner_mismatch: bool = False
+    is_terminal: bool = False
+    #: False when the phase string is not in ``ServoPhase``; such a phase is
+    #: NOT exempt, it inherits the fail-closed unknown-phase policy.
+    phase_known: bool = True
 
     def document(self) -> dict[str, Any]:
         return asdict(self)
@@ -174,6 +256,19 @@ class ReactivePhaseWatchdog:
     def __init__(self, config: ReactiveWatchdogConfig | None = None) -> None:
         self.config = config or ReactiveWatchdogConfig()
         self.reset()
+
+    def deadline_for(self, phase: str) -> float | None:
+        """Return the configured deadline for ``phase``.
+
+        The posture bounded wait keeps honouring the operator-configured
+        ``posture_wait_timeout_s`` so the shipped CLI flag still works; every
+        other phase takes its deadline from the table.
+        """
+
+        policy = phase_policy(phase)
+        if policy.is_posture_wait:
+            return self.config.posture_wait_timeout_s
+        return policy.deadline_s
 
     def reset(self) -> None:
         self._phase: str | None = None
@@ -216,18 +311,32 @@ class ReactivePhaseWatchdog:
             or _mapping(runtime.get("reactive")).get("phase")
             or "idle"
         )
-        phase_group = "posture_wait" if phase in POSTURE_WAIT_PHASES else phase
+        policy = phase_policy(phase)
+        phase_group = "posture_wait" if policy.is_posture_wait else phase
         if phase_group != self._phase:
             self._phase = phase_group
             self._phase_started_s = now
-        assert self._phase_started_s is not None
-        elapsed = max(0.0, now - self._phase_started_s)
         feedback = posture_feedback_snapshot(runtime)
         owners = ownership_snapshot(runtime)
-        posture_timed_out = (
-            phase in POSTURE_WAIT_PHASES
-            and elapsed >= self.config.posture_wait_timeout_s
-        )
+
+        # A phase that CLAIMS to be driving the base measures its deadline
+        # against a continuous zero-command span, not against time in phase:
+        # a legitimately long approach issues commands and rearms the timer,
+        # while a phase that stops commanding without leaving the phase --
+        # the recorded 23.1 s ``whole_body_shadow`` hold with tracking green
+        # -- accumulates until it expires.  A parked phase measures plain
+        # time in phase, because for it a zero command is correct.
+        commanding = base_command_magnitude(runtime) > 1e-9
+        expects_drive = policy.expected_base_owner is BaseOwner.VISUAL_SERVO
+        base_owner_mismatch = expects_drive and not commanding
+        if expects_drive and commanding:
+            self._phase_started_s = now
+        assert self._phase_started_s is not None
+        elapsed = max(0.0, now - self._phase_started_s)
+
+        deadline_s = self.deadline_for(phase)
+        phase_timed_out = deadline_s is not None and elapsed >= deadline_s
+        posture_timed_out = policy.is_posture_wait and phase_timed_out
 
         wall_ns = time.time_ns() if now_unix_ns is None else now_unix_ns
         if isinstance(wall_ns, bool) or not isinstance(wall_ns, int) or wall_ns <= 0:
@@ -238,7 +347,7 @@ class ReactivePhaseWatchdog:
             if isinstance(raw_stamp, int) and not isinstance(raw_stamp, bool) and raw_stamp > 0
             else None
         )
-        heartbeat_required = phase not in HEARTBEAT_EXEMPT_PHASES
+        heartbeat_required = policy.heartbeat_required
         heartbeat_valid = False
         heartbeat_age_s: float | None = None
         heartbeat_invalid_reason: str | None = None
@@ -268,7 +377,7 @@ class ReactivePhaseWatchdog:
                 # never accepted from an unverified status document. Other
                 # active phases receive one bounded startup grace period.
                 heartbeat_timed_out = (
-                    phase in HANDOFF_PHASES
+                    policy.is_handoff
                     or heartbeat_elapsed_s >= self.config.state_heartbeat_timeout_s
                 )
             elif (
@@ -281,7 +390,7 @@ class ReactivePhaseWatchdog:
                 heartbeat_timed_out = True
                 heartbeat_invalid_reason = "state heartbeat stopped advancing"
 
-        timed_out = posture_timed_out or heartbeat_timed_out
+        timed_out = phase_timed_out or heartbeat_timed_out
         code: str | None = None
         message = "phase is progressing within its bounded wait"
         # Keep the more specific posture diagnosis when both deadlines expire
@@ -319,13 +428,33 @@ class ReactivePhaseWatchdog:
                 f"{heartbeat_invalid_reason or 'state heartbeat deadline expired'}; "
                 "reactive control degraded to a stationary terminal state"
             )
+        elif phase_timed_out:
+            if base_owner_mismatch:
+                code = "BASE_COMMAND_STALL_TIMEOUT"
+                message = (
+                    f"phase {phase!r} claims the base "
+                    f"({policy.expected_base_owner.value}) but has commanded "
+                    f"exactly zero for {elapsed:.2f}s (deadline {deadline_s:.2f}s); "
+                    "the base is stopped with no owner driving it"
+                )
+            elif not is_known_phase(phase):
+                code = "UNKNOWN_PHASE_TIMEOUT"
+                message = (
+                    f"phase {phase!r} is not in the servo phase table; it was "
+                    f"bounded by the fail-closed unknown-phase deadline "
+                    f"({deadline_s:.2f}s) after {elapsed:.2f}s"
+                )
+            else:
+                code = "PHASE_DEADLINE_TIMEOUT"
+                message = (
+                    f"phase {phase!r} exceeded its {deadline_s:.2f}s bounded "
+                    f"wait ({elapsed:.2f}s elapsed) without reaching a "
+                    "terminal state"
+                )
         self._last = ReactiveWatchdogDecision(
             phase=phase,
             phase_elapsed_s=elapsed,
-            deadline_s=(
-                self.config.posture_wait_timeout_s
-                if phase in POSTURE_WAIT_PHASES else None
-            ),
+            deadline_s=deadline_s,
             timed_out=timed_out,
             code=code,
             message=message,
@@ -340,6 +469,18 @@ class ReactivePhaseWatchdog:
                 self.config.state_heartbeat_timeout_s
                 if heartbeat_required else None
             ),
+            # A heartbeat failure always stops: the status document itself is
+            # untrustworthy, so no phase-specific escalation is justified.
+            on_expiry=(
+                ExpiryAction.STOP_AND_DEGRADE.value
+                if heartbeat_timed_out
+                else policy.on_expiry.value if phase_timed_out
+                else ExpiryAction.NONE.value
+            ),
+            expected_base_owner=policy.expected_base_owner.value,
+            base_owner_mismatch=base_owner_mismatch,
+            is_terminal=policy.is_terminal,
+            phase_known=is_known_phase(phase),
         )
         return self._last
 
@@ -349,7 +490,15 @@ def replay_trace(
     *,
     stall_threshold_s: float = 5.0,
 ) -> dict[str, Any]:
-    """Summarize contiguous phase spans and identify zero-command stalls."""
+    """Summarize contiguous phase spans and identify zero-command stalls.
+
+    A stall is any NON-TERMINAL phase that held the base at exactly zero for
+    longer than the smaller of ``stall_threshold_s`` and the phase's own
+    deadline.  It used to be restricted to ``POSTURE_WAIT_PHASES``, whose
+    three strings the deployed servo never emits -- which is why replaying
+    the live trace that contains a 23.1 s zero-command ``whole_body_shadow``
+    span reported ``passed: True``.
+    """
 
     rows = [record for record in records if isinstance(record, Mapping)]
     spans: list[dict[str, Any]] = []
@@ -388,15 +537,25 @@ def replay_trace(
     for span in spans:
         duration_s = max(0.0, (span["end_unix_ns"] - span["start_unix_ns"]) / 1e9)
         span["duration_s"] = duration_s
-        if (
-            span["phase"] in POSTURE_WAIT_PHASES
-            and span["all_zero_command"]
-            and duration_s >= stall_threshold_s
-        ):
+        policy = phase_policy(span["phase"])
+        span["deadline_s"] = policy.deadline_s
+        span["expected_base_owner"] = policy.expected_base_owner.value
+        span["is_terminal"] = policy.is_terminal
+        if policy.is_terminal or policy.deadline_s is None:
+            continue
+        budget_s = min(float(stall_threshold_s), float(policy.deadline_s))
+        if span["all_zero_command"] and duration_s >= budget_s:
             stalls.append({
                 **span,
-                "code": "POSTURE_WAIT_STALL",
-                "recommended_terminal_phase": "degraded",
+                "code": (
+                    "POSTURE_WAIT_STALL"
+                    if policy.is_posture_wait
+                    else "BASE_COMMAND_STALL"
+                    if policy.expected_base_owner is BaseOwner.VISUAL_SERVO
+                    else "PHASE_DEADLINE_STALL"
+                ),
+                "on_expiry": policy.on_expiry.value,
+                "recommended_terminal_phase": ServoPhase.DEGRADED.value,
             })
     return {
         "schema": "z_manip.reactive_trace_replay.v1",

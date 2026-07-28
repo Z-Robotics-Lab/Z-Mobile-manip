@@ -31,6 +31,14 @@ from .reactive_servo import (
     TargetGeometry,
     transform_point,
 )
+from .servo_phase import (
+    BaseOwner,
+    ExpiryAction,
+    PHASE_POLICY,
+    PhasePolicy,
+    ServoPhase,
+    phase_policy,
+)
 from .go2w_posture import (
     CommandEvidence,
     CommandOwner,
@@ -70,6 +78,12 @@ __all__ = [
     "ReactiveTargetController",
     "TargetGeometry",
     "transform_point",
+    "BaseOwner",
+    "ExpiryAction",
+    "PHASE_POLICY",
+    "PhasePolicy",
+    "ServoPhase",
+    "phase_policy",
     "CommandEvidence",
     "CommandOwner",
     "Go2WPostureAdapter",

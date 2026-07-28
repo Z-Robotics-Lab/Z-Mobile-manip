@@ -51,6 +51,11 @@ from go2w_runtime_state import (
     validate_runtime_state,
 )
 
+from z_manip.control.servo_phase import (
+    HANDOFF_TERMINAL_PHASES,
+    ExpiryAction,
+    ServoPhase,
+)
 from z_manip.read_only_sessions import (
     ATTEMPT_SCHEMA,
     MANIFEST_SCHEMA,
@@ -59,6 +64,25 @@ from z_manip.read_only_sessions import (
     validate_session_id,
     validate_target_description,
 )
+
+# Phase memberships used by the approach supervisor.  Every member is a
+# ``ServoPhase`` reference, never a quoted string: the servo used to emit
+# "reacquire" while this file and the servo both spelled "reacquiring", so no
+# consumer matched the emitted value.
+#
+# ``reactive_phase`` carries the controller's own phase, which never uses the
+# "reached" presentation remap.
+_REACTIVE_HANDOFF_PHASES = frozenset({
+    ServoPhase.HANDOFF_PROBE.value,
+    ServoPhase.HANDOFF_READY.value,
+})
+# Phases the supervisor reacts to IMMEDIATELY (subject to the acquisition
+# grace window), as opposed to phases that only escalate once their table
+# deadline expires.
+_EAGER_VIEW_RECOVERY_PHASES = frozenset({
+    ServoPhase.VIEW_RECOVERY.value,
+    ServoPhase.SEARCH_REQUIRED.value,
+})
 
 
 MAX_LOG_TAIL_BYTES = 12_000
@@ -1311,20 +1335,20 @@ class DepthServoRunner:
         """
 
         phase = runtime.get("phase")
-        if phase in {"reached", "handoff_probe", "handoff_ready"}:
+        if phase in HANDOFF_TERMINAL_PHASES:
             return True
         output = runtime.get("output")
         if isinstance(output, dict):
             if output.get("needs_ik_probe") is True:
                 return True
-            if output.get("phase") in {"reached", "handoff_probe", "handoff_ready"}:
+            if output.get("phase") in HANDOFF_TERMINAL_PHASES:
                 return True
-            if output.get("reactive_phase") in {"handoff_probe", "handoff_ready"}:
+            if output.get("reactive_phase") in _REACTIVE_HANDOFF_PHASES:
                 return True
         reactive = runtime.get("reactive")
         return isinstance(reactive, dict) and (
             reactive.get("needs_ik_probe") is True
-            or reactive.get("phase") in {"handoff_probe", "handoff_ready"}
+            or reactive.get("phase") in _REACTIVE_HANDOFF_PHASES
         )
 
     def status(self) -> dict[str, Any]:
@@ -2019,7 +2043,18 @@ class DepthServoRunner:
                 now_s=time.monotonic(),
                 now_unix_ns=time.time_ns(),
             )
-            if supervision.timed_out:
+            # Dispatch on the phase table's declared expiry ACTION.  A
+            # deadline whose expiry only logs is the defect this table
+            # replaces, so every expiry lands in one of exactly two arms:
+            # stop the servo and degrade, or spend one bounded view-recovery
+            # attempt (which itself terminates in ``blocked`` when the
+            # reacquisition budget runs out).
+            escalate_recovery = (
+                supervision.timed_out
+                and supervision.on_expiry
+                == ExpiryAction.ESCALATE_VIEW_RECOVERY.value
+            )
+            if supervision.timed_out and not escalate_recovery:
                 self._terminate_process(process, keep_status=True)
                 self._set_workflow(
                     active=False,
@@ -2041,7 +2076,7 @@ class DepthServoRunner:
                     terminal_phase=str(phase),
                 )
                 return
-            if phase in {"view_recovery", "search_required"}:
+            if escalate_recovery or phase in _EAGER_VIEW_RECOVERY_PHASES:
                 now = time.monotonic()
                 if now - servo_started_s < self._acquisition_grace_s:
                     # A freshly seeded track needs grounding + EdgeTAM seeding
@@ -2075,7 +2110,7 @@ class DepthServoRunner:
                 ):
                     return
                 continue
-            if phase != "tracking_lost":
+            if phase != ServoPhase.TRACKING_LOST.value:
                 if phase:
                     self._set_workflow(phase=str(phase))
                 continue

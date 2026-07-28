@@ -964,14 +964,16 @@ def test_whole_body_branch_defers_to_the_loss_stair_and_capture_freshness():
     whole_body_approach -- the arm swung sinusoidally chasing its own motion.
     The branch's exclusion set must contain every loss-stair phase and a
     capture-age guard so stale data can only ever freeze, never steer.
+
+    This used to assert the six phase names were QUOTED inside the branch,
+    which is exactly the duplication that let the emitted string
+    ("reacquire") drift from the consumer spelling ("reacquiring") with no
+    test noticing.  The branch now names the shared ``LOSS_STAIR_PHASES``
+    set, so assert the set membership and the guard, not the literals.
     """
 
-    import inspect
     from pathlib import Path
 
-    source = Path(SERVO.__file__).read_text(encoding="utf-8")
-    marker = source.index("The loss stair MUST win over the whole-body branch")
-    window = source[marker:marker + 1400]
     for phase in (
         "tracking_hold",
         "view_recovery",
@@ -979,8 +981,15 @@ def test_whole_body_branch_defers_to_the_loss_stair_and_capture_freshness():
         "transform_unavailable",
         "tracking_lost",
         "waiting_target",
+        "reacquiring",
+        "posture_blocked",
     ):
-        assert f'"{phase}"' in window, phase
+        assert phase in SERVO.LOSS_STAIR_PHASES, phase
+
+    source = Path(SERVO.__file__).read_text(encoding="utf-8")
+    marker = source.index("The loss stair MUST win over the whole-body branch")
+    window = source[marker:marker + 1400]
+    assert "fallback.phase in LOSS_STAIR_PHASES" in window
     assert "max_target_capture_age_s" in window
     assert "fallback.target_age_s" in window
 

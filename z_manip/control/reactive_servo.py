@@ -118,11 +118,26 @@ class TargetGeometry:
 
 
 class ReactivePhase(str, Enum):
+    """Controller-internal phases.
+
+    Every value here MUST also be a ``z_manip.control.servo_phase.ServoPhase``
+    member; that module checks the parity at import time.  These strings leave
+    the process in the depth-servo status document, so a value that no
+    consumer spells is a silently dead transition.
+    """
+
     WAITING_TARGET = "waiting_target"
     TRANSFORM_UNAVAILABLE = "transform_unavailable"
     BASE_APPROACH = "base_approach"
     POSTURE_ADJUST = "posture_adjust"
-    REACQUIRE = "reacquire"
+    # Spelled "reacquiring", not "reacquire".  The emitted value used to be
+    # "reacquire" while EVERY consumer -- the servo's LOSS_STAIR_PHASES, the
+    # whole-body branch's inline bail-out set, and the legacy branch's own
+    # emission -- spelled "reacquiring".  No consumer matched the emitted
+    # string, so a reacquiring servo was indistinguishable from a healthy
+    # tracking one and the whole-body branch kept solving on a target the
+    # controller had just declared unstable after posture motion.
+    REACQUIRE = "reacquiring"
     TRACKING_HOLD = "tracking_hold"
     VIEW_RECOVERY = "view_recovery"
     SEARCH_REQUIRED = "search_required"
