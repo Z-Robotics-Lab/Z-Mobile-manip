@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import dataclasses
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -51,7 +53,7 @@ def _reactive_core(
     *,
     mode: str = "live",
     target_timeout_s: float = 0.25,
-    transform_timeout_s: float = 0.25,
+    geometry_staleness_timeout_s: float | None = None,
 ):
     return SERVO.DepthServoCore(
         SERVO.DepthServoSettings(
@@ -61,7 +63,15 @@ def _reactive_core(
             target_timeout_s=target_timeout_s,
             tracking_hold_s=0.55,
             tracking_loss_grace_s=max(0.75, target_timeout_s),
-            transform_timeout_s=transform_timeout_s,
+            # Defaults to the target timeout, the tightest value the settings
+            # validator now permits: ``_transforms_received_s`` and
+            # ``_target_received_s`` are written from one camera callback, so a
+            # geometry budget below the target budget can only ever fire early.
+            geometry_staleness_timeout_s=(
+                target_timeout_s
+                if geometry_staleness_timeout_s is None
+                else geometry_staleness_timeout_s
+            ),
         )
     )
 
@@ -502,7 +512,24 @@ def test_side_choice_is_latched_until_terminal_tracking_loss():
 
 
 def test_stale_synchronized_transform_never_reuses_old_geometry_for_motion():
-    core = _reactive_core(target_timeout_s=1.0, transform_timeout_s=0.25)
+    """Old geometry stops the base -- via the TARGET timer, not a second one.
+
+    REWRITTEN, and the rewrite is the point.  This test used to build a core
+    with ``target_timeout_s=1.0, transform_timeout_s=0.25`` and assert that an
+    observation 0.30 s old produced ``transform_unavailable``.  That
+    combination is now rejected at construction: it is the R4 inversion
+    itself, written down as an expectation.  ``_transforms_received_s`` and
+    ``_target_received_s`` are both ``float(stamp_s)`` from one camera
+    callback, so the old assertion was really "a duplicate of the target timer,
+    set four times tighter, fires first" -- and on the shipped robot that meant
+    two dropped camera frames zeroed the base with a TF error message.
+
+    The protection the name promises is still real and still tested: once the
+    observation ages past the target budget the base is zero and the geometry
+    is not reused for motion.  It is the TARGET timer that says so.
+    """
+
+    core = _reactive_core(target_timeout_s=0.25)
     assert _observe_in_frames(
         core,
         camera_xyz=(0.0, 0.0, 0.80),
@@ -512,13 +539,13 @@ def test_stale_synchronized_transform_never_reuses_old_geometry_for_motion():
     )
     output = core.tick(now_s=4.30, tracking=True)
 
-    assert output.phase == "transform_unavailable"
     assert output.published_linear_x == output.published_angular_z == 0.0
-    assert "stale" in output.reason
+    assert output.phase in SERVO.LOSS_STAIR_PHASES
+    assert output.phase != "transform_unavailable"
 
 
 def test_tracking_loss_with_stale_tf_reports_tracker_recovery_not_tf_outage():
-    core = _reactive_core(target_timeout_s=1.0, transform_timeout_s=0.25)
+    core = _reactive_core(target_timeout_s=1.0)
     assert _observe_in_frames(
         core,
         camera_xyz=(0.0, 0.20, 0.80),
@@ -537,7 +564,7 @@ def test_tracking_loss_with_stale_tf_reports_tracker_recovery_not_tf_outage():
 
 
 def test_stale_target_with_tracking_true_is_tracking_loss_not_tf_outage():
-    core = _reactive_core(target_timeout_s=0.25, transform_timeout_s=0.25)
+    core = _reactive_core(target_timeout_s=0.25)
     assert _observe_in_frames(
         core,
         camera_xyz=(0.0, 0.20, 0.80),
@@ -1257,4 +1284,586 @@ def test_every_publisher_goes_through_the_shutdown_guard():
     # The guard's own call site is the single permitted bare publish.
     assert bare == ["publisher.publish(message)"], (
         f"publisher(s) bypassing the shutdown guard: {bare}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# STAGE 2 -- the servo process.
+#
+# R2 the tracking flag never arrives, R4 a duplicated staleness timer wearing a
+# TF error message, R8 the servo kills itself on the way out.
+# ---------------------------------------------------------------------------
+
+
+EDGETAM_NODE = (
+    ROOT / "ros2" / "z_manip_edgetam" / "z_manip_edgetam" / "node.py"
+)
+
+
+def _module_ast(path: Path) -> ast.Module:
+    return ast.parse(path.read_text(encoding="utf-8"))
+
+
+def _latched_qos_names(tree: ast.Module) -> set[str]:
+    """Names bound to a ``QoSProfile(..., durability=...TRANSIENT_LOCAL)``."""
+
+    latched: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = node.value
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "QoSProfile"
+        ):
+            continue
+        for keyword in value.keywords:
+            if keyword.arg != "durability":
+                continue
+            if (
+                isinstance(keyword.value, ast.Attribute)
+                and keyword.value.attr == "TRANSIENT_LOCAL"
+            ):
+                latched.add(target.id)
+    return latched
+
+
+def _subscription_qos_name(tree: ast.Module, *, topic_attr: str) -> str:
+    """QoS argument name of the ``create_subscription`` on ``args.<attr>``."""
+
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "create_subscription"
+            and len(node.args) >= 4
+        ):
+            continue
+        topic = node.args[1]
+        if not (
+            isinstance(topic, ast.Attribute)
+            and topic.attr == topic_attr
+            and isinstance(topic.value, ast.Name)
+            and topic.value.id == "args"
+        ):
+            continue
+        qos = node.args[3]
+        assert isinstance(qos, ast.Name), ast.dump(qos)
+        return qos.id
+    raise AssertionError(f"no create_subscription on args.{topic_attr}")
+
+
+def _publisher_qos_name(tree: ast.Module, *, topic_parameter: str) -> str:
+    """QoS argument name of the ``create_publisher`` on ``_topic('<param>')``."""
+
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "create_publisher"
+            and len(node.args) >= 3
+        ):
+            continue
+        topic = node.args[1]
+        if not (
+            isinstance(topic, ast.Call)
+            and isinstance(topic.func, ast.Attribute)
+            and topic.func.attr == "_topic"
+            and len(topic.args) == 1
+            and isinstance(topic.args[0], ast.Constant)
+            and topic.args[0].value == topic_parameter
+        ):
+            continue
+        qos = node.args[2]
+        assert isinstance(qos, ast.Name), ast.dump(qos)
+        return qos.id
+    raise AssertionError(f"no create_publisher on _topic({topic_parameter!r})")
+
+
+def test_tracking_subscription_durability_matches_the_edgetam_publisher():
+    """R2(a).  ``/track_3d/is_tracking`` must be read LATCHED, like it is sent.
+
+    The publisher offers RELIABLE + TRANSIENT_LOCAL and its README states the
+    contract outright: "A downstream controller that starts after a failure
+    therefore observes the latest false state".  The VLM bridge subscribes
+    latched.  This servo shared one VOLATILE ``qos`` object with five other
+    topics, and a VOLATILE reader against a TRANSIENT_LOCAL writer still
+    MATCHES (durability is request<=offered) -- it just silently forfeits the
+    latched sample, with no warning anywhere.
+
+    Consequence, recorded: in every trace row at ``bundle_count == 1``
+    (artifacts/go2w_real/latest/depth-servo.trace.jsonl{,.1}, 12 of 12) the
+    servo reports ``phase=search_required`` with ``tracking=null``.  With no
+    flag, ``fresh_tracking`` is False on the first bundle, so DepthServoCore
+    passes ``None`` geometry into ReactiveTargetController.update(); its
+    ``_lost()`` finds its OWN ``_last_geometry`` still None and returns
+    SEARCH_REQUIRED with zero grace -- while the core is holding a perfectly
+    good geometry that decision cannot see.  That is symptom B's first half.
+
+    Asserted across BOTH files so drift on either side fails: this is exactly
+    the shape of defect the phase-vocabulary audit found, one contract written
+    twice with nothing forcing the copies to agree.
+    """
+
+    servo = _module_ast(Path(SERVO.__file__))
+    edgetam = _module_ast(EDGETAM_NODE)
+
+    servo_qos = _subscription_qos_name(servo, topic_attr="tracking_topic")
+    assert servo_qos in _latched_qos_names(servo), (
+        f"the servo subscribes to /track_3d/is_tracking with {servo_qos!r}, "
+        "which is not a TRANSIENT_LOCAL QoSProfile; a freshly started servo "
+        "will never receive the publisher's latched sample"
+    )
+
+    publisher_qos = _publisher_qos_name(edgetam, topic_parameter="tracking_topic")
+    assert publisher_qos in _latched_qos_names(edgetam), (
+        "the EdgeTAM publisher stopped offering TRANSIENT_LOCAL; the servo's "
+        "latched subscription is now pointless and R2 needs re-deciding"
+    )
+
+    # The shared VOLATILE profile must not be what carries this subscription.
+    assert servo_qos != _subscription_qos_name(servo, topic_attr="target_topic")
+
+
+def test_latched_tracking_flag_expires_so_a_historical_true_cannot_drive():
+    """R2(b), the mandatory companion.  Landing (a) alone is a fail-open.
+
+    ``std_msgs/Bool`` carries no header.  Under TRANSIENT_LOCAL the durability
+    cache hands a late-joining subscriber the publisher's last sample, and a
+    ``True`` latched by a tracking session that ended before this process
+    started is byte-identical to one published this frame.  Receipt time is the
+    only clock the flag will ever have, so receipt time is what expires it.
+    """
+
+    ttl_s = 0.40
+
+    # Fresh: acted on, in both polarities.
+    assert SERVO._aged_tracking_flag(True, age_s=0.0, ttl_s=ttl_s) is True
+    assert SERVO._aged_tracking_flag(True, age_s=0.39, ttl_s=ttl_s) is True
+    assert SERVO._aged_tracking_flag(False, age_s=0.39, ttl_s=ttl_s) is False
+
+    # Past the TTL: UNKNOWN, not True.  ``None`` and not ``False`` because
+    # every gate spells the positive test (``tracking is True``), so they are
+    # equivalent at the gates while ``None`` is the honest status report.
+    assert SERVO._aged_tracking_flag(True, age_s=0.41, ttl_s=ttl_s) is None
+    assert SERVO._aged_tracking_flag(True, age_s=90.0, ttl_s=ttl_s) is None
+    assert SERVO._aged_tracking_flag(False, age_s=0.41, ttl_s=ttl_s) is None
+
+    # Never received, or received at an unusable time: also UNKNOWN.
+    assert SERVO._aged_tracking_flag(None, age_s=0.0, ttl_s=ttl_s) is None
+    assert SERVO._aged_tracking_flag(True, age_s=None, ttl_s=ttl_s) is None
+    assert SERVO._aged_tracking_flag(True, age_s=math.nan, ttl_s=ttl_s) is None
+
+
+def test_tracking_flag_ttl_is_measured_but_never_tighter_than_target_timeout():
+    """R2(b) sizing.  Three measured bundle periods, floored at the target budget.
+
+    EdgeTAM publishes the flag from ``_publish_observation``, in the same call
+    as the selected-target cloud, so the flag cadence IS the bundle cadence and
+    ``view_update_period_s`` is the right ruler.
+
+    The floor is the safety property.  This TTL exists to reject a sample that
+    is seconds-to-minutes old; it must never become a NEW, tighter stop
+    condition on the same decision ``target_timeout_s`` already governs, or
+    R2(b) starts costing approaches instead of protecting them.
+    """
+
+    target_timeout_s = 0.40
+
+    # Before any cadence has been measured, the nominal FFS period is used.
+    assert SERVO._tracking_flag_ttl_s(
+        view_update_period_s=None,
+        target_timeout_s=target_timeout_s,
+    ) == pytest.approx(
+        max(
+            target_timeout_s,
+            SERVO.TRACKING_FLAG_STALE_PERIODS * SERVO.TRACKING_FLAG_NOMINAL_PERIOD_S,
+        )
+    )
+
+    # A slower measured cadence stretches the TTL with it.
+    assert SERVO._tracking_flag_ttl_s(
+        view_update_period_s=SERVO.VIEW_UPDATE_PERIOD_MAX_INTERVAL_S,
+        target_timeout_s=target_timeout_s,
+    ) == pytest.approx(0.60)
+
+    # THE FLOOR.  ``view_update_period_s`` is band-clamped to [0.10, 0.20], so
+    # walk the whole reachable range plus the degenerate inputs.
+    degenerate = [None, 0.0, -1.0, math.nan, math.inf]
+    measured = [0.10, 0.12, 0.133, 0.15, 0.20]
+    for period in degenerate + measured:
+        ttl_s = SERVO._tracking_flag_ttl_s(
+            view_update_period_s=period,
+            target_timeout_s=target_timeout_s,
+        )
+        assert ttl_s >= target_timeout_s, (
+            f"period {period!r} yields a {ttl_s}s tracking-flag TTL, tighter "
+            f"than the {target_timeout_s}s target timeout that already gates "
+            "the same decision; R2(b) must not manufacture new stops"
+        )
+
+
+def test_one_dropped_camera_frame_no_longer_zeroes_the_base_blaming_tf():
+    """R4.  The geometry budget was a duplicate of the target budget, set tighter.
+
+    ``observe_target`` writes ``self._target_received_s = float(stamp_s)`` and,
+    on the transforms-available branch, ``self._transforms_received_s =
+    float(stamp_s)`` -- the same value, from one camera callback; the
+    not-available branch nulls the geometry outright.  Geometry non-None
+    therefore IMPLIES the two receipt stamps are equal, so ``transform_age_s``
+    is IDENTICALLY ``target_age_s``.
+
+    Shipped, that duplicate was compared against 0.25 s while the real target
+    budget was 0.40 s, at a ~0.133 s bundle cadence.  TWO frame periods
+    (0.265 s) therefore hard-zeroed the base and reported
+    ``transform_unavailable`` -- a TF outage -- while printing the target age
+    and while the runtime observer was publishing perfectly fresh kinematics.
+
+    Constructed the way the LAUNCHER constructs it: pin the flags
+    go2w_depth_servo.sh actually passed, and leave the geometry budget at its
+    default, because the launcher never passed one.
+    """
+
+    settings = SERVO.DepthServoSettings(
+        mode="live",
+        target_timeout_s=0.40,
+        tracking_hold_s=0.80,
+        tracking_loss_grace_s=2.75,
+        handoff_settle_s=0.30,
+    )
+    core = SERVO.DepthServoCore(settings)
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.0, 1.10),
+        base_xyz=(1.20, 0.0, -0.10),
+        arm_xyz=(1.05, 0.0, 0.10),
+        stamp_s=10.0,
+    )
+
+    # One dropped frame: the next bundle lands two cadence periods later.
+    output = core.tick(now_s=10.0 + 2 * 0.133, tracking=True)
+
+    assert output.phase != "transform_unavailable", (
+        f"a {2 * 0.133:.3f}s gap -- one dropped camera frame, well inside the "
+        f"{settings.target_timeout_s}s target budget -- still reports a TF "
+        f"outage: {output.reason!r}"
+    )
+    assert output.target_age_s == pytest.approx(0.266)
+
+
+def test_geometry_staleness_budget_may_not_be_tighter_than_the_target_budget():
+    """R4's structural fix: the inversion is now unconstructible.
+
+    Same shape as the existing ``tracking_loss_grace_s >= target_timeout_s``
+    check.  Equality is legal and is what ships -- the geometry cannot be
+    fresher than the observation it was derived from, so its budget can
+    confirm the target-freshness verdict but must never pre-empt it.
+    """
+
+    with pytest.raises(ValueError, match="geometry staleness timeout"):
+        SERVO.DepthServoSettings(
+            target_timeout_s=0.40,
+            geometry_staleness_timeout_s=0.25,
+        )
+
+    equal = SERVO.DepthServoSettings(
+        target_timeout_s=0.40,
+        geometry_staleness_timeout_s=0.40,
+    )
+    assert equal.geometry_staleness_timeout_s == equal.target_timeout_s
+
+    defaults = SERVO.DepthServoSettings()
+    assert defaults.geometry_staleness_timeout_s >= defaults.target_timeout_s
+
+
+def test_blocked_geometry_still_fails_closed_on_a_missing_transform():
+    """R4 explicitly does NOT delete the guard.
+
+    ``transform_unavailable`` sits in the whole-body bypass set whose comment
+    records live 2026-07-24: raw_y swept +/-0.67 m sinusoidally while the
+    source stamp froze and the arm chased its own motion.  The AGE term was the
+    duplicate; the ``self._geometry is None`` term is the protection, and a
+    fresh observation whose TF lookup failed must still zero the base.
+    """
+
+    core = _reactive_core(target_timeout_s=0.40)
+    core.observe_target(
+        x_m=0.0,
+        y_m=0.1,
+        z_m=0.90,
+        stamp_s=20.0,
+        transform_error="base_link TF unavailable",
+    )
+
+    output = core.tick(now_s=20.01, tracking=True)
+
+    assert output.phase == "transform_unavailable"
+    assert output.published_linear_x == output.published_angular_z == 0.0
+    assert core.geometry is None
+
+
+def test_every_stair_setting_is_pinned_by_the_launcher():
+    """The test commit c208a6d could not write, and why it missed R4.
+
+    That test asserted the launcher's loss-stair values matched the Python
+    defaults -- but it could only ever assert on flags the launcher ALREADY
+    passed, so it covered hold/grace/target-timeout and was structurally
+    incapable of noticing the fourth budget, which had no flag in the launcher
+    at all and sat at an invisible 0.25 s.
+
+    This one walks the mapping from the servo module and every duration field
+    of the settings dataclass, so a stair knob that nobody pins fails here
+    instead of on the robot.
+    """
+
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    defaults = {
+        field.name: field.default
+        for field in dataclasses.fields(SERVO.DepthServoSettings)
+    }
+
+    # Duration fields deliberately outside the freshness/loss stair.  Adding a
+    # new ``*_s`` field forces a decision here rather than allowing silence.
+    not_stair = {
+        # VisualServoController convergence dwell on the legacy optical path,
+        # which deployed construction never enables
+        # (allow_legacy_optical_depth_for_tests stays False).
+        "settle_time_s",
+    }
+    duration_fields = {name for name in defaults if name.endswith("_s")}
+    unclassified = duration_fields - set(SERVO.STAIR_SETTING_FLAGS) - not_stair
+    assert not unclassified, (
+        f"new duration setting(s) {sorted(unclassified)} are neither pinned in "
+        "STAIR_SETTING_FLAGS nor explicitly exempted; classify them or an "
+        "operator reading the launcher cannot see them"
+    )
+
+    for name, flag in SERVO.STAIR_SETTING_FLAGS.items():
+        assert name in defaults, f"STAIR_SETTING_FLAGS names a dead field {name!r}"
+        match = re.search(rf"{re.escape(flag)} (\S+)", launcher)
+        assert match is not None, (
+            f"go2w_depth_servo.sh does not pass {flag}, so the {name!r} budget "
+            "is invisible to whoever reads the launcher"
+        )
+        assert float(match.group(1)) == pytest.approx(defaults[name]), (
+            f"launcher pins {flag} at {match.group(1)} but the Python default "
+            f"for {name} is {defaults[name]}"
+        )
+
+    # And the launcher's ACTUAL command line must parse and land those values.
+    # Asserting the flag text alone would still miss a spelling that argparse
+    # rejects, or one that argparse accepts into a field nothing reads.
+    settings = SERVO._settings_from_args(SERVO._arguments(_launcher_argv()))
+    for name in SERVO.STAIR_SETTING_FLAGS:
+        assert getattr(settings, name) == pytest.approx(defaults[name])
+
+
+def _launcher_argv() -> list[str]:
+    """The servo argv go2w_depth_servo.sh builds, with shell values stubbed."""
+
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    start = launcher.index('python3 "$SCRIPT_DIR/go2w_depth_servo.py"')
+    lines: list[str] = []
+    for line in launcher[start:].splitlines():
+        lines.append(line)
+        if not line.rstrip().endswith("\\"):
+            break
+    tokens = " ".join(lines).replace("\\", "").split()[2:]
+    # ``--mode`` is a choices= flag, so its stub has to be a legal mode.
+    return [
+        ("live" if token == '"$MODE"' else "/tmp/launcher-stub")
+        if "$" in token
+        else token
+        for token in tokens
+    ]
+
+
+def test_launcher_command_line_parses_into_the_shipped_settings():
+    """The whole launcher argv, not a hand-picked subset of its flags.
+
+    Every previous launcher test read the file as TEXT and asserted substrings.
+    That cannot catch a flag argparse would reject, and it cannot catch a flag
+    argparse accepts into a field ``_settings_from_args`` never reads.
+    """
+
+    settings = SERVO._settings_from_args(SERVO._arguments(_launcher_argv()))
+
+    assert settings.mode == "live"
+    assert settings.target_timeout_s == 0.40
+    assert settings.geometry_staleness_timeout_s == 0.40
+    # THE R4 ORDERING, evaluated on what the robot is actually launched with.
+    assert settings.geometry_staleness_timeout_s >= settings.target_timeout_s
+
+
+def test_tf_lookup_blocking_wait_is_capped_independently_of_the_staleness_budget():
+    """R4's fourth-consumer trap: one number sized two unrelated things.
+
+    ``_target_transforms`` takes TWO sequential blocking ``lookup_transform``
+    calls on the node's single-threaded executor -- the same thread as the
+    20 Hz control tick.  Sizing that wait from the geometry staleness budget
+    meant relaxing a freshness COMPARISON from 0.25 to 0.40 would have raised
+    worst-case in-callback BLOCKING from 0.50 s to 0.80 s, sixteen missed
+    ticks, as an invisible side effect.
+    """
+
+    settings = SERVO.DepthServoSettings()
+    per_lookup_s = min(settings.geometry_staleness_timeout_s, SERVO.TF_LOOKUP_TIMEOUT_S)
+
+    assert per_lookup_s == pytest.approx(0.25)
+    assert 2 * per_lookup_s <= 0.50, (
+        "worst-case in-callback blocking on the single-threaded executor rose "
+        "above the 0.50s it was before the staleness budget was widened"
+    )
+
+    source = Path(SERVO.__file__).read_text(encoding="utf-8")
+    window = source[source.index("query_time = Time.from_msg"):][:600]
+    assert "TF_LOOKUP_TIMEOUT_S" in window, (
+        "the tf2 lookup Duration is no longer capped by its own constant"
+    )
+
+
+def _signal_handler_ast() -> ast.FunctionDef:
+    for node in ast.walk(_module_ast(Path(SERVO.__file__))):
+        if isinstance(node, ast.FunctionDef) and node.name == "request_stop":
+            return node
+    raise AssertionError("the SIGTERM/SIGINT handler is gone")
+
+
+def test_signal_handler_only_sets_flags_and_never_re_enters_rcl():
+    """R8.  The pattern to remove is doing WORK in the handler.
+
+    The handler ran ``node.stop()`` -- three zero-Twist publishes plus a status
+    file write -- and then ``rclpy.shutdown()``, from a signal delivered while
+    ``rclpy.spin()`` was on the stack and midway through using those same
+    objects.  One recorded log carries nine tracebacks from that single
+    teardown: 5x RCLError at publisher.c:423, 2x InvalidHandle, 1x
+    ``AttributeError: 'NoneType' object has no attribute 'trigger'`` (a guard
+    condition freed under the executor), 1x FileNotFoundError.
+
+    Commit 6a3f75d guarded the publishes.  That removed the printed text and
+    left the re-entrancy: the handler was still touching rcl objects the spin
+    thread owned.  No try/except can fix that, because the exception is not the
+    bug -- the work is.  So this asserts the SHAPE, not the symptom.
+    """
+
+    handler = _signal_handler_ast()
+    calls = [
+        node for node in ast.walk(handler) if isinstance(node, ast.Call)
+    ]
+    offenders = [
+        ast.unparse(call)
+        for call in calls
+        if not (isinstance(call.func, ast.Attribute) and call.func.attr == "set")
+    ]
+    assert not offenders, (
+        "the signal handler does work again instead of only latching flags: "
+        f"{offenders}"
+    )
+    assert calls, "the handler no longer latches anything"
+
+
+def test_shutdown_work_happens_on_the_main_thread_after_the_spin_loop():
+    """R8's other half: the work has to actually still happen, just later.
+
+    Removing it from the handler is only correct if the final zero-Twist, the
+    final status write, ``destroy_node`` and ``shutdown`` all run once the loop
+    has returned -- and if a handler that can no longer wake a blocking wait is
+    paired with a loop that only waits in bounded steps.  ``rclpy.spin()``
+    blocks unboundedly, and installing Python handlers over SIGINT/SIGTERM
+    displaces the C-level handler ``rclpy.init()`` registered to break it.
+    """
+
+    source = Path(SERVO.__file__).read_text(encoding="utf-8")
+    shutdown = source[source.index("    rclpy.init()"):]
+
+    assert "while rclpy.ok() and not stopped.is_set():" in shutdown
+    assert "executor.spin_once(timeout_sec=SHUTDOWN_POLL_INTERVAL_S)" in shutdown
+    code = [
+        line for line in shutdown.splitlines() if not line.lstrip().startswith("#")
+    ]
+    assert not [line for line in code if "rclpy.spin(node)" in line], (
+        "an unbounded blocking spin cannot be woken by a flag-only handler"
+    )
+    for expected in (
+        "node.stop(_shutdown_phase(stop_requested=stopped.is_set()))",
+        "node.destroy_node()",
+        "rclpy.shutdown()",
+    ):
+        assert expected in shutdown.split("finally:", 1)[1], expected
+
+    # A poll interval no coarser than one control tick keeps the delay to the
+    # final zero-Twist inside a tick period.
+    assert 0.0 < SERVO.SHUTDOWN_POLL_INTERVAL_S <= 0.05
+    assert SERVO._shutdown_phase(stop_requested=True) == "stopped"
+    assert SERVO._shutdown_phase(stop_requested=False) == "exited"
+
+
+def test_atomic_status_write_scratch_path_is_unique_not_the_container_pid(
+    tmp_path, monkeypatch
+):
+    """R8's second half.  ``.{name}.{getpid()}.tmp`` is a compile-time constant here.
+
+    The servo is ALWAYS pid 1 inside its container, so that expression always
+    renders ``.depth-servo.json.1.tmp`` -- and a pid namespace does not make
+    the HOST path unique.  The status directory is bind-mounted read-write into
+    every runtime container, so a second servo or replay container (also pid 1)
+    writes the identical scratch path on the same host directory: one truncates
+    the other's half-written file and ``os.replace`` publishes a torn document,
+    which every reader parses as ``JSONDecodeError -> {}``, i.e. "the servo is
+    not running".
+    """
+
+    status = tmp_path / "depth-servo.json"
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def _record(source, destination):
+        seen.append(Path(source).name)
+        real_replace(source, destination)
+
+    monkeypatch.setattr(SERVO.os, "replace", _record)
+    # Same process, therefore the same pid: uniqueness may not come from it.
+    SERVO._atomic_json(status, {"a": 1})
+    SERVO._atomic_json(status, {"a": 2})
+
+    assert len(set(seen)) == 2, (
+        f"two writes from one pid reused the scratch path {seen[0]!r}; a "
+        "second container is also pid 1 and would collide on it"
+    )
+    assert all(name != ".depth-servo.json.1.tmp" for name in seen)
+    assert json.loads(status.read_text(encoding="utf-8")) == {"a": 2}
+    # A unique name no longer self-cleans by being overwritten, so nothing may
+    # be left behind.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["depth-servo.json"]
+
+
+def test_atomic_status_write_removes_its_scratch_file_when_the_publish_fails(
+    tmp_path, monkeypatch
+):
+    """The cost of uniqueness, paid back.
+
+    A constant scratch name self-cleaned: the next tick overwrote whatever the
+    last failure left behind.  A per-write name does not, and this runs at
+    20 Hz, so a repeating publish failure (a full or read-only status volume --
+    the same directory a magnetometer-log runaway filled to zero bytes free
+    once already) would paper the directory with orphans on top of it.  The
+    failure must be injected AFTER the scratch file exists, which is exactly
+    where the old code had nothing.
+    """
+
+    status = tmp_path / "depth-servo.json"
+
+    def _explode(source, destination):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(SERVO.os, "replace", _explode)
+    with pytest.raises(OSError):
+        SERVO._atomic_json(status, {"a": 1})
+
+    assert list(tmp_path.iterdir()) == [], (
+        f"scratch file left behind at 20 Hz: {[p.name for p in tmp_path.iterdir()]}"
     )

@@ -21,6 +21,7 @@ import statistics
 import threading
 import time
 from typing import Any
+import uuid
 
 import numpy as np
 
@@ -162,7 +163,22 @@ class DepthServoSettings:
     outlier_rebase_spread_m: float = 0.05
     base_frame: str = "base_link"
     arm_base_frame: str = "piper_base_link"
-    transform_timeout_s: float = 0.25
+    # Formerly ``transform_timeout_s``, one letter away from the launcher's
+    # ``--runtime-transform-timeout-s`` (which is a completely different
+    # quantity: the maximum age of the subscribe-only runtime-observer JSON).
+    # This one bounds how stale the DERIVED TargetGeometry may be.
+    #
+    # ``_transforms_received_s`` and ``_target_received_s`` are both assigned
+    # ``float(stamp_s)`` from the SAME camera callback (see ``observe_target``:
+    # the target stamp is written unconditionally, the transform stamp only on
+    # the ``transforms_available`` branch, and the not-available branch nulls
+    # the geometry).  Geometry non-None therefore IMPLIES the two stamps are
+    # equal, so this budget and ``target_timeout_s`` measure the same physical
+    # age.  Shipping 0.25 against a 0.40 target timeout at a ~0.133 s bundle
+    # cadence meant TWO frame periods (0.265 s) hard-zeroed the base with a
+    # reason string that blamed TF while printing the target age.  They are
+    # now pinned equal, and ``__post_init__`` forbids the inversion.
+    geometry_staleness_timeout_s: float = 0.40
     # Explicit test-only compatibility seam. Deployed ROS construction always
     # leaves this false: missing transforms must never fall back to optical z.
     allow_legacy_optical_depth_for_tests: bool = False
@@ -203,8 +219,22 @@ class DepthServoSettings:
             raise ValueError("outlier rebase spread must be finite and positive")
         if not self.base_frame.strip() or not self.arm_base_frame.strip():
             raise ValueError("base and arm-base frames must be non-empty")
-        if not math.isfinite(self.transform_timeout_s) or self.transform_timeout_s <= 0.0:
-            raise ValueError("transform timeout must be finite and positive")
+        if (
+            not math.isfinite(self.geometry_staleness_timeout_s)
+            or self.geometry_staleness_timeout_s <= 0.0
+        ):
+            raise ValueError("geometry staleness timeout must be finite and positive")
+        # ORDERING INVARIANT, same shape as the tracking-loss-grace check above.
+        # ``transform_age_s`` IS ``target_age_s`` whenever the geometry exists
+        # (both are written from one camera callback), so a geometry budget
+        # BELOW the target budget can only ever fire early: it turns a single
+        # dropped camera frame into a hard base zero wearing a TF error
+        # message.  The geometry can never be fresher than the observation it
+        # was derived from, so its budget can never legitimately be tighter.
+        if self.geometry_staleness_timeout_s < self.target_timeout_s:
+            raise ValueError(
+                "geometry staleness timeout must be at least the target timeout",
+            )
         if not math.isfinite(self.handoff_depth_m) or self.handoff_depth_m <= 0.0:
             raise ValueError("handoff depth must be finite and positive")
         if not math.isfinite(self.side_lateral_offset_m) or self.side_lateral_offset_m <= 0.0:
@@ -267,6 +297,49 @@ WHOLE_BODY_REACTIVE_PHASE = "whole_body"
 # reacquisition, or jitter and are ignored so the damper tracks the true rate.
 VIEW_UPDATE_PERIOD_MIN_INTERVAL_S = 0.10
 VIEW_UPDATE_PERIOD_MAX_INTERVAL_S = 0.20
+
+
+# --- /track_3d/is_tracking freshness -----------------------------------------
+#
+# WHY THIS SUBSCRIPTION IS LATCHED AND WHY THE FLAG MUST STILL EXPIRE.
+#
+# The publisher (ros2/z_manip_edgetam/.../node.py, ``tracking_state_qos``)
+# offers RELIABLE + TRANSIENT_LOCAL, and the VLM bridge subscribes latched to
+# match.  This servo shared one VOLATILE profile with every other topic, so a
+# freshly started servo received NO sample at all until EdgeTAM published its
+# next observation.  In that window ``self.tracking`` is None, ``fresh_tracking``
+# is False, and ReactiveTargetController._lost() sees its own ``_last_geometry``
+# still None and returns SEARCH_REQUIRED with ZERO grace -- while DepthServoCore
+# is holding a perfectly good geometry the decision cannot see.  In the recorded
+# corpus (461 trace rows, artifacts/go2w_real/latest/depth-servo.trace.jsonl{,.1})
+# EVERY row at ``bundle_count == 1`` is ``phase=search_required`` with
+# ``tracking=null``: 12 of 12.
+#
+# Latching alone would be a fail-open: ``std_msgs/Bool`` is unstamped, so the
+# durability cache can hand the servo a ``True`` from a session that ended
+# before this process existed and nothing in the message can date it.  Receipt
+# time is therefore recorded alongside the flag and the flag expires against it
+# (``_tracking_flag_ttl_s`` / ``_aged_tracking_flag``).  Landing the QoS change
+# without the expiry is the fail-open half of a two-part fix.
+TRACKING_FLAG_STALE_PERIODS = 3.0
+# Fallback ruler before ``view_update_period_s`` has two in-band arrivals to
+# measure: the shipped FFS bundle cadence (~7.5 Hz).
+TRACKING_FLAG_NOMINAL_PERIOD_S = 0.133
+
+
+# Per-lookup ceiling for the tf2 FALLBACK path in the PointCloud2 callback.
+#
+# ``_target_transforms`` performs TWO sequential blocking ``lookup_transform``
+# calls, each with ``Duration(seconds=...)``, on the node's SINGLE-THREADED
+# executor -- the same thread that runs the 20 Hz control tick.  Sizing that
+# blocking wait from ``geometry_staleness_timeout_s`` coupled two unrelated
+# things: widening the staleness budget from 0.25 to 0.40 would have raised
+# worst-case in-callback blocking from 0.50 s to 0.80 s, i.e. sixteen missed
+# ticks, as a side effect of relaxing a freshness comparison.  Capping here
+# holds today's worst case at exactly 0.50 s while decoupling the two.  A
+# failed lookup is fail-closed (transform_error -> geometry None -> zero), so
+# the cap can only ever stop the robot sooner, never later.
+TF_LOOKUP_TIMEOUT_S = 0.25
 
 
 # Trace cadence floors.  A non-terminal (actively approaching/recovering) servo
@@ -1037,10 +1110,17 @@ class DepthServoCore:
             if self._transforms_received_s is None
             else max(0.0, now_s - self._transforms_received_s)
         )
+        # The ``self._geometry is not None`` term is the load-bearing one and
+        # must stay: live 2026-07-24, raw_y swept +/-0.67 m sinusoidally while
+        # the source stamp froze and the arm chased its own motion.  The AGE
+        # term is a duplicate of ``target_timeout_s`` (the two receipt stamps
+        # are written from one callback), which is why the settings validator
+        # now forbids it from being the tighter of the two: it may confirm the
+        # target-freshness verdict, never pre-empt it.
         transform_fresh = (
             self._geometry is not None
             and transform_age_s is not None
-            and transform_age_s <= self.settings.transform_timeout_s
+            and transform_age_s <= self.settings.geometry_staleness_timeout_s
         )
         # A transform is synchronized to a target observation.  Once the
         # tracker stops publishing targets, both timestamps necessarily age
@@ -1236,13 +1316,39 @@ class DepthServoCore:
 
 
 def _atomic_json(path: Path, document: dict[str, Any]) -> None:
+    """Publish ``document`` at ``path`` through a genuinely unique temp file.
+
+    The old scratch name was ``.{name}.{os.getpid()}.tmp``.  The servo is
+    ALWAYS pid 1 inside its container, so that expression is the compile-time
+    constant ``.depth-servo.json.1.tmp`` -- and pid namespaces do not make the
+    HOST directory unique.  The status directory is bind-mounted read-write
+    into every runtime container, so a second servo/replay container (also pid
+    1) writes the identical scratch path: one process truncates the other's
+    half-written file and ``os.replace`` then publishes a torn document that
+    every reader parses with ``json.JSONDecodeError -> {}``, i.e. as "the servo
+    is not running".  ``uuid4`` is per-write and namespace-independent.
+
+    ``write_text`` (not ``tempfile.mkstemp``) is kept deliberately: mkstemp
+    forces 0600 and the status file is read by other uids on this deployment.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except BaseException:
+        # A unique name no longer self-cleans by being overwritten next tick,
+        # so a failed write must remove its own scratch file or a 20 Hz servo
+        # papers the status directory with orphans.
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _append_jsonl(path: Path, document: dict[str, Any]) -> None:
@@ -1284,6 +1390,61 @@ def _view_period_update(
         return interval_s
     # Light 0.3 weight: a single jittered frame cannot swing the damping cap.
     return 0.7 * previous_period_s + 0.3 * interval_s
+
+
+def _tracking_flag_ttl_s(
+    *,
+    view_update_period_s: float | None,
+    target_timeout_s: float,
+) -> float:
+    """Return how long a received ``/track_3d/is_tracking`` sample stays valid.
+
+    EdgeTAM publishes the flag from ``_publish_observation``, in the SAME call
+    that publishes the selected-target cloud, so the flag cadence IS the bundle
+    cadence and ``view_update_period_s`` (the measured, band-clamped EMA of
+    that cadence) is the right ruler.  Three periods is one lost sample plus
+    two of jitter; at the shipped ~0.133 s cadence that is ~0.40 s.
+
+    Floored at ``target_timeout_s`` on purpose.  This TTL exists to reject a
+    LATCHED HISTORICAL sample -- something seconds to minutes old, because a
+    live publisher would have refreshed it within one frame -- not to police
+    steady-state jitter.  Letting it drop below the target-freshness budget
+    that already governs the very same decision would manufacture new stops
+    without catching anything the target timer does not already catch.
+    """
+
+    period_s = view_update_period_s
+    if period_s is None or not math.isfinite(period_s) or period_s <= 0.0:
+        period_s = TRACKING_FLAG_NOMINAL_PERIOD_S
+    return max(float(target_timeout_s), TRACKING_FLAG_STALE_PERIODS * period_s)
+
+
+def _aged_tracking_flag(
+    flag: bool | None,
+    *,
+    age_s: float | None,
+    ttl_s: float,
+) -> bool | None:
+    """Degrade a stale tracking flag to UNKNOWN (``None``).
+
+    MANDATORY COMPANION TO TRANSIENT_LOCAL DURABILITY on this subscription.
+    ``std_msgs/Bool`` has no header, so a sample handed to a late-joining
+    subscriber by the publisher's durability cache is byte-identical to one
+    published this instant.  Subscribing TRANSIENT_LOCAL without this ages
+    nothing and the servo can act on a ``True`` from a tracking session that
+    ended before the process started -- a fail-open.  Receipt time is the only
+    clock available, so receipt time is what expires.
+
+    UNKNOWN, not ``False``: every consumer already spells the positive test
+    (``tracking is True``), so ``None`` and ``False`` are equivalent at the
+    gates while ``None`` is the honest report in the status document.
+    """
+
+    if flag is None:
+        return None
+    if age_s is None or not math.isfinite(age_s) or age_s > ttl_s:
+        return None
+    return bool(flag)
 
 
 def _trace_min_interval_s(*, terminal: bool) -> float:
@@ -1334,7 +1495,54 @@ def _tick_should_skip(*, stop_requested: bool, ros_ok: bool) -> bool:
     return stop_requested or not ros_ok
 
 
-def _arguments() -> argparse.Namespace:
+def _shutdown_phase(*, stop_requested: bool) -> str:
+    """Terminal phase to publish once the spin loop has returned.
+
+    Split out of the shutdown block so the STOPPED/EXITED distinction -- the
+    difference between "an operator or the supervisor asked us to stop" and
+    "the executor fell out from under us" -- is testable without rclpy.
+    """
+
+    return (
+        ServoPhase.STOPPED.value if stop_requested else ServoPhase.EXITED.value
+    )
+
+
+#: How long the spin loop may block before re-checking the stop flag.
+#:
+#: The SIGTERM handler is not allowed to touch the ROS context (see the
+#: shutdown block), so it cannot wake a blocking wait; and installing a Python
+#: handler over SIGINT/SIGTERM displaces the C-level handler rclpy.init()
+#: registered to trigger every wait set's guard condition.  A bounded wait is
+#: what turns "the handler sets a flag" into "the loop notices".  One 20 Hz
+#: tick period: the final zero-Twist is delayed by at most this much, ~9 mm of
+#: travel at the 0.18 m/s ceiling, and the transport keeps its own watchdog.
+SHUTDOWN_POLL_INTERVAL_S = 0.05
+
+
+#: Every ``DepthServoSettings`` field that participates in the target
+#: freshness / tracking-loss stair, mapped to the CLI flag that sets it.
+#:
+#: The launcher pins every servo knob explicitly, which means a default this
+#: table does NOT name is a value no operator can see or change -- and the
+#: settings-vs-launcher test can only assert on flags the launcher already
+#: passes.  That is exactly how ``--transform-timeout-s`` shipped unpinned at
+#: 0.25 under a 0.40 target timeout: commit c208a6d's launcher test covered
+#: hold/grace/target-timeout because those three appeared in the launcher, and
+#: was structurally incapable of noticing the fourth.  tests/ walks THIS table
+#: and every duration field of the dataclass, so a new stair knob fails the
+#: suite until it is either pinned or explicitly classified as not-stair.
+STAIR_SETTING_FLAGS: dict[str, str] = {
+    "target_timeout_s": "--target-timeout-s",
+    "max_target_capture_age_s": "--max-target-capture-age-s",
+    "tracking_hold_s": "--tracking-hold-s",
+    "tracking_loss_grace_s": "--tracking-loss-grace-s",
+    "geometry_staleness_timeout_s": "--geometry-staleness-timeout-s",
+    "handoff_settle_s": "--handoff-settle-s",
+}
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("shadow", "live"), default="shadow")
     parser.add_argument("--status-file", type=Path, required=True)
@@ -1359,24 +1567,67 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--yaw-deadband-deg", type=float, default=10.0)
     parser.add_argument("--max-yaw-step-rps", type=float, default=0.015)
     parser.add_argument("--target-timeout-s", type=float, default=0.40)
+    parser.add_argument("--max-target-capture-age-s", type=float, default=0.70)
     parser.add_argument("--tracking-hold-s", type=float, default=0.80)
     parser.add_argument("--tracking-loss-grace-s", type=float, default=2.75)
     parser.add_argument("--handoff-settle-s", type=float, default=0.30)
-    parser.add_argument("--transform-timeout-s", type=float, default=0.25)
+    # RENAMED from ``--transform-timeout-s``.  That spelling sat one word away
+    # from ``--runtime-transform-timeout-s`` above while meaning something
+    # entirely different (derived-geometry staleness, not runtime-observer
+    # document age), and the launcher passed only the latter -- so an operator
+    # reading go2w_depth_servo.sh saw "0.50" and had no way to know a second,
+    # tighter, invisible 0.25 s budget was also gating the base.
+    parser.add_argument("--geometry-staleness-timeout-s", type=float, default=0.40)
     parser.add_argument("--rate-hz", type=float, default=20.0)
     parser.add_argument("--whole-body", choices=("off", "casadi"), default="casadi")
     parser.add_argument("--whole-body-urdf", type=Path)
     parser.add_argument("--whole-body-calibration", type=Path)
     parser.add_argument("--whole-body-collision-model", type=Path)
-    return parser.parse_args()
+    return parser
+
+
+def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    return _parser().parse_args(argv)
+
+
+def _settings_from_args(args: argparse.Namespace) -> DepthServoSettings:
+    """Build the settings exactly as the deployed runtime does.
+
+    Extracted out of ``_run_ros`` so the argparse-to-settings mapping -- the
+    only place a launcher flag becomes a control budget -- can be exercised
+    without rclpy, pinocchio, or casadi on the test host.  Inlined, the
+    ``--geometry-staleness-timeout-s``/``--runtime-transform-timeout-s``
+    confusion lived behind an import no test could perform.
+    """
+
+    return DepthServoSettings(
+        mode=args.mode,
+        desired_depth_m=args.desired_depth_m,
+        handoff_depth_m=args.handoff_depth_m,
+        handoff_bearing_rad=math.radians(args.handoff_bearing_deg),
+        min_forward_mps=args.min_forward_mps,
+        max_forward_mps=args.max_forward_mps,
+        max_yaw_rps=args.max_yaw_rps,
+        yaw_deadband_rad=math.radians(args.yaw_deadband_deg),
+        max_yaw_step_rps=args.max_yaw_step_rps,
+        target_timeout_s=args.target_timeout_s,
+        max_target_capture_age_s=args.max_target_capture_age_s,
+        tracking_hold_s=args.tracking_hold_s,
+        tracking_loss_grace_s=args.tracking_loss_grace_s,
+        handoff_settle_s=args.handoff_settle_s,
+        base_frame=args.base_frame,
+        arm_base_frame=args.arm_base_frame,
+        geometry_staleness_timeout_s=args.geometry_staleness_timeout_s,
+    )
 
 
 def _run_ros(args: argparse.Namespace) -> int:
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.duration import Duration
+    from rclpy.executors import SingleThreadedExecutor
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from rclpy.time import Time
     from sensor_msgs.msg import PointCloud2
     from sensor_msgs_py import point_cloud2
@@ -1390,24 +1641,7 @@ def _run_ros(args: argparse.Namespace) -> int:
         or args.runtime_transform_timeout_s <= 0.0
     ):
         raise ValueError("runtime transform timeout must be finite and positive")
-    settings = DepthServoSettings(
-        mode=args.mode,
-        desired_depth_m=args.desired_depth_m,
-        handoff_depth_m=args.handoff_depth_m,
-        handoff_bearing_rad=math.radians(args.handoff_bearing_deg),
-        min_forward_mps=args.min_forward_mps,
-        max_forward_mps=args.max_forward_mps,
-        max_yaw_rps=args.max_yaw_rps,
-        yaw_deadband_rad=math.radians(args.yaw_deadband_deg),
-        max_yaw_step_rps=args.max_yaw_step_rps,
-        target_timeout_s=args.target_timeout_s,
-        tracking_hold_s=args.tracking_hold_s,
-        tracking_loss_grace_s=args.tracking_loss_grace_s,
-        handoff_settle_s=args.handoff_settle_s,
-        base_frame=args.base_frame,
-        arm_base_frame=args.arm_base_frame,
-        transform_timeout_s=args.transform_timeout_s,
-    )
+    settings = _settings_from_args(args)
 
     class DepthServoNode(Node):
         def __init__(self) -> None:
@@ -1416,7 +1650,12 @@ def _run_ros(args: argparse.Namespace) -> int:
             # rclpy.ok()) at its top so no publish races a context teardown.
             self.stop_event = threading.Event()
             self.core = DepthServoCore(settings)
-            self.tracking: bool | None = None
+            # RAW last-received flag.  Nothing may read this directly: every
+            # gate must go through ``self.tracking`` (the aged view), or a
+            # latched historical TRANSIENT_LOCAL sample becomes an eternal
+            # "yes, we are tracking".  See TRACKING_FLAG_STALE_PERIODS.
+            self.tracking_raw: bool | None = None
+            self.tracking_received_s: float | None = None
             self.last_source_stamp_ns: int | None = None
             self.last_source_frame: str | None = None
             # Live measurement of the tracked-target bundle period, used by the
@@ -1478,6 +1717,18 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_trace_phase: str | None = None
             self.last_trace_s = 0.0
             qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+            # MUST match the EdgeTAM publisher's ``tracking_state_qos``
+            # (ros2/z_manip_edgetam/z_manip_edgetam/node.py).  A VOLATILE
+            # reader against a TRANSIENT_LOCAL writer still connects -- QoS
+            # durability is request<=offered -- it just silently forfeits the
+            # latched sample, which is the one a freshly started servo needs.
+            # The VLM bridge already subscribes latched; this servo was the
+            # only reader of this topic that did not.
+            tracking_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
             self.publisher = self.create_publisher(TwistStamped, args.velocity_topic, 1)
@@ -1492,7 +1743,12 @@ def _run_ros(args: argparse.Namespace) -> int:
                 qos,
             )
             self.create_subscription(PointCloud2, args.target_topic, self._target, qos)
-            self.create_subscription(Bool, args.tracking_topic, self._tracking, qos)
+            self.create_subscription(
+                Bool,
+                args.tracking_topic,
+                self._tracking,
+                tracking_qos,
+            )
             self.create_subscription(
                 String,
                 "/go2w/posture_state",
@@ -1572,7 +1828,16 @@ def _run_ros(args: argparse.Namespace) -> int:
                     self.last_transform_error = None
                     return base_matrix, arm_matrix
             query_time = Time.from_msg(source_stamp)
-            timeout = Duration(seconds=settings.transform_timeout_s)
+            # Sized by TF_LOOKUP_TIMEOUT_S, NOT by the geometry staleness
+            # budget: this is a blocking wait taken TWICE on the single
+            # -threaded executor that also runs the control tick, so it must
+            # not grow just because a freshness comparison was relaxed.
+            timeout = Duration(
+                seconds=min(
+                    settings.geometry_staleness_timeout_s,
+                    TF_LOOKUP_TIMEOUT_S,
+                ),
+            )
             try:
                 base = self.tf_buffer.lookup_transform(
                     settings.base_frame,
@@ -1677,7 +1942,35 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self.last_source_stamp_ns = new_source_stamp_ns
 
         def _tracking(self, message: Bool) -> None:
-            self.tracking = bool(message.data)
+            self.tracking_raw = bool(message.data)
+            # ``std_msgs/Bool`` is unstamped, so RECEIPT is the only clock this
+            # flag will ever have.  Recording it is what makes the latched
+            # TRANSIENT_LOCAL subscription above safe rather than fail-open.
+            self.tracking_received_s = time.monotonic()
+
+        @property
+        def tracking(self) -> bool | None:
+            """The tracking flag as of NOW: UNKNOWN once it outlives its TTL.
+
+            Read-only on purpose.  Every consumer (the control tick, the
+            whole-body gate, the published status document) goes through this
+            one accessor so none of them can be left reading the un-aged flag
+            when the next one is added.
+            """
+
+            age_s = (
+                None
+                if self.tracking_received_s is None
+                else max(0.0, time.monotonic() - self.tracking_received_s)
+            )
+            return _aged_tracking_flag(
+                self.tracking_raw,
+                age_s=age_s,
+                ttl_s=_tracking_flag_ttl_s(
+                    view_update_period_s=self.view_update_period_s,
+                    target_timeout_s=settings.target_timeout_s,
+                ),
+            )
 
         def _posture_state(self, message: String) -> None:
             try:
@@ -1940,7 +2233,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             transform_fresh = (
                 geometry is not None
                 and geometry_age_s is not None
-                and geometry_age_s <= settings.transform_timeout_s
+                and geometry_age_s <= settings.geometry_staleness_timeout_s
             )
             posture_age_s = (
                 None
@@ -2375,34 +2668,49 @@ def _run_ros(args: argparse.Namespace) -> int:
     rclpy.init()
     node = DepthServoNode()
     stopped = threading.Event()
-    stop_published = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
+        """SIGNAL-HANDLER CONTRACT: SET FLAGS.  DO NOTHING ELSE.  EVER.
+
+        This handler used to publish three zero Twists, write the final status
+        document and call ``rclpy.shutdown()`` -- all of it re-entering rcl
+        from a signal delivered while ``rclpy.spin()`` was on the stack and
+        mid-way through its own use of those same objects.  One recorded log
+        carries nine tracebacks from that single teardown: 5x RCLError from
+        publisher.c:423 (publish on a context being destroyed), 2x
+        InvalidHandle, 1x ``AttributeError: 'NoneType' object has no attribute
+        'trigger'`` (a guard condition freed underneath the executor), and 1x
+        FileNotFoundError (the status write racing its own scratch file).
+
+        Commit 6a3f75d wrapped the publishes in guards.  That removed the
+        printed text and left the re-entrancy: the handler was still doing
+        work on rcl objects the spin thread owned.  No try/except can fix
+        that, because the bug is not the exception -- it is the work.  The
+        publishes, the final status write, ``destroy_node`` and ``shutdown``
+        now all happen below, on the main thread, after the loop has returned
+        and nothing is inside rcl.
+        """
+
         stopped.set()
-        # Latch the node-level stop so any in-flight/queued timer tick no-ops
-        # instead of racing the shutdown below.
+        # Read by ``_tick_should_skip`` so an already-queued timer callback
+        # no-ops instead of publishing into a teardown.
         node.stop_event.set()
-        # Publish the final zero while the ROS context is still valid.  Calling
-        # shutdown first made the finally block raise and could leave the
-        # transport relying only on its watchdog stop.
-        if not stop_published.is_set():
-            node.stop(ServoPhase.STOPPED.value)
-            stop_published.set()
-        if rclpy.ok():
-            rclpy.shutdown()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        # NOT ``rclpy.spin(node)``: that blocks in an unbounded wait, and the
+        # two ``signal.signal`` calls above have displaced the C-level handler
+        # rclpy.init() installed to break that wait.  A handler that only sets
+        # a flag therefore needs a loop that only waits in bounded steps.
+        while rclpy.ok() and not stopped.is_set():
+            executor.spin_once(timeout_sec=SHUTDOWN_POLL_INTERVAL_S)
     finally:
-        if not stop_published.is_set():
-            node.stop(
-                ServoPhase.STOPPED.value
-                if stopped.is_set()
-                else ServoPhase.EXITED.value
-            )
-            stop_published.set()
+        # Main thread; the loop has returned; the context is still valid.
+        node.stop(_shutdown_phase(stop_requested=stopped.is_set()))
+        executor.remove_node(node)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

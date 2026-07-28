@@ -118,6 +118,15 @@ fi
 # deterministic across the PC/NUC boundary.  A host FastDDS publisher can be
 # visible to local containers yet disappear from the NUC, causing the base
 # watchdog to stop a valid approach after the first short motion.
+# EVERY freshness/loss-stair budget below is pinned explicitly, including the
+# ones that already match the Python defaults.  A stair budget this file does
+# not name is one an operator reading this launcher cannot see: that is how
+# --transform-timeout-s (now --geometry-staleness-timeout-s) shipped at an
+# invisible 0.25 s under a visible 0.40 s --target-timeout-s, so two dropped
+# camera frames hard-zeroed the base with a reason string blaming TF.  The
+# mapping is enforced from go2w_depth_servo.py's STAIR_SETTING_FLAGS by
+# tests/test_go2w_depth_servo_runtime.py; adding a stair knob without pinning
+# it here fails the suite.
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run --rm \
   --name "$CONTAINER_NAME" \
@@ -157,7 +166,9 @@ docker run --rm \
   --yaw-deadband-deg 10 \
   --max-yaw-step-rps 0.015 \
   --target-timeout-s 0.40 \
+  --max-target-capture-age-s 0.70 \
   --tracking-hold-s 0.80 \
   --tracking-loss-grace-s 2.75 \
   --handoff-settle-s 0.30 \
+  --geometry-staleness-timeout-s 0.40 \
   --rate-hz 20
