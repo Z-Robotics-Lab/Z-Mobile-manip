@@ -316,6 +316,17 @@ def _checked_holding_return(
             "attached; refusing to carry it to a pose it could not be set "
             "down from (leaving the object held for operator recovery)",
         )
+    # Retrace by preference, shortcut only as a fallback.  The direct carry cuts
+    # the corner from the lift top straight to the pregrasp, so the arm comes
+    # home along a corridor it never went out on.  Operator report 2026-07-28:
+    # reaching out is clean and the return drives the gripper into the Mid-360.
+    # An exact reverse of the outbound legs is geometry the arm has already
+    # traversed in this scene, which is a strictly stronger claim than a fresh
+    # corridor that merely passes the same checker.  The carry is kept for the
+    # case where the replay itself is rejected -- refusing to move at all would
+    # strand a held object.
+    if evidence.legacy_corridor_valid:
+        return None
     if evidence.carry_valid:
         assert evidence.carry_raw is not None
         return stage_executor.coalesce_collinear_execution_path(evidence.carry_raw)
@@ -360,7 +371,13 @@ def _require_carry_start(
     prior_state: dict[str, object],
     carry: np.ndarray,
 ) -> None:
-    """Prove the arm physically ended the lift where the carry starts."""
+    """Prove the arm physically ended the lift where the return starts.
+
+    Applies to whichever corridor is driven.  The durable receipt is the only
+    evidence that the arm is where the plan believes it is; a return that
+    starts somewhere else is driving unvalidated geometry no matter which
+    corridor it then follows.
+    """
 
     recorded = np.asarray(prior_state["final_joints_rad"], dtype=float)
     error = float(np.max(np.abs(recorded - np.asarray(carry, dtype=float)[0])))
@@ -700,9 +717,13 @@ def execute_workflow_phase(
                         feedback_tolerance_rad=stage_executor.DEFAULT_FEEDBACK_TOLERANCE_RAD,
                     )
                 else:
+                    reverse_lift = np.asarray(timed_lift[::-1], dtype=float)
+                    # Same durable-evidence gate the carry gets: the arm must
+                    # physically be where the lift receipt says it stopped.
+                    _require_carry_start(prior_state, reverse_lift)
                     reverse_lift_times_s = float(lift_times_s[-1]) - lift_times_s[::-1]
                     final = stage_executor.execute_timed_joint_path(
-                        robot, np.asarray(timed_lift[::-1], dtype=float),
+                        robot, reverse_lift,
                         np.asarray(reverse_lift_times_s, dtype=float), guard,
                         speed_percent=speed_percent,
                         segment_timeout_s=segment_timeout_s,

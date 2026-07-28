@@ -262,24 +262,33 @@ def _return_home(tmp_path, monkeypatch, events, *, plan, prior_phase="holding_at
     return prior_path, result
 
 
-def test_return_home_holding_carries_straight_home_without_putting_the_object_down(
+def test_return_home_holding_retraces_the_outbound_corridor(
     tmp_path,
     monkeypatch,
 ):
+    """The loaded return goes back the way it came, not by a new shortcut.
+
+    Operator report 2026-07-28: reaching out is clean and the return drives the
+    gripper into the Mid-360.  The direct carry cut the corner from the lift top
+    straight to the pregrasp, so the arm came home along a corridor it had never
+    travelled.  Retracing is a strictly stronger claim than passing the same
+    checker: this exact geometry was already traversed in this scene, and the
+    dense planned sampling means the EXECUTED sweep matches the interpolation
+    that was validated (see tests/test_return_corridor_execution.py, where an
+    unsynchronised move_j across a long shortcut edge leaves the checked
+    corridor entirely).
+    """
+
     events: list[tuple[str, np.ndarray]] = []
     prior_path, result = _return_home(
         tmp_path, monkeypatch, events, plan=artifact(),
     )
 
-    # One continuous carry from the lift top to the pregrasp, then the checked
-    # run Home.  No timed segment at all: the reverse lift -- the put-down --
-    # is gone, and the object never revisits the grasp pose.
-    assert [name for name, _path in events] == ["joint", "joint"]
-    np.testing.assert_allclose(events[0][1], [Q_LIFT, Q_PRE])
-    np.testing.assert_allclose(events[1][1], [Q_PRE, Q_HOME])
-    assert not any(
-        np.allclose(path[-1], Q_GRASP) for _name, path in events
-    ), "the carry must never return the object to the grasp pose"
+    # Reverse lift (timed, so the object descends on its own profile), then the
+    # reverse approach, then the checked run Home -- the outbound legs, backwards.
+    assert [name for name, _path in events] == ["timed", "joint", "joint"]
+    np.testing.assert_allclose(events[0][1][0], Q_LIFT)
+    np.testing.assert_allclose(events[-1][1], [Q_PRE, Q_HOME])
     workflow = result["workflow"]
     assert workflow["phase"] == "holding_at_home"
     assert workflow["holding_object"] is True

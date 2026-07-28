@@ -13,15 +13,40 @@ SSH=(ssh -i "$NUC_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$NUC_HOST")
   exit 1
 }
 
+# The three markers are emitted ONCE, during bridge startup.  Scoping the query
+# to the service's current systemd invocation is therefore the only window that
+# means what this check means: "did THIS instance verify its data channel and
+# take single ownership".
+#
+# The previous window was `-u SERVICE -n 240`, the last 240 log lines regardless
+# of restart boundaries.  The bridge logs a "WebRTC motion service evidence"
+# heartbeat every ~3 s, so 240 lines is ~12 minutes: past that, the startup
+# markers scroll out and a perfectly healthy transport reads STALE.  Measured on
+# the live NUC 2026-07-28 with the service active and NRestarts=0 -- markers 441
+# and 432 lines back, zero of the three inside the window, verdict STALE.  Since
+# the only caller is go2w_depth_servo.sh, every task started more than ~12 min
+# after the bridge came up restarted a working single-owner base bridge and then
+# waited up to 12 s for it to return, with no base authority in between.
+#
+# --grep filters journal-side, so this stays cheap on a long-lived invocation
+# instead of shipping the whole heartbeat stream over ssh.
 transport_state() {
   "${SSH[@]}" "SERVICE='$SERVICE' bash -s" <<'REMOTE'
 set -euo pipefail
 active="$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)"
-logs="$(journalctl --user -u "$SERVICE" -n 240 --no-pager -o cat 2>/dev/null || true)"
+invocation="$(systemctl --user show "$SERVICE" -p InvocationID --value 2>/dev/null || true)"
+if [[ "$active" != active || -z "$invocation" ]]; then
+  # No running instance to have proven anything: fail closed to a restart.
+  printf 'stale\n'
+  exit 0
+fi
+logs="$(journalctl --user _SYSTEMD_INVOCATION_ID="$invocation" --no-pager -o cat \
+  --grep='Data Channel Verification:|Data channel is not open|LIVE single-owner bridge enabled' \
+  2>/dev/null || true)"
 ok_line="$(grep -nF 'Data Channel Verification:' <<<"$logs" | grep -F 'OK' | tail -n1 | cut -d: -f1 || true)"
 fail_line="$(grep -nF 'Data channel is not open' <<<"$logs" | tail -n1 | cut -d: -f1 || true)"
 owner_line="$(grep -nF 'LIVE single-owner bridge enabled' <<<"$logs" | tail -n1 | cut -d: -f1 || true)"
-if [[ "$active" == active && -n "$ok_line" && -n "$owner_line" && ( -z "$fail_line" || "$ok_line" -gt "$fail_line" ) ]]; then
+if [[ -n "$ok_line" && -n "$owner_line" && ( -z "$fail_line" || "$ok_line" -gt "$fail_line" ) ]]; then
   printf 'ready\n'
 else
   printf 'stale\n'

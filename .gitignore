@@ -39,3 +39,7 @@ __pycache__/
 build/
 dist/
 *.pyc
+.claude/
+docker/vamp/
+tools/
+flowdiagram.png
