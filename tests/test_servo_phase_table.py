@@ -29,14 +29,19 @@ import pytest
 
 from z_manip.control.reactive_servo import ReactivePhase
 from z_manip.control.servo_phase import (
+    EAGER_RECOVERY_PHASES,
+    LOSS_STAIR_PHASES,
     MIN_EFFECTIVE_BASE_COMMAND,
     NO_PROGRESS_DEADLINE_S,
     PHASE_POLICY,
+    SHIPPED_TRACKING_LOSS_GRACE_S,
     BaseOwner,
     ExpiryAction,
     GUARDED_PHASE_LITERALS,
+    PhasePolicy,
     ServoPhase,
     phase_policy,
+    view_recovery_deadline_s,
 )
 
 
@@ -1012,6 +1017,19 @@ def test_only_no_target_phases_escalate_into_the_wrist_search():
     (``tracking_hold_s`` defaults to 0.0 and is validated below the 0.75 s
     loss grace, and REACQUIRE is "rebuilding a stable 3-D track after posture
     motion"), so sweeping the camera away from it cannot help.
+
+    NARROWED SINCE, twice, and both directions are the safe one:
+
+    * ``view_recovery`` LEFT the set.  Its deadline now means "the servo did
+      not step out of ``view_recovery`` within its own full configured
+      ``tracking_loss_grace_s``", i.e. the reactive FSM is not stepping -- and
+      a wrist search cannot fix a frozen FSM.  Exactly the argument already
+      made for ``tracking_hold``/``reacquiring``.  The happy path is
+      unaffected: a healthy servo steps to ``search_required`` by itself at
+      the grace, and THAT phase is escalated on sight.
+    * ``acquiring`` was never added.  It means the controller has never held a
+      3-D target, so there is no last-known viewing ray for a sweep to return
+      to; it stops and degrades instead.
     """
 
     escalating = {
@@ -1023,15 +1041,171 @@ def test_only_no_target_phases_escalate_into_the_wrist_search():
     assert escalating == {
         ServoPhase.WAITING_TARGET.value,
         ServoPhase.TRACKING_LOST.value,
-        ServoPhase.VIEW_RECOVERY.value,
         ServoPhase.SEARCH_REQUIRED.value,
     }, (
         "a phase gained the power to start an unexercised wrist sweep; "
         "justify it against the recorded corpus before widening this set"
     )
-    for phase in (ServoPhase.TRACKING_HOLD, ServoPhase.REACQUIRE):
+    for phase in (
+        ServoPhase.TRACKING_HOLD,
+        ServoPhase.REACQUIRE,
+        ServoPhase.VIEW_RECOVERY,
+        ServoPhase.ACQUIRING,
+    ):
         assert PHASE_POLICY[phase].on_expiry is ExpiryAction.STOP_AND_DEGRADE
     # Every escapee must still have a real action; none may silently park.
     for policy in PHASE_POLICY.values():
         if policy.deadline_s is not None:
             assert policy.on_expiry is not ExpiryAction.NONE
+
+
+# ---------------------------------------------------------------------------
+# ACQUIRING -- "not yet" is not "lost", and it must still END.
+# ---------------------------------------------------------------------------
+
+
+def test_acquiring_is_bounded_terminal_and_stationary():
+    """Landing ACQUIRING without a bounded, terminal exit is a hard fail-open.
+
+    ``_lost()`` answered its ``_last_geometry is None`` branch with
+    SEARCH_REQUIRED -- the stair's most severe verdict -- for a controller
+    that had simply never received a bundle.  That is the first tick of every
+    session (12 of 12 rows at ``bundle_count == 1`` in the recorded corpus),
+    and the supervisor spent a reacquisition attempt sweeping the wrist away
+    from a freshly seeded target (symptom B).
+
+    But splitting the phase out is only safe if the new phase ends by itself:
+    a row with ``deadline_s=None`` would stall forever, and the offline replay
+    harness used to flag zero-command stalls only inside POSTURE_WAIT_PHASES,
+    so it would have stayed green on that infinite stall.  This test pins
+    every property that makes the split safe.
+    """
+
+    policy = PHASE_POLICY[ServoPhase.ACQUIRING]
+
+    # A finite deadline, and an expiry that is terminal AND stationary.
+    assert policy.deadline_s is not None
+    assert policy.deadline_s > 0.0 and policy.deadline_s < float("inf")
+    assert policy.on_expiry is ExpiryAction.STOP_AND_DEGRADE
+    assert policy.expected_base_owner is BaseOwner.ZERO_HOLD
+    assert policy.heartbeat_required is True
+    assert policy.is_terminal is False
+    # It must not be able to start an unexercised wrist sweep.
+    assert policy.escalate_on_observation is False
+    assert ServoPhase.ACQUIRING.value not in EAGER_RECOVERY_PHASES
+    # It is a loss-stair member so the whole-body branch never solves on it.
+    assert ServoPhase.ACQUIRING.value in LOSS_STAIR_PHASES
+    # Its zero-command time must accumulate the cross-phase stall budget.
+    assert policy.counts_no_progress is True
+
+    # It must OUTLAST the supervisor's deliberate acquisition hold, or the
+    # supervisor's hold would be cut short by this very deadline.
+    planning_path = ROOT / "scripts" / "runtime" / "go2w_planning_control.py"
+    grace_s = None
+    for node in ast.walk(ast.parse(planning_path.read_text(encoding="utf-8"))):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "SERVO_ACQUISITION_GRACE_S"
+            and isinstance(node.value, ast.Constant)
+        ):
+            grace_s = float(node.value.value)
+    assert grace_s is not None
+    assert policy.deadline_s > grace_s, (
+        f"acquiring expires at {policy.deadline_s}s, inside the supervisor's "
+        f"{grace_s}s acquisition hold; the hold could never complete"
+    )
+
+
+def test_the_offline_harness_flags_a_stalled_acquiring_run():
+    """The replay harness must not stay green on a parked ``acquiring``.
+
+    This is the specific fail-open the phase split could have created:
+    ``replay_trace`` once flagged zero-command stalls only for
+    POSTURE_WAIT_PHASES, so a servo parked in a brand-new phase forever would
+    have replayed as ``passed: True``.
+    """
+
+    rows = [
+        _parked_row(ServoPhase.ACQUIRING.value, index)
+        for index in range(int(30 * 20))  # 30 s at 20 Hz
+    ]
+
+    report = SUPERVISION.replay_trace(rows, stall_threshold_s=5.0)
+
+    assert report["passed"] is False
+    assert report["no_progress_stalls"], "the cross-phase detector missed it"
+    codes = {stall["code"] for stall in report["stalls"]}
+    assert "PHASE_DEADLINE_STALL" in codes
+    stall = next(s for s in report["stalls"] if s["code"] == "PHASE_DEADLINE_STALL")
+    assert stall["phase"] == ServoPhase.ACQUIRING.value
+    assert stall["on_expiry"] == ExpiryAction.STOP_AND_DEGRADE.value
+
+
+def test_a_parked_acquiring_servo_times_out_in_the_live_watchdog():
+    """The same bound, in the deployed watchdog rather than the replay."""
+
+    fired_s, decision = _first_timeout(lambda _index: ServoPhase.ACQUIRING.value)
+
+    assert fired_s is not None, "an acquiring servo never timed out"
+    assert decision.timed_out is True
+    assert decision.on_expiry == ExpiryAction.STOP_AND_DEGRADE.value
+    assert fired_s <= PHASE_POLICY[ServoPhase.ACQUIRING].deadline_s + 0.10
+
+
+def test_every_eager_phase_agrees_with_its_own_table_row():
+    """The supervisor may not overrule the table about the same phase.
+
+    ``_EAGER_VIEW_RECOVERY_PHASES`` was hand-written next to a table that said
+    something different, which is how ``view_recovery`` ended up being acted on
+    at 0.80 s while its own row called for a 20 s wait.
+    """
+
+    assert EAGER_RECOVERY_PHASES
+    for phase in EAGER_RECOVERY_PHASES:
+        policy = PHASE_POLICY[ServoPhase(phase)]
+        assert policy.escalate_on_observation is True
+        assert policy.on_expiry is ExpiryAction.ESCALATE_VIEW_RECOVERY
+        assert policy.is_terminal is False
+
+    # And the invariant is enforced at construction, not just observed here.
+    with pytest.raises(ValueError):
+        PhasePolicy(
+            deadline_s=5.0,
+            on_expiry=ExpiryAction.STOP_AND_DEGRADE,
+            heartbeat_required=True,
+            expected_base_owner=BaseOwner.ZERO_HOLD,
+            is_terminal=False,
+            escalate_on_observation=True,
+        )
+
+
+def test_view_recovery_deadline_is_the_servos_number_not_a_second_opinion():
+    """R5: one bound for one event, sourced from the servo's own document."""
+
+    assert PHASE_POLICY[ServoPhase.VIEW_RECOVERY].on_expiry is (
+        ExpiryAction.STOP_AND_DEGRADE
+    )
+    assert ServoPhase.VIEW_RECOVERY.value not in EAGER_RECOVERY_PHASES
+
+    watchdog = SUPERVISION.ReactivePhaseWatchdog()
+    phase = ServoPhase.VIEW_RECOVERY.value
+    assert watchdog.deadline_for(phase, {"limits": {"tracking_loss_grace_s": 5.5}}) == 5.5
+    # Absent limits fall back to the SHIPPED launcher value, not to a looser
+    # table default.
+    assert watchdog.deadline_for(phase) == SHIPPED_TRACKING_LOSS_GRACE_S
+    assert SHIPPED_TRACKING_LOSS_GRACE_S == _launcher_flag_value(
+        "--tracking-loss-grace-s"
+    ), (
+        "the launcher's --tracking-loss-grace-s and the supervisor's fallback "
+        "drifted apart; that divergence IS the defect"
+    )
+    # Never looser than the cross-phase stall budget.
+    assert view_recovery_deadline_s(1e6) <= NO_PROGRESS_DEADLINE_S
+
+
+def _launcher_flag_value(flag: str) -> float:
+    launcher = ROOT / "scripts" / "runtime" / "go2w_depth_servo.sh"
+    tokens = launcher.read_text(encoding="utf-8").split()
+    return float(tokens[tokens.index(flag) + 1])

@@ -34,8 +34,10 @@ from z_manip.control.servo_phase import (  # noqa: E402
     ServoPhase,
     is_known_phase,
     phase_policy,
+    view_recovery_deadline_s,
 )
 from z_manip.control.servo_phase import (  # noqa: E402
+    EAGER_RECOVERY_PHASES,
     HANDOFF_PHASES,
     HEARTBEAT_EXEMPT_PHASES,
     POSTURE_WAIT_PHASES,
@@ -70,6 +72,7 @@ from z_manip.control.servo_phase import (  # noqa: E402
 # ALSO carries a cross-phase accumulator, ``no_progress_s``, which is cleared
 # only by a real base command and bounded by ``NO_PROGRESS_DEADLINE_S``.
 __all__ = [
+    "EAGER_RECOVERY_PHASES",
     "HANDOFF_PHASES",
     "HEARTBEAT_EXEMPT_PHASES",
     "POSTURE_WAIT_PHASES",
@@ -81,6 +84,7 @@ __all__ = [
     "ownership_snapshot",
     "posture_feedback_snapshot",
     "replay_trace",
+    "servo_tracking_loss_grace_s",
 ]
 
 
@@ -152,6 +156,24 @@ def base_is_commanding(runtime: Mapping[str, Any]) -> bool:
     """
 
     return base_command_magnitude(runtime) >= MIN_EFFECTIVE_BASE_COMMAND
+
+
+def servo_tracking_loss_grace_s(runtime: Mapping[str, Any]) -> float | None:
+    """Return the loss grace the SERVO says it is configured with.
+
+    ``depth_servo_status.v1`` grew a ``limits`` block precisely so the
+    supervisor stops holding a second, independently written opinion about one
+    physical event.  Before it, the servo was launched with
+    ``--tracking-loss-grace-s 2.75`` and the supervisor acted on
+    ``view_recovery`` at 0.80 s; 1.95 s of configured recovery time could never
+    be spent and nothing in either process could see the disagreement.
+
+    Absent or non-finite -> None, and
+    :func:`~z_manip.control.servo_phase.view_recovery_deadline_s` then falls
+    back to the shipped value rather than to a table default 7x looser.
+    """
+
+    return _finite(_mapping(runtime.get("limits")).get("tracking_loss_grace_s"))
 
 
 def ownership_snapshot(runtime: Mapping[str, Any]) -> dict[str, str]:
@@ -287,17 +309,36 @@ class ReactivePhaseWatchdog:
         self.config = config or ReactiveWatchdogConfig()
         self.reset()
 
-    def deadline_for(self, phase: str) -> float | None:
+    def deadline_for(
+        self,
+        phase: str,
+        runtime: Mapping[str, Any] | None = None,
+    ) -> float | None:
         """Return the configured deadline for ``phase``.
 
-        The posture bounded wait keeps honouring the operator-configured
-        ``posture_wait_timeout_s`` so the shipped CLI flag still works; every
-        other phase takes its deadline from the table.
+        Two phases do not take the table's static number:
+
+        ``posture_adjust`` & co
+            keep honouring the operator-configured ``posture_wait_timeout_s``
+            so the shipped CLI flag still works.
+
+        ``view_recovery``
+            is bounded by the SERVO's own ``tracking_loss_grace_s``, read out
+            of ``runtime["limits"]``.  The servo occupies this phase from
+            ``tracking_hold_s`` until ``tracking_loss_grace_s`` and then steps
+            to ``search_required`` by itself, so any bound written here
+            independently of those numbers is a second opinion about one
+            event.  ``runtime=None`` (or a document with no ``limits`` block)
+            falls back to the shipped 2.75 s, NOT to a looser table default.
         """
 
         policy = phase_policy(phase)
         if policy.is_posture_wait:
             return self.config.posture_wait_timeout_s
+        if phase == ServoPhase.VIEW_RECOVERY.value:
+            return view_recovery_deadline_s(
+                servo_tracking_loss_grace_s(runtime or {})
+            )
         return policy.deadline_s
 
     def note_supervisor_progress(self) -> None:
@@ -415,7 +456,7 @@ class ReactivePhaseWatchdog:
             and no_progress_s >= no_progress_deadline_s
         )
 
-        deadline_s = self.deadline_for(phase)
+        deadline_s = self.deadline_for(phase, runtime)
         phase_timed_out = deadline_s is not None and elapsed >= deadline_s
         posture_timed_out = policy.is_posture_wait and phase_timed_out
 

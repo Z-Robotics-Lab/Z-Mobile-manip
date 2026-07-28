@@ -338,11 +338,43 @@ rejected. Tracking loss commands zero immediately, allows a stationary 0.75 s
 reacquisition window, then runs at most three fresh perception attempts. It
 never blind-drives through a missing target.
 
-`view_recovery` and `search_required` are stationary recovery phases. The
-supervisor first terminates the base-servo owner (which sends its zero-command
-cleanup), then runs the bounded wrist search and a fresh EdgeTAM seed. Only
-after a stable target is recovered does it restart base approach. Wrist search
-and base velocity therefore never run concurrently. `handoff_probe`,
+`acquiring`, `view_recovery` and `search_required` are all stationary phases,
+and they are three different events:
+
+* `acquiring` — the servo has never received a 3-D target in this session
+  (freshly seeded tracker, first depth-joined bundle not yet arrived). Base
+  and wrist both hold; there is nothing to recover. It carries a 12 s deadline
+  whose expiry stops the servo and reports `degraded`. It deliberately never
+  starts a wrist search: sweeping the camera off a just-seeded target is the
+  one action guaranteed to make acquisition harder.
+* `view_recovery` — a tracked target has aged past `--tracking-hold-s`
+  (0.80 s) but not yet past `--tracking-loss-grace-s` (2.75 s). The supervisor
+  leaves the servo alone here so the configured grace is actually spent, and
+  bounds it with that same configured grace, which the servo now reports in
+  `status.limits.tracking_loss_grace_s`. It used to act on this phase name
+  directly, at 0.80 s, so 1.95 s of configured recovery was unreachable.
+* `search_required` — the servo's own verdict that the full loss grace is
+  spent. This is the one phase the supervisor acts on immediately.
+
+On `search_required` (or on any other phase's deadline expiring with a
+recovery escalation) the supervisor first terminates the base-servo owner
+(which sends its zero-command cleanup), then runs the bounded wrist search and
+a fresh EdgeTAM seed. Only after a stable target is recovered does it restart
+base approach. Wrist search and base velocity therefore never run
+concurrently.
+
+Two further bounded waits surround the servo process itself. A spawned
+launcher has 30 s to produce its first status document (the shipped launcher
+measures ~11.2 s of transport preflight, arm-owner acquisition and container
+start before the servo writes a byte); after that the run ends in `degraded`
+with "depth servo did not report within...". A servo that has reported and
+then leaves its status document missing, unparseable, wrong-schema or over the
+64 KiB reader limit shows workflow phase `status_unavailable` and ends in
+`degraded` after 2 s. Both exist because an unreadable document used to be
+indistinguishable from `idle`, which is heartbeat-exempt: nothing could time
+out and every new task was refused with `APPROACH_ACTION_BUSY`.
+
+`handoff_probe`,
 `handoff_ready`, and the legacy `reached` phase all use the same zero-speed
 fresh-grasp handoff; no far-field perception or trajectory is reused.
 

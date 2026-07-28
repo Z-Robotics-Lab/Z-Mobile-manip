@@ -15,6 +15,10 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from z_manip.control.servo_phase import ServoPhase  # noqa: E402
+from z_manip.control.reactive_servo import ReactivePhase  # noqa: E402
+
 SCRIPT = ROOT / "scripts" / "runtime" / "go2w_depth_servo.py"
 LAUNCHER = ROOT / "scripts" / "runtime" / "go2w_depth_servo.sh"
 SPEC = importlib.util.spec_from_file_location("go2w_depth_servo", SCRIPT)
@@ -545,6 +549,23 @@ def test_stale_synchronized_transform_never_reuses_old_geometry_for_motion():
 
 
 def test_tracking_loss_with_stale_tf_reports_tracker_recovery_not_tf_outage():
+    """Not a TF outage -- and, since this stage, not a loss either.
+
+    EXPECTATION CHANGED, deliberately.  It asserted ``search_required``.  The
+    core here has taken ONE observation and then ticked with
+    ``tracking=False``, so ``ReactiveTargetController.update`` is handed
+    ``None`` and its own ``_last_geometry`` has never been set: the controller
+    has never held a 3-D target in this session.  That is the
+    ``bundle_count == 1`` startup state, which is 12 of 12 rows in the recorded
+    corpus, and answering it with the loss stair's most severe verdict is what
+    made the supervisor sweep the wrist away from a freshly seeded target
+    (symptom B).  It now answers ``acquiring``, which carries its own table
+    row, its own finite deadline and a terminal stationary expiry.
+
+    What the test's NAME promises is unchanged and still pinned: the phase is
+    not ``transform_unavailable``, and the base is stopped either way.
+    """
+
     core = _reactive_core(target_timeout_s=1.0)
     assert _observe_in_frames(
         core,
@@ -556,11 +577,12 @@ def test_tracking_loss_with_stale_tf_reports_tracker_recovery_not_tf_outage():
 
     output = core.tick(now_s=5.30, tracking=False)
 
-    assert output.phase == "search_required"
+    assert output.phase == ServoPhase.ACQUIRING.value
+    assert output.phase != ServoPhase.TRANSFORM_UNAVAILABLE.value
     assert output.published_linear_x == output.published_angular_z == 0.0
     assert core.reactive_status is not None
-    assert core.reactive_status["phase"] == "search_required"
-    assert "search" in output.reason
+    assert core.reactive_status["phase"] == ServoPhase.ACQUIRING.value
+    assert "3-D target" in output.reason
 
 
 def test_stale_target_with_tracking_true_is_tracking_loss_not_tf_outage():
@@ -2022,3 +2044,154 @@ def test_atomic_status_write_removes_its_scratch_file_when_the_publish_fails(
     assert list(tmp_path.iterdir()) == [], (
         f"scratch file left behind at 20 Hz: {[p.name for p in tmp_path.iterdir()]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# R5 hazard -- extending VIEW_RECOVERY triples the life of a phase whose
+# decision carries an "active wrist sweep".  What actually bounds it?
+# ---------------------------------------------------------------------------
+
+
+def test_no_arm_motion_is_commanded_while_the_servo_is_on_the_loss_stair():
+    """WHAT BOUNDS THE SWEEP'S GEOMETRY: nothing executes it.
+
+    R5 lets ``view_recovery`` live for the servo's full configured
+    ``tracking_loss_grace_s`` (2.75 s) instead of being cut at
+    ``tracking_hold_s`` (0.80 s).  ``ReactiveTargetController._lost`` returns
+    ``ArmViewIntent(mode=SEARCH)`` from that branch, and ``view_recovery``
+    bypasses the whole-body branch and therefore ``FixedSelfCollisionGuard``
+    entirely -- and the recorded gripper-to-LiDAR margin reached 0.6 mm.  A
+    2.75 s UNGUARDED sweep would not be free.
+
+    It is not a sweep.  The chain, pinned here in all three links:
+
+    1. ``_whole_body_output`` sets ``self.whole_body_command = None`` on entry
+       and returns the fallback unchanged for any ``LOSS_STAIR_PHASES`` member;
+       ``view_recovery`` is a member.
+    2. ``_publish_arm_view_intent`` returns immediately when
+       ``self.whole_body_command is None``.  It is the ONLY writer of the
+       joint-velocity intent topic the PiPER executor obeys.
+    3. The executor holds pose once the last intent ages past
+       ``MAX_INTENT_AGE_S``.
+
+    So the SEARCH mode reaches the status document (and
+    ``ownership_snapshot`` labels it ``intent_only``) and reaches no actuator.
+    If someone later publishes an arm intent from the loss stair, this test
+    fails and the 2.75 s window has to be re-argued.
+    """
+
+    assert ServoPhase.VIEW_RECOVERY.value in SERVO.LOSS_STAIR_PHASES
+    assert ServoPhase.ACQUIRING.value in SERVO.LOSS_STAIR_PHASES
+
+    whole_body = ast.unparse(_function_ast("_whole_body_output"))
+    assert "self.whole_body_command = None" in whole_body
+    assert "fallback.phase in LOSS_STAIR_PHASES" in whole_body
+
+    publish_intent = ast.unparse(_function_ast("_publish_arm_view_intent"))
+    assert "command = self.whole_body_command" in publish_intent
+    assert "command is None" in publish_intent
+    guard_index = publish_intent.index("command is None")
+    publish_index = publish_intent.index("_publish_guarded")
+    assert guard_index < publish_index, (
+        "the arm-view intent is published before the whole-body-command guard; "
+        "a loss-stair phase can now command the wrist"
+    )
+
+    # The intent topic has exactly one writer.
+    writers = _innermost_function_names(
+        lambda node: isinstance(node, ast.Attribute)
+        and node.attr == "arm_view_intent_publisher"
+    )
+    # ``__init__`` creates it; only ``_publish_arm_view_intent`` uses it.
+    assert set(writers) == {"__init__", "_publish_arm_view_intent"}, writers
+
+    executor = ast.parse(
+        (ROOT / "scripts" / "runtime" / "piper_reactive_view_executor.py")
+        .read_text(encoding="utf-8")
+    )
+    limits = {
+        node.targets[0].id: node.value
+        for node in ast.walk(executor)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    }
+    assert "MAX_INTENT_AGE_S" in limits
+    assert float(ast.literal_eval(limits["MAX_INTENT_AGE_S"])) <= 1.0, (
+        "the executor's intent lease grew; a stale SEARCH intent could now "
+        "outlive the loss-stair tick that produced it"
+    )
+
+
+def test_the_status_document_reports_the_servos_own_loss_stair_limits():
+    """R5: the supervisor must read ONE number, not write a second one.
+
+    ``go2w_depth_servo.sh`` passes ``--tracking-hold-s 0.80`` and
+    ``--tracking-loss-grace-s 2.75``.  The supervisor used to act on the phase
+    NAME ``view_recovery``, which the servo enters at 0.80 s, so the 2.75 s was
+    unreachable dead config.  It now derives its bound from
+    ``status["limits"]["tracking_loss_grace_s"]``, so this key is a contract.
+    """
+
+    write_status = ast.unparse(_function_ast("_write_status"))
+    assert "'limits'" in write_status
+    for field in (
+        "tracking_loss_grace_s",
+        "tracking_hold_s",
+        "target_timeout_s",
+    ):
+        assert f"settings.{field}" in write_status, (
+            f"the status document stopped reporting {field}; the supervisor's "
+            "derived deadline silently falls back to a hard-coded constant"
+        )
+
+    # The reader on the other side names the same path.
+    supervision = ast.parse(
+        (ROOT / "scripts" / "runtime" / "go2w_reactive_supervision.py")
+        .read_text(encoding="utf-8")
+    )
+    reader = next(
+        node
+        for node in ast.walk(supervision)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "servo_tracking_loss_grace_s"
+    )
+    source = ast.unparse(reader)
+    assert "'limits'" in source and "'tracking_loss_grace_s'" in source
+
+
+def test_acquiring_is_emitted_before_the_first_bundle_not_search_required():
+    """Symptom B, at the source: the first tick of every session.
+
+    In the recorded corpus every row at ``bundle_count == 1`` is
+    ``phase=search_required`` with ``tracking=null`` (12 of 12,
+    artifacts/go2w_real/latest/depth-servo.trace.jsonl{,.1}).  The controller
+    had never been handed a geometry, so ``_lost()`` fell into its
+    ``_last_geometry is None`` branch and answered with the loss stair's most
+    severe verdict.
+    """
+
+    core = _reactive_core(target_timeout_s=0.40)
+    # One good bundle has landed -- the core HAS a geometry -- but the latched
+    # ``/track_3d/is_tracking`` flag has not arrived, so ``tracking`` is None
+    # and the geometry never reaches the controller.  That is the recorded row
+    # exactly.
+    assert _observe_in_frames(
+        core,
+        camera_xyz=(0.0, 0.10, 0.80),
+        base_xyz=(0.85, 0.0, -0.20),
+        arm_xyz=(0.70, 0.0, 0.05),
+        stamp_s=1.0,
+    )
+
+    output = core.tick(now_s=1.10, tracking=None)
+
+    assert output.phase == ServoPhase.ACQUIRING.value
+    assert output.phase != ServoPhase.SEARCH_REQUIRED.value
+    assert output.published_linear_x == output.published_angular_z == 0.0
+    assert output.proposed_linear_x == output.proposed_angular_z == 0.0
+    # The wrist holds the pose perception seeded the tracker from; the old
+    # answer asked it to SEARCH, i.e. to sweep off that very target.
+    assert core.reactive_status["arm_view"]["mode"] == "hold"
+    # The controller's own phase, not just the presentation remap.
+    assert core.reactive_status["phase"] == ReactivePhase.ACQUIRING.value

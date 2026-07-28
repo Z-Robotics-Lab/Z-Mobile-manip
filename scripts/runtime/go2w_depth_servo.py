@@ -1190,11 +1190,23 @@ class DepthServoCore:
             body_posture_actionable=body_posture_actionable,
         )
         self._last_decision = decision
-        if (
-            not fresh_tracking
-            and decision.phase is ReactivePhase.SEARCH_REQUIRED
-        ):
-            # A terminal loss ends the side-approach session.  A subsequent
+        if not fresh_tracking and decision.phase in {
+            ReactivePhase.SEARCH_REQUIRED,
+            # ACQUIRING is included deliberately, and it is not cosmetic.
+            # ``_side_sign`` lives on the CORE and is set by observations,
+            # while ``ReactiveTargetController._last_geometry`` is only set on
+            # a tick with fresh tracking AND fresh transforms.  So a core can
+            # hold a latched approach side while the controller has never seen
+            # a geometry -- and before ACQUIRING existed, that exact state
+            # answered SEARCH_REQUIRED and cleared the latch.  Splitting the
+            # phase without splitting this condition would have carried a
+            # previous session's approach side into a target the controller
+            # has not even received yet.  Pinned by
+            # ``test_side_choice_is_latched_until_terminal_tracking_loss``.
+            ReactivePhase.ACQUIRING,
+        }:
+            # A terminal loss -- or an acquisition that has produced no
+            # geometry at all -- ends the side-approach session.  A subsequent
             # reacquisition must choose its side from the new target geometry.
             self._side_sign = None
         phase = decision.phase.value
@@ -2344,6 +2356,20 @@ def _run_ros(args: argparse.Namespace) -> int:
                 "running": running,
                 "mode": settings.mode,
                 "phase": published_phase,
+                # The loss-stair budgets THIS process is actually running
+                # with.  The supervisor derives its ``view_recovery`` deadline
+                # from ``tracking_loss_grace_s`` instead of holding a second,
+                # independently written opinion about the same event: it used
+                # to act on the phase NAME, which the servo enters at
+                # ``tracking_hold_s`` = 0.80 s, so ``--tracking-loss-grace-s
+                # 2.75`` was unreachable dead config on every loss.  Three
+                # floats; the measured document is ~9 KiB median / 11.8 KiB
+                # max against the reader's 64 KiB cap.
+                "limits": {
+                    "target_timeout_s": settings.target_timeout_s,
+                    "tracking_hold_s": settings.tracking_hold_s,
+                    "tracking_loss_grace_s": settings.tracking_loss_grace_s,
+                },
                 "tracking": self.tracking,
                 "target": None if target is None else {
                     "x_m": target[0],

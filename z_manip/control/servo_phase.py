@@ -132,6 +132,12 @@ class ServoPhase(str, Enum):
     EXITED = "exited"
 
     # --- ReactivePhase parity block --------------------------------------
+    #: The controller has NEVER held a 3-D target in this session.  Split out
+    #: of ``search_required`` because the two are not the same event: a loss
+    #: has a last-known viewing ray to recover, an acquisition has nothing at
+    #: all, and treating "not yet" as "lost" made detect-then-search a startup
+    #: coin flip (symptom B).  See :func:`ReactiveTargetController._lost`.
+    ACQUIRING = "acquiring"
     WAITING_TARGET = "waiting_target"
     TRANSFORM_UNAVAILABLE = "transform_unavailable"
     BASE_APPROACH = "base_approach"
@@ -198,6 +204,23 @@ class PhasePolicy:
     #: never clears it, because clearing on a phase change is exactly the
     #: flapping escape hatch this field exists to close.
     counts_no_progress: bool = True
+    #: The supervisor spends one bounded recovery attempt the MOMENT it
+    #: observes this phase, instead of waiting for ``deadline_s`` to expire.
+    #:
+    #: This is the seventh hand-written phase membership, previously
+    #: ``_EAGER_VIEW_RECOVERY_PHASES = {view_recovery, search_required}`` in
+    #: go2w_planning_control.py.  It is a table column now because the set was
+    #: WRONG and nothing could see it: ``view_recovery`` is entered by the
+    #: servo at ``tracking_hold_s`` (0.80 s on the shipped launcher) so the
+    #: supervisor killed the servo 0.80 s into a loss, and the servo's own
+    #: ``--tracking-loss-grace-s 2.75`` could never be spent -- 1.95 s of
+    #: configured, deliberate recovery time was dead config.
+    #:
+    #: An eager phase MUST name ``ESCALATE_VIEW_RECOVERY`` as its expiry
+    #: action (enforced below): reacting immediately to a phase whose own
+    #: table row says the right answer is "stop and degrade" would be the
+    #: supervisor overruling the table, which is how the two diverged before.
+    escalate_on_observation: bool = False
 
     def __post_init__(self) -> None:
         if self.deadline_s is not None:
@@ -219,6 +242,18 @@ class PhasePolicy:
                 "a terminal phase must not accumulate the cross-phase "
                 "no-progress budget; the supervisor acts on it immediately"
             )
+        if self.escalate_on_observation:
+            if self.on_expiry is not ExpiryAction.ESCALATE_VIEW_RECOVERY:
+                raise ValueError(
+                    "a phase the supervisor escalates on sight must also name "
+                    "ESCALATE_VIEW_RECOVERY as its expiry action; otherwise "
+                    "the supervisor and the table disagree about the same "
+                    "phase"
+                )
+            if self.is_terminal:
+                raise ValueError(
+                    "a terminal phase cannot be escalated on observation"
+                )
 
 
 _STOP = ExpiryAction.STOP_AND_DEGRADE
@@ -268,6 +303,57 @@ NO_PROGRESS_DEADLINE_S = 20.0
 #: publishing 0.001 m/s -- a number that moves nothing.
 MIN_EFFECTIVE_BASE_COMMAND = 5e-3
 
+#: The ``--tracking-loss-grace-s`` the shipped launcher passes the servo
+#: (scripts/runtime/go2w_depth_servo.sh).  It is written here ONLY as the
+#: fallback for a status document that does not report the servo's own
+#: configured value; :func:`view_recovery_deadline_s` prefers the reported one
+#: so the two processes cannot drift apart the way they had.
+SHIPPED_TRACKING_LOSS_GRACE_S = 2.75
+
+#: Floor on the derived ``view_recovery`` deadline.  A servo configured with a
+#: sub-second grace would otherwise get a supervisor deadline tighter than one
+#: 0.05 s supervisor poll plus one 0.05 s servo tick plus the status write, and
+#: would be killed for a scheduling hiccup.
+MIN_VIEW_RECOVERY_DEADLINE_S = 1.0
+
+
+def view_recovery_deadline_s(configured_grace_s: float | None) -> float:
+    """Bound ``view_recovery`` by the SERVO's own configured loss grace.
+
+    WHY THIS IS NOT A CONSTANT.  ``view_recovery`` is the phase the servo
+    occupies from ``tracking_hold_s`` until ``tracking_loss_grace_s``, after
+    which the servo itself steps to ``search_required``.  On the shipped
+    launcher that residency is 2.75 - 0.80 = 1.95 s.  Any supervisor bound
+    written independently of those two numbers is a second opinion about one
+    physical event, and the recorded failure is exactly that: the supervisor
+    acted at 0.80 s (phase entry) so the configured 2.75 s could never be
+    spent.
+
+    So the bound is the servo's OWN grace: if the servo has sat in
+    ``view_recovery`` for longer than its entire loss-grace budget, its FSM is
+    not stepping, and a wrist search cannot fix a frozen FSM -- same reasoning
+    as ``tracking_hold`` and ``reacquiring``, both of which STOP.
+
+    Fail-closed on a missing/garbage value: fall back to the shipped 2.75 s
+    rather than to the 20 s a table default would give, and clamp to
+    :data:`NO_PROGRESS_DEADLINE_S` so a mis-configured servo cannot buy itself
+    a phase deadline the cross-phase stall budget would cut short anyway.
+    """
+
+    grace = configured_grace_s
+    if (
+        grace is None
+        or isinstance(grace, bool)
+        or not isinstance(grace, (int, float))
+        or not math.isfinite(float(grace))
+        or float(grace) <= 0.0
+    ):
+        grace = SHIPPED_TRACKING_LOSS_GRACE_S
+    return min(
+        max(float(grace), MIN_VIEW_RECOVERY_DEADLINE_S),
+        NO_PROGRESS_DEADLINE_S,
+    )
+
 #: A phase string this table does not know is a fail-closed condition, not a
 #: free pass: it gets a short bounded life and a hard stop.  The previous
 #: design gave any unlisted phase ``deadline_s = None`` forever.
@@ -306,6 +392,30 @@ PHASE_POLICY: Mapping[ServoPhase, PhasePolicy] = {
     ),
 
     # ---- acquisition / loss stair ---------------------------------------
+    # ACQUISITION IS NOT LOSS.  ``_lost()`` used to answer its
+    # ``_last_geometry is None`` branch with the most severe verdict it had,
+    # SEARCH_REQUIRED, so a servo that had simply not received its first
+    # bundle yet was indistinguishable from one that had tracked a target and
+    # lost it past the full grace.  The supervisor then spent a reacquisition
+    # attempt on a wrist sweep that pointed the camera AWAY from a target
+    # perception had just seeded (symptom B).
+    #
+    # STOP, not RECOVER, and deliberately NOT ``escalate_on_observation``.
+    # There is no last-known viewing ray to recover, so a sweep is guesswork;
+    # and the honest operator signal for "the servo never received a 3-D
+    # target" is a stationary terminal state naming that, not a silent sweep.
+    # 12 s is four times the measured 2-3 s seed-to-first-bundle latency and
+    # is strictly greater than ``SERVO_ACQUISITION_GRACE_S`` (5.0 s) so the
+    # supervisor's deliberate acquisition hold cannot be cut short by this
+    # deadline; ``tests/test_servo_phase_table.py`` pins that ordering.
+    ServoPhase.ACQUIRING: PhasePolicy(
+        deadline_s=DEFAULT_DEADLINE_S,
+        on_expiry=_STOP,
+        heartbeat_required=True,
+        expected_base_owner=_HOLD,
+        is_terminal=False,
+        is_loss_stair=True,
+    ),
     ServoPhase.WAITING_TARGET: PhasePolicy(
         deadline_s=20.0,
         on_expiry=_RECOVER,
@@ -363,14 +473,35 @@ PHASE_POLICY: Mapping[ServoPhase, PhasePolicy] = {
         is_terminal=False,
         is_loss_stair=True,
     ),
+    # The supervisor no longer acts on SIGHT of this phase.  It used to, and
+    # because the servo enters ``view_recovery`` at ``tracking_hold_s`` = 0.80 s
+    # the servo's configured ``--tracking-loss-grace-s 2.75`` was unreachable
+    # dead config: the recovery window the operator asked for was cut at 29% of
+    # its length, every time, on every loss.
+    #
+    # ``deadline_s`` here is only the STATIC fallback.
+    # ``ReactivePhaseWatchdog.deadline_for`` prefers the grace the servo
+    # reports in ``status["limits"]["tracking_loss_grace_s"]`` -- see
+    # :func:`view_recovery_deadline_s` for why a second, independently written
+    # bound on the same physical event is the defect and not the fix.
+    #
+    # STOP, not RECOVER: reaching this deadline means the servo did not step
+    # out of ``view_recovery`` within its OWN full grace, i.e. the reactive
+    # FSM is not stepping.  A wrist search cannot fix a frozen FSM; it just
+    # sweeps the camera off a target that is still in view.  Identical
+    # reasoning to ``tracking_hold`` and ``reacquiring`` above.
     ServoPhase.VIEW_RECOVERY: PhasePolicy(
-        deadline_s=20.0,
-        on_expiry=_RECOVER,
+        deadline_s=SHIPPED_TRACKING_LOSS_GRACE_S,
+        on_expiry=_STOP,
         heartbeat_required=True,
         expected_base_owner=_HOLD,
         is_terminal=False,
         is_loss_stair=True,
     ),
+    # The ONE phase the supervisor escalates on sight.  It is the servo's own
+    # verdict that the full configured loss grace has been spent, so waiting
+    # for a second, supervisor-side deadline on top of it would only add
+    # latency to a decision the servo already made with better information.
     ServoPhase.SEARCH_REQUIRED: PhasePolicy(
         deadline_s=20.0,
         on_expiry=_RECOVER,
@@ -378,6 +509,7 @@ PHASE_POLICY: Mapping[ServoPhase, PhasePolicy] = {
         expected_base_owner=_HOLD,
         is_terminal=False,
         is_loss_stair=True,
+        escalate_on_observation=True,
     ),
 
     # ---- posture bounded wait (one shared budget) ------------------------
@@ -557,6 +689,43 @@ def _check_no_progress_bound() -> None:
 _check_no_progress_bound()
 
 
+def _check_derived_view_recovery_bound() -> None:
+    """The RUNTIME-derived view_recovery deadline obeys the same invariant.
+
+    ``ReactivePhaseWatchdog.deadline_for`` may return
+    :func:`view_recovery_deadline_s` instead of the table's own ``deadline_s``
+    for this one phase, so the import-time pin above -- which only inspects the
+    table -- does not cover it.  Without this the cross-phase budget could be
+    quietly inverted by a number that never appears in this file.
+    """
+
+    policy = PHASE_POLICY[ServoPhase.VIEW_RECOVERY]
+    assert policy.counts_no_progress
+    for candidate in (
+        None,
+        0.0,
+        -1.0,
+        float("nan"),
+        1e9,
+        MIN_VIEW_RECOVERY_DEADLINE_S,
+        SHIPPED_TRACKING_LOSS_GRACE_S,
+    ):
+        derived = view_recovery_deadline_s(candidate)
+        if not math.isfinite(derived) or derived <= 0.0:
+            raise RuntimeError(
+                "the derived view_recovery deadline must stay finite and "
+                f"positive; {candidate!r} produced {derived!r}"
+            )
+        if derived > NO_PROGRESS_DEADLINE_S:
+            raise RuntimeError(
+                "the derived view_recovery deadline exceeds the cross-phase "
+                f"no-progress bound; {candidate!r} produced {derived!r}"
+            )
+
+
+_check_derived_view_recovery_bound()
+
+
 def phase_policy(phase: object) -> PhasePolicy:
     """Return the bounded-wait contract for ``phase``, fail-closed.
 
@@ -603,6 +772,10 @@ DRIVING_PHASES: frozenset[str] = _select(
 RECOVERY_ESCALATION_PHASES: frozenset[str] = _select(
     lambda p: p.on_expiry is ExpiryAction.ESCALATE_VIEW_RECOVERY
 )
+#: Phases the supervisor spends a bounded recovery attempt on the moment it
+#: observes them.  Replaces ``_EAGER_VIEW_RECOVERY_PHASES``, the seventh
+#: hand-written phase membership.
+EAGER_RECOVERY_PHASES: frozenset[str] = _select(lambda p: p.escalate_on_observation)
 #: Phases whose zero-command time accumulates the cross-phase stall budget.
 NO_PROGRESS_PHASES: frozenset[str] = _select(lambda p: p.counts_no_progress)
 
@@ -629,6 +802,7 @@ __all__ = [
     "BaseOwner",
     "DEFAULT_DEADLINE_S",
     "DRIVING_PHASES",
+    "EAGER_RECOVERY_PHASES",
     "ExpiryAction",
     "GUARDED_PHASE_LITERALS",
     "HANDOFF_PHASES",
@@ -636,15 +810,18 @@ __all__ = [
     "HEARTBEAT_EXEMPT_PHASES",
     "LOSS_STAIR_PHASES",
     "MIN_EFFECTIVE_BASE_COMMAND",
+    "MIN_VIEW_RECOVERY_DEADLINE_S",
     "NO_PROGRESS_DEADLINE_S",
     "NO_PROGRESS_PHASES",
     "PHASE_POLICY",
     "POSTURE_WAIT_PHASES",
     "PhasePolicy",
     "RECOVERY_ESCALATION_PHASES",
+    "SHIPPED_TRACKING_LOSS_GRACE_S",
     "ServoPhase",
     "TERMINAL_PHASES",
     "UNKNOWN_PHASE_POLICY",
     "is_known_phase",
     "phase_policy",
+    "view_recovery_deadline_s",
 ]

@@ -3346,6 +3346,13 @@
       const phaseAliases = {
         detecting: "detect", wrist_search: "search", shadow_view: "search", move: "search", observe: "search",
         seeding_tracker: "track", waiting_for_track: "track", tracking: "track",
+        // "acquiring": the servo has never received a 3-D target in this
+        // session.  That is the track step still working, NOT a loss; mapping
+        // it to "search" would light the same lamp as a terminal loss, which
+        // is exactly the conflation this phase was split out to remove.
+        // "status_unavailable": the supervisor cannot read the servo's status
+        // document (bounded and terminal, but there is no servo phase to show).
+        acquiring: "track", waiting_target: "track", status_unavailable: "track",
         align: "approach", approach: "approach", approaching: "approach", base_approach: "approach",
         posture_adjust: "posture", waiting_base_quiet: "posture", commanding: "posture", settling: "posture",
         whole_body_approach: "approach", whole_body_shadow: "approach", whole_body_blocked: "posture",
