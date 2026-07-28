@@ -204,6 +204,7 @@ def test_geometry_safe_candidate_is_rejected_when_task_replay_does_not_improve()
 from z_manip.control.whole_body_collision import (  # noqa: E402
     CHASSIS_CONTROL_DOF,
     hold_arm_release_chassis,
+    hold_whole_body,
 )
 from z_manip.control.whole_body_model import CONTROL_DOF, CONTROL_NAMES  # noqa: E402
 
@@ -260,3 +261,39 @@ def test_a_malformed_control_vector_is_rejected():
         except ValueError:
             continue
         raise AssertionError(f"accepted a malformed control vector: {bad!r}")
+
+
+def test_a_blocked_fixed_fixture_gate_holds_the_whole_body():
+    """The one confirmed regression of 2026-07-28, pinned.
+
+    Releasing the chassis while the arm is frozen was geometrically defensible
+    -- the gate is handed only the arm joints -- but it broke the visual-servo
+    loop: measured on 433 rows of that day's traces, the gate blocked the arm on
+    13 and on at least two of them the chassis was still driving at 0.18 m/s, so
+    the pose the grasp is computed from is not the pose the servo was
+    converging to. On a plug-sized target that is the reported shift.
+    """
+
+    velocity = np.asarray([0.18, -0.05, 0.01, -0.02, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8])
+    held = hold_whole_body(velocity)
+
+    np.testing.assert_array_equal(held, np.zeros(CONTROL_DOF))
+    # The caller still reports the primary intent, so the input is untouched.
+    assert velocity[0] == 0.18
+
+
+def test_the_runtime_uses_the_whole_body_hold_not_the_arm_only_hold():
+    """Bind the runtime to the right primitive.
+
+    ``hold_arm_release_chassis`` is retained as the correct primitive for a gate
+    that genuinely only constrains the arm. Wiring it back into the
+    fixed-fixture path would silently reinstate the regression, and no
+    behavioural test can catch it here because WholeBodyRuntimeController needs
+    casadi, which is not importable on this host.
+    """
+
+    source = (ROOT / "z_manip" / "control" / "whole_body_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    assert "hold_whole_body(" in source
+    assert "hold_arm_release_chassis" not in source

@@ -24,7 +24,7 @@ from .whole_body_model import (
     ReducedWholeBodyVelocity,
 )
 from .reactive_servo import ViewMeasurementDampingConfig
-from .whole_body_collision import hold_arm_release_chassis, select_collision_safe_arm_step
+from .whole_body_collision import hold_whole_body, select_collision_safe_arm_step
 from .whole_body_optimizer import (
     CasadiBoxQP,
     WholeBodyOptimizerConfig,
@@ -358,29 +358,43 @@ class WholeBodyRuntimeController:
                 # is still alive", and the base was the one group of DOFs the
                 # gate had no information about.
                 #
-                # The arm is still held to zero -- the margin really was negative
-                # (-0.7 mm on that approach), so no arm step is authorized. Only
-                # the base keeps the authority the gate never evaluated.
+                # RELEASING THE CHASSIS HERE WAS WRONG, and it is the one
+                # confirmed regression of 2026-07-28.  The geometric argument
+                # was sound about COLLISION and wrong about CONTROL: on 433 rows
+                # of that day's post-change traces the gate blocked the arm on
+                # 13 (3.0%), and on at least two of them the chassis was still
+                # driving at 0.18 m/s.  Freezing one half of a coupled
+                # visual-servo loop while driving the other half means the pose
+                # the grasp is finally computed from is not the pose the servo
+                # was converging to -- a contact-pose error, and on a
+                # plug-sized target that is the operator's "small objects
+                # shift".
+                #
+                # Holding everything was previously unacceptable only because it
+                # was UNBOUNDED (one recorded hold ran 23.3 s with the target a
+                # metre away and nothing timed it out).  The phase table now
+                # gives this a deadline, so a persistent hold expires into a
+                # named stop instead of parking forever.
                 result = replace(
                     result,
                     velocity=ReducedWholeBodyVelocity.from_vector(
-                        hold_arm_release_chassis(result.velocity.as_vector()),
+                        hold_whole_body(result.velocity.as_vector()),
                     ),
-                    backend="fixed-fixture-arm-hold",
+                    backend="fixed-fixture-hold",
                     objective_after=result.objective_before,
                     residual_after=result.residual_before,
-                    # An arm held stationary inside the envelope while the base
-                    # continues its evaluated intent IS a legal command, so this
-                    # stays executable.  ``failure_code`` still names the gate so
-                    # the condition remains visible instead of reading as an
-                    # ordinary approach.
+                    # Deliberately still executable so the hold keeps a DRIVING
+                    # phase and therefore a zero-command deadline.  Reporting it
+                    # as a failure would move it to a phase whose stall clock
+                    # measures plain time in phase, which the recorded flapping
+                    # defeats.  ``failure_code`` keeps the condition visible.
                     success=True,
                     reason=(
                         "no continuous fixed-fixture-safe arm step also lowered "
-                        "the nonlinear whole-body objective; arm held stationary "
-                        "while the base keeps its evaluated intent"
+                        "the nonlinear whole-body objective; holding the whole "
+                        "body so the servo's pose stays coherent"
                     ),
-                    failure_code="FIXED_FIXTURE_ARM_HOLD",
+                    failure_code="FIXED_FIXTURE_HOLD",
                 )
         else:
             collision_document = {
