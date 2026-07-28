@@ -233,6 +233,48 @@ class AntipodalGraspSource:
 
     # -- public API -------------------------------------------------------
 
+    def _gravity_in_cloud_frame(self, context: GraspContext) -> np.ndarray:
+        """Gravity expressed in the frame the object cloud is given in.
+
+        The upright prior is only meaningful against real gravity, and
+        ``up_axis`` describes the ARM BASE frame.  When the cloud arrives in the
+        camera optical frame -- which is what the perception dry run hands over,
+        with +Z along the boresight -- the configured axis is not up at all; on
+        the recorded charger sessions it sits 124.8 degrees away from true up.
+        Snapping to it makes the camera boresight "vertical", so a flat patch
+        seen obliquely reports its projected spread as a third object dimension:
+        the 1.6 mm-thick charger face measured 16.0 mm and was admitted as a
+        closing width, ranked first, and 23 better-scored candidates were tried
+        and rejected behind it.
+
+        ``t_target_src`` maps the cloud frame into the arm base frame, so its
+        rotation transposed carries base +Z back into the cloud frame.  An
+        identity transform means the cloud is already in the base frame and the
+        configured axis is correct.
+        """
+
+        transform = getattr(context, "t_target_src", None)
+        if transform is None:
+            return self.up_axis
+        try:
+            matrix = np.asarray(transform, dtype=np.float64)
+        except (TypeError, ValueError):
+            # Never let a malformed transform become an exception on the grasp
+            # path: the configured axis is a safe, previously-shipped default.
+            return self.up_axis
+        if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+            return self.up_axis
+        rotation = matrix[:3, :3]
+        if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-3):
+            # A non-orthonormal transform cannot be inverted meaningfully; fall
+            # back rather than snapping to a scaled axis.
+            return self.up_axis
+        up = rotation.T @ self.up_axis
+        norm = float(np.linalg.norm(up))
+        if not np.isfinite(norm) or norm < 1e-9:
+            return self.up_axis
+        return up / norm
+
     def generate(self, context: GraspContext) -> GraspCandidates:
         if context.object_points is None:
             raise GraspGenerationError("antipodal generation requires an object cloud")
@@ -246,7 +288,8 @@ class AntipodalGraspSource:
             take = np.linspace(0, len(points) - 1, self.max_surface_points).astype(int)
             points = points[take]
 
-        obb = self._fit_obb(points)
+        up = self._gravity_in_cloud_frame(context)
+        obb = self._fit_obb(points, up)
         if float(np.min(obb.full_extent)) > self.max_aperture_m * 1.05:
             raise GraspGenerationError(
                 "object has no OBB dimension within gripper aperture; "
@@ -261,7 +304,7 @@ class AntipodalGraspSource:
         # be any horizontal direction; otherwise use the OBB faces (boxes).
         grasp_center = obb.center
         graspable: list[_ClosingAxis] = []
-        section = self._round_cross_section(points, obb)
+        section = self._round_cross_section(points, obb, up)
         if section is not None:
             graspable = [
                 candidate
@@ -341,7 +384,7 @@ class AntipodalGraspSource:
 
     # -- geometry ---------------------------------------------------------
 
-    def _fit_obb(self, points: np.ndarray) -> _OBB:
+    def _fit_obb(self, points: np.ndarray, up: object = None) -> _OBB:
         median = np.median(points, axis=0)
         centred = points - median
         _, _, axes = np.linalg.svd(centred, full_matrices=False)
@@ -350,7 +393,7 @@ class AntipodalGraspSource:
         # the gripper rotates off the graspable face.  Snap a near-vertical axis
         # to exact vertical and re-orthonormalize the other two into the exact
         # horizontal plane, so the two horizontal closing axes are level.
-        axes, vertical_index = self._snap_axes_to_gravity(axes)
+        axes, vertical_index = self._snap_axes_to_gravity(axes, up)
         projected = centred @ axes.T
         # 1st/99th percentiles instead of raw min/max: FFS depth is clean but a
         # handful of stray points must not inflate a face width and reject an
@@ -377,15 +420,19 @@ class AntipodalGraspSource:
     def _snap_axes_to_gravity(
         self,
         axes: np.ndarray,
+        up: object = None,
     ) -> tuple[np.ndarray, Optional[int]]:
         """Snap a near-vertical principal axis to exact gravity, level the rest.
+
+        ``up`` is gravity expressed in the CLOUD's frame; ``None`` falls back to
+        the configured axis for callers that already work in an upright frame.
 
         Returns the (possibly rewritten) orthonormal axis rows and the index of
         the vertical axis, or ``None`` when no axis is within the snap cone (the
         object is not upright — leave PCA untouched).
         """
 
-        up = self.up_axis
+        up = self.up_axis if up is None else np.asarray(up, dtype=np.float64)
         axes = np.asarray(axes, dtype=np.float64)
         dots = axes @ up
         vertical_index = int(np.argmax(np.abs(dots)))
@@ -497,6 +544,7 @@ class AntipodalGraspSource:
         self,
         points: np.ndarray,
         obb: _OBB,
+        up: object = None,
     ) -> Optional[_RoundSection]:
         """Recover a true upright round cross-section, or ``None`` for non-round.
 
@@ -510,7 +558,7 @@ class AntipodalGraspSource:
 
         if not self.rotational_symmetry or obb.vertical_index is None:
             return None
-        up = self.up_axis
+        up = self.up_axis if up is None else np.asarray(up, dtype=np.float64)
         k = obb.vertical_index
         horizontal = [obb.axes[i] for i in range(3) if i != k]
         e1, e2 = horizontal[0], horizontal[1]

@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 import z_manip.models.antipodal_grasp as antipodal_module
 from z_manip.models.antipodal_grasp import AntipodalGraspSource
@@ -399,3 +400,70 @@ def test_corridor_backfill_rescues_starved_candidate_set():
     assert len(rescued.grasps) > len(starved.grasps)
     # Penalized backfill never outranks a corridor-clean candidate.
     assert np.max(rescued.scores) == pytest.approx(np.max(starved.scores), abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# The upright prior must be evaluated against real gravity, not against the
+# cloud frame's Z.
+#
+# Every recorded perception session writes frame = camera_color_optical_frame,
+# where +Z is the camera boresight.  up_axis defaults to (0, 0, 1) and NO
+# production caller ever passes it, so _snap_axes_to_gravity was snapping the
+# boresight to "vertical".  A flat patch seen obliquely then reports its
+# projected spread as a third object dimension -- and because the scoring
+# explicitly prefers the NARROWEST graspable face, that phantom axis wins.
+
+
+def _camera_from_base(pitch_rad: float) -> np.ndarray:
+    """A wrist camera looking forward and down by ``pitch_rad``."""
+
+    cos, sin = np.cos(pitch_rad), np.sin(pitch_rad)
+    optical = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+    pitch = np.array([[1.0, 0.0, 0.0], [0.0, cos, -sin], [0.0, sin, cos]])
+    transform = np.eye(4)
+    transform[:3, :3] = optical @ pitch
+    transform[:3, 3] = (0.05, 0.0, 0.30)
+    return transform
+
+
+def test_gravity_comes_from_the_cloud_frame_not_from_a_fixed_axis():
+    source = AntipodalGraspSource()
+    context = SimpleNamespace(t_target_src=_camera_from_base(0.61))
+
+    up = source._gravity_in_cloud_frame(context)
+
+    assert np.isclose(np.linalg.norm(up), 1.0)
+    # Base +Z carried into the camera frame is nowhere near the boresight.
+    angle_deg = np.degrees(np.arccos(abs(float(up[2]))))
+    assert angle_deg > 45.0, (
+        f"true up is only {angle_deg:.1f} deg from the boresight; the fixture no "
+        "longer represents a wrist camera and cannot catch the defect"
+    )
+
+
+def test_an_identity_transform_keeps_the_configured_axis():
+    """A cloud already in the base frame must be unaffected."""
+
+    source = AntipodalGraspSource()
+    up = source._gravity_in_cloud_frame(SimpleNamespace(t_target_src=np.eye(4)))
+    np.testing.assert_allclose(up, source.up_axis)
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [None, "not a transform", np.eye(3), np.full((4, 4), np.nan)],
+)
+def test_an_unusable_transform_falls_back_rather_than_snapping_to_garbage(transform):
+    source = AntipodalGraspSource()
+    up = source._gravity_in_cloud_frame(SimpleNamespace(t_target_src=transform))
+    np.testing.assert_allclose(up, source.up_axis)
+
+
+def test_a_scaled_transform_is_refused():
+    """A non-orthonormal rotation cannot be inverted into a meaningful axis."""
+
+    scaled = np.eye(4)
+    scaled[:3, :3] = np.diag((1.05, 1.05, 1.05))
+    source = AntipodalGraspSource()
+    up = source._gravity_in_cloud_frame(SimpleNamespace(t_target_src=scaled))
+    np.testing.assert_allclose(up, source.up_axis)
