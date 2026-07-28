@@ -23,6 +23,7 @@ import ast
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -558,10 +559,22 @@ def test_ik_probe_still_has_no_producer_in_this_repository():
     ``IK_PROBE_SCHEMA`` in go2w_depth_servo.py.
     """
 
+    # Only TRACKED files. An rglob walk descends into .claude/worktrees/, where
+    # this repo keeps ~20 git worktrees, and reports every one of their copies of
+    # go2w_depth_servo.py -- a failure that says nothing about a producer
+    # existing. It is also invisible from inside a worktree, where ROOT has no
+    # nested worktrees, so the check passes there and fails only after a merge.
+    tracked = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        capture_output=True,
+        check=True,
+    ).stdout.decode("utf-8", "replace").split("\0")
+
     hits: list[str] = []
-    for path in ROOT.rglob("*"):
-        if not path.is_file() or ".git/" in str(path):
+    for name in tracked:
+        if not name:
             continue
+        path = ROOT / name
         if path.suffix not in {".py", ".sh", ".yaml", ".yml", ".json", ".html"}:
             continue
         try:
@@ -569,7 +582,7 @@ def test_ik_probe_still_has_no_producer_in_this_repository():
         except (OSError, UnicodeError):
             continue
         if "reactive/ik_probe" in text:
-            hits.append(str(path.relative_to(ROOT)))
+            hits.append(name)
 
     assert sorted(hits) == [
         "scripts/runtime/go2w_depth_servo.py",
