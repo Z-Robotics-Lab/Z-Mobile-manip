@@ -110,6 +110,68 @@ LIFT_STREAM_REFERENCE_SPEED_PERCENT = 15
 # (b) removes the stop-and-go halt at the pregrasp standoff (now a via).  The
 # reference speed is deliberately gentle so the tool creeps into contact.
 APPROACH_STREAM_REFERENCE_SPEED_PERCENT = 15
+# Measured PiPER S-V1.8-8 continuous joint rate, in degrees per second per
+# percent of set_speed_percent.  Regressed from the recorded pregrasp transits,
+# which execute as ONE coalesced move_j edge so leg_time = arc/rate + fixed
+# overhead is directly solvable: speed 5% -> 8.80 deg/s over 3 runs and
+# speed 20% -> 34.69 deg/s over 8 runs, i.e. 1.76 and 1.73 deg/s per percent.
+# The conservative floor is taken.  This value only ever picks how far a
+# planned schedule is stretched, and is clamped on both sides, so a wrong
+# value costs smoothness and never safety.
+#
+# EVERY run behind this number was UNLOADED, so it does not describe a holding
+# arm -- see PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT below.
+PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT = 1.70
+# The same regression, run on legs that were carrying the object.  The seven
+# recorded ``return-home-holding`` legs are the loaded analogue of the transits
+# above: one coalesced move_j, with holding_object=true, and with
+# executor_started_unix_ns / finished_unix_ns / speed_percent all recorded, so
+# leg_time = arc/(rate * speed) + overhead is solvable the same way.
+#
+#   run       speed  duration  chord     implied rate
+#   ...114366     5   18.993 s  98.10d   1.172 deg/s/%
+#   ...403866     5   21.452 s 128.87d   1.343
+#   ...352316    15    7.053 s  93.48d   1.299
+#   ...156297    15    7.228 s  92.51d   1.240
+#   ...660655    20    5.819 s  92.95d   1.304
+#   ...815652    20    5.851 s 105.75d   1.470
+#   ...195912    20    5.727 s  85.51d   1.232
+#
+# Least squares over all seven gives 1.278 deg/s per percent with a 2.255 s
+# fixed overhead (rms residual 0.676 s over 5.7-21.5 s legs).  As with the
+# unloaded constant the conservative floor is taken, below every observed
+# sample.  A holding arm is roughly three quarters the speed of an empty one,
+# which is why applying the unloaded 1.70 to a loaded leg asked for about twice
+# the rate the arm actually delivers.
+PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT = 1.15
+# Fraction of that rate a streamed schedule is allowed to demand.  Headroom
+# below 1.0 so the arm never saturates into tracking lag on a tick boundary.
+STREAM_RATE_UTILISATION = 0.90
+# Gross-deviation backstop for a streamed path.  This is NOT a precision gate:
+# the per-waypoint in-tolerance gate was removed because it stopped the arm at
+# every lift IK vertex.  It aborts a stalled or badly-lagging stream part way
+# through instead of commanding every remaining target into an arm that is not
+# following, which is what happened before -- the re-anchor keys on schedule lag,
+# which is TIME, so nothing in the loop ever compared a measured joint to a
+# commanded one.
+#
+# WHAT IT DOES NOT CATCH: a dropped or slipped payload while the joints keep
+# tracking perfectly.  It reads joints only.  Gripper aperture is verified before
+# the lift and after it, not during, so a mid-path drop still returns success.
+#
+# The bound must stay BELOW the path's own excursion or a total stall is
+# invisible -- the arm simply sits at the start and the deviation tops out at the
+# distance the profile intended.  A fixed 6 deg floor fails that test on the
+# majority of real lifts: across 162 recorded lift plans the max excursion is
+# p10 9.14 / p50 12.16 / p90 22.07 deg, so at speed 15-20 (the two most-used
+# recorded speeds) a 6 deg floor plus the reachable term never fires on more than
+# half of them.  Hence the excursion-relative term, and hence the floor is a CAP
+# rather than the bound itself.
+STREAM_TRACKING_ERROR_FLOOR_RAD = math.radians(6.0)
+# Fraction of the path's own excursion that a healthy arm may lag by.  A real arm
+# trails the stream by about one tick of travel, an order of magnitude under
+# this; a stall crosses it before the path ends by construction.
+STREAM_TRACKING_EXCURSION_FRACTION = 0.5
 # 0.30 s at the 50 Hz stream keeps the arm within a bounded 15-sample drift
 # on a non-realtime host; the previous 0.15 s tripped on ordinary scheduler
 # jitter and its failure path unloaded a holding arm.
@@ -140,6 +202,22 @@ JOINT_LIMIT_TOLERANCE_RAD = 1e-5
 MEASURED_HOME_MAX_CONVERGENCE_RAD = math.radians(20.0)
 MEASURED_HOME_MAX_STEP_RAD = math.radians(5.0)
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+# Planning-side evidence that every leg driven with the object in the gripper
+# was revalidated in the LOADED configuration -- payload rigidly attached to
+# the tool, gripper closed on it, and the Go2W platform fixtures (chassis,
+# head, NUC, Mid-360 lidar) treated as obstacles for that payload.  Outbound
+# transit and approach are checked with an EMPTY gripper; replaying them in
+# reverse while holding does not inherit that evidence, so the executor
+# refuses to drive a return corridor which does not carry this block.
+HOLDING_RETURN_KEY = "holding_return"
+HOLDING_RETURN_SCHEMA = "z_manip.holding_return_validation.v1"
+CARRY_RAW_KEY = "carry_raw"
+# Segment names the executor understands inside that block.  ``carry`` is the
+# direct lift-top -> pregrasp edge; ``lift``/``reverse_approach`` are the two
+# legacy replay legs it can replace; ``return_transit`` is the run Home, which
+# is driven while holding on every route and is therefore always required.
+HOLDING_RETURN_SEGMENTS = ("lift", "reverse_approach", "carry", "return_transit")
+CARRY_ENDPOINT_TOLERANCE_RAD = 1e-5
 
 
 class SafetyError(RuntimeError):
@@ -814,6 +892,134 @@ def validate_stage_context(
     raise SafetyError(f"unsupported stage: {stage}")
 
 
+@dataclass(frozen=True)
+class HoldingReturnEvidence:
+    """Which while-holding legs this artifact proved safe when loaded."""
+
+    segments: Mapping[str, bool]
+    carry_raw: np.ndarray | None
+    carry_rejection_reason: str
+    collision_model: str
+
+    @property
+    def carry_valid(self) -> bool:
+        return bool(self.segments.get("carry")) and self.carry_raw is not None
+
+    @property
+    def legacy_corridor_valid(self) -> bool:
+        """Reverse-lift + reverse-approach, re-checked with the load on."""
+
+        return bool(self.segments.get("lift")) and bool(
+            self.segments.get("reverse_approach"),
+        )
+
+    @property
+    def return_transit_valid(self) -> bool:
+        return bool(self.segments.get("return_transit"))
+
+
+def holding_return_evidence(artifact: PlanningArtifact) -> HoldingReturnEvidence:
+    """Load the attached-object validation for every while-holding leg.
+
+    Fail-closed in both directions.  A missing block raises rather than
+    defaulting to "probably fine": a plan without it was only ever checked
+    with an EMPTY gripper, and reversing an empty-gripper corridor is exactly
+    how a carried object reached the lidar.  A malformed or internally
+    inconsistent block raises as well; only the individual per-segment
+    verdicts are allowed to be false, and the caller decides which
+    combinations it can still drive.
+    """
+
+    block = artifact.report.get(HOLDING_RETURN_KEY)
+    if block is None:
+        raise SafetyError(
+            "planning artifact carries no holding_return validation: every leg "
+            "driven with the object in the gripper must be revalidated with the "
+            "object attached before it is commanded (replan to continue)",
+        )
+    if not isinstance(block, Mapping):
+        raise SafetyError("holding_return must be one JSON object")
+    if block.get("schema") != HOLDING_RETURN_SCHEMA:
+        raise SafetyError("unsupported holding_return schema")
+    if block.get("attached_at") != "grasp":
+        raise SafetyError("holding_return must attach the payload at the grasp pose")
+    model = block.get("collision_model")
+    if not isinstance(model, str) or not model:
+        raise SafetyError("holding_return does not name its collision model")
+    segments = block.get("segments")
+    if not isinstance(segments, Mapping):
+        raise SafetyError("holding_return.segments must be one JSON object")
+    verdicts: dict[str, bool] = {}
+    for name in HOLDING_RETURN_SEGMENTS:
+        value = segments.get(name)
+        if not isinstance(value, bool):
+            raise SafetyError(
+                f"holding_return.segments.{name} must be exactly true or false",
+            )
+        verdicts[name] = value
+    reason = block.get("carry_rejection_reason", "")
+    if not isinstance(reason, str):
+        raise SafetyError("holding_return.carry_rejection_reason must be a string")
+
+    has_array = CARRY_RAW_KEY in artifact.arrays
+    if verdicts["carry"] and not has_array:
+        raise SafetyError("holding_return claims a valid carry but the NPZ has none")
+    carry: np.ndarray | None = None
+    if has_array:
+        carry = _validate_carry_path(artifact, block)
+    if verdicts["carry"] and reason:
+        raise SafetyError("a valid carry cannot also carry a rejection reason")
+    return HoldingReturnEvidence(
+        segments=verdicts,
+        carry_raw=carry,
+        carry_rejection_reason=reason,
+        collision_model=model,
+    )
+
+
+def _validate_carry_path(
+    artifact: PlanningArtifact,
+    block: Mapping[str, Any],
+) -> np.ndarray:
+    """Validate the direct lift-top -> pregrasp retreat polyline."""
+
+    path = np.asarray(artifact.arrays[CARRY_RAW_KEY], dtype=float)
+    if path.ndim != 2 or path.shape[1:] != (6,) or len(path) < 2:
+        raise SafetyError(f"{CARRY_RAW_KEY} must contain at least two 6-axis waypoints")
+    if len(path) > MAX_PATH_WAYPOINTS:
+        raise SafetyError(
+            f"{CARRY_RAW_KEY} exceeds the {MAX_PATH_WAYPOINTS}-waypoint safety cap",
+        )
+    if not np.isfinite(path).all():
+        raise SafetyError(f"{CARRY_RAW_KEY} contains non-finite values")
+    low = JOINT_LIMITS_RAD[:, 0] - JOINT_LIMIT_TOLERANCE_RAD
+    high = JOINT_LIMITS_RAD[:, 1] + JOINT_LIMIT_TOLERANCE_RAD
+    if np.any(path < low) or np.any(path > high):
+        raise SafetyError(f"{CARRY_RAW_KEY} contains a waypoint outside PiPER joint limits")
+    expected = block.get("carry_raw_waypoints")
+    if isinstance(expected, bool) or expected != len(path):
+        raise SafetyError("carry_raw_waypoints does not match the NPZ carry polyline")
+    lift = np.asarray(artifact.arrays["lift_raw"], dtype=float)
+    transit = np.asarray(artifact.arrays["transit_raw"], dtype=float)
+    if float(np.max(np.abs(path[0] - lift[-1]))) > CARRY_ENDPOINT_TOLERANCE_RAD:
+        raise SafetyError("carry does not start at the planned lift top")
+    # This is what makes the following reverse transit legal by construction:
+    # its first waypoint is transit_raw[-1], which coalescing always retains.
+    if float(np.max(np.abs(path[-1] - transit[-1]))) > CARRY_ENDPOINT_TOLERANCE_RAD:
+        raise SafetyError("carry does not end at the planned pregrasp")
+    return path
+
+
+def carry_path(artifact: PlanningArtifact) -> np.ndarray:
+    """Return the executable carry edge, or fail closed."""
+
+    evidence = holding_return_evidence(artifact)
+    if not evidence.carry_valid:
+        raise SafetyError("this artifact has no collision-validated carry edge")
+    assert evidence.carry_raw is not None
+    return coalesce_collinear_execution_path(evidence.carry_raw)
+
+
 def coalesce_collinear_execution_path(
     path: np.ndarray,
     *,
@@ -1344,6 +1550,64 @@ def execute_joint_path(
     return actual
 
 
+def stream_time_scale(
+    positions: np.ndarray,
+    times_s: np.ndarray,
+    *,
+    speed_percent: int,
+    reference_speed_percent: int,
+    holding_load: bool,
+) -> float:
+    """Stretch a planned schedule only as far as the arm's own rate requires.
+
+    The planner time-parameterises against URDF velocity limits scaled by
+    ``velocity_scale``, which has nothing whatever to do with PiPER's
+    ``set_speed_percent``.  Deriving the stretch from a fixed
+    reference/requested speed ratio therefore over-stretched every low-speed
+    run: at ``speed_percent=5`` the shipped ratio ``max(1, 15/5) = 3`` turned a
+    2.07 s approach into 6.22 s and asked the arm for 3.1 deg/s, while its
+    move_j actually runs at 8.8 deg/s.  The arm answered each 0.068 deg target
+    in 7.7 ms and then stood still for the remaining 51.8 ms of the 59.5 ms
+    tick -- 105 accel/decel restarts at 17 Hz with a duty cycle of 0.23.  That
+    ratchet is the "分段式 / very jitter" the operator sees on the final
+    descent, and it is the same trap ("streamed reference speed above the run
+    speed") this project has now shipped twice.
+
+    Scaling from the arm's MEASURED continuous rate asks for the fastest
+    profile it can actually track without gaps.  The legacy ratio is kept as a
+    hard upper clamp, so this can never be slower than what ships today, and
+    the ``max(1.0, ...)`` floor keeps it from ever compressing the planner's
+    bounded velocity/acceleration profile.  At ``speed_percent >= 15`` both
+    bounds are 1.0 and the result is bit-identical to today.
+
+    A HOLDING arm is budgeted against its OWN measured rate, not the empty
+    arm's.  Both legs ratchet at 17 Hz under the shipped fixed ratio -- the lift
+    as visibly as the approach -- so refusing to retime the loaded leg at all
+    would forfeit most of the fix.  But a loaded arm delivers roughly three
+    quarters of the unloaded rate, so budgeting it at the unloaded constant
+    asks for about twice what it can track, on the one leg where losing the
+    profile means dropping the payload.
+    """
+
+    schedule = np.asarray(times_s, dtype=float)
+    steps = np.abs(np.diff(np.asarray(positions, dtype=float), axis=0)).max(axis=1)
+    peak_rate_rad_s = float(np.max(steps / np.diff(schedule)))
+    legacy_scale = max(1.0, reference_speed_percent / float(speed_percent))
+    rate_deg_s_per_percent = (
+        PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+        if holding_load
+        else PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+    )
+    budget_rad_s = (
+        math.radians(rate_deg_s_per_percent)
+        * float(speed_percent)
+        * STREAM_RATE_UTILISATION
+    )
+    if not math.isfinite(peak_rate_rad_s) or budget_rad_s <= 0.0:
+        return legacy_scale
+    return max(1.0, min(peak_rate_rad_s / budget_rad_s, legacy_scale))
+
+
 def execute_timed_joint_path(
     robot: Any,
     path: np.ndarray,
@@ -1399,13 +1663,34 @@ def execute_timed_joint_path(
     guard.mark_before_command()
     robot.set_speed_percent(speed_percent)
     enable_arm(robot, guard, timeout_s=3.0, monotonic=monotonic, sleep=sleep)
-    time_scale = max(1.0, reference_speed_percent / float(speed_percent))
+    time_scale = stream_time_scale(
+        positions,
+        times,
+        speed_percent=speed_percent,
+        reference_speed_percent=reference_speed_percent,
+        holding_load=guard.holding_load,
+    )
+    rate_deg_s_per_percent = (
+        PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+        if guard.holding_load
+        else PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+    )
+    # Keep the tracking bound under this path's own excursion, or a total stall
+    # never exceeds it: a stalled arm's deviation tops out at exactly the
+    # distance the profile intended to cover.
+    excursion_rad = float(np.max(np.abs(positions - positions[0])))
+    tracking_floor_rad = min(
+        STREAM_TRACKING_ERROR_FLOOR_RAD,
+        STREAM_TRACKING_EXCURSION_FRACTION * excursion_rad,
+    )
     started = monotonic()
     before_final_stamp = -math.inf
     before_final_status_stamp = -math.inf
     actual_before_final = actual
     resync_total_s = 0.0
     resync_count = 0
+    tracked_joints = actual
+    tracked_at = monotonic()
     for index, target in enumerate(positions[1:], start=1):
         due = started + float(times[index]) * time_scale
         remaining = due - monotonic()
@@ -1444,6 +1729,43 @@ def execute_timed_joint_path(
             actual_before_final, before_final_stamp = read_joint_feedback(robot)
             before_final_status_stamp = status_stamp
         _command_joint_target(robot, target, guard)
+
+        # Gross-deviation backstop, on every tick.  ``get_joint_angles`` returns
+        # the driver's cached joint frames and transmits nothing, and the
+        # ``check_arm_status`` call directly above is the same kind of cached
+        # read -- so this adds no CAN traffic and cannot interact with the bus
+        # deadlock or the passive-CAN gate.  An earlier revision throttled it to
+        # 0.25 s to "save a CAN round trip"; that rationale was false, and the
+        # throttle bought nothing but detection latency.
+        #
+        # A healthy arm trails the stream by about one tick of travel; the floor
+        # is an order of magnitude above that, so ordinary lag cannot trip it,
+        # while a stall accumulates deviation at the profile rate and crosses
+        # the bound within a couple of seconds at the speeds this runs at.
+        now = monotonic()
+        measured, _ = read_joint_feedback(robot)
+        deviation = float(np.max(np.abs(measured - positions[index])))
+        # What the arm could physically have closed since the previous tick, so
+        # a slow tick is never read as a tracking failure.  Budgeted at the
+        # arm's own rate for this load state -- using the unloaded rate here
+        # would make the bound most generous exactly where the payload risk is.
+        reachable = (
+            math.radians(rate_deg_s_per_percent)
+            * float(speed_percent)
+            * (now - tracked_at)
+        )
+        allowed = tracking_floor_rad + reachable
+        if deviation > allowed:
+            raise SafetyError(
+                "streamed path lost joint tracking: measured joints deviate "
+                f"{math.degrees(deviation):.2f}deg from the commanded target "
+                f"at waypoint {index}/{len(positions) - 1}, beyond the "
+                f"{math.degrees(allowed):.2f}deg bound; the arm moved "
+                f"{math.degrees(float(np.max(np.abs(measured - tracked_joints)))):.2f}"
+                f"deg since the previous tick",
+            )
+        tracked_joints = measured
+        tracked_at = now
 
     max_delta_rad = float(np.max(np.abs(positions[-1] - actual_before_final)))
     conservative_rate_rad_s = math.radians(90.0) * speed_percent / 100.0

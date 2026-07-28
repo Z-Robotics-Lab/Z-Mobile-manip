@@ -26,6 +26,11 @@ import numpy as np
 
 
 COLLISION_WITNESS_REPLAY_LIMIT = 4
+# Wall-clock budget for revalidating every leg the arm drives with the object
+# in its gripper.  Measured 0.6-6.3 s over 172 recorded sessions; the cost is
+# dominated by the payload-vs-scene nearest-neighbour query along the run
+# Home, which scales with transit length x scene size.
+HOLDING_RETURN_TIMEOUT_S = 20.0
 
 
 # A resident, network-disabled planning worker may call ``main`` repeatedly.
@@ -1368,6 +1373,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         approach = planner._retime_joint_path(raw_approach)
         lift = planner._retime_joint_path(raw_lift)
         timings_s["retime"] = time.perf_counter() - retime_started
+        # The transit and approach above were checked with an EMPTY gripper:
+        # the object is an obstacle to avoid, not a payload attached to the
+        # tool.  The workflow drives those same corridors backwards while
+        # HOLDING the object, which sweeps a larger volume across the Go2W
+        # platform.  Check every one of those legs again, loaded, and emit one
+        # direct lift-top -> pregrasp carry edge so the return no longer has to
+        # put the object back down to rejoin the approach.
+        holding_started = time.perf_counter()
+        holding_return = planner.plan_holding_return(
+            transit_raw=raw_transit,
+            approach_raw=raw_approach,
+            lift_raw=raw_lift,
+            scene_points=scene_base,
+            target_points=target_base,
+            stamp_s=stamp_s,
+            required_width_m=planned.required_width_m,
+            # A budget of its own, deliberately not the grasp-search budget:
+            # whatever the search spent must not decide whether the loaded
+            # return gets checked.  Blowing this one is a genuine anomaly and
+            # fails the plan closed rather than shipping unchecked legs.
+            control=PlanningControl().limited_to(
+                HOLDING_RETURN_TIMEOUT_S,
+                "holding-return revalidation",
+            ),
+        )
+        timings_s["holding_return"] = time.perf_counter() - holding_started
     except (PlanningError, ValueError) as error:
         timings_s.setdefault("search", time.perf_counter() - search_started)
         report["error"] = f"{type(error).__name__}: {error}"
@@ -1405,6 +1436,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     artifact_started = time.perf_counter()
     planned_grasp_path = output / "planned_grasp.npz"
+    # Only ship the carry edge when it actually validated with the object
+    # attached.  A rejected carry leaves the executor on the (also loaded-
+    # checked) reverse-lift replay instead of on an unproven shortcut.
+    carry_arrays = (
+        {"carry_raw": np.asarray(holding_return.carry_raw, dtype=float)}
+        if holding_return.carry_valid
+        else {}
+    )
     np.savez_compressed(
         planned_grasp_path,
         grasp_pose=np.asarray(planned.grasp_pose, dtype=float),
@@ -1412,6 +1451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         transit_raw=raw_transit,
         approach_raw=raw_approach,
         lift_raw=raw_lift,
+        **carry_arrays,
         transit=np.asarray(transit.positions, dtype=float),
         transit_times_s=np.asarray(transit.times_s, dtype=float),
         approach=np.asarray(approach.positions, dtype=float),
@@ -1466,6 +1506,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "collision_gripper_aperture_m": planner.grasp_collision_aperture(
             planned.required_width_m,
         ),
+        "holding_return": holding_return.document(),
         "transit_raw_waypoints": len(raw_transit),
         "approach_raw_waypoints": len(raw_approach),
         "lift_raw_waypoints": len(raw_lift),

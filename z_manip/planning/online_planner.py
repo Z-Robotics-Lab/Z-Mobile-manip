@@ -63,6 +63,81 @@ from z_manip.planning_control import checkpoint, PlanningControl
 from z_manip.trajectory_clearance import evaluate_fixed_fixture_trajectory
 
 
+# Every ``validate_path`` segment whose swept volume includes a payload
+# rigidly attached to the tool.  Adding a name here is what makes a motion
+# "checked while holding"; nothing may be executed with ``holding_object``
+# true unless it was validated under one of these.
+ATTACHED_PAYLOAD_SEGMENTS = (
+    'lift',
+    'lifted_retreat',
+    'holding_transit',
+    'carry',
+    'place_transit',
+)
+# The subset validated with the gripper collapsed onto the object.  The lift
+# and the homeward legs are executed with the fingers closed on the payload;
+# the ROS place segments keep the wider open-gripper model they shipped with.
+CLOSED_GRIPPER_PAYLOAD_SEGMENTS = ('lift', 'lifted_retreat', 'holding_transit')
+# Forward-kinematics samples used to profile the direct carry edge.
+CARRY_PROFILE_SAMPLES = 201
+# Numerical tolerance on the tip-height profile of the carry.  A joint space
+# chord through a revolute arm wobbles by a few tens of microns; the largest
+# rise measured over 172 recorded sessions was 0.13 mm.
+CARRY_TIP_RISE_TOLERANCE_M = 5.0e-4
+# How far below the reverse-lift + reverse-approach replay the carry is allowed
+# to take the payload before it is refused as a put-down.  The contract is
+# RELATIVE to the corridor the refusal falls back to, not to the grasp height:
+# the replay descends all the way to the grasp pose AND then travels out to the
+# same pregrasp the carry ends at, so its floor is min(grasp, pregrasp).  An
+# absolute "stay above the grasp" rule refused the carry on 3 of 172 recorded
+# plans whose pregrasp legitimately sits 2-27 mm BELOW the grasp (in-reach
+# lateral picks), and the fallback then reached that identical low pose having
+# also set the object down on its pick spot on the way.  Refusing a route for a
+# height the alternative also reaches, at the cost of an extra put-down, is
+# strictly worse for the operator.
+CARRY_MAX_DIP_BELOW_REPLAY_M = 5.0e-4
+
+
+@dataclass(frozen=True)
+class HoldingReturnPlan:
+    """Collision evidence for every leg driven with the object in hand."""
+
+    carry_raw: np.ndarray
+    segments: dict[str, bool]
+    carry_tip_height: dict[str, float]
+    carry_rejection_reason: str
+
+    @property
+    def carry_valid(self) -> bool:
+        return bool(self.segments.get('carry'))
+
+    @property
+    def legacy_corridor_valid(self) -> bool:
+        """Is the reverse-lift + reverse-approach replay safe while loaded?"""
+
+        return bool(
+            self.segments.get('lift')
+            and self.segments.get('reverse_approach')
+        )
+
+    @property
+    def return_transit_valid(self) -> bool:
+        return bool(self.segments.get('return_transit'))
+
+    def document(self) -> dict[str, object]:
+        """Serialize the evidence the executor gates on."""
+
+        return {
+            'schema': 'z_manip.holding_return_validation.v1',
+            'collision_model': 'closed_on_object_with_platform_fixtures',
+            'attached_at': 'grasp',
+            'segments': dict(self.segments),
+            'carry_raw_waypoints': int(len(self.carry_raw)),
+            'carry_tip_height_m': dict(self.carry_tip_height),
+            'carry_rejection_reason': self.carry_rejection_reason,
+        }
+
+
 @dataclass(frozen=True, eq=False)
 class PerceptionObservation:
     """One synchronized observation, expressed in the PiPER base frame."""
@@ -460,6 +535,51 @@ class OnlinePlanner:
             closing_axis=self.config.tool_geometry.tip_closing_axis,
         )
 
+    def _collision_model_for_carried_payload(
+        self,
+        model: RobotCollisionModel,
+    ) -> RobotCollisionModel:
+        """Make robot-mounted fixtures obstacles for a CARRIED payload.
+
+        The platform fixtures (Go2W chassis, head, NUC and the Mid-360 lidar)
+        are declared ``check_target=False`` because an unheld grasp target sits
+        in the scene, far from the base, and pairing it with base-mounted
+        geometry only produced noise.  That exemption becomes a fail-open the
+        moment the target is ATTACHED to the tip: the payload then travels the
+        whole way back to Home across exactly that geometry, and nothing was
+        checking it.  A gripper carrying an object home therefore had no
+        object-vs-lidar test at all.
+
+        Tip-mounted supplemental capsules (the D435 body and the camera plate)
+        already carry ``check_target=True`` and are unaffected; they move
+        rigidly with the payload, so their verdict is a constant that the
+        existing attached lift check already exercises.
+
+        This deliberately derives from the configured capsule set rather than
+        from any geometry of its own, so a corrected fixture pose or a newly
+        added bracket capsule is picked up automatically.
+        """
+
+        capsules = tuple(
+            replace(capsule, check_target=True)
+            if capsule.supplemental_self_collision and not capsule.check_target
+            else capsule
+            for capsule in model.capsules
+        )
+        if capsules == model.capsules:
+            return model
+        return replace(model, capsules=capsules)
+
+    def carried_payload_collision_model(
+        self,
+        required_width_m: object,
+    ) -> RobotCollisionModel:
+        """Return the closed-on-object model used for every holding segment."""
+
+        return self._collision_model_for_carried_payload(
+            self._collision_model_for_grasp_width(required_width_m),
+        )
+
     def candidates(
         self,
         observation: PerceptionObservation,
@@ -606,7 +726,10 @@ class OnlinePlanner:
                 attached_checker = checker_with_target(
                     allowed_contact_capsules=self.collision_model.target_contact_capsules,
                     attachment_joints=attachment,
-                    collision_model=self._collision_model_for_grasp_width(
+                    # The lift is the first motion made with the payload in
+                    # hand, so the platform fixtures become obstacles for it
+                    # here exactly as they do for every later holding leg.
+                    collision_model=self.carried_payload_collision_model(
                         required_width_m,
                     ),
                 )
@@ -1068,13 +1191,29 @@ class OnlinePlanner:
         if not self._fixed_fixture_path_valid(positions):
             return False
         try:
-            if segment_name in ('lift', 'carry', 'place_transit'):
+            if segment_name in ATTACHED_PAYLOAD_SEGMENTS:
                 if attachment_joints is None:
                     return False
+                # ``lift`` breaks support contact with the gripper closed on
+                # the object.  ``lifted_retreat`` and ``holding_transit`` are
+                # the segments executed AFTER that break, on the way home with
+                # the payload already clear of its support, so they use the
+                # same closed-on-object gripper model but no support-contact
+                # exemption.  ``carry``/``place_transit`` keep the OPEN model
+                # they have always used: open fingers bound a strictly larger
+                # swept volume than closed ones, so that stays conservative.
                 collision_model = (
                     self._collision_model_for_grasp_width(required_width_m)
-                    if segment_name == 'lift'
+                    if segment_name in CLOSED_GRIPPER_PAYLOAD_SEGMENTS
                     else self.collision_model
+                )
+                # Every one of these segments moves a payload rigidly attached
+                # to the tip, so the base-mounted fixtures must be obstacles
+                # for it.  Without this the object returning Home is checked
+                # against the perceived scene and the arm's own links but not
+                # against the Mid-360, the head plate, the NUC or the chassis.
+                collision_model = self._collision_model_for_carried_payload(
+                    collision_model,
                 )
                 checker = self._new_checker(
                     scene_points=scene,
@@ -1097,14 +1236,26 @@ class OnlinePlanner:
                     departure_direction_base=departure_direction,
                 )
                 return all(
-                    checker.is_segment_valid(first, second)
+                    # Forward the caller's budget: a dense payload-vs-scene
+                    # sweep along a 53-waypoint transit over a 28k-point cloud
+                    # is the single most expensive thing in this function, and
+                    # without this it runs to completion no matter what
+                    # deadline the caller set.
+                    checker.is_segment_valid(first, second, control=control)
                     for first, second in zip(positions, positions[1:])
                 )
             if segment_name == 'place_approach':
                 if attachment_joints is None:
                     return False
                 attachment = np.asarray(attachment_joints, dtype=float)
-                blocked = self._new_checker(scene_points=scene, stamp_s=stamp_s)
+                payload_model = self._collision_model_for_carried_payload(
+                    self.collision_model,
+                )
+                blocked = self._new_checker(
+                    scene_points=scene,
+                    stamp_s=stamp_s,
+                    collision_model=payload_model,
+                )
                 blocked.update_attached_target(
                     target,
                     attachment_joints=attachment,
@@ -1140,6 +1291,7 @@ class OnlinePlanner:
                 support_contact = self._new_checker(
                     scene_points=scene,
                     stamp_s=stamp_s,
+                    collision_model=payload_model,
                 )
                 support_contact.update_attached_target(
                     final_target,
@@ -1208,6 +1360,154 @@ class OnlinePlanner:
         except (TypeError, ValueError):
             return False
 
+    def plan_holding_return(
+        self,
+        *,
+        transit_raw: object,
+        approach_raw: object,
+        lift_raw: object,
+        scene_points: object,
+        target_points: object,
+        stamp_s: float,
+        required_width_m: object | None = None,
+        control: PlanningControl | None = None,
+    ) -> HoldingReturnPlan:
+        """Check every leg the arm drives while the object is in its hand.
+
+        The outbound plan is validated with an EMPTY gripper: ``transit`` and
+        ``approach`` treat the object as a scene obstacle to avoid, not as a
+        payload bolted to the tool.  The return trip replays those same arrays
+        backwards while HOLDING the object, which sweeps a strictly larger
+        volume through the space above the Go2W platform.  Nothing revalidated
+        that, so the homeward run was executed on a corridor whose safety
+        evidence had been collected for a different robot configuration.
+
+        This computes the evidence the return needs, in the loaded
+        configuration:
+
+        ``lift``              the lift column, forward.  Collision is a
+                              property of the states swept, not of the
+                              direction of travel, so this equally attests the
+                              reverse lift used by the recovery limb.
+        ``reverse_approach``  grasp -> pregrasp, validated as a departure from
+                              the support with the payload attached.
+        ``carry``             one direct lift-top -> pregrasp edge, which lets
+                              the executor skip the reverse lift entirely and
+                              stop putting the object back down on its way
+                              home.
+        ``return_transit``    pregrasp -> Home.  This is the run home, and the
+                              leg on which a carried object can reach the
+                              platform fixtures.
+
+        Every one of them is checked with the payload attached at the grasp
+        pose, against the closed-on-object gripper model, with the platform
+        fixtures made obstacles for the payload.  Failures are reported, never
+        raised: the caller records what passed and the executor refuses to
+        drive anything that did not.
+        """
+
+        transit = np.asarray(transit_raw, dtype=float)
+        approach = np.asarray(approach_raw, dtype=float)
+        lift = np.asarray(lift_raw, dtype=float)
+        scene = np.asarray(scene_points, dtype=float)
+        target = np.asarray(target_points, dtype=float)
+        for name, array in (
+            ('transit_raw', transit),
+            ('approach_raw', approach),
+            ('lift_raw', lift),
+        ):
+            if (
+                array.ndim != 2
+                or array.shape[1] != self.chain.dof
+                or len(array) < 2
+                or not np.all(np.isfinite(array))
+            ):
+                raise ValueError(f'{name} must be a finite (N, dof) polyline')
+
+        grasp_joints = approach[-1]
+        carry = np.vstack((lift[-1], transit[-1]))
+
+        def _validate(segment_name: str, path: np.ndarray) -> bool:
+            return bool(self.validate_path(
+                path,
+                scene_points=scene,
+                target_points=target,
+                stamp_s=stamp_s,
+                segment_name=segment_name,
+                attachment_joints=grasp_joints,
+                required_width_m=required_width_m,
+                control=control,
+            ))
+
+        checkpoint(control, 'holding-return revalidation')
+        segments = {
+            'lift': _validate('lift', lift),
+            'reverse_approach': _validate('lift', approach[::-1]),
+            'carry': _validate('lifted_retreat', carry),
+            'return_transit': _validate('holding_transit', transit),
+        }
+        checkpoint(control, 'holding-return revalidation')
+
+        tool_from_tip = np.asarray(
+            self.config.grasp_plan.tool_from_tip,
+            dtype=float,
+        )
+
+        def _tip_z(joints: np.ndarray) -> float:
+            return float((self.chain.forward(joints) @ tool_from_tip)[2, 3])
+
+        samples = carry[0] + np.outer(
+            np.linspace(0.0, 1.0, CARRY_PROFILE_SAMPLES),
+            carry[1] - carry[0],
+        )
+        heights = np.asarray([_tip_z(joints) for joints in samples], dtype=float)
+        grasp_height = _tip_z(grasp_joints)
+        # The corridor a refused carry falls back to is the reverse-lift +
+        # reverse-approach replay, which lowers the payload onto the grasp pose
+        # and then travels out to the same pregrasp the carry ends at.  Its
+        # floor is therefore the lower of those two heights, and that -- not
+        # the grasp height alone -- is what the carry has to beat to be an
+        # improvement.
+        replay_floor = min(grasp_height, float(heights[-1]))
+        profile = {
+            'lift_top_m': float(heights[0]),
+            'pregrasp_m': float(heights[-1]),
+            'grasp_m': grasp_height,
+            'minimum_m': float(np.min(heights)),
+            'minimum_above_grasp_m': float(np.min(heights) - grasp_height),
+            'replay_floor_m': replay_floor,
+            'minimum_above_replay_floor_m': float(np.min(heights) - replay_floor),
+            'maximum_rise_m': float(np.max(np.diff(heights), initial=0.0)),
+            'non_increasing': bool(
+                np.all(np.diff(heights) <= CARRY_TIP_RISE_TOLERANCE_M)
+            ),
+        }
+        # Refuse a "carry" that would dip the payload BELOW the floor of the
+        # replay it replaces.  Such an edge is a put-down by another name and
+        # is exactly the behaviour this deletes.  Collision remains the
+        # authority for safety; this is the behavioural contract on top, and it
+        # is deliberately relative so that refusing the carry always leaves the
+        # operator with a route that keeps the object at least as high.  A rise
+        # along the way is not refused: lifting the payload higher cannot make
+        # it a put-down, and the collision verdict on 'lifted_retreat' already
+        # owns whether the higher route is safe.
+        if not segments['carry']:
+            carry_reason = 'collision'
+        elif (
+            profile['minimum_above_replay_floor_m'] < -CARRY_MAX_DIP_BELOW_REPLAY_M
+        ):
+            carry_reason = 'carry_dips_below_the_replay_it_replaces'
+        else:
+            carry_reason = ''
+        if carry_reason:
+            segments['carry'] = False
+        return HoldingReturnPlan(
+            carry_raw=carry,
+            segments=segments,
+            carry_tip_height=profile,
+            carry_rejection_reason=carry_reason,
+        )
+
     def joint_motion(
         self,
         *,
@@ -1224,7 +1524,13 @@ class OnlinePlanner:
         goal = np.asarray(goal_joints, dtype=float)
         scene = np.asarray(scene_points, dtype=float)
         target = np.asarray(target_points, dtype=float)
-        checker = self._new_checker(scene_points=scene, stamp_s=stamp_s)
+        checker = self._new_checker(
+            scene_points=scene,
+            stamp_s=stamp_s,
+            collision_model=self._collision_model_for_carried_payload(
+                self.collision_model,
+            ),
+        )
         checker.update_attached_target(
             target,
             attachment_joints=current,

@@ -443,3 +443,148 @@ def test_planning_dry_run_has_no_ros_or_transport_calls():
     assert '"selected_global_rank": int(planned.selected_global_rank)' in source
     assert 'planned.higher_rank_rejection_count' in source
     assert '"transit_duration_s"' in source
+
+
+def test_the_planner_emits_and_gates_the_loaded_return_corridor():
+    """The dry run must produce the attached-object evidence, not just paths.
+
+    Without this block every artifact it writes is one the executor refuses to
+    drive home while holding, which is the intended fail-closed default for
+    plans whose return legs were only ever checked with an empty gripper.
+    """
+
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "planner.plan_holding_return(" in source
+    assert '"holding_return": holding_return.document()' in source
+    # The carry edge ships only when it validated attached.
+    assert "if holding_return.carry_valid" in source
+    assert "**carry_arrays," in source
+    assert '"carry_raw": np.asarray(holding_return.carry_raw' in source
+
+
+def test_holding_return_validation_uses_the_loaded_collision_model():
+    from z_manip.planning import online_planner as planner_module
+
+    assert "lifted_retreat" in planner_module.ATTACHED_PAYLOAD_SEGMENTS
+    assert "holding_transit" in planner_module.ATTACHED_PAYLOAD_SEGMENTS
+    assert "lifted_retreat" in planner_module.CLOSED_GRIPPER_PAYLOAD_SEGMENTS
+    assert "holding_transit" in planner_module.CLOSED_GRIPPER_PAYLOAD_SEGMENTS
+    # The pre-existing ROS place segments keep the wider open-gripper model.
+    assert "carry" not in planner_module.CLOSED_GRIPPER_PAYLOAD_SEGMENTS
+    assert "place_transit" not in planner_module.CLOSED_GRIPPER_PAYLOAD_SEGMENTS
+
+
+def test_a_carried_payload_is_checked_against_the_platform_fixtures():
+    """The Mid-360, chassis, head and NUC must be obstacles for the payload.
+
+    They ship as ``check_target=False`` because an unheld target sits out in
+    the scene, far from the base.  The moment the object is attached to the
+    tool that exemption becomes a fail-open: the payload rides all the way
+    back to Home across exactly that geometry with nothing checking it.  This
+    is derived from the configured capsule set, so a corrected fixture pose or
+    a newly modelled bracket is picked up without touching this code.
+    """
+
+    from z_manip.collision.pointcloud import CapsuleSpec, RobotCollisionModel
+    from z_manip.planning.online_planner import OnlinePlanner
+
+    model = RobotCollisionModel(capsules=(
+        CapsuleSpec(
+            name="mid360",
+            start_frame="base",
+            end_frame="base",
+            radius=0.0325,
+            check_scene=False,
+            check_target=False,
+            supplemental_self_collision=True,
+        ),
+        CapsuleSpec(
+            name="palm",
+            start_frame="tip",
+            end_frame="tip",
+            radius=0.03,
+        ),
+    ))
+    loaded = OnlinePlanner._collision_model_for_carried_payload(
+        OnlinePlanner.__new__(OnlinePlanner),
+        model,
+    )
+
+    by_name = {capsule.name: capsule for capsule in loaded.capsules}
+    assert by_name["mid360"].check_target is True, (
+        "a carried payload is not being checked against the lidar"
+    )
+    assert by_name["mid360"].check_scene is False, "scene semantics must not change"
+    assert by_name["palm"] == model.capsules[1]
+    # Unchanged models are returned untouched, so nothing is copied needlessly.
+    assert OnlinePlanner._collision_model_for_carried_payload(
+        OnlinePlanner.__new__(OnlinePlanner), loaded,
+    ) is loaded
+
+
+# The five robot-mounted fixtures a carried object can reach on the way Home.
+SHIPPED_PLATFORM_FIXTURES = (
+    "platform_head",
+    "platform_head_lower",
+    "go2w_chassis",
+    "mid360",
+    "nuc",
+)
+
+
+def test_the_shipped_capsule_config_arms_the_payload_check():
+    """Bind the gate to the file whose contents actually decide it.
+
+    ``_collision_model_for_carried_payload`` flips ``check_target`` only for
+    capsules marked ``supplemental_self_collision``.  That flag lives in
+    ``configs/piper_collision_capsules.json``, which the gate never names, and
+    the flag's documented meaning is about self-collision PAIRING -- so a
+    future edit that drops it from ``mid360`` is entirely plausible and would
+    silently turn the payload-vs-lidar check back off with the suite green.
+    This is the failure this project keeps shipping: the value that decides a
+    gate lives in a file the gate does not reference.
+    """
+
+    from z_manip.collision.pointcloud import RobotCollisionModel
+    from z_manip.planning.online_planner import OnlinePlanner
+
+    shipped = RobotCollisionModel.from_mapping(
+        json.loads(
+            (ROOT / "configs/piper_collision_capsules.json").read_text(
+                encoding="utf-8",
+            ),
+        ),
+    )
+    by_name = {capsule.name: capsule for capsule in shipped.capsules}
+    for name in SHIPPED_PLATFORM_FIXTURES:
+        assert name in by_name, f"{name} vanished from the shipped capsule set"
+        # ``supplemental_self_collision`` is what the payload gate keys on, and
+        # that flag's documented meaning is about self-collision PAIRING, so an
+        # edit dropping it here is entirely plausible and would silently turn
+        # the payload-vs-lidar check back off with the suite green.  Some
+        # fixtures now ship ``check_target=True`` outright (the Mid-360 keep-out
+        # fix); that makes the gate redundant for those, never wrong, and the
+        # flag still has to survive for the ones it is not redundant for.
+        assert by_name[name].supplemental_self_collision is True, (
+            f"{name} no longer carries supplemental_self_collision; the payload "
+            "gate keys on that flag and will stop arming this fixture"
+        )
+
+    loaded = OnlinePlanner._collision_model_for_carried_payload(
+        OnlinePlanner.__new__(OnlinePlanner),
+        shipped,
+    )
+
+    armed = {capsule.name: capsule for capsule in loaded.capsules}
+    for name in SHIPPED_PLATFORM_FIXTURES:
+        assert armed[name].check_target is True, (
+            f"a carried payload is not checked against {name}: the shipped "
+            "capsule config no longer arms the platform-fixture gate"
+        )
+        # Scene semantics are untouched -- these are not scene obstacles.
+        assert armed[name].check_scene == by_name[name].check_scene
+    # Nothing else in the shipped set changes verdict.
+    for name, capsule in armed.items():
+        if name not in SHIPPED_PLATFORM_FIXTURES:
+            assert capsule == by_name[name]

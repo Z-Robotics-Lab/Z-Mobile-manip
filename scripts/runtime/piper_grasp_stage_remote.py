@@ -183,7 +183,14 @@ def execute_remote_stage(
         if executed.stdout:
             print(executed.stdout, end="" if executed.stdout.endswith("\n") else "\n", flush=True)
         if executed.returncode != 0:
-            raise RemoteStageError(f"NUC {stage} execution stopped safely (exit {executed.returncode})")
+            # The stdout printed above lands in this process's log; the
+            # EXCEPTION is what reaches the operator's UI.  Carry the executor's
+            # explanation into it so a safety stop names its own cause there too.
+            detail = executed.stdout.strip()
+            raise RemoteStageError(
+                f"NUC {stage} execution stopped safely (exit {executed.returncode})"
+                + (f": {detail}" if detail else "")
+            )
 
         receipt_output.parent.mkdir(parents=True, exist_ok=True)
         fetched = _run(

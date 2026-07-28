@@ -326,7 +326,17 @@ def main() -> int:
                     f"(remote evidence preserved at {remote_receipts}): {fetch_error}",
                 )
             if executed.returncode != 0:
-                raise RuntimeError(f"NUC full grasp stopped safely (exit {executed.returncode})")
+                # Carry the executor's own words back.  Every safety gate on the
+                # NUC explains itself -- which joint deviated, at which waypoint,
+                # against which bound -- and an exit code alone throws all of it
+                # away at the ssh boundary, leaving the operator a stage name and
+                # nothing to act on.  Every other failure branch in this file
+                # already forwards stdout; this one did not.
+                detail = executed.stdout.strip()
+                raise RuntimeError(
+                    f"NUC full grasp stopped safely (exit {executed.returncode})"
+                    + (f": {detail}" if detail else "")
+                )
             if not (args.receipt_dir / "executor-start-receipt.json").is_file():
                 raise RuntimeError("NUC executor succeeded without transport-start evidence")
             print(json.dumps({
