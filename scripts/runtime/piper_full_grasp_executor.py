@@ -474,6 +474,12 @@ def execute_full_grasp(
     # Return along exact collision-checked edges.  Lower the held object to
     # its original grasp pose, release it there, then retreat open.
     guard = stage_executor.CommandGuard()
+    # Every leg from here to the release runs with the object in the gripper.
+    # A guard that does not say so has two consequences, both bad: a command
+    # fault fires the electronic e-stop, which unloads this installation and
+    # DROPS the object mid-air, and the streamed descent gets time-scaled from
+    # a rate regression taken entirely on an empty gripper.
+    guard.holding_load = True
     try:
         timed_lift, lift_times_s = stage_executor.timed_stage_path(
             artifact,
@@ -661,6 +667,10 @@ def execute_workflow_phase(
             _verify_holding_object(
                 robot, effector, guard, artifact, gripper_force_n=gripper_force_n,
             )
+            # Proven to be holding.  Say so before any motion: the e-stop path
+            # and the streamed time scaling both key on this, and both are
+            # wrong for a loaded arm when it reads False.
+            guard.holding_load = True
             if workflow_phase == "return-home-holding":
                 if carry is not None:
                     # One continuous move_j from the lift top straight to the

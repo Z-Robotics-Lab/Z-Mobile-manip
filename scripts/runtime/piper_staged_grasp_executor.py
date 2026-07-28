@@ -118,10 +118,33 @@ APPROACH_STREAM_REFERENCE_SPEED_PERCENT = 15
 # The conservative floor is taken.  This value only ever picks how far a
 # planned schedule is stretched, and is clamped on both sides, so a wrong
 # value costs smoothness and never safety.
+#
+# EVERY run behind this number was UNLOADED.  The corpus cannot extend it to a
+# holding arm: across 16 recorded grasps with stage receipts the achieved rate
+# on the loaded lift (p50 6.75, p90 15.83 deg/s) is not slower than the unloaded
+# approach (p50 3.08, p90 10.04 deg/s), but those runs were all commanded with
+# the OLD conservative stretch, and no receipt records speed_percent -- so they
+# say nothing about how a HOLDING arm tracks when asked for twice the rate.
+# ``stream_time_scale`` therefore refuses to apply this to a loaded leg.
 PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT = 1.70
 # Fraction of that rate a streamed schedule is allowed to demand.  Headroom
 # below 1.0 so the arm never saturates into tracking lag on a tick boundary.
 STREAM_RATE_UTILISATION = 0.90
+# Gross-deviation backstop for a streamed path.  This is NOT a precision gate:
+# the per-waypoint in-tolerance gate was removed because it stopped the arm at
+# every lift IK vertex.  It exists so a slip, a drop, or a controller that has
+# stopped accepting targets fails closed instead of streaming the remaining
+# schedule and reporting success.
+#
+# The bound is a fixed floor plus what the arm could physically have closed
+# since the last sample, so it does NOT scale with how far the profile intends
+# to travel.  A proportional bound cannot detect the failure that matters most:
+# a totally stalled arm deviates by exactly the intended distance, so any
+# multiple of it passes forever.
+STREAM_TRACKING_ERROR_FLOOR_RAD = math.radians(6.0)
+# How often the stream samples feedback.  Every tick would add a CAN round trip
+# at 17 Hz to a bus this project has already deadlocked once.
+STREAM_TRACKING_SAMPLE_S = 0.25
 # 0.30 s at the 50 Hz stream keeps the arm within a bounded 15-sample drift
 # on a non-realtime host; the previous 0.15 s tripped on ordinary scheduler
 # jitter and its failure path unloaded a holding arm.
@@ -1506,6 +1529,7 @@ def stream_time_scale(
     *,
     speed_percent: int,
     reference_speed_percent: int,
+    holding_load: bool,
 ) -> float:
     """Stretch a planned schedule only as far as the arm's own rate requires.
 
@@ -1528,12 +1552,22 @@ def stream_time_scale(
     the ``max(1.0, ...)`` floor keeps it from ever compressing the planner's
     bounded velocity/acceleration profile.  At ``speed_percent >= 15`` both
     bounds are 1.0 and the result is bit-identical to today.
+
+    A HOLDING arm keeps the legacy stretch.  The measured rate this speeds up to
+    was regressed from unloaded move_j legs only, and the judder it exists to
+    cure is on the UNLOADED approach descent -- the loaded lift legs would be
+    handed a 2x rate increase on evidence that does not cover them, with a
+    payload whose slip is not directly observable.  Gating on load keeps the
+    entire benefit where the complaint is and takes no unmeasured risk where it
+    is not.
     """
 
     schedule = np.asarray(times_s, dtype=float)
     steps = np.abs(np.diff(np.asarray(positions, dtype=float), axis=0)).max(axis=1)
     peak_rate_rad_s = float(np.max(steps / np.diff(schedule)))
     legacy_scale = max(1.0, reference_speed_percent / float(speed_percent))
+    if holding_load:
+        return legacy_scale
     budget_rad_s = (
         math.radians(PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT)
         * float(speed_percent)
@@ -1604,6 +1638,7 @@ def execute_timed_joint_path(
         times,
         speed_percent=speed_percent,
         reference_speed_percent=reference_speed_percent,
+        holding_load=guard.holding_load,
     )
     started = monotonic()
     before_final_stamp = -math.inf
@@ -1611,6 +1646,8 @@ def execute_timed_joint_path(
     actual_before_final = actual
     resync_total_s = 0.0
     resync_count = 0
+    tracked_joints = actual
+    tracked_at = monotonic()
     for index, target in enumerate(positions[1:], start=1):
         due = started + float(times[index]) * time_scale
         remaining = due - monotonic()
@@ -1649,6 +1686,36 @@ def execute_timed_joint_path(
             actual_before_final, before_final_stamp = read_joint_feedback(robot)
             before_final_status_stamp = status_stamp
         _command_joint_target(robot, target, guard)
+
+        # Gross-deviation backstop.  Sampled, not per-tick, so it costs one CAN
+        # round trip every STREAM_TRACKING_SAMPLE_S instead of one per target.
+        # A healthy arm trails the stream by about one tick of travel; the floor
+        # is an order of magnitude above that, so ordinary lag cannot trip it,
+        # while a stall accumulates deviation at the profile rate and crosses
+        # the bound within roughly a second at the speeds this runs at.
+        now = monotonic()
+        if now - tracked_at >= STREAM_TRACKING_SAMPLE_S:
+            measured, _ = read_joint_feedback(robot)
+            deviation = float(np.max(np.abs(measured - positions[index])))
+            # What the arm could physically have closed since the last sample,
+            # so a slow feedback cadence is not read as a tracking failure.
+            reachable = (
+                math.radians(PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT)
+                * float(speed_percent)
+                * (now - tracked_at)
+            )
+            allowed = STREAM_TRACKING_ERROR_FLOOR_RAD + reachable
+            if deviation > allowed:
+                raise SafetyError(
+                    "streamed path lost joint tracking: measured joints deviate "
+                    f"{math.degrees(deviation):.2f}deg from the commanded target "
+                    f"at waypoint {index}/{len(positions) - 1}, beyond the "
+                    f"{math.degrees(allowed):.2f}deg bound; the arm moved "
+                    f"{math.degrees(float(np.max(np.abs(measured - tracked_joints)))):.2f}"
+                    f"deg since the last sample",
+                )
+            tracked_joints = measured
+            tracked_at = now
 
     max_delta_rad = float(np.max(np.abs(positions[-1] - actual_before_final)))
     conservative_rate_rad_s = math.radians(90.0) * speed_percent / 100.0

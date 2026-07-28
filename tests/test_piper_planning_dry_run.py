@@ -559,9 +559,16 @@ def test_the_shipped_capsule_config_arms_the_payload_check():
     by_name = {capsule.name: capsule for capsule in shipped.capsules}
     for name in SHIPPED_PLATFORM_FIXTURES:
         assert name in by_name, f"{name} vanished from the shipped capsule set"
-        assert by_name[name].check_target is False, (
-            f"{name} no longer ships as check_target=False; either the payload "
-            "gate is now redundant for it or the config changed meaning"
+        # ``supplemental_self_collision`` is what the payload gate keys on, and
+        # that flag's documented meaning is about self-collision PAIRING, so an
+        # edit dropping it here is entirely plausible and would silently turn
+        # the payload-vs-lidar check back off with the suite green.  Some
+        # fixtures now ship ``check_target=True`` outright (the Mid-360 keep-out
+        # fix); that makes the gate redundant for those, never wrong, and the
+        # flag still has to survive for the ones it is not redundant for.
+        assert by_name[name].supplemental_self_collision is True, (
+            f"{name} no longer carries supplemental_self_collision; the payload "
+            "gate keys on that flag and will stop arming this fixture"
         )
 
     loaded = OnlinePlanner._collision_model_for_carried_payload(

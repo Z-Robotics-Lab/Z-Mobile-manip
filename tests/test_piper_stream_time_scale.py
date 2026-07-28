@@ -54,13 +54,16 @@ RECORDED_LIFT_PEAK_DEG_S = (11.80, 13.43, 14.21)
 ARM_RATE_AT_SPEED_5_DEG_S = 8.80
 
 
-def scale(peak_deg_s, *, speed_percent, duration_s=2.0, reference=15):
+def scale(
+    peak_deg_s, *, speed_percent, duration_s=2.0, reference=15, holding_load=False
+):
     positions, times = constant_rate_path(peak_deg_s, duration_s)
     return EXECUTOR.stream_time_scale(
         positions,
         times,
         speed_percent=speed_percent,
         reference_speed_percent=reference,
+        holding_load=holding_load,
     )
 
 
@@ -82,9 +85,9 @@ def test_recorded_approach_is_not_stretched_at_the_operator_speed(peak_deg_s):
 
 
 @pytest.mark.parametrize("peak_deg_s", RECORDED_LIFT_PEAK_DEG_S)
-def test_recorded_lift_is_stretched_only_as_far_as_the_arm_requires(peak_deg_s):
-    # The lift genuinely outruns the arm at speed 5 and must still stretch --
-    # but to the arm's requirement, not to a fixed 3x.
+def test_an_unloaded_profile_is_stretched_only_as_far_as_the_arm_requires(peak_deg_s):
+    # A profile this fast genuinely outruns the arm at speed 5 and must still
+    # stretch -- but to the arm's requirement, not to a fixed 3x.
     value = scale(peak_deg_s, speed_percent=5)
     budget = (
         EXECUTOR.PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
@@ -95,10 +98,47 @@ def test_recorded_lift_is_stretched_only_as_far_as_the_arm_requires(peak_deg_s):
     assert 1.0 < value < 3.0
 
 
+@pytest.mark.parametrize("peak_deg_s", RECORDED_LIFT_PEAK_DEG_S)
+def test_a_holding_arm_keeps_the_legacy_stretch(peak_deg_s):
+    """The measured rate does not cover a loaded arm, so it is not applied.
+
+    ``PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT`` was regressed from unloaded
+    move_j legs.  Applying it to the recorded lift peaks at speed 5 would raise
+    the commanded joint rate from 3.78 to 7.65 deg/s -- roughly double, at 90%
+    of a constant with no loaded evidence behind it, on the one leg where a
+    tracking failure means dropping the payload.  The judder this whole change
+    cures is on the UNLOADED approach descent, so gating on load costs nothing.
+    """
+
+    loaded = scale(peak_deg_s, speed_percent=5, holding_load=True)
+    unloaded = scale(peak_deg_s, speed_percent=5, holding_load=False)
+
+    assert loaded == pytest.approx(max(1.0, 15 / 5.0))
+    assert loaded > unloaded
+
+
+def test_a_holding_arm_is_never_commanded_faster_than_what_ships_today():
+    """Sweep the whole legal range; the loaded path must be exactly legacy."""
+
+    for peak_deg_s in (0.01, 1.0, 5.72, 14.21, 60.0, 400.0):
+        for speed_percent in range(1, EXECUTOR.MAX_SPEED_PERCENT + 1):
+            legacy = max(1.0, 15 / float(speed_percent))
+            value = scale(peak_deg_s, speed_percent=speed_percent, holding_load=True)
+            assert value == pytest.approx(legacy), (peak_deg_s, speed_percent)
+
+
 def test_no_op_at_or_above_the_reference_speed():
     for peak_deg_s in RECORDED_APPROACH_PEAK_DEG_S + RECORDED_LIFT_PEAK_DEG_S:
         for speed_percent in (15, 20, 30, 50):
-            assert scale(peak_deg_s, speed_percent=speed_percent) == 1.0
+            for holding in (False, True):
+                assert (
+                    scale(
+                        peak_deg_s,
+                        speed_percent=speed_percent,
+                        holding_load=holding,
+                    )
+                    == 1.0
+                )
 
 
 def test_never_slower_than_shipped_and_never_compresses_the_planner_profile():
@@ -143,7 +183,11 @@ def test_the_effective_command_interval_stops_being_a_visible_ratchet():
     nominal_interval_s = float(np.median(np.diff(times)))
     shipped = max(1.0, 15 / 5.0)
     fixed = EXECUTOR.stream_time_scale(
-        positions, times, speed_percent=5, reference_speed_percent=15,
+        positions,
+        times,
+        speed_percent=5,
+        reference_speed_percent=15,
+        holding_load=False,
     )
 
     assert nominal_interval_s * shipped > 0.055
