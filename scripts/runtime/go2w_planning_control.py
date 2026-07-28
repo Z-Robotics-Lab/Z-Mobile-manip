@@ -1617,6 +1617,14 @@ class DepthServoRunner:
         task with APPROACH_ACTION_BUSY.  Naming the reason is what lets
         ``servo_report_verdict`` put a deadline on it.
 
+        That ``idle`` fallback is itself now gone: a document with no usable
+        phase resolves to ``UNREPORTED_PHASE`` and inherits the fail-closed
+        unknown-phase policy (see ``ReactivePhaseWatchdog.observe`` and
+        tests/test_servo_phase_reachability.py).  The two defences are
+        independent on purpose -- this one keeps an unreadable document from
+        reaching the watchdog at all, that one keeps a readable but silent
+        document from being read as "nothing to wait for".
+
         The size rejection is the one most likely to fire in the field: the
         measured document is ~9 KiB median / 11.8 KiB max against this 64 KiB
         cap, and it grows with the whole-body block.

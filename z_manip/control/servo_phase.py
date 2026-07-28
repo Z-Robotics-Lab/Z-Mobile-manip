@@ -365,6 +365,27 @@ UNKNOWN_PHASE_POLICY = PhasePolicy(
     is_terminal=False,
 )
 
+#: What a status document that carries NO usable phase resolves to.
+#:
+#: This is deliberately NOT a :class:`ServoPhase` member and deliberately NOT
+#: ``idle``.  ``ReactivePhaseWatchdog.observe`` used to fall back to the literal
+#: ``"idle"``, which is TERMINAL, heartbeat-exempt and carries no deadline --
+#: so a readable, schema-valid, heartbeat-fresh document that simply omitted
+#: ``phase`` parked the robot forever with ``timed_out`` False and
+#: ``phase_known`` True.  It read as *checked and fine*.  That was the last
+#: absorbing state in the graph, and it is the audit's structural finding (a)
+#: in miniature: the value that decided the transition was the ABSENCE of a
+#: key, and no consumer named it.
+#:
+#: Because it is not a table member it inherits :data:`UNKNOWN_PHASE_POLICY`
+#: automatically -- 5 s, ``STOP_AND_DEGRADE``, non-terminal.  "The servo said
+#: nothing" is not evidence that there is nothing to wait for.
+#:
+#: An EXPLICIT ``"idle"`` still means what it always meant (no approach is
+#: running, exited via the supervise loop's own ``active``/``poll()`` checks);
+#: only the absence of a phase changed meaning.
+UNREPORTED_PHASE = "phase_unreported"
+
 
 PHASE_POLICY: Mapping[ServoPhase, PhasePolicy] = {
     # ---- lifecycle -------------------------------------------------------
@@ -821,6 +842,7 @@ __all__ = [
     "ServoPhase",
     "TERMINAL_PHASES",
     "UNKNOWN_PHASE_POLICY",
+    "UNREPORTED_PHASE",
     "is_known_phase",
     "phase_policy",
     "view_recovery_deadline_s",

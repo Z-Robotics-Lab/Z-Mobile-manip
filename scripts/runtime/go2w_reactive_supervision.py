@@ -29,6 +29,7 @@ if str(STACK_ROOT) not in sys.path:
 from z_manip.control.servo_phase import (  # noqa: E402
     MIN_EFFECTIVE_BASE_COMMAND,
     NO_PROGRESS_DEADLINE_S,
+    UNREPORTED_PHASE,
     BaseOwner,
     ExpiryAction,
     ServoPhase,
@@ -400,10 +401,18 @@ class ReactivePhaseWatchdog:
         now = float(now_s)
         if not math.isfinite(now):
             raise ValueError("watchdog timestamp must be finite")
+        # A document that carries no usable phase resolves to UNREPORTED_PHASE,
+        # NOT to "idle".  ``idle`` is terminal, heartbeat-exempt and has no
+        # deadline, so falling back to it laundered "the servo told us nothing"
+        # into "the run is over, nothing to wait for" -- a readable,
+        # schema-valid, heartbeat-fresh document that simply omitted ``phase``
+        # parked the base at (0, 0) forever with ``timed_out`` False.  See
+        # tests/test_servo_phase_reachability.py.  UNREPORTED_PHASE is not a
+        # table member, so it inherits the fail-closed UNKNOWN_PHASE_POLICY.
         phase = str(
             runtime.get("phase")
             or _mapping(runtime.get("reactive")).get("phase")
-            or "idle"
+            or UNREPORTED_PHASE
         )
         policy = phase_policy(phase)
         phase_group = "posture_wait" if policy.is_posture_wait else phase
