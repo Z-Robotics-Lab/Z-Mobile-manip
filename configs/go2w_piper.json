@@ -156,6 +156,7 @@
   "grasp_plan": {
     "pregrasp_distance_m": 0.10,
     "pregrasp_distance_fallback_m": 0.05,
+    "max_approach_step_m": 0.010,
     "approach_steps": 6,
     "lift_distance_m": 0.07,
     "lift_steps": 4,

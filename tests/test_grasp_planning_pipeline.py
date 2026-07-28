@@ -1116,3 +1116,34 @@ def test_a_fallback_longer_than_the_preferred_standoff_is_refused():
 
     with pytest.raises(ValueError, match="must be positive"):
         _ladder_config(pregrasp_distance_fallback_m=0.0)
+
+
+def test_the_contact_approach_step_does_not_grow_with_the_standoff():
+    """Changing the standoff must not silently coarsen the descent.
+
+    ``approach_steps`` is a COUNT, so doubling pregrasp_distance_m doubled the
+    Cartesian step from 10 mm to 20 mm.  Both the continuation IK error per
+    sample and the bow away from the commanded ray (the arm does not travel the
+    straight line between two joint targets -- see
+    tests/test_return_corridor_execution.py) grow with that step, and the grasp
+    landed off-target.
+    """
+
+    generator = GraspPlanGenerator(
+        FakeIK(),
+        FakePlanner(),
+        _ladder_config(approach_steps=6, max_approach_step_m=0.010),
+    )
+
+    for distance_m in (0.05, 0.10, 0.20):
+        steps = generator._approach_steps_for(distance_m)
+        assert distance_m / (steps - 1) <= 0.010 + 1e-9, (
+            f"{distance_m * 100:.0f}cm approach sampled at "
+            f"{distance_m / (steps - 1) * 1000:.1f}mm per step"
+        )
+
+    # The historical fixed-count behaviour stays available and unchanged.
+    legacy = GraspPlanGenerator(
+        FakeIK(), FakePlanner(), _ladder_config(approach_steps=6)
+    )
+    assert legacy._approach_steps_for(0.10) == 6

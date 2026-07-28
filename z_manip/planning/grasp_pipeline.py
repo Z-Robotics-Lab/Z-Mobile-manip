@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import dataclass
 from collections.abc import Callable
 import inspect
+import math
 from typing import Protocol
 
 import numpy as np
@@ -85,11 +86,22 @@ class GraspPlanConfig:
     # over the recorded corpus the pregrasp-to-nearest-observed-object-point
     # went 75.1 mm (07-17) to 26.9 mm (07-28), which is the operator's "the
     # pregrasp is already right up against the object".  A per-hypothesis ladder
-    # keeps the rescue exactly where it is needed and nowhere else.  Set equal
+    # keeps the rescue exactly where it is needed and nowhere else.
     # ``None`` disables the ladder entirely, which is the default so that no
     # existing deployment or fixture changes behaviour by upgrading.
     pregrasp_distance_fallback_m: float | None = None
     approach_steps: int = 6
+    # Longest Cartesian step the contact approach may take, in metres.
+    # ``approach_steps`` is a fixed COUNT, so the step LENGTH scales with the
+    # standoff: at 6 steps a 0.05 m approach moves 10 mm per sample and a 0.10 m
+    # approach moves 20 mm.  That matters twice over.  The continuation IK error
+    # per sample grows with the step, and -- measured on recorded data, see
+    # tests/test_return_corridor_execution.py -- the arm does NOT travel the
+    # straight line between two joint targets, so the descent bows away from the
+    # commanded ray by an amount that grows with the step.  Doubling the standoff
+    # without this cap doubled both, and the grasp landed off-target.
+    # ``None`` keeps the historical fixed-count behaviour.
+    max_approach_step_m: float | None = None
     lift_distance_m: float = 0.10
     lift_steps: int = 5
     lift_direction_base: tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -128,6 +140,8 @@ class GraspPlanConfig:
             self.pregrasp_distance_fallback_m <= 0.0
         ):
             raise ValueError("the pregrasp fallback distance must be positive")
+        if self.max_approach_step_m is not None and self.max_approach_step_m <= 0.0:
+            raise ValueError("the maximum approach step must be positive")
         if (
             self.pregrasp_distance_fallback_m is not None
             and self.pregrasp_distance_fallback_m > self.pregrasp_distance_m
@@ -688,6 +702,19 @@ class GraspPlanGenerator:
         checkpoint(control, "grasp transit planning")
         return result
 
+    def _approach_steps_for(self, distance_m: float) -> int:
+        """Sample the contact approach at a bounded Cartesian step length.
+
+        Keeps the descent granularity independent of the standoff, so changing
+        the standoff cannot silently coarsen the approach.
+        """
+
+        steps = int(self.config.approach_steps)
+        cap = self.config.max_approach_step_m
+        if cap is None:
+            return steps
+        return max(steps, int(math.ceil(float(distance_m) / cap)) + 1)
+
     def _evaluate_hypothesis(
         self,
         *,
@@ -740,7 +767,11 @@ class GraspPlanGenerator:
                 continue
             try:
                 approach_joints, grasp_solution = self._cartesian_ik(
-                    _interpolate_pose(pregrasp, grasp, self.config.approach_steps),
+                    _interpolate_pose(
+                        pregrasp,
+                        grasp,
+                        self._approach_steps_for(distance_m),
+                    ),
                     pregrasp_solution.joints,
                     control,
                 )
