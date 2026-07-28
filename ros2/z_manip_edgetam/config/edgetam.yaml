@@ -7,9 +7,17 @@ z_manip_edgetam:
     # scripts/runtime/ffs_depth_stack.sh (service: docker/ffs_service).  Same
     # exact frameset stamps and frame_id as the raw stream; measured ~18 fps.
     # Shootout vs raw D435 (2026-07-23, static scene): floor plane-fit RMS
-    # 1.07 mm vs 2.23 mm, temporal std p95 42 mm vs 105 mm, holes 12% vs 28%
-    # (IR frame).  Registration validated against librealsense rs.align to
-    # 1.09 mm median.
+    # 1.07 mm vs 2.23 mm, temporal std p95 42 mm vs 105 mm.  Registration
+    # validated against librealsense rs.align to 1.09 mm median.
+    # CORRECTION (2026-07-28): the "holes 12% vs 28%" line that used to sit
+    # here was measured in the IR frame BEFORE registration and BEFORE the
+    # relay's noise filter, so it never described this topic.  Measured on the
+    # published topic against stamp-matched raw D435 aligned depth (24 frames):
+    # valid in [0.28, 2.5] m is 0.609 FFS vs 0.669 raw -- FFS has LESS coverage
+    # here, with 7.6% of the image raw-valid/FFS-invalid against 1.7% the other
+    # way.  Note every acceptance number above is a PRECISION metric and none
+    # of them can see a bias; the accuracy regression lives in
+    # tests/test_ffs_depth_filter.py's live-data suite.
     # FALLBACK (raw D435): set depth_topic back to
     #     /camera/aligned_depth_to_color/image_raw
     # then `go2w_perception_lab.sh build` + component-manager restart

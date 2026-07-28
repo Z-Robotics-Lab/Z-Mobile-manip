@@ -211,7 +211,7 @@ def test_full_chain_removes_specks_and_flying_pixels_together():
     cfg = ffs.FilterConfig()
     out, report = ffs.filter_depth(scene, cfg)
     assert _small_components(out) == 0
-    assert report["stages"] == ["edge", "speckle", "median"]
+    assert report["stages"] == ["clamp", "edge", "speckle", "median"]
     assert report["removed"] >= 0
 
 
@@ -251,12 +251,19 @@ def test_disabled_is_passthrough_same_object():
 
 def test_from_env_defaults():
     cfg = ffs.FilterConfig.from_env(env={})
-    assert cfg.enabled and cfg.edge and cfg.speckle and cfg.median
+    assert cfg.enabled and cfg.edge and cfg.speckle and cfg.median and cfg.clamp
     assert cfg.temporal is False
     assert cfg.max_grad_mm == 120.0
     assert cfg.speckle_max_size == 50
     assert cfg.median_ksize == 5
-    assert cfg.active_stages() == ["edge", "speckle", "median"]
+    # thresholds live in disparity px, and the near clip matches the 0.28 m
+    # contract in z_manip/adapters and edgetam.yaml
+    assert cfg.edge_mode == "bleed"
+    assert (cfg.edge_radius, cfg.edge_near_radius) == (7, 2)
+    assert cfg.edge_margin_px == 1.0
+    assert cfg.speckle_max_diff_px == 0.5
+    assert cfg.min_depth_mm == 280
+    assert cfg.active_stages() == ["clamp", "edge", "speckle", "median"]
 
 
 def test_from_env_overrides_and_master_switch():
@@ -273,14 +280,14 @@ def test_from_env_overrides_and_master_switch():
     assert tuned.speckle_max_size == 80
     assert tuned.median_ksize == 3
     assert tuned.temporal is True
-    assert tuned.active_stages() == ["speckle", "median", "temporal"]
+    assert tuned.active_stages() == ["clamp", "speckle", "median", "temporal"]
 
 
 def test_per_stage_toggle_via_config():
     scene, _ = add_box(make_floor())
     only_speckle = ffs.FilterConfig(edge=False, median=False)
     out, report = ffs.filter_depth(scene, only_speckle)
-    assert report["stages"] == ["speckle"]
+    assert report["stages"] == ["clamp", "speckle"]
 
 
 def test_median_ksize_clamped_to_supported_aperture():
@@ -338,10 +345,355 @@ def test_stack_mounts_filter_and_documents_env():
         "FFS_FILTER_EDGE_MAX_GRAD_MM",
         "FFS_FILTER_SPECKLE",
         "FFS_FILTER_SPECKLE_MAX_SIZE",
-        "FFS_FILTER_SPECKLE_MAX_DIFF_MM",
+        "FFS_FILTER_SPECKLE_MAX_DIFF_PX",
+        "FFS_FILTER_CLAMP",
+        "FFS_FILTER_MIN_DEPTH_MM",
+        "FFS_FILTER_EDGE_MODE",
+        "FFS_FILTER_EDGE_RADIUS",
+        "FFS_FILTER_EDGE_MARGIN_PX",
         "FFS_FILTER_MEDIAN",
         "FFS_FILTER_MEDIAN_KSIZE",
         "FFS_FILTER_TEMPORAL",
     ):
         assert var in src, f"{var} not documented/passed in stack script"
     assert "${FFS_FILTER:-1}" in src   # default-on, overridable
+
+
+# --------------------------------------------------------------------------- #
+# LIVE-DATA regression suite
+#
+# tests/data/ffs_depth_live_pairs.npz holds 4 exact-stamp-matched
+# (raw D435 aligned depth, published FFS depth) pairs captured read-only off the
+# running stack on 2026-07-28 (topics /camera/aligned_depth_to_color/image_raw
+# and /camera/ffs_depth_aligned/image_raw, both 640x480 16UC1 mm in
+# camera_color_optical_frame).  Every acceptance number the FFS chain had before
+# was a PRECISION metric -- plane-fit RMS, temporal std, hole %, mad_p95 -- and
+# none of them can see a bias.  These check FFS against a real reference.
+#
+# Scene caveat baked into these bounds: the captured scenes span 0.85-3.0 m and
+# contain essentially NO pixels in [0.30, 0.60) m, so nothing here measures the
+# grasp band.  The grasp-band guarantee is carried by
+# test_edge_bleed_is_plane_invariant_across_range instead, which pins the
+# mathematical invariance the thresholds rest on.
+# --------------------------------------------------------------------------- #
+LIVE_PAIRS = ROOT / "tests" / "data" / "ffs_depth_live_pairs.npz"
+
+
+def _live_pairs():
+    if not LIVE_PAIRS.exists():                      # pragma: no cover
+        pytest.skip(f"live capture fixture missing: {LIVE_PAIRS}")
+    d = np.load(LIVE_PAIRS)
+    n = int(d["n"])
+    return [(d[f"raw_{i}"], d[f"ffs_{i}"]) for i in range(n)], float(
+        d["disparity_const_mm_px"])
+
+
+def _live_cfg(disp_const, **kw):
+    return ffs.FilterConfig(disparity_const_mm_px=disp_const, **kw)
+
+
+def _legacy_chain(depth):
+    """The chain exactly as it shipped: 3x3/120 mm gate, mm speckle, naive median."""
+    a = ffs.remove_flying_pixels(depth, 120.0)
+    b = ffs.remove_speckles(a, 50, 24)
+    med = cv2.medianBlur(b, 5)
+    return np.where((b > 0) & (med > 0), med, b).astype(np.uint16)
+
+
+def _edge_distance(raw):
+    """Distance in px to the nearest strong depth discontinuity in the reference."""
+    v = raw > 0
+    lo = cv2.erode(np.where(v, raw.astype(np.float32), 1e6), ffs._KERNEL3)
+    hi = cv2.dilate(np.where(v, raw.astype(np.float32), 0.0), ffs._KERNEL3)
+    edge = (v & (hi - lo > 100) & (hi - lo < 1e5)).astype(np.uint8)
+    return cv2.distanceTransform(1 - edge, cv2.DIST_L2, 3)
+
+
+# --- 1. the silhouette bleed the filter is supposed to target ---------------- #
+def test_edge_bleed_gate_cuts_the_near_silhouette_overshoot_on_live_frames():
+    """The p90 of (FFS - raw) inside 4 px of a real silhouette must come down.
+
+    The bleed is a TAIL, not a shift: the median excess inside 4 px is only
+    +6..+25 mm but the p90 reaches +180..+210 mm, and those are the points that
+    hang in front of / behind object outlines in the 3D view.  A 3x3/120 mm
+    gradient gate leaves the p90 untouched (it moves it by ~1 mm) because a
+    200 mm excess spread over a 7 px ramp is under 30 mm/px.
+    """
+    pairs, dc = _live_pairs()
+    before, legacy, after = [], [], []
+    for raw, ffs_depth in pairs:
+        dist = _edge_distance(raw)
+        band = (dist < 4) & (raw >= 280) & (raw <= 2500)
+        new, _ = ffs.filter_depth(ffs_depth, _live_cfg(dc))
+        old = _legacy_chain(ffs_depth)
+        for sink, img in ((before, ffs_depth), (legacy, old), (after, new)):
+            sel = band & (img >= 280) & (img <= 2500)
+            sink.append((img.astype(np.float32) - raw.astype(np.float32))[sel])
+    p90 = lambda xs: float(np.percentile(np.concatenate(xs), 90))
+    b, l, a = p90(before), p90(legacy), p90(after)
+    assert b > 100.0, f"fixture should contain a real bleed tail, got p90 {b:.0f} mm"
+    assert l > 0.95 * b, (
+        f"legacy 3x3 gate unexpectedly helped ({b:.0f} -> {l:.0f} mm); if the "
+        "fixture changed, re-derive the ramp profile before re-tuning")
+    assert a < 0.88 * b, f"edge-bleed gate did not cut the overshoot: {b:.0f} -> {a:.0f} mm"
+
+
+def test_edge_bleed_gate_reduces_points_beyond_the_reference_background():
+    """Points that sit BEHIND everything real in their neighbourhood must shrink.
+
+    This is the unambiguous failure: not "a bit far" but past the local
+    background the reference sensor reports, i.e. floating in free space.
+    """
+    pairs, dc = _live_pairs()
+    k15 = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    tally = {"before": [0, 0], "after": [0, 0]}
+    for raw, ffs_depth in pairs:
+        rv = raw > 0
+        rf = raw.astype(np.float32)
+        bg = cv2.dilate(np.where(rv, rf, 0.0), k15)
+        fg = cv2.erode(np.where(rv, rf, 1e6), k15)
+        strong = rv & (bg - fg > 200) & (fg < 1e5)
+        new, _ = ffs.filter_depth(ffs_depth, _live_cfg(dc))
+        for name, img in (("before", ffs_depth), ("after", new)):
+            sel = strong & (img >= 280) & (img <= 2500)
+            tally[name][0] += int(sel.sum())
+            tally[name][1] += int((sel & (img.astype(np.float32) > bg + 10)).sum())
+    rate = lambda k: tally[k][1] / max(1, tally[k][0])
+    assert rate("before") > 0.005, "fixture should contain beyond-background points"
+    assert rate("after") < 0.85 * rate("before"), (
+        f'beyond-background rate {rate("before"):.4f} -> {rate("after"):.4f}')
+
+
+def test_edge_bleed_is_plane_invariant_across_range():
+    """A plane at ANY slant and ANY range must survive the gate intact.
+
+    This is the property that lets the 0.6-2.5 m measurements set a threshold
+    for the UNMEASURED 0.3-0.6 m grasp band.  In disparity a plane is exactly
+    affine in (u, v), so its max-disparity excess over a square window scales
+    linearly with the window radius and the (R/r)*step_r term cancels it
+    identically -- independent of slant and of range.  A mm-domain slope test
+    cannot do this: an 80-degree floor and a silhouette ramp both run at about
+    30 mm/px.
+    """
+    v_idx, u_idx = np.mgrid[0:H, 0:W].astype(np.float32)
+    C = ffs.DISPARITY_CONST_MM_PX
+    for z0_mm in (300.0, 350.0, 450.0, 700.0, 1200.0, 2400.0):
+        for slant in (0.4, 0.8, 1.2, 1.4):
+            # Build the plane in DISPARITY -- that is what a real plane IS --
+            # then invert to uint16 mm, so the fixture is a physically
+            # realisable surface complete with the 1 mm quantisation that
+            # terraces close-range geometry.  slant 1.4 spans roughly 0.17x to
+            # 3x z0 across the frame: grazing incidence.
+            disp = (C / z0_mm) * (1.0 + slant * (u_idx - W / 2) / W
+                                  + 0.5 * slant * (v_idx - H / 2) / H)
+            depth = np.clip(np.rint(C / disp), 0, 65535).astype(np.uint16)
+            lost = int(((depth > 0) & (ffs.remove_edge_bleed(depth, C) == 0)).sum())
+            assert lost == 0, (
+                f"oblique plane at {z0_mm:.0f} mm (slant {slant}, depth "
+                f"{depth.min()}-{depth.max()} mm) lost {lost} px")
+
+    # ...while a real standoff INSIDE the grasp band is still caught: a 7 cm
+    # step at 0.45 m is a 7.2 disparity px jump, far above the 1.0 px floor.
+    step = np.full((H, W), 450, np.uint16)
+    step[150:330, 200:440] = 380
+    dropped = int(((step > 0) & (ffs.remove_edge_bleed(step, C) == 0)).sum())
+    assert dropped > 2000, f"grasp-band silhouette not detected ({dropped} px)"
+
+
+def test_edge_bleed_never_erodes_the_foreground_side():
+    """The gate is one-sided: nothing with an empty foreground is ever dropped.
+
+    A pixel on the NEAR side of a discontinuity has step_R = 0 by construction,
+    so object silhouettes are never eaten -- only the unsupported background
+    ribbon behind them is.  Checked on a synthetic step (exact) and on the live
+    frames (the near-side rim of every real silhouette).
+    """
+    floor = make_floor()
+    scene, interior = add_box(floor)                 # 600 mm box on a ~1300 mm floor
+    keep = ffs.remove_edge_bleed(scene, ffs.DISPARITY_CONST_MM_PX)
+    box = scene == scene[interior].min()
+    assert np.array_equal(keep[interior], scene[interior])
+    # every pixel at the box's own depth survives, including its outermost row
+    assert int((box & (keep == 0)).sum()) == 0
+
+    pairs, dc = _live_pairs()
+    for raw, ffs_depth in pairs:
+        keep = ffs.remove_edge_bleed(ffs_depth, dc)
+        dropped = (ffs_depth > 0) & (keep == 0)
+        if not dropped.any():
+            continue
+        # a dropped pixel always has a strictly nearer surface within 7 px
+        disp = ffs.to_disparity(ffs_depth, dc)
+        wide = cv2.dilate(disp, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+        assert float((wide - disp)[dropped].min()) > 1.0
+
+
+# --- 2. hole-aware median ---------------------------------------------------- #
+def test_median_is_hole_aware_and_never_pulls_a_pixel_nearer_through_a_hole():
+    """cv2.medianBlur sorts the 0s, so k holes bias the result k/2 ranks NEAR.
+
+    On the live frames the old stage moved 16k px/frame by -2.8 mm on average
+    but as much as -2496 mm on a single pixel -- a near-side flying pixel
+    manufactured by the smoother itself, exactly where the map is least
+    trustworthy.  The hole-aware stage must be exactly unbiased.
+    """
+    pairs, _ = _live_pairs()
+    naive_worst, new_worst = 0, 0
+    naive_touched = new_touched = 0
+    for _raw, ffs_depth in pairs:
+        med = cv2.medianBlur(ffs_depth, 5)
+        naive = np.where((ffs_depth > 0) & (med > 0), med, ffs_depth).astype(np.uint16)
+        new = ffs.smooth_banding(ffs_depth, 5)
+        for img, key in ((naive, "naive"), (new, "new")):
+            ch = img.astype(np.int32) - ffs_depth.astype(np.int32)
+            touched = int(np.count_nonzero(ch))
+            if key == "naive":
+                naive_worst = min(naive_worst, int(ch.min())); naive_touched += touched
+            else:
+                new_worst = min(new_worst, int(ch.min())); new_touched += touched
+    assert naive_worst < -500, (
+        f"fixture should exhibit the hole bias; naive worst {naive_worst} mm")
+    # the new stage only ever substitutes a rank drawn from a hole-free window,
+    # so a change larger than the local surface variation is impossible
+    assert new_worst > -200, f"hole-aware median still swings {new_worst} mm"
+    assert new_touched > 0.2 * naive_touched, (
+        "hole-awareness must not disable the smoothing wholesale "
+        f"({new_touched} vs {naive_touched} px touched)")
+
+
+def test_median_only_substitutes_from_a_hole_free_window():
+    """Exact contract: any pixel whose k x k window touches a hole is untouched."""
+    scene, _ = add_box(make_floor(band_amp_mm=6.0))
+    scene = scene.copy()
+    scene[200:206, 300:306] = 0                       # a hole
+    out = ffs.smooth_banding(scene, 5)
+    invalid = (scene == 0).astype(np.uint8)
+    # a pixel adjacent to the hole must keep its original value: neither the
+    # 5x5 nor the 3x3 window around it is hole-free
+    assert out[199, 302] == scene[199, 302]
+    assert out[206, 302] == scene[206, 302]
+    # far from any hole the median is applied as before
+    assert out[100, 100] == cv2.medianBlur(scene, 5)[100, 100]
+    assert np.array_equal(out > 0, scene > 0)
+
+
+# --- 3. coverage: which stage costs what ------------------------------------- #
+def test_new_chain_keeps_far_more_coverage_than_the_legacy_chain():
+    """Equal-start comparison on an UNFILTERED real depth map.
+
+    The published FFS frame has already been carved by the shipped filter, so
+    comparing chains on it flatters the legacy one.  The raw D435 aligned frame
+    in the same color frame is an unfiltered real depth map, which is the only
+    honest common starting point available read-only.
+    """
+    pairs, dc = _live_pairs()
+    legacy_valid = new_valid = in_valid = 0
+    stage_drops = {}
+    for raw, _ffs in pairs:
+        in_valid += int(np.count_nonzero(raw))
+        legacy_valid += int(np.count_nonzero(_legacy_chain(raw)))
+        out, rep = ffs.filter_depth(raw, _live_cfg(dc))
+        new_valid += int(np.count_nonzero(out))
+        for k, v in rep["dropped"].items():
+            stage_drops[k] = stage_drops.get(k, 0) + v
+    legacy_loss = 1.0 - legacy_valid / in_valid
+    new_loss = 1.0 - new_valid / in_valid
+    assert legacy_loss > 0.10, f"legacy chain loss {legacy_loss:.4f}"
+    assert new_loss < 0.05, f"new chain loss {new_loss:.4f}"
+    # and the report must attribute it, which is the whole point of the split
+    assert set(stage_drops) == {"clamp", "edge", "speckle", "median"}
+    assert stage_drops["median"] == 0     # the median never changes validity
+
+
+def test_speckle_in_disparity_stops_deleting_the_far_field():
+    """A fixed mm join tolerance shreds the far field; depth noise grows as z^2.
+
+    On the raw D435 frames a 24 mm tolerance deletes over 40% of everything
+    beyond 2.5 m, because at that range adjacent pixels of a flat surface
+    already differ by more than 24 mm, so the surface fragments into
+    sub-max_size components and the stage removes it wholesale.
+    """
+    pairs, dc = _live_pairs()
+    far_pop = mm_lost = disp_lost = 0
+    for raw, _ffs in pairs:
+        far = (raw > 2500) & (raw < 60000)
+        far_pop += int(far.sum())
+        mm_lost += int((far & (ffs.remove_speckles(raw, 50, 24) == 0)).sum())
+        disp_lost += int((far & (ffs.remove_speckles(
+            raw, 50, disparity_const_mm_px=dc, max_diff_px=0.5) == 0)).sum())
+    assert far_pop > 10000, "fixture should contain a far field"
+    assert mm_lost / far_pop > 0.30, f"mm speckle far-field loss {mm_lost/far_pop:.3f}"
+    assert disp_lost / far_pop < 0.05, (
+        f"disparity speckle far-field loss {disp_lost/far_pop:.3f}")
+
+
+def test_new_chain_does_not_manufacture_validity_flicker():
+    """A static scene must not shimmer.
+
+    Over the captured static run the legacy chain nearly TRIPLES the fraction of
+    pixels that toggle between valid and invalid frame to frame (9% -> 26% on
+    the raw stream).  That shimmer is what reads as a sparse, banded cloud in a
+    live 3D view; the depth values themselves are barely noisier than the raw
+    sensor's.
+    """
+    pairs, dc = _live_pairs()
+    seq = {"input": [], "legacy": [], "new": []}
+    for raw, _ffs in pairs:
+        seq["input"].append(raw > 0)
+        seq["legacy"].append(_legacy_chain(raw) > 0)
+        seq["new"].append(ffs.filter_depth(raw, _live_cfg(dc))[0] > 0)
+    def toggling(masks):
+        st = np.stack(masks)
+        frac = st.mean(axis=0)
+        return float(((frac > 0.01) & (frac < 0.99)).mean())
+    base, legacy, new = (toggling(seq[k]) for k in ("input", "legacy", "new"))
+    assert legacy > 1.8 * base, f"fixture: legacy flicker {base:.4f} -> {legacy:.4f}"
+    assert new < 1.35 * base, f"new chain added flicker {base:.4f} -> {new:.4f}"
+
+
+# --- 4. near-range clamp ------------------------------------------------------ #
+def test_clamp_enforces_the_028_m_contract_consumers_are_written_against():
+    """z_manip/adapters pins DEPTH_NEAR_CLIP_M = 0.28 and edgetam.yaml
+    min_depth_m: 0.28 for this very topic; the raw D435 stream never emits
+    below ~0.24 m.  FFS has no hardware near limit and was publishing ~1900
+    px/frame at 0.08-0.15 m -- points inside the gripper, on the robot's own
+    body, that no consumer's near clip is expecting to have to reject.
+    """
+    pairs, dc = _live_pairs()
+    before = after = 0
+    for _raw, ffs_depth in pairs:
+        before += int(((ffs_depth > 0) & (ffs_depth < 280)).sum())
+        out, _ = ffs.filter_depth(ffs_depth, _live_cfg(dc))
+        after += int(((out > 0) & (out < 280)).sum())
+    assert before > 1000, f"fixture should contain the sub-clip points ({before})"
+    assert after == 0
+
+    adapters = (ROOT / "z_manip" / "adapters" / "__init__.py").read_text(encoding="utf-8")
+    assert "DEPTH_NEAR_CLIP_M = 0.28" in adapters, (
+        "the clamp default is pinned to the consumer contract; if that moved, "
+        "move FilterConfig.min_depth_mm with it")
+    assert ffs.FilterConfig().min_depth_mm == 280
+
+
+def test_clamp_is_a_pure_range_mask():
+    scene = np.array([[0, 100, 279, 280, 2000, 9999, 10000, 10001]], np.uint16)
+    out = ffs.clamp_range(scene, 280, 10000)
+    assert out.tolist() == [[0, 0, 0, 280, 2000, 9999, 10000, 0]]
+
+
+def test_report_attributes_drops_per_stage():
+    scene, _ = add_box(make_floor(band_amp_mm=4.0))
+    scene, _ = add_specks(scene, n=25, seed=11)
+    out, report = ffs.filter_depth(scene, ffs.FilterConfig())
+    assert set(report["dropped"]) == {"clamp", "edge", "speckle", "median"}
+    assert sum(report["dropped"].values()) == report["removed"]
+
+
+def test_relay_logs_the_per_stage_split_and_uses_live_calibration():
+    src = RELAY_PATH.read_text(encoding="utf-8")
+    # the filter's thresholds are in disparity px, so it needs fx_ir*B from the
+    # calibration the relay already fail-closed verifies against camera_info
+    assert "disparity_const_mm_px" in src
+    assert "self.calib['K_ir1']['fx']" in src
+    assert "report.get('dropped'" in src
+    assert "filt_drop~" in src

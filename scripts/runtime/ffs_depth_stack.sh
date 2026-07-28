@@ -27,22 +27,43 @@ set -euo pipefail
 #
 # DEPTH NOISE FILTER (runs in the relay, one pass upstream of every consumer --
 # EdgeTAM depth, grasp scene_points, UI cloud, collision).  Vectorised cv2/numpy
-# on the uint16 mm depth image, ~3.3 ms/frame at 640x480 (edge 1.8 + speckle 1.2
-# + median 1.0).  Core lives in scripts/runtime/ffs_depth_filter.py (pure funcs,
-# bind-mounted next to the relay), so a change is `down`+`up`, never a rebuild.
+# on the uint16 mm depth image, ~4.4 ms/frame at 640x480 (clamp 0.1 + bleed 1.0
+# + speckle 1.3 + median 2.0).  Core lives in scripts/runtime/ffs_depth_filter.py
+# (pure funcs, bind-mounted next to the relay), so a change is `down`+`up`, never
+# a rebuild.
+#
+# THRESHOLDS ARE IN DISPARITY px, NOT mm.  Stereo depth noise scales as z^2
+# (2 mm at 0.4 m, 80 mm at 2.5 m for this camera), so a single mm threshold is
+# wrong at one end of the range or the other; in disparity the matching noise is
+# range-free and a plane is exactly affine at any slant.  The relay derives the
+# conversion constant (fx_ir * baseline * 1000) from the calibration it already
+# verifies against live camera_info.
+#
 # Toggle stages/params via env (defaults in parens); restore RAW depth with
 # FFS_FILTER=0 (single switch, no rebuild):
 #   FFS_FILTER                    master on/off                      (1)
-#   FFS_FILTER_EDGE               flying-pixel/edge-bleed gradient   (1)
-#   FFS_FILTER_EDGE_MAX_GRAD_MM   3x3 depth-jump threshold, mm       (120)
+#   FFS_FILTER_CLAMP              near/far range clamp               (1)
+#   FFS_FILTER_MIN_DEPTH_MM       near clip, mm (consumer contract)  (280)
+#   FFS_FILTER_MAX_DEPTH_MM       far clip, mm                       (10000)
+#   FFS_FILTER_EDGE               silhouette edge-bleed gate         (1)
+#   FFS_FILTER_EDGE_MODE          bleed | grad (legacy 3x3 mm gate)  (bleed)
+#   FFS_FILTER_EDGE_RADIUS        wide window radius, px (ramp len)  (7)
+#   FFS_FILTER_EDGE_NEAR_RADIUS   slope-reference radius, px         (2)
+#   FFS_FILTER_EDGE_MARGIN_PX     disparity noise floor, px          (1.0)
+#   FFS_FILTER_EDGE_MAX_GRAD_MM   legacy grad-mode threshold, mm     (120)
 #   FFS_FILTER_SPECKLE            free-space speck removal           (1)
 #   FFS_FILTER_SPECKLE_MAX_SIZE   filterSpeckles maxSpeckleSize, px  (50)
-#   FFS_FILTER_SPECKLE_MAX_DIFF_MM filterSpeckles maxDiff, mm        (24)
-#   FFS_FILTER_MEDIAN             banding/ripple median              (1)
+#   FFS_FILTER_SPECKLE_MAX_DIFF_PX filterSpeckles maxDiff, disp px   (0.5)
+#   FFS_FILTER_MEDIAN             banding/ripple median (hole-aware) (1)
 #   FFS_FILTER_MEDIAN_KSIZE       median aperture (3 or 5)           (5)
 #   FFS_FILTER_TEMPORAL           per-pixel motion-gated EMA         (0, OFF)
 #   FFS_FILTER_TEMPORAL_ALPHA     EMA weight on current frame        (0.5)
 #   FFS_FILTER_TEMPORAL_CHANGE_MM per-pixel reset threshold, mm      (40)
+#   FFS_FILTER_DISPARITY_CONST    override fx_ir*B*1000, mm*px       (from calib)
+#
+# The relay's 10 s report now prints the PER-STAGE drop split, e.g.
+#   filt_drop~3100px/frame [clamp=1937 edge=900 speckle=30 median=0]
+# so a coverage regression can be attributed without an offline capture.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="${Z_MANIP_FFS_IMAGE:-ffs:infer}"
@@ -114,11 +135,18 @@ start_relay() {
     -e FFS_IR2_TOPIC=/nuc/camera/ffs_ir_pair/infra2/compressed \
     -e "FFS_MAX_FPS=${Z_MANIP_FFS_MAX_FPS:-10}" \
     -e "FFS_FILTER=${FFS_FILTER:-1}" \
+    -e "FFS_FILTER_CLAMP=${FFS_FILTER_CLAMP:-1}" \
+    -e "FFS_FILTER_MIN_DEPTH_MM=${FFS_FILTER_MIN_DEPTH_MM:-280}" \
+    -e "FFS_FILTER_MAX_DEPTH_MM=${FFS_FILTER_MAX_DEPTH_MM:-10000}" \
     -e "FFS_FILTER_EDGE=${FFS_FILTER_EDGE:-1}" \
+    -e "FFS_FILTER_EDGE_MODE=${FFS_FILTER_EDGE_MODE:-bleed}" \
+    -e "FFS_FILTER_EDGE_RADIUS=${FFS_FILTER_EDGE_RADIUS:-7}" \
+    -e "FFS_FILTER_EDGE_NEAR_RADIUS=${FFS_FILTER_EDGE_NEAR_RADIUS:-2}" \
+    -e "FFS_FILTER_EDGE_MARGIN_PX=${FFS_FILTER_EDGE_MARGIN_PX:-1.0}" \
     -e "FFS_FILTER_EDGE_MAX_GRAD_MM=${FFS_FILTER_EDGE_MAX_GRAD_MM:-120}" \
     -e "FFS_FILTER_SPECKLE=${FFS_FILTER_SPECKLE:-1}" \
     -e "FFS_FILTER_SPECKLE_MAX_SIZE=${FFS_FILTER_SPECKLE_MAX_SIZE:-50}" \
-    -e "FFS_FILTER_SPECKLE_MAX_DIFF_MM=${FFS_FILTER_SPECKLE_MAX_DIFF_MM:-24}" \
+    -e "FFS_FILTER_SPECKLE_MAX_DIFF_PX=${FFS_FILTER_SPECKLE_MAX_DIFF_PX:-0.5}" \
     -e "FFS_FILTER_MEDIAN=${FFS_FILTER_MEDIAN:-1}" \
     -e "FFS_FILTER_MEDIAN_KSIZE=${FFS_FILTER_MEDIAN_KSIZE:-5}" \
     -e "FFS_FILTER_TEMPORAL=${FFS_FILTER_TEMPORAL:-0}" \

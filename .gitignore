@@ -16,6 +16,9 @@ configs/*_calibration.json
 *.npz
 *.pcd
 *.ply
+# 例外：tests/data 下的录制夹具是测试的输入，体积小，必须入库
+# （place_lab_crate_scene.npz 等原本靠 git add -f 进来，这里写明意图）
+!tests/data/*.npz
 
 # 只读参考仓（clone_deps.sh 拉取，不入库）
 refs/

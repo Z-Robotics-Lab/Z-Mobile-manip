@@ -90,11 +90,23 @@ class FfsDepthRelay(Node):
         # points, the UI cloud and collision checking.  Disable at runtime with
         # FFS_FILTER=0 (restart, no rebuild -- relay + filter are bind-mounted).
         self._filter_cfg = FilterConfig.from_env()
+        # The filter thresholds live in DISPARITY px, so it needs this camera's
+        # fx_ir * baseline (mm*px).  Take it from the calibration the relay has
+        # already fail-closed verified against live camera_info rather than the
+        # module default, so a camera swap cannot silently mistune the filter.
+        if 'FFS_FILTER_DISPARITY_CONST' not in os.environ:
+            self._filter_cfg.disparity_const_mm_px = (
+                float(self.calib['K_ir1']['fx'])
+                * float(self.calib['baseline_m']) * 1000.0)
         self._filter_prev = None
         self._filter_removed = 0
+        self._filter_dropped = {}
         self.get_logger().info(
             f'depth filter: enabled={self._filter_cfg.enabled} '
-            f'stages={self._filter_cfg.active_stages()}')
+            f'stages={self._filter_cfg.active_stages()} '
+            f'edge_mode={self._filter_cfg.edge_mode} '
+            f'disparity_const={self._filter_cfg.disparity_const_mm_px:.1f} mm*px '
+            f'near_clip={self._filter_cfg.min_depth_mm} mm')
 
         self._pub = self.create_publisher(Image, OUT_TOPIC,
                                           qos_profile_sensor_data)
@@ -199,6 +211,9 @@ class FfsDepthRelay(Node):
                                              self._filter_prev)
                 self._filter_prev = depth
                 self._filter_removed += report['removed']
+                for _stage, _n in report.get('dropped', {}).items():
+                    self._filter_dropped[_stage] = \
+                        self._filter_dropped.get(_stage, 0) + _n
                 raw = np.ascontiguousarray(depth).tobytes()
             msg = Image()
             msg.header.stamp.sec = stamp // 10**9
@@ -219,7 +234,13 @@ class FfsDepthRelay(Node):
         p50 = sorted(lat)[len(lat) // 2] if lat else float('nan')
         filt = ''
         if self._filter_cfg.enabled and self._published:
-            filt = f' filt_drop~{self._filter_removed / self._published:.0f}px/frame'
+            # Per-stage split, not just the total: it is the only way to tell
+            # which stage is costing coverage without an offline capture.
+            per = ' '.join(
+                f'{k}={v / self._published:.0f}'
+                for k, v in self._filter_dropped.items())
+            filt = (f' filt_drop~{self._filter_removed / self._published:.0f}'
+                    f'px/frame [{per}]')
         self.get_logger().info(
             f'pairs_in={self._received} published={self._published} '
             f'rate~{self._published / max(1e-9, 10.0):.1f}fps '
@@ -228,6 +249,7 @@ class FfsDepthRelay(Node):
         self._published = 0
         self._bytes_in = 0
         self._filter_removed = 0
+        self._filter_dropped = {}
         if len(self._lat_ms) > 400:
             self._lat_ms = self._lat_ms[-100:]
 
