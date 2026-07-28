@@ -69,6 +69,17 @@ class ReadOnlyBackend(Protocol):
     ) -> BackendResult:
         """Redo passive/session gates and offline planning."""
 
+    def runtime_fingerprint(self) -> str | None:
+        """Hash of the exact code/config bytes the resident workers load.
+
+        OPTIONAL.  This module must contain no ROS, SSH, CAN, subprocess or
+        filesystem-layout knowledge, and the fingerprint is defined by the
+        deployed layout, so it can only come from the backend.  A backend that
+        does not implement it makes every attempt report ``null`` rather than
+        failing -- absence of a stamp is not evidence of a stable tree, and the
+        attempt document says which of the two it is.
+        """
+
 
 def validate_target_description(value: object) -> str:
     """Return one normalized, non-path target description.
@@ -302,6 +313,60 @@ class ReadOnlySessionService:
         for name in ("perception", "planning", "_state"):
             (self._root / name).mkdir(parents=True, exist_ok=True)
 
+    def _runtime_fingerprint(self) -> str | None:
+        """Ask the backend for the current runtime fingerprint, or ``None``.
+
+        Never raises and never propagates a backend fault into the action: a
+        broken fingerprint probe must not be able to fail a perception request
+        that would otherwise have succeeded.
+        """
+
+        probe = getattr(self._backend, "runtime_fingerprint", None)
+        if probe is None:
+            return None
+        try:
+            value = probe()
+        except Exception:  # a diagnostic may never fail an action
+            return None
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _runtime_fingerprint_block(
+        started: str | None,
+        finished: str | None,
+    ) -> dict[str, Any]:
+        """Fingerprint provenance for one attempt, measured at both ends.
+
+        WHY BOTH ENDS.  ``go2w_depth_servo.sh`` bind-mounts the working tree
+        read-only and runs from it, and the resident perception/planning workers
+        import their modules ONCE at startup, so an edit landing mid-attempt is
+        a live deploy that the attempt itself cannot otherwise see.  Recorded:
+        commits a0f9e10 (10:38) and 0124a20 (12:10) each produced a
+        resident-worker fingerprint mismatch minutes later, a component
+        self-heal, and a retry that inherited the previous sub-attempt's already
+        closed passive window -- 900-1200 rejections and
+        ``PERCEPTION_PROCESS_FAILED``, twice out of two, on a target that
+        succeeded five times with zero rejections when the tree held still.
+        A single stamp cannot distinguish "ran on this tree" from "started on
+        one tree and finished on another"; two can.
+
+        ``changed_during_attempt`` is asserted only when BOTH stamps are known
+        and differ.  Absence is reported as ``null`` rather than as a change:
+        every fake backend in the test suite and any deployment without the
+        probe lands there, and manufacturing an alarm for all of them would make
+        the real one invisible.
+        """
+
+        return {
+            "started": started,
+            "finished": finished,
+            "changed_during_attempt": (
+                None
+                if started is None or finished is None
+                else started != finished
+            ),
+        }
+
     def _new_session(self, action: str) -> tuple[str, Path]:
         timestamp = self._now().astimezone(timezone.utc).strftime("%Y%m%d-%H%M%S")
         action_root = self._root / action
@@ -461,6 +526,7 @@ class ReadOnlySessionService:
         try:
             session_id, session = self._new_session("perception")
             started = self._now()
+            fingerprint_started = self._runtime_fingerprint()
             in_flight = session / ".perception.inflight"
             in_flight.mkdir(mode=0o700)
             log = session / "perception.log"
@@ -505,6 +571,10 @@ class ReadOnlySessionService:
                     "motion_commands_published": 0,
                     "can_tx_available": False,
                 },
+                "runtime_fingerprint": self._runtime_fingerprint_block(
+                    fingerprint_started,
+                    self._runtime_fingerprint(),
+                ),
             }
             _write_json_exclusive(session / "attempt.json", attempt)
             _freeze_tree(session)
@@ -566,6 +636,7 @@ class ReadOnlySessionService:
         try:
             session_id, session = self._new_session("planning")
             started = self._now()
+            fingerprint_started = self._runtime_fingerprint()
             selected_id: str | None = None
             result = BackendResult(
                 exit_code=1,
@@ -627,6 +698,10 @@ class ReadOnlySessionService:
                     "can_tx_available": False,
                     "actuator_transport_available": False,
                 },
+                "runtime_fingerprint": self._runtime_fingerprint_block(
+                    fingerprint_started,
+                    self._runtime_fingerprint(),
+                ),
             }
             _write_json_exclusive(session / "attempt.json", attempt)
             _freeze_tree(session)

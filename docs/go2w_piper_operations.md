@@ -338,13 +338,169 @@ rejected. Tracking loss commands zero immediately, allows a stationary 0.75 s
 reacquisition window, then runs at most three fresh perception attempts. It
 never blind-drives through a missing target.
 
-`view_recovery` and `search_required` are stationary recovery phases. The
-supervisor first terminates the base-servo owner (which sends its zero-command
-cleanup), then runs the bounded wrist search and a fresh EdgeTAM seed. Only
-after a stable target is recovered does it restart base approach. Wrist search
-and base velocity therefore never run concurrently. `handoff_probe`,
+`acquiring`, `view_recovery` and `search_required` are all stationary phases,
+and they are three different events:
+
+* `acquiring` — the servo has never received a 3-D target in this session
+  (freshly seeded tracker, first depth-joined bundle not yet arrived). Base
+  and wrist both hold; there is nothing to recover. It carries a 12 s deadline
+  whose expiry stops the servo and reports `degraded`. It deliberately never
+  starts a wrist search: sweeping the camera off a just-seeded target is the
+  one action guaranteed to make acquisition harder.
+* `view_recovery` — a tracked target has aged past `--tracking-hold-s`
+  (0.80 s) but not yet past `--tracking-loss-grace-s` (2.75 s). The supervisor
+  leaves the servo alone here so the configured grace is actually spent, and
+  bounds it with that same configured grace, which the servo now reports in
+  `status.limits.tracking_loss_grace_s`. It used to act on this phase name
+  directly, at 0.80 s, so 1.95 s of configured recovery was unreachable.
+* `search_required` — the servo's own verdict that the full loss grace is
+  spent. This is the one phase the supervisor acts on immediately.
+
+On `search_required` (or on any other phase's deadline expiring with a
+recovery escalation) the supervisor first terminates the base-servo owner
+(which sends its zero-command cleanup), then runs the bounded wrist search and
+a fresh EdgeTAM seed. Only after a stable target is recovered does it restart
+base approach. Wrist search and base velocity therefore never run
+concurrently.
+
+Two further bounded waits surround the servo process itself. A spawned
+launcher has 30 s to produce its first status document (the shipped launcher
+measures ~11.2 s of transport preflight, arm-owner acquisition and container
+start before the servo writes a byte); after that the run ends in `degraded`
+with "depth servo did not report within...". A servo that has reported and
+then leaves its status document missing, unparseable, wrong-schema or over the
+64 KiB reader limit shows workflow phase `status_unavailable` and ends in
+`degraded` after 2 s. Both exist because an unreadable document used to be
+indistinguishable from `idle`, which is heartbeat-exempt: nothing could time
+out and every new task was refused with `APPROACH_ACTION_BUSY`.
+
+`handoff_probe`,
 `handoff_ready`, and the legacy `reached` phase all use the same zero-speed
 fresh-grasp handoff; no far-field perception or trajectory is reused.
+
+### Editing the checkout during a task IS a deploy
+
+`scripts/runtime/go2w_depth_servo.sh` bind-mounts `$STACK_ROOT` read-only into
+the servo container and runs `go2w_depth_servo.py` straight out of it, and the
+resident perception/planning workers import their modules once at startup. A
+`git commit`, a `git checkout`, or an editor save while a task is in flight is
+therefore a live deploy to a powered-up robot.
+
+What that looked like before it was instrumented: one recorded session's
+tracebacks place `_tick` at five different line numbers (1835, 1954, 2043, 2045,
+2183) inside a single run, and commits `a0f9e10` (10:38) and `0124a20` (12:10)
+each produced a resident-worker fingerprint mismatch minutes later, a perception
+component self-heal, and a retry that reused the previous sub-attempt's already
+closed passive window — 900-1200 stamp-overlap rejections, the whole 15 s budget
+burnt, `PERCEPTION_PROCESS_FAILED`, and a plainly detected object routed into a
+wrist search. Twice out of two, against five clean runs of the same sparse
+target with zero rejections.
+
+Three things now make that visible instead of mysterious:
+
+* The launcher measures `scripts/runtime/z_manip_runtime_fingerprint.py` before
+  `docker run`, prints it, and hands it to the servo in
+  `Z_MANIP_RUNTIME_FINGERPRINT`. If the tree is dirty it prints a `LIVE DEPLOY
+  WARNING` block naming the fingerprint and every modified path. **It warns, it
+  does not refuse.** This tree is dirty for most of a working session by design,
+  so a refusal would fire on the normal case and be bypassed. The stronger fix —
+  bind-mounting a content-addressed copy so a running task cannot be changed at
+  all — is the recommendation, and is *not* implemented: it rewrites the launch
+  path of a robot that cannot be tested against here, and a mistake in it stops
+  the servo from starting rather than degrading it.
+* `depth-servo.json` carries a `runtime_fingerprint` block (launch vs live,
+  re-measured every 2 s), and **every trace row** carries the short live
+  fingerprint plus a `runtime_fingerprint_mutated` flag. A trace whose rows
+  change fingerprint part-way through is a trace of two different programs.
+
+  This only works because the launcher and the servo hash the **same files**,
+  and the first version of it did not. `runtime_inputs()` includes
+  `$WORKSPACE_ROOT/go2W_Sim/assets/urdf/go2w_sensored.urdf`, the one hashed file
+  outside the checkout, and the container was given it only at
+  `/robot/go2w_sensored.urdf`. The servo hashed 98 files where the launcher
+  hashed 99 (`834e35138ae0` vs `87e820e6b6c2` against the live tree) and
+  reported `runtime_fingerprint_mutated: true` on every row of every run against
+  a frozen tree — an alarm that is always on, which is worse than no alarm. The
+  launcher now asks the tool for its digest *and* its out-of-tree inputs in one
+  `--launch-manifest` call and bind-mounts each of them at its own absolute
+  path. **If you add a hashed input outside `$STACK_ROOT`, it must be mounted at
+  its own path**; `tests/test_runtime_fingerprint_mounts.py` builds a synthetic
+  container view from the launcher's own mount list and fails if the two digests
+  diverge.
+* The approach status endpoint carries a `deployment` block and the dashboard
+  shows it as **Runtime deployment**. A mutation seen by *either* the servo or
+  the workbench raises `RUNTIME_TREE_MUTATED_DURING_RUN`. It stops nothing — a
+  robot that halted every time you saved a file would be unusable — it tells you
+  to restart the affected components before trusting the run.
+
+`unverified` is its own neutral state, not an alarm: replays, shadow runs and
+any launch without the environment variable land there.
+
+Perception and planning attempts record the same thing at both ends.
+`attempt.json` carries `runtime_fingerprint.started` / `.finished` /
+`.changed_during_attempt`, so an attempt that began on one tree and finished on
+another says so.
+
+### Passive windows are never inherited by a retry
+
+Both perception retry paths — the inner fresh-seed retry and the rc=70
+resident-worker self-heal — now clear **every** artifact of the previous
+sub-attempt, including `live_passive_joint_report.json`, which the older code
+left behind. While a valid `selected_passive_joint_report.json` exists the
+wrapper does not open a new passive window at all, which is why all six recorded
+self-heals show `passive_capture_count: 0` against 2-21 captures on their own
+first sub-attempt.
+
+If the dry run nevertheless finds itself matching fresh bundles against a window
+that closed before its own bundle wait began, it now fails after 2 s with
+`PERCEPTION_PASSIVE_WINDOW_STALE` and a message giving both distances, instead
+of burning its full budget and surfacing as `PERCEPTION_PROCESS_FAILED`. The
+remedy is always a fresh capture. **The zero-TX gate itself is unchanged**: the
+overlap tolerance is still ±250 ms, `_SEED_VALID_FAILURE_CODES` still contains
+only `GRASP_GEOMETRY_FAILED`, and no perception failure lacking zero-TX evidence
+can start base motion.
+
+### systemd start limiters
+
+Four units used to inherit the default 5-starts-per-10 s limiter, and nothing in
+the repository ever called `reset-failed`; under `set -e` a tripped limiter
+aborted the launcher with no message saying so. Each unit now declares its own
+choice, with the reason written in the unit file:
+
+| unit | limiter | `RestartSec` | still latches a crash loop whose failed starts survive | why |
+| --- | --- | --- | --- | --- |
+| `z-mobile-manip-piper-reactive-view` | 60 s / 10 | 1 s | 5.67 s | single CAN owner; a crash loop must latch, operator launches must not trip it |
+| `z-manip-piper-passive-feedback` | 60 s / 8 | 3 s | 5.57 s | zero-TX evidence producer, hand-restarted by seven call sites around every arm motion |
+| `z-mobile-manip-go2w-reactive-live` | 60 s / 8 | 3 s | 5.57 s | single owner of the only channel that reaches the base |
+| `z-manip-planning-workbench` | `StartLimitIntervalSec=0` | — | never (deliberate) | owns no exclusive hardware and *is* the operator's only interface; follows the `d435i` / `ffs-ir-throttle` precedent |
+
+The fourth column is the point of the table and it was missing. A systemd crash
+cycle is `uptime + RestartSec`, not `RestartSec`: the passive-feedback and
+reactive-live units were first written at 60 s / 15 and 60 s / 10, which latch
+only a loop whose failed starts die within 1.29 s and 3.67 s respectively — less
+than the 1.0 s TX-counter sampling window in
+`piper_passive_joint_state_bridge.py` plus `bash -lc`, `source ros_env.sh` and
+`import rclpy`. Both units claimed a latch they did not have. A burst of 8
+restores it. `tests/test_runtime_deployment_contract.py` recomputes this column
+from each unit's own keys and fails if the unit file's stated number goes stale.
+
+`go2w_depth_servo.sh` and `go2w_base_transport_preflight.sh` now detect
+`Result=start-limit-hit`, print the unit and its `NRestarts`, and clear that
+specific latch once per launch. Their postconditions (`is-active`, and the
+bounded readiness loop) are unchanged, so a genuinely broken unit still fails the
+launch — it just says why.
+
+### Bag QoS must match the publisher
+
+`configs/rosbag_sensor_qos.yaml` recorded `/track_3d/selected_target_pointcloud`
+and `/z_manip/perception/target_pointcloud` as `best_effort` while both
+publishers are `RELIABLE`. The subscription still connects (QoS is
+request ≤ offered), so nothing errored — it simply stopped NACKing, and every
+sample lost to Wi-Fi contention was gone from the bag. Both are now recorded
+`reliable` at the publishers' depth 10, so a replay of a hang can no longer
+conclude "perception never reached the controller" about a run in which it did.
+`/z_manip/perception/scene_pointcloud` stays `best_effort`, correctly: its
+publisher uses `qos_profile_sensor_data`.
 
 **Full stop** cancels the server-side workflow, terminates the depth-servo
 process, clears its task context, and interrupts a pending local wrist-search

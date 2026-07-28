@@ -18,13 +18,30 @@ import os
 from pathlib import Path
 import signal
 import statistics
+import sys
 import threading
 import time
 from typing import Any
+import uuid
 
 import numpy as np
 
-from z_manip.control.reactive_servo import (
+# ``z_manip_runtime_fingerprint`` is a SIBLING FILE, not a package module, and
+# it must stay one: it anchors STACK_ROOT on its own location, so importing it
+# from ``z_manip`` would resolve to whichever copy of the package won the path
+# (the container has a second one baked in at /opt/z_manip/python) and would
+# fingerprint the wrong tree.  Inside the container ``sys.path[0]`` is already
+# this directory; under a test that loads this file through an importlib spec it
+# is not, so name it explicitly.
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from z_manip_runtime_fingerprint import (  # noqa: E402
+    RUNTIME_FINGERPRINT_ENV,
+    RuntimeFingerprintWatch,
+)
+from z_manip.control.reactive_servo import (  # noqa: E402
     ArmViewIntent,
     BaseMotionIntent,
     PostureIntent,
@@ -33,6 +50,12 @@ from z_manip.control.reactive_servo import (
     ReactiveServoDecision,
     ReactiveTargetController,
     TargetGeometry,
+)
+from z_manip.control.go2w_posture import PosturePhase
+from z_manip.control.servo_phase import (
+    HANDOFF_TERMINAL_PHASES,
+    LOSS_STAIR_PHASES,
+    ServoPhase,
 )
 from z_manip.control.visual_servo import VisualServoConfig, VisualServoController
 from z_manip.control.whole_body_runtime import (
@@ -50,12 +73,53 @@ ARM_STATUS_TIMEOUT_S = 0.50
 ARM_INTENT_TTL_NS = 250_000_000
 ARM_INTENT_SCHEMA = "z_manip.piper_reactive_view_intent.v1"
 ARM_STATUS_SCHEMA = "z_manip.piper_reactive_view_status.v1"
-# Read-only close-range IK feasibility channel.  A resident close-range
-# planning runner may certify grasp/pregrasp IK on this topic so the reactive
-# controller can declare HANDOFF_READY.  When no producer is present the probe
-# is unavailable (None) and the controller stays fail-closed in HANDOFF_PROBE.
+# Read-only close-range IK feasibility channel.
+#
+# THERE IS NO PRODUCER IN THIS REPOSITORY.  ``grep -rn "reactive/ik_probe"``
+# returns exactly two hits and both are in this file (this constant and the
+# subscription).  ``DepthServoCore._ik_feasible`` is therefore permanently
+# ``None``, so ``ReactivePhase.HANDOFF_READY``, ``DepthServoCore._done`` via
+# that branch, the ``reached`` presentation remap and the ``fallback.done``
+# arm of the whole-body settle branch are all unreachable in the deployed
+# configuration.
+#
+# THIS IS DELIBERATE AND IS KEPT, not deleted, because:
+#
+#   1. The gate is fail-closed by construction.  ``_ik_probe_state`` returns
+#      ``None`` on absence, staleness or a malformed payload, and both
+#      HANDOFF_READY sites require ``ik_feasible is True``.  Deleting the gate
+#      would mean declaring a manipulation handoff on distance and posture
+#      alone -- the exact fail-open this hardening programme exists to remove.
+#   2. The handoff is NOT dead: it terminates one level earlier, at
+#      HANDOFF_PROBE.  ``needs_ik_probe`` is set whenever the corridor is
+#      reached with ``ik_feasible is None``, and the supervisor's
+#      ``_runtime_requests_handoff`` accepts ``needs_ik_probe is True`` and
+#      ``reactive_phase in {handoff_probe, handoff_ready}``.  So the deployed
+#      terminal is HANDOFF_PROBE -> the supervisor stops the servo -> the
+#      close-range grasp transaction opens.  HANDOFF_READY is the *upgrade*
+#      path for when a certifier exists.
+#
+# TO MAKE HANDOFF_READY REACHABLE, a producer must publish
+# ``std_msgs/String`` JSON on ``/z_manip/reactive/ik_probe`` with
+# ``{"schema": IK_PROBE_SCHEMA, "feasible": <bool>}`` at better than
+# ``IK_PROBE_TIMEOUT_S`` (1.0 s), where ``feasible`` is a real pregrasp+grasp
+# IK solve against the CURRENT measured base/arm state.  The natural owner is
+# the resident close-range planning runner in
+# ``ros2/z_manip_place`` / the mobile-handoff grasp path, which already solves
+# that IK after the servo stops.  Publishing anything weaker (e.g. a reach
+# heuristic) would convert this fail-closed gate into a fail-open one.
 IK_PROBE_SCHEMA = "z_manip.reactive_ik_probe.v1"
 IK_PROBE_TIMEOUT_S = 1.0
+
+# Bounded life for the one-way handoff latch.  The latch is set by a SINGLE
+# tick and, before this bound, had no reset edge and no expiry: once set, the
+# node returned early from every subsequent ``_tick`` forever.  The contract is
+# that the 5 Hz supervisor observes the handoff within one loop iteration
+# (~50 ms) and stops this process.  20 s without that means nobody is watching,
+# so the latch escalates to an explicit ``handoff_abandoned`` terminal.  The
+# exit is ALWAYS a stop, never a resume: an un-latch that let the base drive
+# again mid-grasp would be a fail-open.
+HANDOFF_LATCH_TIMEOUT_S = 20.0
 
 
 # Measured PC-to-NUC NTP midpoint offset is ~0.31s (see the reactive-view
@@ -115,7 +179,22 @@ class DepthServoSettings:
     outlier_rebase_spread_m: float = 0.05
     base_frame: str = "base_link"
     arm_base_frame: str = "piper_base_link"
-    transform_timeout_s: float = 0.25
+    # Formerly ``transform_timeout_s``, one letter away from the launcher's
+    # ``--runtime-transform-timeout-s`` (which is a completely different
+    # quantity: the maximum age of the subscribe-only runtime-observer JSON).
+    # This one bounds how stale the DERIVED TargetGeometry may be.
+    #
+    # ``_transforms_received_s`` and ``_target_received_s`` are both assigned
+    # ``float(stamp_s)`` from the SAME camera callback (see ``observe_target``:
+    # the target stamp is written unconditionally, the transform stamp only on
+    # the ``transforms_available`` branch, and the not-available branch nulls
+    # the geometry).  Geometry non-None therefore IMPLIES the two stamps are
+    # equal, so this budget and ``target_timeout_s`` measure the same physical
+    # age.  Shipping 0.25 against a 0.40 target timeout at a ~0.133 s bundle
+    # cadence meant TWO frame periods (0.265 s) hard-zeroed the base with a
+    # reason string that blamed TF while printing the target age.  They are
+    # now pinned equal, and ``__post_init__`` forbids the inversion.
+    geometry_staleness_timeout_s: float = 0.40
     # Explicit test-only compatibility seam. Deployed ROS construction always
     # leaves this false: missing transforms must never fall back to optical z.
     allow_legacy_optical_depth_for_tests: bool = False
@@ -156,8 +235,22 @@ class DepthServoSettings:
             raise ValueError("outlier rebase spread must be finite and positive")
         if not self.base_frame.strip() or not self.arm_base_frame.strip():
             raise ValueError("base and arm-base frames must be non-empty")
-        if not math.isfinite(self.transform_timeout_s) or self.transform_timeout_s <= 0.0:
-            raise ValueError("transform timeout must be finite and positive")
+        if (
+            not math.isfinite(self.geometry_staleness_timeout_s)
+            or self.geometry_staleness_timeout_s <= 0.0
+        ):
+            raise ValueError("geometry staleness timeout must be finite and positive")
+        # ORDERING INVARIANT, same shape as the tracking-loss-grace check above.
+        # ``transform_age_s`` IS ``target_age_s`` whenever the geometry exists
+        # (both are written from one camera callback), so a geometry budget
+        # BELOW the target budget can only ever fire early: it turns a single
+        # dropped camera frame into a hard base zero wearing a TF error
+        # message.  The geometry can never be fresher than the observation it
+        # was derived from, so its budget can never legitimately be tighter.
+        if self.geometry_staleness_timeout_s < self.target_timeout_s:
+            raise ValueError(
+                "geometry staleness timeout must be at least the target timeout",
+            )
         if not math.isfinite(self.handoff_depth_m) or self.handoff_depth_m <= 0.0:
             raise ValueError("handoff depth must be finite and positive")
         if not math.isfinite(self.side_lateral_offset_m) or self.side_lateral_offset_m <= 0.0:
@@ -196,23 +289,22 @@ class DepthServoOutput:
     needs_ik_probe: bool = False
 
 
-HANDOFF_TERMINAL_PHASES = frozenset({"reached", "handoff_probe", "handoff_ready"})
+# ``HANDOFF_TERMINAL_PHASES`` and ``LOSS_STAIR_PHASES`` are imported from
+# ``z_manip.control.servo_phase``: they used to be hand-written here and
+# hand-written AGAIN in go2w_reactive_supervision.py and inline in the
+# whole-body branch below, with memberships that silently disagreed.
+# LOSS_STAIR_PHASES: phases in which the servo has lost or frozen its live
+# track.  A tracked-bundle arrival that immediately follows one of these is a
+# loss-phase exit: the inter-arrival interval spans the loss dwell and must not
+# feed the view-update damping EMA (a multi-second stall would otherwise poison
+# the arm-view period).
 
 
-# Phases in which the servo has lost or frozen its live track.  A tracked-bundle
-# arrival that immediately follows one of these is a loss-phase exit: the
-# inter-arrival interval spans the loss dwell and must not feed the view-update
-# damping EMA (a multi-second stall would otherwise poison the arm-view period).
-LOSS_STAIR_PHASES = frozenset({
-    "waiting_target",
-    "transform_unavailable",
-    "tracking_lost",
-    "reacquiring",
-    "posture_blocked",
-    "tracking_hold",
-    "view_recovery",
-    "search_required",
-})
+# ``reactive_phase`` sentinel for rows the whole-body branch owns.  It is
+# deliberately NOT a ``ServoPhase``: it never reaches the top-level ``phase``
+# field, and it exists so a consumer can tell "the reactive controller chose
+# this" from "the QP chose this".
+WHOLE_BODY_REACTIVE_PHASE = "whole_body"
 
 
 # The tracked-target bundle cadence is the measured FFS rate (~7.5-8.1 Hz, i.e.
@@ -221,6 +313,64 @@ LOSS_STAIR_PHASES = frozenset({
 # reacquisition, or jitter and are ignored so the damper tracks the true rate.
 VIEW_UPDATE_PERIOD_MIN_INTERVAL_S = 0.10
 VIEW_UPDATE_PERIOD_MAX_INTERVAL_S = 0.20
+
+
+# --- /track_3d/is_tracking freshness -----------------------------------------
+#
+# WHY THIS SUBSCRIPTION IS LATCHED AND WHY THE FLAG MUST STILL EXPIRE.
+#
+# The publisher (ros2/z_manip_edgetam/.../node.py, ``tracking_state_qos``)
+# offers RELIABLE + TRANSIENT_LOCAL, and the VLM bridge subscribes latched to
+# match.  This servo shared one VOLATILE profile with every other topic, so a
+# freshly started servo received NO sample at all until EdgeTAM published its
+# next observation.  In that window ``self.tracking`` is None, ``fresh_tracking``
+# is False, and ReactiveTargetController._lost() sees its own ``_last_geometry``
+# still None and returns SEARCH_REQUIRED with ZERO grace -- while DepthServoCore
+# is holding a perfectly good geometry the decision cannot see.  In the recorded
+# corpus (461 trace rows, artifacts/go2w_real/latest/depth-servo.trace.jsonl{,.1})
+# EVERY row at ``bundle_count == 1`` is ``phase=search_required`` with
+# ``tracking=null``: 12 of 12.
+#
+# WHAT LATCHING COSTS, STATED HONESTLY.  ``std_msgs/Bool`` is unstamped, so a
+# ``True`` handed over from the durability cache is byte-identical to one
+# published this instant and NOTHING IN THIS PROCESS CAN DATE IT.  In
+# particular the receipt-time TTL below cannot: a historical sample is
+# delivered to a late-joining reader at MATCH time, so its receipt age is ~0 by
+# construction.  Do not read ``_aged_tracking_flag`` as the defence against a
+# stale latched True; it is not, and an earlier draft of this comment claimed
+# it was.
+#
+# What actually bounds the exposure is that the SELECTED-TARGET CLOUD is NOT
+# latched.  ``fresh_tracking`` requires a target received within
+# ``target_timeout_s``, and EdgeTAM publishes the flag from inside
+# ``_publish_observation``, in the same call as the cloud.  So a retained True
+# can only ever pair with a genuinely fresh target, and the widest window it
+# spans is the sub-frame gap between the two publishes of one bundle.
+#
+# The TTL is still here and still worth its keep, for the case it CAN see: a
+# live publisher that goes quiet after we matched.  It is fail-closed by
+# construction (it turns True into None, never None or False into True) and
+# floored at ``target_timeout_s`` so it can never become a new, tighter stop on
+# a decision the target timer already governs.
+TRACKING_FLAG_STALE_PERIODS = 3.0
+# Fallback ruler before ``view_update_period_s`` has two in-band arrivals to
+# measure: the shipped FFS bundle cadence (~7.5 Hz).
+TRACKING_FLAG_NOMINAL_PERIOD_S = 0.133
+
+
+# Per-lookup ceiling for the tf2 FALLBACK path in the PointCloud2 callback.
+#
+# ``_target_transforms`` performs TWO sequential blocking ``lookup_transform``
+# calls, each with ``Duration(seconds=...)``, on the node's SINGLE-THREADED
+# executor -- the same thread that runs the 20 Hz control tick.  Sizing that
+# blocking wait from ``geometry_staleness_timeout_s`` coupled two unrelated
+# things: widening the staleness budget from 0.25 to 0.40 would have raised
+# worst-case in-callback blocking from 0.50 s to 0.80 s, i.e. sixteen missed
+# ticks, as a side effect of relaxing a freshness comparison.  Capping here
+# holds today's worst case at exactly 0.50 s while decoupling the two.  A
+# failed lookup is fail-closed (transform_error -> geometry None -> zero), so
+# the cap can only ever stop the robot sooner, never later.
+TF_LOOKUP_TIMEOUT_S = 0.25
 
 
 # Trace cadence floors.  A non-terminal (actively approaching/recovering) servo
@@ -260,6 +410,96 @@ def _latch_handoff_output(
         published_linear_x=0.0,
         published_angular_z=0.0,
     )
+
+
+def _handoff_latch_output(
+    latched: DepthServoOutput | None,
+    *,
+    latched_since_s: float | None,
+    now_s: float,
+    timeout_s: float = HANDOFF_LATCH_TIMEOUT_S,
+) -> DepthServoOutput | None:
+    """The explicit reset edge for the one-way handoff latch.
+
+    ``_latch_handoff_output`` is set by a single tick.  It had NO reset and NO
+    expiry, so a servo whose supervisor never stopped it republished the same
+    latched status at 20 Hz indefinitely, with ``needs_ik_probe`` still true --
+    an advancing heartbeat and a permanent request for a transaction nobody
+    was going to open.
+
+    The edge is deliberately ONE-WAY-TO-STOP.  Data-driven un-latching (say,
+    tracking recovering after a dropout) was rejected: the wrist camera is
+    routinely occluded by the arm during a close-range handoff, so that rule
+    would let the base drive again mid-grasp.  Expiry therefore produces
+    ``handoff_abandoned``: still exactly (0, 0), but with ``needs_ik_probe``
+    and ``reactive_phase`` CLEARED so ``_runtime_requests_handoff`` no longer
+    reads it as a request to open a grasp transaction, and with a phase whose
+    table row carries ``deadline_s = 0.0`` and ``on_expiry =
+    stop_and_degrade`` so the supervisor terminates it on first sight.
+    """
+
+    if latched is None:
+        return None
+    if latched.phase == ServoPhase.HANDOFF_ABANDONED.value:
+        return latched
+    if (
+        latched_since_s is None
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0.0
+        or not math.isfinite(now_s)
+    ):
+        return latched
+    held_s = now_s - latched_since_s
+    if held_s < timeout_s:
+        return latched
+    return replace(
+        latched,
+        phase=ServoPhase.HANDOFF_ABANDONED.value,
+        proposed_linear_x=0.0,
+        proposed_angular_z=0.0,
+        published_linear_x=0.0,
+        published_angular_z=0.0,
+        done=True,
+        needs_ik_probe=False,
+        reactive_phase=None,
+        reason=(
+            f"close-range handoff latched for {held_s:.1f}s without the "
+            f"supervisor stopping this servo (bound {timeout_s:.1f}s); the "
+            "base stays at zero and the supervisor must terminate or degrade"
+        ),
+    )
+
+
+def _abandoned_reactive_status(
+    reactive: dict[str, Any] | None,
+    *,
+    phase: str,
+) -> dict[str, Any] | None:
+    """Strip the handoff REQUEST out of the reactive block once abandoned.
+
+    ``_handoff_latch_output`` clears ``needs_ik_probe``/``reactive_phase`` on
+    the OUTPUT, but the status document's ``reactive`` block is rendered from
+    ``DepthServoCore.reactive_status``, and during the latch ``_tick`` returns
+    before ``core.tick`` runs -- so the core's last decision stays frozen with
+    ``needs_ik_probe: True`` and ``phase: handoff_probe``.
+
+    ``DepthServoRunner._runtime_requests_handoff`` reads that block as a
+    fallback, so an abandoned latch still answered "yes, open a close-range
+    grasp transaction".  That was safe only because ``_supervise`` happens to
+    evaluate ``supervision.timed_out`` before the handoff check -- a
+    live-motion guarantee resting on statement order in a different file.
+    Clear it at the source instead, so the answer does not depend on who asks
+    first.
+    """
+
+    if reactive is None or phase != ServoPhase.HANDOFF_ABANDONED.value:
+        return reactive
+    return {
+        **reactive,
+        "phase": ServoPhase.HANDOFF_ABANDONED.value,
+        "needs_ik_probe": False,
+        "handoff_ready": False,
+    }
 
 
 def _whole_body_posture_rate_converged(
@@ -536,10 +776,12 @@ def _posture_feedback_state(
         and capabilities.get("euler_state") == "SUPPORTED_OBSERVED"
     )
     euler_unavailable = _euler_body_unavailable(document)
+    # PosturePhase, NOT ServoPhase.  "stopping" has no PosturePhase member;
+    # it is a defensive spelling for an adapter mid-teardown.
     blocked = stop_latched or phase in {
-        "blocked",
-        "fault",
-        "stopped",
+        PosturePhase.BLOCKED.value,
+        PosturePhase.FAULT.value,
+        PosturePhase.STOPPED.value,
         "stopping",
     }
     feedback = document.get("feedback")
@@ -555,7 +797,10 @@ def _posture_feedback_state(
         )
     settled = (
         mode == "live"
-        and phase == "reached"
+        # PosturePhase, NOT ServoPhase: the posture adapter has its own
+        # vocabulary that happens to reuse the string "reached".  Naming the
+        # enum keeps the two namespaces from being confused again.
+        and phase == PosturePhase.REACHED.value
         and feedback_fresh
         and not stop_latched
         and euler_supported
@@ -896,10 +1141,17 @@ class DepthServoCore:
             if self._transforms_received_s is None
             else max(0.0, now_s - self._transforms_received_s)
         )
+        # The ``self._geometry is not None`` term is the load-bearing one and
+        # must stay: live 2026-07-24, raw_y swept +/-0.67 m sinusoidally while
+        # the source stamp froze and the arm chased its own motion.  The AGE
+        # term is a duplicate of ``target_timeout_s`` (the two receipt stamps
+        # are written from one callback), which is why the settings validator
+        # now forbids it from being the tighter of the two: it may confirm the
+        # target-freshness verdict, never pre-empt it.
         transform_fresh = (
             self._geometry is not None
             and transform_age_s is not None
-            and transform_age_s <= self.settings.transform_timeout_s
+            and transform_age_s <= self.settings.geometry_staleness_timeout_s
         )
         # A transform is synchronized to a target observation.  Once the
         # tracker stops publishing targets, both timestamps necessarily age
@@ -922,7 +1174,7 @@ class DepthServoCore:
                 geometry=None,
                 reason=reason,
             )
-            output = self._zero("transform_unavailable", age_s)
+            output = self._zero(ServoPhase.TRANSFORM_UNAVAILABLE.value, age_s)
             return DepthServoOutput(
                 **{
                     **asdict(output),
@@ -933,7 +1185,7 @@ class DepthServoCore:
         if posture_blocked and self._last_decision is not None and (
             self._last_decision.phase is ReactivePhase.POSTURE_ADJUST
         ):
-            output = self._zero("posture_blocked", age_s)
+            output = self._zero(ServoPhase.POSTURE_BLOCKED.value, age_s)
             return DepthServoOutput(
                 **{
                     **asdict(output),
@@ -954,24 +1206,36 @@ class DepthServoCore:
             body_posture_actionable=body_posture_actionable,
         )
         self._last_decision = decision
-        if (
-            not fresh_tracking
-            and decision.phase is ReactivePhase.SEARCH_REQUIRED
-        ):
-            # A terminal loss ends the side-approach session.  A subsequent
+        if not fresh_tracking and decision.phase in {
+            ReactivePhase.SEARCH_REQUIRED,
+            # ACQUIRING is included deliberately, and it is not cosmetic.
+            # ``_side_sign`` lives on the CORE and is set by observations,
+            # while ``ReactiveTargetController._last_geometry`` is only set on
+            # a tick with fresh tracking AND fresh transforms.  So a core can
+            # hold a latched approach side while the controller has never seen
+            # a geometry -- and before ACQUIRING existed, that exact state
+            # answered SEARCH_REQUIRED and cleared the latch.  Splitting the
+            # phase without splitting this condition would have carried a
+            # previous session's approach side into a target the controller
+            # has not even received yet.  Pinned by
+            # ``test_side_choice_is_latched_until_terminal_tracking_loss``.
+            ReactivePhase.ACQUIRING,
+        }:
+            # A terminal loss -- or an acquisition that has produced no
+            # geometry at all -- ends the side-approach session.  A subsequent
             # reacquisition must choose its side from the new target geometry.
             self._side_sign = None
         phase = decision.phase.value
         if decision.phase is ReactivePhase.HANDOFF_READY:
             self._done = True
-            phase = "reached"
+            phase = ServoPhase.REACHED.value
         elif decision.phase is ReactivePhase.BASE_APPROACH:
-            phase = "approach"
+            phase = ServoPhase.APPROACH.value
         elif (
             posture_shadow_verified
             and decision.phase is ReactivePhase.POSTURE_ADJUST
         ):
-            phase = "posture_shadow_verified"
+            phase = ServoPhase.POSTURE_SHADOW_VERIFIED.value
         linear_x = decision.base.linear_x_mps
         angular_z = decision.base.angular_z_rps
         live = self.settings.mode == "live"
@@ -1015,9 +1279,9 @@ class DepthServoCore:
     ) -> DepthServoOutput:
         now = float(now_s)
         if self._done:
-            return self._zero("reached", 0.0)
+            return self._zero(ServoPhase.REACHED.value, 0.0)
         if self._target is None or self._target_received_s is None:
-            return self._zero("waiting_target", None)
+            return self._zero(ServoPhase.WAITING_TARGET.value, None)
         age_s = max(0.0, now - self._target_received_s)
         if not self.settings.allow_legacy_optical_depth_for_tests:
             return self._reactive_tick(
@@ -1032,9 +1296,9 @@ class DepthServoCore:
             )
         if tracking is not True or age_s > self.settings.target_timeout_s:
             phase = (
-                "reacquiring"
+                ServoPhase.REACQUIRE.value
                 if age_s <= self.settings.tracking_loss_grace_s
-                else "tracking_lost"
+                else ServoPhase.TRACKING_LOST.value
             )
             return self._zero(phase, age_s)
         x_m, y_m, z_m = self._target
@@ -1051,7 +1315,7 @@ class DepthServoCore:
         ):
             self._done = True
             return DepthServoOutput(
-                phase="reached",
+                phase=ServoPhase.REACHED.value,
                 proposed_linear_x=0.0,
                 proposed_angular_z=0.0,
                 published_linear_x=0.0,
@@ -1074,12 +1338,12 @@ class DepthServoCore:
             linear_x = max(linear_x, self.settings.min_forward_mps)
         elif z_m <= self.settings.handoff_depth_m:
             linear_x = 0.0
-        phase = "approach"
+        phase = ServoPhase.APPROACH.value
         if command.converged:
             self._done = True
-            phase = "reached"
+            phase = ServoPhase.REACHED.value
         elif linear_x == 0.0 and command.angular_z == 0.0:
-            phase = "settling"
+            phase = ServoPhase.SETTLING.value
         live = self.settings.mode == "live"
         return DepthServoOutput(
             phase=phase,
@@ -1095,13 +1359,39 @@ class DepthServoCore:
 
 
 def _atomic_json(path: Path, document: dict[str, Any]) -> None:
+    """Publish ``document`` at ``path`` through a genuinely unique temp file.
+
+    The old scratch name was ``.{name}.{os.getpid()}.tmp``.  The servo is
+    ALWAYS pid 1 inside its container, so that expression is the compile-time
+    constant ``.depth-servo.json.1.tmp`` -- and pid namespaces do not make the
+    HOST directory unique.  The status directory is bind-mounted read-write
+    into every runtime container, so a second servo/replay container (also pid
+    1) writes the identical scratch path: one process truncates the other's
+    half-written file and ``os.replace`` then publishes a torn document that
+    every reader parses with ``json.JSONDecodeError -> {}``, i.e. as "the servo
+    is not running".  ``uuid4`` is per-write and namespace-independent.
+
+    ``write_text`` (not ``tempfile.mkstemp``) is kept deliberately: mkstemp
+    forces 0600 and the status file is read by other uids on this deployment.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except BaseException:
+        # A unique name no longer self-cleans by being overwritten next tick,
+        # so a failed write must remove its own scratch file or a 20 Hz servo
+        # papers the status directory with orphans.
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _append_jsonl(path: Path, document: dict[str, Any]) -> None:
@@ -1145,6 +1435,64 @@ def _view_period_update(
     return 0.7 * previous_period_s + 0.3 * interval_s
 
 
+def _tracking_flag_ttl_s(
+    *,
+    view_update_period_s: float | None,
+    target_timeout_s: float,
+) -> float:
+    """Return how long a received ``/track_3d/is_tracking`` sample stays valid.
+
+    EdgeTAM publishes the flag from ``_publish_observation``, in the SAME call
+    that publishes the selected-target cloud, so the flag cadence IS the bundle
+    cadence and ``view_update_period_s`` (the measured, band-clamped EMA of
+    that cadence) is the right ruler.  Three periods is one lost sample plus
+    two of jitter; at the shipped ~0.133 s cadence that is ~0.40 s.
+
+    Floored at ``target_timeout_s`` on purpose.  This TTL exists to notice a
+    publisher that went QUIET after we matched -- not to police steady-state
+    jitter, and (see ``_aged_tracking_flag``) not to date a latched historical
+    sample, which it structurally cannot do.  Letting it drop below the
+    target-freshness budget that already governs the very same decision would
+    manufacture new stops without catching anything the target timer does not
+    already catch.
+    """
+
+    period_s = view_update_period_s
+    if period_s is None or not math.isfinite(period_s) or period_s <= 0.0:
+        period_s = TRACKING_FLAG_NOMINAL_PERIOD_S
+    return max(float(target_timeout_s), TRACKING_FLAG_STALE_PERIODS * period_s)
+
+
+def _aged_tracking_flag(
+    flag: bool | None,
+    *,
+    age_s: float | None,
+    ttl_s: float,
+) -> bool | None:
+    """Degrade a tracking flag we have not heard refreshed to UNKNOWN.
+
+    SCOPE, PRECISELY.  ``std_msgs/Bool`` has no header, so receipt time is the
+    only clock available -- and receipt time is NOT the sample's age.  A
+    TRANSIENT_LOCAL historical sample is delivered at match time, so this
+    function CANNOT catch a ``True`` retained from a session that ended before
+    the process started.  See the module comment above
+    ``TRACKING_FLAG_STALE_PERIODS`` for what does bound that (the un-latched
+    target cloud).  What this DOES catch is a publisher that went quiet after
+    we matched: the flag stops being refreshed, receipt age grows, and the gate
+    stops believing it.
+
+    UNKNOWN, not ``False``: every consumer already spells the positive test
+    (``tracking is True``), so ``None`` and ``False`` are equivalent at the
+    gates while ``None`` is the honest report in the status document.
+    """
+
+    if flag is None:
+        return None
+    if age_s is None or not math.isfinite(age_s) or age_s > ttl_s:
+        return None
+    return bool(flag)
+
+
 def _trace_min_interval_s(*, terminal: bool) -> float:
     """Trace-row cadence floor: 1 Hz when parked, 5 Hz during live motion."""
 
@@ -1162,13 +1510,27 @@ def _trace_row(
     ``view_update_period_s`` (the live FFS-rate damping period) and the
     monotonic ``bundle_count`` are promoted to first-class fields so a trace can
     be read for cadence health without cross-referencing the status file.
+
+    ``runtime_fingerprint``/``runtime_fingerprint_mutated`` are on EVERY ROW, not
+    just in the status file, because the status file holds one instant and the
+    trace is what anybody analysing a hang actually reads.  A trace whose rows
+    change fingerprint part-way through is a trace of two different programs,
+    and nothing else in the row says so -- the recorded evidence for this stage
+    is a session whose ``_tick`` frame moved through five line numbers while its
+    trace looked continuous.  The short form is used: 12 hex characters on a
+    ~1-2 KiB row against a 2 MB rotation cap, and it is the width
+    ``go2w_component_manager.sh`` already prints.
     """
 
+    fingerprint = document.get("runtime_fingerprint")
+    fingerprint_block = fingerprint if isinstance(fingerprint, dict) else {}
     return {
         "schema": "z_manip.depth_servo_trace.v1",
         "updated_unix_ns": document["updated_unix_ns"],
         "mode": document["mode"],
         "phase": document["phase"],
+        "runtime_fingerprint": fingerprint_block.get("live_short"),
+        "runtime_fingerprint_mutated": fingerprint_block.get("mutated"),
         "tracking": document["tracking"],
         "target": document["target"],
         "source_stamp_ns": document["source_stamp_ns"],
@@ -1193,7 +1555,96 @@ def _tick_should_skip(*, stop_requested: bool, ros_ok: bool) -> bool:
     return stop_requested or not ros_ok
 
 
-def _arguments() -> argparse.Namespace:
+def _publish_suppressed(
+    *,
+    stop_requested: bool,
+    ros_ok: bool,
+    final_stop: bool,
+) -> bool:
+    """Whether a publish attempt must be dropped on the floor.
+
+    THIS IS THE STOP MUTE, AND IT USED TO BE AN ACCIDENT.  Until this function
+    existed, ``_tick_should_skip`` at the TOP of ``_tick`` was the only thing
+    standing between SIGTERM and a full-speed base command, and it does not
+    stand there for a tick that has ALREADY STARTED.  Python delivers a signal
+    on the main thread at a bytecode boundary, and ``_tick`` runs on the main
+    thread under the executor; so a SIGTERM arriving after ``_tick`` passed its
+    skip check let the tick run to completion and publish
+    ``last_output.published_linear_x`` -- up to the 0.18 m/s ceiling -- plus a
+    posture intent and an arm-view intent, all AFTER the operator asked the
+    robot to stop.  The window is not the 50 ms poll interval: it is whatever
+    is left of the tick, including the whole-body solve and the status write.
+
+    That hazard did not exist before R8 -- by accident.  The old signal handler
+    called ``rclpy.shutdown()`` inline, which flipped ``rclpy.ok()`` false, and
+    every publish site gates on ``rclpy.ok()``; the handler therefore muted the
+    whole node through the back door.  R8 correctly reduced the handler to two
+    flag sets, and silently took the mute with it, because the publish sites
+    named only ``rclpy.ok()`` and never named the stop latch.  The mute has to
+    be SPELLED OUT to survive a change to the shutdown path.
+
+    ``final_stop`` is the deliberate escape hatch and the reason a blanket
+    ``stop_event`` gate would have been the worse bug: ``stop()`` runs after
+    the latch is set, and its three zero Twists are the entire point of the
+    teardown.  Only the terminal stop may pass; a tick may not.  ``ros_ok`` is
+    checked FIRST so even ``final_stop`` cannot publish into a dead context.
+    """
+
+    if not ros_ok:
+        return True
+    if final_stop:
+        return False
+    return stop_requested
+
+
+def _shutdown_phase(*, stop_requested: bool) -> str:
+    """Terminal phase to publish once the spin loop has returned.
+
+    Split out of the shutdown block so the STOPPED/EXITED distinction -- the
+    difference between "an operator or the supervisor asked us to stop" and
+    "the executor fell out from under us" -- is testable without rclpy.
+    """
+
+    return (
+        ServoPhase.STOPPED.value if stop_requested else ServoPhase.EXITED.value
+    )
+
+
+#: How long the spin loop may block before re-checking the stop flag.
+#:
+#: The SIGTERM handler is not allowed to touch the ROS context (see the
+#: shutdown block), so it cannot wake a blocking wait; and installing a Python
+#: handler over SIGINT/SIGTERM displaces the C-level handler rclpy.init()
+#: registered to trigger every wait set's guard condition.  A bounded wait is
+#: what turns "the handler sets a flag" into "the loop notices".  One 20 Hz
+#: tick period: the final zero-Twist is delayed by at most this much, ~9 mm of
+#: travel at the 0.18 m/s ceiling, and the transport keeps its own watchdog.
+SHUTDOWN_POLL_INTERVAL_S = 0.05
+
+
+#: Every ``DepthServoSettings`` field that participates in the target
+#: freshness / tracking-loss stair, mapped to the CLI flag that sets it.
+#:
+#: The launcher pins every servo knob explicitly, which means a default this
+#: table does NOT name is a value no operator can see or change -- and the
+#: settings-vs-launcher test can only assert on flags the launcher already
+#: passes.  That is exactly how ``--transform-timeout-s`` shipped unpinned at
+#: 0.25 under a 0.40 target timeout: commit c208a6d's launcher test covered
+#: hold/grace/target-timeout because those three appeared in the launcher, and
+#: was structurally incapable of noticing the fourth.  tests/ walks THIS table
+#: and every duration field of the dataclass, so a new stair knob fails the
+#: suite until it is either pinned or explicitly classified as not-stair.
+STAIR_SETTING_FLAGS: dict[str, str] = {
+    "target_timeout_s": "--target-timeout-s",
+    "max_target_capture_age_s": "--max-target-capture-age-s",
+    "tracking_hold_s": "--tracking-hold-s",
+    "tracking_loss_grace_s": "--tracking-loss-grace-s",
+    "geometry_staleness_timeout_s": "--geometry-staleness-timeout-s",
+    "handoff_settle_s": "--handoff-settle-s",
+}
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("shadow", "live"), default="shadow")
     parser.add_argument("--status-file", type=Path, required=True)
@@ -1218,24 +1669,67 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--yaw-deadband-deg", type=float, default=10.0)
     parser.add_argument("--max-yaw-step-rps", type=float, default=0.015)
     parser.add_argument("--target-timeout-s", type=float, default=0.40)
+    parser.add_argument("--max-target-capture-age-s", type=float, default=0.70)
     parser.add_argument("--tracking-hold-s", type=float, default=0.80)
     parser.add_argument("--tracking-loss-grace-s", type=float, default=2.75)
     parser.add_argument("--handoff-settle-s", type=float, default=0.30)
-    parser.add_argument("--transform-timeout-s", type=float, default=0.25)
+    # RENAMED from ``--transform-timeout-s``.  That spelling sat one word away
+    # from ``--runtime-transform-timeout-s`` above while meaning something
+    # entirely different (derived-geometry staleness, not runtime-observer
+    # document age), and the launcher passed only the latter -- so an operator
+    # reading go2w_depth_servo.sh saw "0.50" and had no way to know a second,
+    # tighter, invisible 0.25 s budget was also gating the base.
+    parser.add_argument("--geometry-staleness-timeout-s", type=float, default=0.40)
     parser.add_argument("--rate-hz", type=float, default=20.0)
     parser.add_argument("--whole-body", choices=("off", "casadi"), default="casadi")
     parser.add_argument("--whole-body-urdf", type=Path)
     parser.add_argument("--whole-body-calibration", type=Path)
     parser.add_argument("--whole-body-collision-model", type=Path)
-    return parser.parse_args()
+    return parser
+
+
+def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    return _parser().parse_args(argv)
+
+
+def _settings_from_args(args: argparse.Namespace) -> DepthServoSettings:
+    """Build the settings exactly as the deployed runtime does.
+
+    Extracted out of ``_run_ros`` so the argparse-to-settings mapping -- the
+    only place a launcher flag becomes a control budget -- can be exercised
+    without rclpy, pinocchio, or casadi on the test host.  Inlined, the
+    ``--geometry-staleness-timeout-s``/``--runtime-transform-timeout-s``
+    confusion lived behind an import no test could perform.
+    """
+
+    return DepthServoSettings(
+        mode=args.mode,
+        desired_depth_m=args.desired_depth_m,
+        handoff_depth_m=args.handoff_depth_m,
+        handoff_bearing_rad=math.radians(args.handoff_bearing_deg),
+        min_forward_mps=args.min_forward_mps,
+        max_forward_mps=args.max_forward_mps,
+        max_yaw_rps=args.max_yaw_rps,
+        yaw_deadband_rad=math.radians(args.yaw_deadband_deg),
+        max_yaw_step_rps=args.max_yaw_step_rps,
+        target_timeout_s=args.target_timeout_s,
+        max_target_capture_age_s=args.max_target_capture_age_s,
+        tracking_hold_s=args.tracking_hold_s,
+        tracking_loss_grace_s=args.tracking_loss_grace_s,
+        handoff_settle_s=args.handoff_settle_s,
+        base_frame=args.base_frame,
+        arm_base_frame=args.arm_base_frame,
+        geometry_staleness_timeout_s=args.geometry_staleness_timeout_s,
+    )
 
 
 def _run_ros(args: argparse.Namespace) -> int:
     import rclpy
     from geometry_msgs.msg import TwistStamped
     from rclpy.duration import Duration
+    from rclpy.executors import SingleThreadedExecutor
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from rclpy.time import Time
     from sensor_msgs.msg import PointCloud2
     from sensor_msgs_py import point_cloud2
@@ -1249,24 +1743,7 @@ def _run_ros(args: argparse.Namespace) -> int:
         or args.runtime_transform_timeout_s <= 0.0
     ):
         raise ValueError("runtime transform timeout must be finite and positive")
-    settings = DepthServoSettings(
-        mode=args.mode,
-        desired_depth_m=args.desired_depth_m,
-        handoff_depth_m=args.handoff_depth_m,
-        handoff_bearing_rad=math.radians(args.handoff_bearing_deg),
-        min_forward_mps=args.min_forward_mps,
-        max_forward_mps=args.max_forward_mps,
-        max_yaw_rps=args.max_yaw_rps,
-        yaw_deadband_rad=math.radians(args.yaw_deadband_deg),
-        max_yaw_step_rps=args.max_yaw_step_rps,
-        target_timeout_s=args.target_timeout_s,
-        tracking_hold_s=args.tracking_hold_s,
-        tracking_loss_grace_s=args.tracking_loss_grace_s,
-        handoff_settle_s=args.handoff_settle_s,
-        base_frame=args.base_frame,
-        arm_base_frame=args.arm_base_frame,
-        transform_timeout_s=args.transform_timeout_s,
-    )
+    settings = _settings_from_args(args)
 
     class DepthServoNode(Node):
         def __init__(self) -> None:
@@ -1275,7 +1752,12 @@ def _run_ros(args: argparse.Namespace) -> int:
             # rclpy.ok()) at its top so no publish races a context teardown.
             self.stop_event = threading.Event()
             self.core = DepthServoCore(settings)
-            self.tracking: bool | None = None
+            # RAW last-received flag.  Nothing may read this directly: every
+            # gate must go through ``self.tracking`` (the aged view), or a
+            # latched historical TRANSIENT_LOCAL sample becomes an eternal
+            # "yes, we are tracking".  See TRACKING_FLAG_STALE_PERIODS.
+            self.tracking_raw: bool | None = None
+            self.tracking_received_s: float | None = None
             self.last_source_stamp_ns: int | None = None
             self.last_source_frame: str | None = None
             # Live measurement of the tracked-target bundle period, used by the
@@ -1312,6 +1794,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.whole_body_handoff_settle_cycles = 0
             self.last_conditioned_yaw_rps = 0.0
             self.handoff_latched_output: DepthServoOutput | None = None
+            self.handoff_latched_since_s: float | None = None
             if args.whole_body == "casadi":
                 if (
                     args.whole_body_urdf is None
@@ -1335,7 +1818,28 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_output = self.core.tick(now_s=time.monotonic(), tracking=False)
             self.last_trace_phase: str | None = None
             self.last_trace_s = 0.0
+            # The launcher measures the tree immediately before ``docker run``
+            # and exports it.  Taking the LAUNCHER'S value rather than hashing
+            # here is the whole point: by the time this process reaches its
+            # first tick the tree may already have moved, and a self-measured
+            # "launch" fingerprint would silently adopt the mutation as its own
+            # baseline and then report a clean match forever.
+            self.fingerprint_watch = RuntimeFingerprintWatch(
+                launch=(os.environ.get(RUNTIME_FINGERPRINT_ENV) or None),
+            )
             qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+            # MUST match the EdgeTAM publisher's ``tracking_state_qos``
+            # (ros2/z_manip_edgetam/z_manip_edgetam/node.py).  A VOLATILE
+            # reader against a TRANSIENT_LOCAL writer still connects -- QoS
+            # durability is request<=offered -- it just silently forfeits the
+            # latched sample, which is the one a freshly started servo needs.
+            # The VLM bridge already subscribes latched; this servo was the
+            # only reader of this topic that did not.
+            tracking_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
             self.publisher = self.create_publisher(TwistStamped, args.velocity_topic, 1)
@@ -1350,7 +1854,12 @@ def _run_ros(args: argparse.Namespace) -> int:
                 qos,
             )
             self.create_subscription(PointCloud2, args.target_topic, self._target, qos)
-            self.create_subscription(Bool, args.tracking_topic, self._tracking, qos)
+            self.create_subscription(
+                Bool,
+                args.tracking_topic,
+                self._tracking,
+                tracking_qos,
+            )
             self.create_subscription(
                 String,
                 "/go2w/posture_state",
@@ -1370,7 +1879,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 qos,
             )
             self.create_timer(1.0 / args.rate_hz, self._tick)
-            self._write_status("starting")
+            self._write_status(ServoPhase.STARTING.value)
 
         @staticmethod
         def _matrix(transform_stamped: Any) -> np.ndarray:
@@ -1430,7 +1939,16 @@ def _run_ros(args: argparse.Namespace) -> int:
                     self.last_transform_error = None
                     return base_matrix, arm_matrix
             query_time = Time.from_msg(source_stamp)
-            timeout = Duration(seconds=settings.transform_timeout_s)
+            # Sized by TF_LOOKUP_TIMEOUT_S, NOT by the geometry staleness
+            # budget: this is a blocking wait taken TWICE on the single
+            # -threaded executor that also runs the control tick, so it must
+            # not grow just because a freshness comparison was relaxed.
+            timeout = Duration(
+                seconds=min(
+                    settings.geometry_staleness_timeout_s,
+                    TF_LOOKUP_TIMEOUT_S,
+                ),
+            )
             try:
                 base = self.tf_buffer.lookup_transform(
                     settings.base_frame,
@@ -1535,7 +2053,35 @@ def _run_ros(args: argparse.Namespace) -> int:
                 self.last_source_stamp_ns = new_source_stamp_ns
 
         def _tracking(self, message: Bool) -> None:
-            self.tracking = bool(message.data)
+            self.tracking_raw = bool(message.data)
+            # ``std_msgs/Bool`` is unstamped, so RECEIPT is the only clock this
+            # flag will ever have.  Recording it is what makes the latched
+            # TRANSIENT_LOCAL subscription above safe rather than fail-open.
+            self.tracking_received_s = time.monotonic()
+
+        @property
+        def tracking(self) -> bool | None:
+            """The tracking flag as of NOW: UNKNOWN once it outlives its TTL.
+
+            Read-only on purpose.  Every consumer (the control tick, the
+            whole-body gate, the published status document) goes through this
+            one accessor so none of them can be left reading the un-aged flag
+            when the next one is added.
+            """
+
+            age_s = (
+                None
+                if self.tracking_received_s is None
+                else max(0.0, time.monotonic() - self.tracking_received_s)
+            )
+            return _aged_tracking_flag(
+                self.tracking_raw,
+                age_s=age_s,
+                ttl_s=_tracking_flag_ttl_s(
+                    view_update_period_s=self.view_update_period_s,
+                    target_timeout_s=settings.target_timeout_s,
+                ),
+            )
 
         def _posture_state(self, message: String) -> None:
             try:
@@ -1739,7 +2285,13 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_arm_view_intent = document
             self.arm_view_intent_seq = max(self.arm_view_intent_seq, sequence + 1)
 
-        def _publish_guarded(self, publisher: Any, message: Any) -> None:
+        def _publish_guarded(
+            self,
+            publisher: Any,
+            message: Any,
+            *,
+            final_stop: bool = False,
+        ) -> None:
             """Publish, tolerating ONLY the rcl-context teardown race.
 
             A stop/restart can tear the rcl context down between the
@@ -1759,9 +2311,19 @@ def _run_ros(args: argparse.Namespace) -> int:
             reacquisition budget on wrist searches.  It presented as "detects
             the target but will not drive to it", i.e. a perception fault, and
             was nothing of the kind.
+
+            IT IS ALSO THE STOP MUTE.  Routing every publisher through one
+            function is only worth anything if that function knows about the
+            stop latch, so the ``rclpy.ok()`` gate is now
+            ``_publish_suppressed(...)`` -- see that function for why the
+            latch has to be named here and not only at the top of ``_tick``.
             """
 
-            if not rclpy.ok():
+            if _publish_suppressed(
+                stop_requested=self.stop_event.is_set(),
+                ros_ok=rclpy.ok(),
+                final_stop=final_stop,
+            ):
                 return
             try:
                 publisher.publish(message)
@@ -1769,15 +2331,27 @@ def _run_ros(args: argparse.Namespace) -> int:
                 if rclpy.ok():
                     raise
 
-        def _publish(self, linear_x: float, angular_z: float) -> None:
-            if not rclpy.ok():
+        def _publish(
+            self,
+            linear_x: float,
+            angular_z: float,
+            *,
+            final_stop: bool = False,
+        ) -> None:
+            # Gate here as well as in _publish_guarded: this builds a message
+            # off ``self.get_clock()``, which is itself an rcl handle.
+            if _publish_suppressed(
+                stop_requested=self.stop_event.is_set(),
+                ros_ok=rclpy.ok(),
+                final_stop=final_stop,
+            ):
                 return
             message = TwistStamped()
             message.header.stamp = self.get_clock().now().to_msg()
             message.header.frame_id = "base_link"
             message.twist.linear.x = float(linear_x)
             message.twist.angular.z = float(angular_z)
-            self._publish_guarded(self.publisher, message)
+            self._publish_guarded(self.publisher, message, final_stop=final_stop)
 
         def _write_status(self, state: str | None = None, *, running: bool = True) -> None:
             target = self.core.target
@@ -1798,7 +2372,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             transform_fresh = (
                 geometry is not None
                 and geometry_age_s is not None
-                and geometry_age_s <= settings.transform_timeout_s
+                and geometry_age_s <= settings.geometry_staleness_timeout_s
             )
             posture_age_s = (
                 None
@@ -1815,11 +2389,36 @@ def _run_ros(args: argparse.Namespace) -> int:
                 if self.ik_probe_status_received_s is None
                 else max(0.0, time.monotonic() - self.ik_probe_status_received_s)
             )
+            published_phase = state or self.last_output.phase
             document = {
                 "schema": STATUS_SCHEMA,
                 "running": running,
                 "mode": settings.mode,
-                "phase": state or self.last_output.phase,
+                "phase": published_phase,
+                # The loss-stair budgets THIS process is actually running
+                # with.  The supervisor derives its ``view_recovery`` deadline
+                # from ``tracking_loss_grace_s`` instead of holding a second,
+                # independently written opinion about the same event: it used
+                # to act on the phase NAME, which the servo enters at
+                # ``tracking_hold_s`` = 0.80 s, so ``--tracking-loss-grace-s
+                # 2.75`` was unreachable dead config on every loss.  Three
+                # floats; the measured document is ~9 KiB median / 11.8 KiB
+                # max against the reader's 64 KiB cap.
+                "limits": {
+                    "target_timeout_s": settings.target_timeout_s,
+                    "tracking_hold_s": settings.tracking_hold_s,
+                    "tracking_loss_grace_s": settings.tracking_loss_grace_s,
+                },
+                # WHICH BYTES IS THIS PROCESS ACTUALLY RUNNING?  The launcher
+                # bind-mounts the working tree read-only and executes out of it,
+                # so the answer changes without a restart.  ``launch`` is the
+                # fingerprint the launcher measured immediately before
+                # ``docker run`` and handed over in the environment; ``live`` is
+                # re-measured here at RUNTIME_FINGERPRINT_RECHECK_S.  The
+                # supervisor turns ``mutated`` into an operator-visible event;
+                # this file just reports it.  ~200 bytes against the reader's
+                # 64 KiB cap on a measured 11.8 KiB max document.
+                "runtime_fingerprint": self.fingerprint_watch.state(),
                 "tracking": self.tracking,
                 "target": None if target is None else {
                     "x_m": target[0],
@@ -1832,7 +2431,10 @@ def _run_ros(args: argparse.Namespace) -> int:
                     if geometry is not None
                     else self.core.camera_geometry
                 ),
-                "reactive": self.core.reactive_status,
+                "reactive": _abandoned_reactive_status(
+                    self.core.reactive_status,
+                    phase=published_phase,
+                ),
                 "transforms": {
                     "valid": transform_fresh,
                     "error": (
@@ -1940,7 +2542,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             if self.whole_body is None:
                 if args.whole_body == "casadi":
                     return DepthServoOutput(
-                        phase="whole_body_blocked",
+                        phase=ServoPhase.WHOLE_BODY_BLOCKED.value,
                         proposed_linear_x=0.0,
                         proposed_angular_z=0.0,
                         published_linear_x=0.0,
@@ -1964,11 +2566,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                 # kept the arm swinging through a 6s wifi stall (live
                 # 2026-07-24: raw_y swept +/-0.67m sinusoidally while the
                 # source stamp froze -- the arm was chasing its own motion).
-                or fallback.phase in {
-                    "transform_unavailable", "tracking_lost", "reacquiring",
-                    "waiting_target", "posture_blocked", "tracking_hold",
-                    "view_recovery", "search_required",
-                }
+                or fallback.phase in LOSS_STAIR_PHASES
                 # Belt and braces: never solve on a target older than the
                 # capture-freshness budget, whatever phase the core reports.
                 or (
@@ -2005,7 +2603,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             except Exception as error:
                 self.whole_body_error = f"whole-body solve failed: {error}"
                 return DepthServoOutput(
-                    phase="whole_body_blocked",
+                    phase=ServoPhase.WHOLE_BODY_BLOCKED.value,
                     proposed_linear_x=0.0,
                     proposed_angular_z=0.0,
                     published_linear_x=0.0,
@@ -2014,7 +2612,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     yaw_error_rad=geometry.base_bearing_rad,
                     target_age_s=fallback.target_age_s,
                     reason=self.whole_body_error,
-                    reactive_phase="whole_body",
+                    reactive_phase=WHOLE_BODY_REACTIVE_PHASE,
                 )
             self.whole_body_command = command
             self.whole_body_error = None
@@ -2049,7 +2647,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     if fallback.done:
                         self.whole_body.reset()
                         return DepthServoOutput(
-                            phase="reached",
+                            phase=ServoPhase.REACHED.value,
                             proposed_linear_x=0.0,
                             proposed_angular_z=0.0,
                             published_linear_x=0.0,
@@ -2065,14 +2663,14 @@ def _run_ros(args: argparse.Namespace) -> int:
                                 "measured Euler and PiPER view loops plus close-range "
                                 "IK handoff converged"
                             ),
-                            reactive_phase="handoff_ready",
+                            reactive_phase=ServoPhase.HANDOFF_READY.value,
                         )
 
                 return DepthServoOutput(
                     phase=(
-                        "whole_body_posture"
+                        ServoPhase.WHOLE_BODY_POSTURE.value
                         if command.executable
-                        else "whole_body_shadow"
+                        else ServoPhase.WHOLE_BODY_SHADOW.value
                     ),
                     proposed_linear_x=0.0,
                     proposed_angular_z=0.0,
@@ -2091,7 +2689,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                         if command.executable
                         else "whole-body posture intent gated by stale measured state"
                     ),
-                    reactive_phase="posture_adjust",
+                    reactive_phase=ServoPhase.POSTURE_ADJUST.value,
                 )
 
             self.whole_body_handoff_settle_cycles = 0
@@ -2129,7 +2727,11 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_conditioned_yaw_rps = yaw
             executable = command.executable
             return DepthServoOutput(
-                phase=("whole_body_approach" if executable else "whole_body_shadow"),
+                phase=(
+                    ServoPhase.WHOLE_BODY_APPROACH.value
+                    if executable
+                    else ServoPhase.WHOLE_BODY_SHADOW.value
+                ),
                 proposed_linear_x=linear,
                 proposed_angular_z=yaw,
                 published_linear_x=linear if executable else 0.0,
@@ -2142,7 +2744,7 @@ def _run_ros(args: argparse.Namespace) -> int:
                     if executable
                     else "Pinocchio/CasADi shadow intent; measured live gates not satisfied"
                 ),
-                reactive_phase="whole_body",
+                reactive_phase=WHOLE_BODY_REACTIVE_PHASE,
             )
 
         def _tick(self) -> None:
@@ -2158,6 +2760,13 @@ def _run_ros(args: argparse.Namespace) -> int:
             # and preserve the terminal status until the 5 Hz supervisor has
             # stopped this launcher and opened the fresh grasp transaction.
             if self.handoff_latched_output is not None:
+                # The latch has an explicit, bounded exit; see
+                # ``_handoff_latch_output``.  The exit is always a stop.
+                self.handoff_latched_output = _handoff_latch_output(
+                    self.handoff_latched_output,
+                    latched_since_s=self.handoff_latched_since_s,
+                    now_s=time.monotonic(),
+                )
                 self.last_output = self.handoff_latched_output
                 if settings.mode == "live":
                     self._publish(0.0, 0.0)
@@ -2185,6 +2794,7 @@ def _run_ros(args: argparse.Namespace) -> int:
             handoff = _latch_handoff_output(None, candidate)
             if handoff is not None:
                 self.handoff_latched_output = handoff
+                self.handoff_latched_since_s = time.monotonic()
                 self.last_output = handoff
                 if settings.mode == "live":
                     self._publish(0.0, 0.0)
@@ -2201,10 +2811,15 @@ def _run_ros(args: argparse.Namespace) -> int:
                 )
             self._write_status()
 
-        def stop(self, phase: str = "stopped") -> None:
+        def stop(self, phase: str = ServoPhase.STOPPED.value) -> None:
             if settings.mode == "live":
                 for _ in range(3):
-                    self._publish(0.0, 0.0)
+                    # ``final_stop`` is what lets these three past the stop
+                    # mute the signal handler just latched.  It is the ONLY
+                    # place in this file that may pass it -- a test asserts
+                    # that -- because everything else publishing after the
+                    # latch is, by definition, a command nobody asked for.
+                    self._publish(0.0, 0.0, final_stop=True)
             self.last_output = DepthServoOutput(
                 phase=phase,
                 proposed_linear_x=0.0,
@@ -2221,30 +2836,64 @@ def _run_ros(args: argparse.Namespace) -> int:
     rclpy.init()
     node = DepthServoNode()
     stopped = threading.Event()
-    stop_published = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
+        """SIGNAL-HANDLER CONTRACT: SET FLAGS.  DO NOTHING ELSE.  EVER.
+
+        This handler used to publish three zero Twists, write the final status
+        document and call ``rclpy.shutdown()`` -- all of it re-entering rcl
+        from a signal delivered while ``rclpy.spin()`` was on the stack and
+        mid-way through its own use of those same objects.  One recorded log
+        carries nine tracebacks from that single teardown: 5x RCLError from
+        publisher.c:423 (publish on a context being destroyed), 2x
+        InvalidHandle, 1x ``AttributeError: 'NoneType' object has no attribute
+        'trigger'`` (a guard condition freed underneath the executor), and 1x
+        FileNotFoundError (the status write racing its own scratch file).
+
+        Commit 6a3f75d wrapped the publishes in guards.  That removed the
+        printed text and left the re-entrancy: the handler was still doing
+        work on rcl objects the spin thread owned.  No try/except can fix
+        that, because the bug is not the exception -- it is the work.  The
+        publishes, the final status write, ``destroy_node`` and ``shutdown``
+        now all happen below, on the main thread, after the loop has returned
+        and nothing is inside rcl.
+
+        THE FLAG SETS ARE LOAD-BEARING, NOT BOOKKEEPING.  Deleting the inline
+        ``rclpy.shutdown()`` also deleted the accidental mute it produced --
+        ``rclpy.ok()`` going false silenced every publisher, including one
+        inside a tick that had already passed its skip check.  ``stop_event``
+        is now read by ``_publish``/``_publish_guarded`` (via
+        ``_publish_suppressed``) as well as by ``_tick``, so the mute is
+        explicit and survives the next change to this block.
+        """
+
         stopped.set()
-        # Latch the node-level stop so any in-flight/queued timer tick no-ops
-        # instead of racing the shutdown below.
+        # Read by ``_tick_should_skip`` so an already-queued timer callback
+        # no-ops instead of publishing into a teardown -- AND by every publish
+        # site, so a tick already past that check cannot still emit a command.
         node.stop_event.set()
-        # Publish the final zero while the ROS context is still valid.  Calling
-        # shutdown first made the finally block raise and could leave the
-        # transport relying only on its watchdog stop.
-        if not stop_published.is_set():
-            node.stop("stopped")
-            stop_published.set()
-        if rclpy.ok():
-            rclpy.shutdown()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        # NOT ``rclpy.spin(node)``: that blocks in an unbounded wait, and the
+        # two ``signal.signal`` calls above have displaced the C-level handler
+        # rclpy.init() installed to break that wait.  A handler that only sets
+        # a flag therefore needs a loop that only waits in bounded steps.
+        while rclpy.ok() and not stopped.is_set():
+            executor.spin_once(timeout_sec=SHUTDOWN_POLL_INTERVAL_S)
     finally:
-        if not stop_published.is_set():
-            node.stop("stopped" if stopped.is_set() else "exited")
-            stop_published.set()
+        # Main thread; the loop has returned; the context is still valid.
+        # ``stop`` publishes with final_stop=True, which is the one thing the
+        # stop mute lets through -- see _publish_suppressed.
+        node.stop(_shutdown_phase(stop_requested=stopped.is_set()))
+        executor.remove_node(node)
+        # Release the executor's own guard condition before the context goes;
+        # remove_node alone leaks it (the "'NoneType' object has no attribute
+        # 'trigger'" family of teardown noise).
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

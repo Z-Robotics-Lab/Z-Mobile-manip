@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +18,15 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from z_manip.control.servo_phase import (  # noqa: E402
+    EAGER_RECOVERY_PHASES,
+    PHASE_POLICY,
+    ExpiryAction,
+    ServoPhase,
+    view_recovery_deadline_s,
+)
+
 SCRIPT = ROOT / "scripts" / "runtime" / "go2w_planning_control.py"
 sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("go2w_planning_control", SCRIPT)
@@ -1535,7 +1545,21 @@ def test_depth_servo_wrist_search_reseed_grasp_geometry_advances_once(tmp_path):
 
 
 def test_depth_servo_view_recovery_stops_base_before_wrist_search(tmp_path):
-    for recovery_phase in ("view_recovery", "search_required"):
+    """The base is stopped before any wrist sweep -- for ``search_required``.
+
+    THE LOOP LOST ``view_recovery``, and that removal is R5, not a slip.  The
+    servo enters ``view_recovery`` at ``tracking_hold_s`` (0.80 s on the
+    shipped launcher) and only steps to ``search_required`` at
+    ``tracking_loss_grace_s`` (2.75 s).  Reacting to the NAME ``view_recovery``
+    therefore killed the servo 0.80 s into every loss and made
+    ``--tracking-loss-grace-s 2.75`` unreachable dead config -- 1.95 s of
+    recovery the operator explicitly configured could never be spent.
+
+    ``test_view_recovery_alone_never_spends_a_reacquisition_attempt`` below is
+    the other half of the same contract and fails on the pre-change file.
+    """
+
+    for recovery_phase in (ServoPhase.SEARCH_REQUIRED.value,):
         phase_dir = tmp_path / recovery_phase
         phase_dir.mkdir()
 
@@ -3680,6 +3704,444 @@ def test_monitor_holds_search_through_the_acquisition_grace_window(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# R3 -- the acquisition grace was spent before the servo existed, and a
+# missing/unreadable status document could never time out.
+# ---------------------------------------------------------------------------
+
+
+def _slow_servo_script(path: Path, *, delay_s: float, phase: str) -> Path:
+    """A launcher that writes NOTHING for ``delay_s``, like the real one.
+
+    ``go2w_depth_servo.sh`` spends ~11.2 s before the servo writes its first
+    byte: base-transport preflight ssh probes -> ``acquire_arm_owner`` ssh ->
+    ``docker rm -f`` -> ``docker run`` -> rclpy/CasADi/URDF init.  Every fake
+    servo elsewhere in this file writes its status in the first ~50 ms, which
+    is precisely why the defect was invisible to the suite.
+    """
+
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        f"time.sleep({delay_s!r})\n"
+        f"phase = {phase!r}\n"
+        "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+        "'schema':'z_manip.depth_servo_status.v1','running':True,'phase':phase,"
+        "'updated_unix_ns':time.time_ns()}))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_acquisition_grace_is_anchored_on_the_servos_first_report_not_on_popen(
+    tmp_path,
+):
+    """R3: the 5 s grace used to be fully spent before the servo existed.
+
+    ``servo_started_s = time.monotonic()`` was stamped immediately after a
+    NON-BLOCKING ``Popen`` of the bash launcher, which spends ~11.2 s before
+    the servo writes its first byte.  So the grace expired while the servo did
+    not yet exist, the guard fell through, and a healthy servo was SIGTERMed
+    ~19 ms after its first status document: recorded 13:36:08.412
+    ``waiting_target`` -> 13:36:08.713 ``search_required`` -> 13:36:08.762
+    ``stopped``, a 0.35 s session killed on its first tick.
+
+    Here the launcher stays silent for 0.9 s and the grace is 0.8 s.  Anchored
+    on ``Popen`` the grace is gone before the first document lands and the
+    sweep starts immediately; anchored on the first NON-"starting" document it
+    still has its whole 0.8 s to run.
+    """
+
+    class Search:
+        def __init__(self):
+            self.calls = 0
+            self.first_call_s = None
+
+        def run(self, target, *, mode, speed_percent, cancel, operator_present=False):
+            self.calls += 1
+            if self.first_call_s is None:
+                self.first_call_s = time.monotonic()
+            return True
+
+        def status(self):
+            return {"phase": "found", "failure": None}
+
+        def stop(self):
+            return None
+
+    search = Search()
+    runner = CONTROL.DepthServoRunner(
+        _slow_servo_script(
+            tmp_path / "servo.py",
+            delay_s=0.9,
+            phase=ServoPhase.SEARCH_REQUIRED.value,
+        ),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=_FakeInteractiveService(),
+        wrist_search=search,
+        acquisition_grace_s=0.8,
+    )
+    started_s = time.monotonic()
+    assert runner.start(
+        "shadow", target="charger", operator_present=True, speed_percent=9
+    )["started"] is True
+    deadline = time.monotonic() + 6.0
+    while search.calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    runner.stop()
+
+    assert search.calls >= 1, "the supervisor never reacted at all"
+    elapsed_s = search.first_call_s - started_s
+    # 0.9 s of silent launcher + the full 0.8 s grace = 1.7 s at the earliest.
+    # Anchored on Popen this lands at ~0.9 s, so the margin is not tight.
+    assert elapsed_s >= 1.6, (
+        "the acquisition grace was already spent when the servo made its "
+        f"first report; the sweep started {elapsed_s:.2f}s after Popen"
+    )
+
+
+def test_every_spawn_site_rearms_the_acquisition_clocks(tmp_path):
+    """R3: the anchor was a LOCAL of ``_supervise``, so respawn could not re-arm it.
+
+    ``grep -n servo_started_s`` returned exactly two hits -- the assignment and
+    the comparison -- both inside ``_supervise``.  The recovery respawn in
+    ``_recover_view_with_stationary_base`` and the ``start()`` spawn therefore
+    provably could not re-arm it, so after one recovery every subsequent
+    session ran with a grace that had expired long ago.
+
+    The clocks now live on the instance and are re-armed inside
+    ``_spawn_process_locked``, the single funnel all three spawn sites use.
+    This test pins BOTH facts: the funnel re-arms, and no spawn site bypasses
+    the funnel.
+    """
+
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", ServoPhase.APPROACH.value),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+    )
+    assert runner._servo_spawned_s is None
+    assert runner._servo_acquisition_anchor_s is None
+
+    with runner._lock:
+        process, log = runner._spawn_process_locked("shadow")
+    first_spawn_s = runner._servo_spawned_s
+    assert isinstance(first_spawn_s, float)
+    # Pretend a full session ran: both stop clocks are latched.
+    runner._servo_first_status_s = first_spawn_s
+    runner._servo_acquisition_anchor_s = first_spawn_s
+    runner._servo_status_unreadable_since_s = first_spawn_s
+
+    time.sleep(0.05)
+    with runner._lock:
+        runner._terminate_process(process, keep_status=True)
+        second_process, second_log = runner._spawn_process_locked("shadow")
+    assert runner._servo_spawned_s > first_spawn_s
+    assert runner._servo_first_status_s is None
+    assert runner._servo_acquisition_anchor_s is None
+    assert runner._servo_status_unreadable_since_s is None
+    runner._terminate_process(second_process, keep_status=False)
+    log.close()
+    second_log.close()
+
+    # No spawn site may bypass the funnel: ``Popen`` appears exactly once in
+    # the whole module's DepthServoRunner, inside ``_spawn_process_locked``.
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    popen_owners = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "Popen"
+            ):
+                popen_owners.append(node.name)
+    assert popen_owners.count("_spawn_process_locked") == 1
+    assert set(popen_owners) <= {"_spawn_process_locked", "_run", "_start_locked"}, (
+        f"a new subprocess spawn appeared outside the clock funnel: {popen_owners}"
+    )
+
+
+def test_first_report_deadline_is_terminal_stationary_and_bounded():
+    """R3 CLOCK A, pure.
+
+    The naive repair -- "treat a missing status as still starting and hold" --
+    is an UNBOUNDED fail-open: with no status document the watchdog's phase
+    defaults to ``idle``, which is heartbeat-exempt and terminal, so
+    ``supervision.timed_out`` is structurally unreachable and the only exit is
+    ``process.poll()``, which a hung ssh or a hung ``docker run`` never
+    reaches.  So the wait has a hard deadline whose expiry is terminal.
+    """
+
+    # Still starting: the ~11.2 s launcher must not be killed.
+    holding = CONTROL.servo_report_verdict(
+        now_s=1_011.2,
+        spawned_s=1_000.0,
+        first_status_s=None,
+        unreadable_since_s=None,
+        unreadable_reason="no status document",
+    )
+    assert holding.expired is False
+
+    expired = CONTROL.servo_report_verdict(
+        now_s=1_000.0 + CONTROL.SERVO_FIRST_STATUS_TIMEOUT_S,
+        spawned_s=1_000.0,
+        first_status_s=None,
+        unreadable_since_s=None,
+        unreadable_reason="no status document",
+    )
+    assert expired.expired is True
+    assert expired.code == "SERVO_FIRST_REPORT_TIMEOUT"
+    assert "did not report within" in expired.message
+
+    # The bound is finite and comfortably clear of the measured launcher.
+    assert math.isfinite(CONTROL.SERVO_FIRST_STATUS_TIMEOUT_S)
+    assert CONTROL.SERVO_FIRST_STATUS_TIMEOUT_S >= 20.0
+
+    # Fail-closed: a supervisor that cannot say when it spawned must not grant
+    # an unbounded wait.
+    no_clock = CONTROL.servo_report_verdict(
+        now_s=1_000.0,
+        spawned_s=None,
+        first_status_s=None,
+        unreadable_since_s=None,
+        unreadable_reason=None,
+    )
+    assert no_clock.expired is True
+    assert no_clock.code == "SERVO_SPAWN_CLOCK_MISSING"
+
+
+def test_unreadable_status_is_its_own_bounded_state_not_idle(tmp_path):
+    """R3: ``{}`` meant BOTH "no servo yet" and "document unusable".
+
+    ``_runtime_status`` returned ``{}`` for a missing, unparseable,
+    wrong-schema or oversized document.  ``runtime.get("phase")`` was then
+    None, the watchdog defaulted the phase to ``idle`` -- heartbeat-exempt,
+    terminal, no deadline -- so nothing timed out, the supervise loop spun
+    forever and ``start()`` rejected every new task with APPROACH_ACTION_BUSY.
+
+    The oversized case is the one most likely to fire: the measured document
+    is ~9 KiB median / 11.8 KiB max against a 64 KiB reader cap that grows
+    with the whole-body block.
+    """
+
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", ServoPhase.APPROACH.value),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+    )
+    status_path = tmp_path / "status.json"
+
+    document, reason = runner._read_runtime_status()
+    assert document == {} and reason == "no status document"
+
+    status_path.write_text("{not json", encoding="utf-8")
+    document, reason = runner._read_runtime_status()
+    assert document == {} and "could not be read" in reason
+
+    status_path.write_text(json.dumps({"schema": "something.else"}), encoding="utf-8")
+    document, reason = runner._read_runtime_status()
+    assert document == {} and "not z_manip.depth_servo_status.v1" in reason
+
+    status_path.write_text(
+        json.dumps({
+            "schema": "z_manip.depth_servo_status.v1",
+            "phase": ServoPhase.APPROACH.value,
+            "padding": "x" * (65 * 1024),
+        }),
+        encoding="utf-8",
+    )
+    document, reason = runner._read_runtime_status()
+    assert document == {} and "over the 65536 byte reader limit" in reason
+
+    status_path.write_text(
+        json.dumps({
+            "schema": "z_manip.depth_servo_status.v1",
+            "phase": ServoPhase.APPROACH.value,
+        }),
+        encoding="utf-8",
+    )
+    document, reason = runner._read_runtime_status()
+    assert reason is None and document["phase"] == ServoPhase.APPROACH.value
+
+    # And the clock on it is bounded and terminal.
+    holding = CONTROL.servo_report_verdict(
+        now_s=100.0,
+        spawned_s=1.0,
+        first_status_s=50.0,
+        unreadable_since_s=99.5,
+        unreadable_reason="status document is 999999 bytes",
+    )
+    assert holding.expired is False
+    expired = CONTROL.servo_report_verdict(
+        now_s=100.0 + CONTROL.SERVO_STATUS_UNAVAILABLE_TIMEOUT_S,
+        spawned_s=1.0,
+        first_status_s=50.0,
+        unreadable_since_s=100.0,
+        unreadable_reason="status document is 999999 bytes",
+    )
+    assert expired.expired is True
+    assert expired.code == "SERVO_STATUS_UNAVAILABLE_TIMEOUT"
+    assert math.isfinite(CONTROL.SERVO_STATUS_UNAVAILABLE_TIMEOUT_S)
+
+
+def test_an_oversized_status_document_degrades_instead_of_hanging(tmp_path):
+    """The end-to-end shape of the hang: a live servo the supervisor cannot read.
+
+    Before this stage the supervise loop read ``{}``, saw phase None, fell
+    through every branch and ``continue``d forever while the servo kept
+    running -- the operator's only exit was Full Stop, and every new task was
+    refused with APPROACH_ACTION_BUSY.
+    """
+
+    script = tmp_path / "servo.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+        "'schema':'z_manip.depth_servo_status.v1','running':True,"
+        f"'phase':{ServoPhase.APPROACH.value!r},"
+        "'updated_unix_ns':time.time_ns()}))\n"
+        "time.sleep(0.4)\n"
+        # Now blow past the reader's 64 KiB cap, exactly as the whole-body
+        # block growing the document would.
+        "pathlib.Path(sys.argv[2]).write_text(json.dumps({"
+        "'schema':'z_manip.depth_servo_status.v1','running':True,"
+        f"'phase':{ServoPhase.APPROACH.value!r},"
+        "'updated_unix_ns':time.time_ns(),'padding':'x'*70000}))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    runner = CONTROL.DepthServoRunner(
+        script,
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=_FakeInteractiveService(),
+    )
+    assert runner.start("shadow", target="charger")["started"] is True
+    deadline = time.monotonic() + 10.0
+    workflow = runner.status()["workflow"]
+    seen_phases = set()
+    while time.monotonic() < deadline:
+        workflow = runner.status()["workflow"]
+        seen_phases.add(workflow.get("phase"))
+        if workflow.get("active") is False:
+            break
+        time.sleep(0.05)
+    # Read the terminal workflow BEFORE Full Stop, which latches "stopped"
+    # over any terminal phase the supervisor reached on its own.
+    terminal = dict(workflow)
+    runner.stop()
+
+    assert terminal["phase"] == "degraded", (
+        "an unreadable status document hung the supervisor instead of ending "
+        f"the run (workflow was {terminal})"
+    )
+    assert "unusable" in str(terminal["failure"])
+    # The hold before the deadline is NAMED, not silently spelled "idle".
+    assert CONTROL.WORKFLOW_STATUS_UNAVAILABLE in seen_phases, seen_phases
+    # And it is only used AFTER the servo has reported once; the pre-first-
+    # report wait is a different clock and must not be labelled a fault.
+    assert CONTROL.WORKFLOW_STATUS_UNAVAILABLE not in (
+        CONTROL.ServoPhase.__members__
+    )
+
+
+# ---------------------------------------------------------------------------
+# R5 -- the supervisor killed at 0.80 s so the servo's 2.75 s was dead config.
+# ---------------------------------------------------------------------------
+
+
+def test_view_recovery_alone_never_spends_a_reacquisition_attempt(tmp_path):
+    """R5: acting on the NAME ``view_recovery`` cut the loss grace to 29%.
+
+    ``ReactiveTargetController`` enters VIEW_RECOVERY as soon as the target is
+    older than ``tracking_hold_s`` -- 0.80 s on the shipped launcher -- and
+    only steps to SEARCH_REQUIRED at ``tracking_loss_grace_s`` = 2.75 s.  The
+    supervisor's eager set contained ``view_recovery``, so it terminated the
+    servo 0.80 s into every loss and ``--tracking-loss-grace-s 2.75`` could
+    never be spent.
+
+    The eager set is now the ONE phase that is the servo's own verdict that
+    the full grace has been spent.  A servo sitting in ``view_recovery`` is
+    left alone to finish its own recovery.
+    """
+
+    class Search:
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, target, *, mode, speed_percent, cancel, operator_present=False):
+            self.calls += 1
+            return True
+
+        def status(self):
+            return {"phase": "found", "failure": None}
+
+        def stop(self):
+            return None
+
+    search = Search()
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", ServoPhase.VIEW_RECOVERY.value),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+        session_service=_FakeInteractiveService(),
+        wrist_search=search,
+        acquisition_grace_s=0.0,
+    )
+    assert runner.start(
+        "shadow", target="charger", operator_present=True, speed_percent=9
+    )["started"] is True
+    time.sleep(1.2)
+    calls = search.calls
+    attempts = runner.status()["workflow"]["reacquisition_attempts"]
+    runner.stop()
+
+    assert calls == 0, (
+        "the supervisor spent a reacquisition attempt on sight of "
+        "view_recovery; the servo's configured tracking_loss_grace_s is "
+        "unreachable again"
+    )
+    assert attempts == 0
+    assert ServoPhase.VIEW_RECOVERY.value not in EAGER_RECOVERY_PHASES
+    assert EAGER_RECOVERY_PHASES == frozenset({ServoPhase.SEARCH_REQUIRED.value})
+
+
+def test_view_recovery_deadline_follows_the_servos_own_configured_grace():
+    """R5: one number for one event, read out of the servo's own document.
+
+    The supervisor used to hold an opinion about ``view_recovery`` written
+    entirely independently of the servo's ``--tracking-loss-grace-s``.  It now
+    derives the bound from ``status["limits"]["tracking_loss_grace_s"]``, so
+    changing the launcher flag moves both.
+    """
+
+    watchdog = CONTROL.go2w_reactive_supervision.ReactivePhaseWatchdog()
+    phase = ServoPhase.VIEW_RECOVERY.value
+
+    assert watchdog.deadline_for(phase, {"limits": {"tracking_loss_grace_s": 4.0}}) == 4.0
+    assert watchdog.deadline_for(phase, {"limits": {"tracking_loss_grace_s": 2.75}}) == 2.75
+    # Fail-closed fallbacks: the SHIPPED value, not a 7x looser table default.
+    assert watchdog.deadline_for(phase) == 2.75
+    assert watchdog.deadline_for(phase, {}) == 2.75
+    assert watchdog.deadline_for(phase, {"limits": {"tracking_loss_grace_s": "nope"}}) == 2.75
+    # Clamped both ways so the cross-phase stall budget can never be inverted.
+    assert view_recovery_deadline_s(1e9) == CONTROL.go2w_reactive_supervision.NO_PROGRESS_DEADLINE_S
+    assert view_recovery_deadline_s(0.05) >= 1.0
+    # And its expiry stops rather than sweeping.
+    assert (
+        PHASE_POLICY[ServoPhase.VIEW_RECOVERY].on_expiry
+        is ExpiryAction.STOP_AND_DEGRADE
+    )
+
+
+# ---------------------------------------------------------------------------
 # Base body-posture lock: the servo->grasp handoff worker owns the lock and
 # releases it on every exit path.
 # ---------------------------------------------------------------------------
@@ -4768,3 +5230,106 @@ def test_named_combo_is_echoed_into_the_live_approach_workflow(tmp_path):
     assert workflow["place_back"] is False
     assert workflow["hold_seconds"] == 0.0
     runner.stop()
+
+
+# ===========================================================================
+# R9 -- an operator-visible event for "the working tree changed under this run".
+# ===========================================================================
+
+
+def test_a_mutation_seen_by_either_process_is_one_operator_event():
+    """Two processes watch the same bytes; either seeing it is seeing it.
+
+    The servo watches from inside its read-only bind mount, the supervisor from
+    the host.  They measure the same files, so a DISAGREEMENT is itself evidence
+    and must not be averaged away into "probably fine".
+    """
+
+    from_servo = CONTROL.deployment_event(
+        servo_state={
+            "launch_short": "a" * 12,
+            "live_short": "b" * 12,
+            "mutated": True,
+        },
+        supervisor_state={"mutated": False, "launch_short": "a" * 12},
+    )
+    assert from_servo["mutated"] is True
+    assert from_servo["event"]["code"] == "RUNTIME_TREE_MUTATED_DURING_RUN"
+    assert from_servo["event"]["observed_by"] == "depth_servo"
+    assert "a" * 12 in from_servo["event"]["message"]
+    assert "b" * 12 in from_servo["event"]["message"]
+
+    from_supervisor = CONTROL.deployment_event(
+        servo_state={"mutated": False},
+        supervisor_state={
+            "mutated": True, "launch_short": "c" * 12, "live_short": "d" * 12,
+        },
+    )
+    assert from_supervisor["event"]["observed_by"] == "supervisor"
+
+
+def test_an_unusable_servo_fingerprint_degrades_to_the_supervisor_view():
+    """The servo block arrives from another process's JSON: assume nothing."""
+
+    for junk in (None, "starting", 7, [], {}):
+        block = CONTROL.deployment_event(
+            servo_state=junk,
+            supervisor_state={
+                "mutated": True, "launch_short": "a" * 12, "live_short": "b" * 12,
+            },
+        )
+        assert block["mutated"] is True
+        assert block["event"]["observed_by"] == "supervisor"
+    clean = CONTROL.deployment_event(
+        servo_state="not-a-dict", supervisor_state={"mutated": False},
+    )
+    assert clean["event"] is None
+    assert clean["servo"] is None
+
+
+def test_the_approach_status_endpoint_carries_the_deployment_block(tmp_path):
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+    )
+    deployment = runner.status()["deployment"]
+    assert deployment["schema"] == "z_manip.runtime_deployment.v1"
+    # The supervisor always has a view of its own, even with no servo running --
+    # which is exactly when an operator is most likely to be editing.
+    assert deployment["supervisor"]["live"] is not None
+    assert deployment["mutated"] is False
+    assert deployment["event"] is None
+
+
+def test_the_supervisors_launch_baseline_is_never_re_taken(tmp_path):
+    """Re-taking it would adopt every edit as the new normal."""
+
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+    )
+    baseline = runner.status()["deployment"]["supervisor"]["launch"]
+    runner._fingerprint_watch = CONTROL.RuntimeFingerprintWatch(
+        launch=baseline,
+        recheck_s=0.0,
+        probe=lambda: ("mutated" * 8, None),
+    )
+    deployment = runner.status()["deployment"]
+    assert deployment["supervisor"]["launch"] == baseline
+    assert deployment["mutated"] is True
+    assert deployment["event"]["code"] == "RUNTIME_TREE_MUTATED_DURING_RUN"
+
+
+def test_the_dashboard_renders_the_deployment_event():
+    """An event nothing displays is not operator-visible."""
+
+    html = HTML.read_text(encoding="utf-8")
+    assert 'id="approach-deployment"' in html
+    assert "function renderDeployment(" in html
+    assert "renderDeployment(state.approach);" in html
+    assert "TREE CHANGED DURING RUN" in html
+    # "unverified" must be its own neutral state, not an alarm: replays and
+    # shadow runs land there and an alarm on all of them hides the real one.
+    assert "fingerprint unverified" in html

@@ -30,7 +30,7 @@ import struct
 import subprocess
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from urllib.parse import urlsplit
 
 import go2w_base_lock
@@ -38,6 +38,11 @@ import go2w_debug_ui
 import go2w_interactive_sessions
 import go2w_reactive_supervision
 import go2w_wrist_search
+from z_manip_runtime_fingerprint import (
+    RUNTIME_FINGERPRINT_ENV,
+    RuntimeFingerprintWatch,
+    try_runtime_fingerprint,
+)
 from go2w_live_perception import LivePerceptionRenderer
 from go2w_runtime_state import (
     MAX_RUNTIME_CANDIDATES,
@@ -51,6 +56,13 @@ from go2w_runtime_state import (
     validate_runtime_state,
 )
 
+from z_manip.control.servo_phase import (
+    EAGER_RECOVERY_PHASES,
+    HANDOFF_TERMINAL_PHASES,
+    ExpiryAction,
+    ServoPhase,
+    phase_policy,
+)
 from z_manip.read_only_sessions import (
     ATTEMPT_SCHEMA,
     MANIFEST_SCHEMA,
@@ -59,6 +71,33 @@ from z_manip.read_only_sessions import (
     validate_session_id,
     validate_target_description,
 )
+
+# Phase memberships used by the approach supervisor.  Every member is a
+# ``ServoPhase`` reference, never a quoted string: the servo used to emit
+# "reacquire" while this file and the servo both spelled "reacquiring", so no
+# consumer matched the emitted value.
+#
+# ``reactive_phase`` carries the controller's own phase, which never uses the
+# "reached" presentation remap.
+_REACTIVE_HANDOFF_PHASES = frozenset({
+    ServoPhase.HANDOFF_PROBE.value,
+    ServoPhase.HANDOFF_READY.value,
+})
+# Phases the supervisor reacts to IMMEDIATELY (subject to the acquisition
+# grace window), as opposed to phases that only escalate once their table
+# deadline expires.
+#
+# THIS SET IS NO LONGER WRITTEN HERE.  It was
+# ``{view_recovery, search_required}`` -- the seventh hand-written phase
+# membership -- and it was wrong in a way neither file could see: the servo
+# enters ``view_recovery`` at ``tracking_hold_s`` (0.80 s on the shipped
+# launcher) and only steps to ``search_required`` at ``tracking_loss_grace_s``
+# (2.75 s), so acting on the NAME ``view_recovery`` killed the servo 0.80 s
+# into every loss and the 1.95 s of recovery the operator configured could
+# never be spent.  Membership is now a column in the one table
+# (``PhasePolicy.escalate_on_observation``), and the table forbids a member
+# whose own expiry action is not ESCALATE_VIEW_RECOVERY.
+_EAGER_VIEW_RECOVERY_PHASES = EAGER_RECOVERY_PHASES
 
 
 MAX_LOG_TAIL_BYTES = 12_000
@@ -120,7 +159,50 @@ CLOUD_SOURCE_NAMES = {0: "d435_raw", 1: "ffs"}
 # Default advertised poll interval for lower-rate JSON/perception endpoints.
 DEFAULT_POLL_INTERVAL_MS = 200
 HOME_FAST_VERIFY_TOLERANCE_RAD = math.radians(1.0)
+# CLOCK B.  How long after the servo's FIRST NON-"starting" status document a
+# recovery-escalation phase is treated as acquisition rather than loss.
+#
+# It used to be anchored on ``time.monotonic()`` taken immediately after a
+# NON-BLOCKING ``Popen`` of the bash launcher.  The launcher spends ~11.2 s
+# before the servo writes its first byte (base-transport preflight ssh probes
+# -> acquire_arm_owner ssh -> docker rm -f -> docker run -> rclpy/CasADi/URDF
+# init), so the whole 5 s was spent BEFORE THE SERVO PROCESS EXISTED and the
+# guard fell through on the servo's very first tick.  Recorded 2026-07-27:
+# 13:36:08.412 waiting_target -> 13:36:08.713 search_required -> 13:36:08.762
+# stopped, a 0.35 s session; and the 11:04 cluster of four 0.36-0.42 s sessions
+# 14.4-14.9 s apart that spent the whole reacquisition budget in 45 s and ended
+# the task in ``blocked: view recovery budget exhausted``.
 SERVO_ACQUISITION_GRACE_S = 5.0
+# CLOCK A.  Spawn -> first status document of ANY phase.  Terminal on expiry.
+#
+# This clock is MANDATORY, not a nicety.  The naive repair for the bug above --
+# "a missing status means the servo is still starting, so hold" -- is an
+# UNBOUNDED fail-open: with no status file ``_runtime_status`` returns ``{}``,
+# the watchdog's phase defaults to ``idle``, ``idle`` is heartbeat-exempt and
+# terminal, so ``supervision.timed_out`` is structurally unreachable and the
+# only remaining exit is ``process.poll()`` -- which a hung ssh or a hung
+# ``docker run`` never reaches.
+#
+# The value is the phase table's own ``starting`` deadline rather than a
+# seventh independent number: "spawn until the servo is alive" is one event,
+# and the ~11.2 s measured launcher leaves 2.7x headroom inside it.
+SERVO_FIRST_STATUS_TIMEOUT_S = float(
+    phase_policy(ServoPhase.STARTING).deadline_s or 30.0
+)
+# CLOCK C.  How long a servo that HAS reported may leave its status document
+# unreadable before the supervisor stops it.
+#
+# ``_runtime_status`` collapses missing, unparseable, wrong-schema and
+# oversized documents into the same ``{}`` as "no servo yet", and the phase
+# then defaults to ``idle`` -- heartbeat-exempt, terminal, no deadline.  So an
+# oversized document (the 64 KiB reader cap, against a ~9 KiB median / 11.8 KiB
+# max that grows with the whole-body block) hung the supervisor forever while
+# ``start()`` rejected every new task with APPROACH_ACTION_BUSY.
+#
+# 2.0 s is one notch above the 1.5 s state-heartbeat bound so an unreadable
+# document is diagnosed as unreadable instead of racing the heartbeat, and the
+# servo rewrites the document every tick at the shipped 20 Hz.
+SERVO_STATUS_UNAVAILABLE_TIMEOUT_S = 2.0
 # One post-stop passive-joint window.  Widened 2.0 -> 3.5 s: the recorded
 # PASSIVE_JOINT_GATE aborts were transient publisher hiccups where a strictly
 # post-stop sample arrived just after the old 2.0 s cap, not genuine loss.  A
@@ -156,6 +238,17 @@ MOBILE_HANDOFF_CAPTURE_MAX_SKEW_S = 1.0
 MOBILE_HANDOFF_PERCEPTION_RETRY_CODES = frozenset({
     "PERCEPTION_PROCESS_FAILED",
     "PERCEPTION_CAMERA_FRAME_TIMEOUT",
+    # PERCEPTION_PASSIVE_WINDOW_STALE was carved OUT of
+    # PERCEPTION_PROCESS_FAILED, which is already in this set: a perception
+    # attempt that failed because its passive window had closed before its own
+    # bundle wait began reached this code path as PERCEPTION_PROCESS_FAILED and
+    # was retried.  Omitting it here would silently convert a retried failure
+    # into a hard block -- a behaviour change nobody asked for, hidden inside a
+    # renaming.  It is also the most obviously transient member of the set: the
+    # remedy is a fresh receive-only capture, which is exactly what the one
+    # recapture this budget buys performs, and the recapture is validated by
+    # every unchanged gate before anything moves.
+    "PERCEPTION_PASSIVE_WINDOW_STALE",
 })
 MAX_HANDOFF_EVIDENCE_BYTES = 512 * 1024
 # Default dwell at Home while holding the object between the carry-home and
@@ -1211,6 +1304,199 @@ class PlanningOnlyRunner:
             )
 
 
+#: Workflow phase for "the servo is alive but its status document cannot be
+#: read".  It is deliberately NOT a ``ServoPhase``: no servo ever emits it, it
+#: is the supervisor's own name for the absence of a servo phase.  Before it,
+#: this state was spelled ``{}`` and was therefore indistinguishable from
+#: ``idle``.
+WORKFLOW_STATUS_UNAVAILABLE = "status_unavailable"
+
+#: Operator-visible event code for "the working tree changed under a running
+#: process".  Not a workflow phase and not a failure: it stops nothing, because
+#: stopping on it would hand an operator a robot that halts every time they save
+#: a file.  It is an EVENT the dashboard renders, and it is the only thing that
+#: makes the recorded failure chain (edit -> resident-worker fingerprint
+#: mismatch -> component self-heal -> inherited passive window -> 900-1200
+#: rejections -> PERCEPTION_PROCESS_FAILED -> wrist_search on a detected object)
+#: legible at the moment it starts rather than an hour later in a log.
+DEPLOYMENT_EVENT_TREE_MUTATED = "RUNTIME_TREE_MUTATED_DURING_RUN"
+
+
+def deployment_event(
+    *,
+    servo_state: object,
+    supervisor_state: dict[str, object],
+) -> dict[str, Any]:
+    """Fold the servo's and the supervisor's fingerprint views into one block.
+
+    Two independent processes observe the same tree: the servo from inside its
+    read-only bind mount, the supervisor from the host.  Either of them seeing a
+    mutation is a mutation -- they measure the same bytes, so a disagreement
+    between them is itself evidence and must not be averaged away.
+
+    Pure, and takes ``servo_state`` as ``object`` on purpose: it is read
+    straight out of a JSON document written by another process, so it may be
+    absent, ``None``, or any type at all.  An unusable servo block degrades to
+    "the supervisor's own view only", never to "clean".
+    """
+
+    servo = servo_state if isinstance(servo_state, dict) else {}
+    servo_mutated = servo.get("mutated") is True
+    supervisor_mutated = supervisor_state.get("mutated") is True
+    mutated = servo_mutated or supervisor_mutated
+    event: dict[str, Any] | None = None
+    if mutated:
+        source = servo if servo_mutated else supervisor_state
+        event = {
+            "code": DEPLOYMENT_EVENT_TREE_MUTATED,
+            "observed_by": "depth_servo" if servo_mutated else "supervisor",
+            "message": (
+                "The Z-Mobile-manip working tree changed while this run was in "
+                f"flight: launched with runtime fingerprint "
+                f"{source.get('launch_short')}, now {source.get('live_short')}. "
+                "The launcher bind-mounts that tree read-only and runs from it, "
+                "so the running code is no longer the code that started. "
+                "Expect a resident-worker fingerprint mismatch and a component "
+                "self-heal; restart the affected components before trusting "
+                "this run."
+            ),
+        }
+    return {
+        "schema": "z_manip.runtime_deployment.v1",
+        "mutated": mutated,
+        "servo": servo or None,
+        "supervisor": supervisor_state,
+        "event": event,
+    }
+
+
+class ServoReportVerdict(NamedTuple):
+    """Whether the spawn/report clocks have expired, and why.
+
+    Pure so the decision is testable on a host without rclpy, pinocchio or
+    casadi -- the same reason ``whole_body_collision.hold_arm_release_chassis``
+    was extracted.
+
+    ``NamedTuple`` rather than ``@dataclass``: with ``from __future__ import
+    annotations`` a dataclass needs ``sys.modules[cls.__module__]`` at class
+    creation, and ``tests/test_go2w_planning_control.py`` execs this file
+    through a spec it never registers in ``sys.modules``.
+    """
+
+    expired: bool
+    code: str | None
+    message: str
+
+
+def servo_report_verdict(
+    *,
+    now_s: float,
+    spawned_s: float | None,
+    first_status_s: float | None,
+    unreadable_since_s: float | None,
+    unreadable_reason: str | None,
+    first_status_timeout_s: float = SERVO_FIRST_STATUS_TIMEOUT_S,
+    status_unavailable_timeout_s: float = SERVO_STATUS_UNAVAILABLE_TIMEOUT_S,
+) -> ServoReportVerdict:
+    """Bound the two windows in which the servo has NO usable phase.
+
+    CLOCK A (``first_status_s is None``): the launcher was spawned but nothing
+    has ever written a readable status document.  There is no phase, so the
+    phase table cannot bound it and ``supervision.timed_out`` is structurally
+    unreachable; ``process.poll()`` is the only other exit and a hung ssh or a
+    hung ``docker run`` never reaches it.  Expiry is terminal and stationary.
+
+    CLOCK C (``unreadable_since_s is not None``): the servo DID report and then
+    its document became missing, unparseable, wrong-schema or oversized.  The
+    old code collapsed that into the same ``{}`` as clock A, defaulted the
+    phase to ``idle`` -- heartbeat-exempt, terminal, no deadline -- and hung
+    forever while ``start()`` rejected every new task as APPROACH_ACTION_BUSY.
+
+    Fail-closed on a missing spawn stamp: a supervisor that cannot say when it
+    spawned the servo must not grant an unbounded wait.
+    """
+
+    if not math.isfinite(now_s):
+        raise ValueError("supervisor clock must be finite")
+    if first_status_s is None:
+        if spawned_s is None or not math.isfinite(spawned_s):
+            return ServoReportVerdict(
+                expired=True,
+                code="SERVO_SPAWN_CLOCK_MISSING",
+                message=(
+                    "the depth servo spawn time was never recorded, so its "
+                    "first-report deadline cannot be bounded"
+                ),
+            )
+        elapsed_s = max(0.0, now_s - spawned_s)
+        if elapsed_s >= first_status_timeout_s:
+            return ServoReportVerdict(
+                expired=True,
+                code="SERVO_FIRST_REPORT_TIMEOUT",
+                message=(
+                    f"depth servo did not report within "
+                    f"{first_status_timeout_s:.2f}s of being spawned "
+                    f"({elapsed_s:.2f}s elapsed, "
+                    f"{unreadable_reason or 'no status document'})"
+                ),
+            )
+        return ServoReportVerdict(
+            expired=False,
+            code=None,
+            message="depth servo is starting; waiting for its first status document",
+        )
+    if unreadable_since_s is None:
+        return ServoReportVerdict(
+            expired=False, code=None, message="depth servo status is readable"
+        )
+    unreadable_s = max(0.0, now_s - unreadable_since_s)
+    if unreadable_s >= status_unavailable_timeout_s:
+        return ServoReportVerdict(
+            expired=True,
+            code="SERVO_STATUS_UNAVAILABLE_TIMEOUT",
+            message=(
+                f"the depth servo status document has been unusable for "
+                f"{unreadable_s:.2f}s (bound {status_unavailable_timeout_s:.2f}s): "
+                f"{unreadable_reason or 'unreadable'}"
+            ),
+        )
+    return ServoReportVerdict(
+        expired=False,
+        code=None,
+        message=f"depth servo status is unreadable ({unreadable_reason or 'unknown'})",
+    )
+
+
+def within_acquisition_grace(
+    *,
+    now_s: float,
+    acquisition_anchor_s: float | None,
+    acquisition_grace_s: float,
+) -> bool:
+    """CLOCK B: is a recovery-escalation phase still plain acquisition?
+
+    The anchor is the servo's first NON-``starting`` status document, never the
+    ``Popen`` return.  ``_spawn_process_locked`` unlinks the status file before
+    every spawn, so that anchor is unambiguous, and it is re-armed by all three
+    spawn sites because it is re-armed inside ``_spawn_process_locked`` itself
+    -- the old anchor was a LOCAL of ``_supervise``, which is why the recovery
+    respawn provably could not re-arm it.
+
+    Unanchored -> NOT in grace, the fail-closed answer: "in grace" means hold
+    and do nothing, "not in grace" means spend one attempt from a bounded
+    budget that itself terminates in ``blocked``.
+    """
+
+    if acquisition_anchor_s is None:
+        return False
+    if not math.isfinite(now_s) or not math.isfinite(acquisition_anchor_s):
+        return False
+    grace_s = float(acquisition_grace_s)
+    if not math.isfinite(grace_s) or grace_s <= 0.0:
+        return False
+    return (now_s - acquisition_anchor_s) < grace_s
+
+
 class DepthServoRunner:
     """Own depth approach, bounded reacquisition, and optional grasp handoff.
 
@@ -1269,6 +1555,37 @@ class DepthServoRunner:
             )
         )
         self._cancel = threading.Event()
+        # --- the three servo-report clocks (R3) ---------------------------
+        # CLASS-level, not locals of ``_supervise``.  The previous anchor was
+        # ``servo_started_s = time.monotonic()`` inside ``_supervise``, so the
+        # recovery respawn at ``_recover_view_with_stationary_base`` provably
+        # could not re-arm it; ``grep -n servo_started_s`` returned exactly the
+        # two lines that set and read it.  All three are re-armed in
+        # ``_spawn_process_locked``, which is the single funnel every spawn
+        # site goes through.
+        #: CLOCK A anchor: the ``Popen`` return.
+        self._servo_spawned_s: float | None = None
+        #: CLOCK A stop: the first READABLE status document of any phase.
+        self._servo_first_status_s: float | None = None
+        #: CLOCK B anchor: the first readable status document whose phase is
+        #: not ``starting``.  ``_spawn_process_locked`` unlinks the status file
+        #: before every spawn, so this cannot latch onto a previous session's.
+        self._servo_acquisition_anchor_s: float | None = None
+        #: CLOCK C anchor: when the document stopped being readable, after it
+        #: had been.  None while it is readable.
+        self._servo_status_unreadable_since_s: float | None = None
+        #: R9: the supervisor's own view of the tree it and the servo both run
+        #: out of.  The launch baseline is this PROCESS's own start, taken once
+        #: and never re-taken -- re-taking it would adopt every mutation as the
+        #: new normal, which is exactly the failure mode being closed.  The env
+        #: var lets a launcher pin it explicitly; absent, the workbench measures
+        #: itself at construction.
+        self._fingerprint_watch = RuntimeFingerprintWatch(
+            launch=(
+                os.environ.get(RUNTIME_FINGERPRINT_ENV)
+                or try_runtime_fingerprint()[0]
+            ),
+        )
         self._workflow: dict[str, Any] = {
             "active": False,
             "phase": "idle",
@@ -1289,16 +1606,56 @@ class DepthServoRunner:
     def _process_running_locked(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
-    def _runtime_status(self) -> dict[str, Any]:
-        runtime: dict[str, Any] = {}
+    def _read_runtime_status(self) -> tuple[dict[str, Any], str | None]:
+        """Return the status document and, if it is unusable, WHY.
+
+        Every rejection used to collapse into the same ``{}`` that also means
+        "no servo has started yet".  The supervisor then read
+        ``runtime.get("phase")`` as None, the watchdog defaulted the phase to
+        ``idle`` -- heartbeat-exempt, terminal, no deadline -- and the run hung
+        with nothing able to time out, while ``start()`` rejected every new
+        task with APPROACH_ACTION_BUSY.  Naming the reason is what lets
+        ``servo_report_verdict`` put a deadline on it.
+
+        That ``idle`` fallback is itself now gone: a document with no usable
+        phase resolves to ``UNREPORTED_PHASE`` and inherits the fail-closed
+        unknown-phase policy (see ``ReactivePhaseWatchdog.observe`` and
+        tests/test_servo_phase_reachability.py).  The two defences are
+        independent on purpose -- this one keeps an unreadable document from
+        reaching the watchdog at all, that one keeps a readable but silent
+        document from being read as "nothing to wait for".
+
+        The size rejection is the one most likely to fire in the field: the
+        measured document is ~9 KiB median / 11.8 KiB max against this 64 KiB
+        cap, and it grows with the whole-body block.
+        """
+
+        max_bytes = 64 * 1024
         try:
-            if self.status_path.is_file() and self.status_path.stat().st_size <= 64 * 1024:
-                candidate = json.loads(self.status_path.read_text(encoding="utf-8"))
-                if isinstance(candidate, dict) and candidate.get("schema") == "z_manip.depth_servo_status.v1":
-                    runtime = candidate
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            runtime = {}
-        return runtime
+            if not self.status_path.is_file():
+                return {}, "no status document"
+            size = self.status_path.stat().st_size
+            if size > max_bytes:
+                return {}, (
+                    f"status document is {size} bytes, over the {max_bytes} "
+                    "byte reader limit"
+                )
+            candidate = json.loads(self.status_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            return {}, f"status document could not be read: {error}"
+        if not isinstance(candidate, dict):
+            return {}, "status document is not a JSON object"
+        if candidate.get("schema") != "z_manip.depth_servo_status.v1":
+            return {}, (
+                "status document carries schema "
+                f"{candidate.get('schema')!r}, not z_manip.depth_servo_status.v1"
+            )
+        return candidate, None
+
+    def _runtime_status(self) -> dict[str, Any]:
+        """Backwards-compatible view for the read-only status endpoint."""
+
+        return self._read_runtime_status()[0]
 
     @staticmethod
     def _runtime_requests_handoff(runtime: dict[str, Any]) -> bool:
@@ -1311,20 +1668,20 @@ class DepthServoRunner:
         """
 
         phase = runtime.get("phase")
-        if phase in {"reached", "handoff_probe", "handoff_ready"}:
+        if phase in HANDOFF_TERMINAL_PHASES:
             return True
         output = runtime.get("output")
         if isinstance(output, dict):
             if output.get("needs_ik_probe") is True:
                 return True
-            if output.get("phase") in {"reached", "handoff_probe", "handoff_ready"}:
+            if output.get("phase") in HANDOFF_TERMINAL_PHASES:
                 return True
-            if output.get("reactive_phase") in {"handoff_probe", "handoff_ready"}:
+            if output.get("reactive_phase") in _REACTIVE_HANDOFF_PHASES:
                 return True
         reactive = runtime.get("reactive")
         return isinstance(reactive, dict) and (
             reactive.get("needs_ik_probe") is True
-            or reactive.get("phase") in {"handoff_probe", "handoff_ready"}
+            or reactive.get("phase") in _REACTIVE_HANDOFF_PHASES
         )
 
     def status(self) -> dict[str, Any]:
@@ -1371,11 +1728,21 @@ class DepthServoRunner:
             "exit_code": exit_code,
             "runtime": runtime,
             "supervision": self._reactive_watchdog.last.document(),
+            # R9: THE DEPLOYMENT IS THE WORKING TREE.  The servo's own view
+            # travels inside its status document; the supervisor adds its own so
+            # a mutation is still visible when the servo is not running (which
+            # is when an operator is most likely to be editing).
+            "deployment": deployment_event(
+                servo_state=runtime.get("runtime_fingerprint"),
+                supervisor_state=self._fingerprint_watch.state(),
+            ),
             "workflow": workflow,
             "wrist_search": wrist_search,
         }
 
     def _spawn_process_locked(self, mode: str) -> tuple[subprocess.Popen[bytes], Any]:
+        # Unlinking first is what makes the first-status anchors unambiguous:
+        # no clock below can latch onto the PREVIOUS session's document.
         self.status_path.unlink(missing_ok=True)
         log = self.log_path.open("ab")
         try:
@@ -1393,6 +1760,15 @@ class DepthServoRunner:
             raise
         self._process = process
         self._mode = mode
+        # RE-ARM EVERY CLOCK HERE, not at a call site.  This method is the one
+        # funnel all three spawn sites (``start``, the initial spawn in
+        # ``_supervise``, and the recovery respawn in
+        # ``_recover_view_with_stationary_base``) pass through, so a fourth
+        # spawn site added later cannot forget to re-arm them.
+        self._servo_spawned_s = time.monotonic()
+        self._servo_first_status_s = None
+        self._servo_acquisition_anchor_s = None
+        self._servo_status_unreadable_since_s = None
         threading.Thread(
             target=self._watch,
             args=(process, log),
@@ -1868,6 +2244,14 @@ class DepthServoRunner:
                 return False
             self._workflow["phase"] = "waiting_for_track"
             self._message = "Target recovered with the base stationary; visual approach restarted."
+        # A wrist search moves no wheels, so the watchdog's cross-phase
+        # no-progress budget is already full when the servo restarts and would
+        # expire on the first observation of the recovered run -- collapsing
+        # the whole reacquisition budget into a few seconds instead of giving
+        # each attempt its own bound.  A COMPLETED, counted recovery is
+        # supervisory progress, so clear that budget only; the per-phase timer
+        # and the heartbeat state are deliberately left alone.
+        self._reactive_watchdog.note_supervisor_progress()
         return True
 
     def _wait_for_joint_feedback(self, cancel: threading.Event) -> str | None:
@@ -2002,7 +2386,6 @@ class DepthServoRunner:
                 self._message = "Target acquired; visual approach is running."
 
         last_reacquisition_s = 0.0
-        servo_started_s = time.monotonic()
         while not cancel.wait(0.05):
             with self._lock:
                 process = self._process
@@ -2012,14 +2395,90 @@ class DepthServoRunner:
             if process is None or process.poll() is not None:
                 self._set_workflow(active=False, phase="blocked", failure="depth servo exited")
                 return
-            runtime = self._runtime_status()
+            runtime, unreadable_reason = self._read_runtime_status()
+            now = time.monotonic()
+            # --- advance the three servo-report clocks (R3) ----------------
+            with self._lock:
+                if unreadable_reason is None:
+                    if self._servo_first_status_s is None:
+                        self._servo_first_status_s = now
+                    self._servo_status_unreadable_since_s = None
+                    if (
+                        self._servo_acquisition_anchor_s is None
+                        and runtime.get("phase") != ServoPhase.STARTING.value
+                    ):
+                        # CLOCK B starts HERE -- at the first status document
+                        # that is not "still coming up" -- and not at the
+                        # non-blocking Popen ~11.2 s earlier.
+                        self._servo_acquisition_anchor_s = now
+                elif self._servo_status_unreadable_since_s is None:
+                    self._servo_status_unreadable_since_s = now
+                spawned_s = self._servo_spawned_s
+                first_status_s = self._servo_first_status_s
+                unreadable_since_s = self._servo_status_unreadable_since_s
+                acquisition_anchor_s = self._servo_acquisition_anchor_s
+            report = servo_report_verdict(
+                now_s=now,
+                spawned_s=spawned_s,
+                first_status_s=first_status_s,
+                unreadable_since_s=unreadable_since_s,
+                unreadable_reason=unreadable_reason,
+            )
+            if report.expired:
+                self._terminate_process(process, keep_status=True)
+                self._set_workflow(
+                    active=False,
+                    phase="degraded",
+                    failure=report.message,
+                    supervision=self._reactive_watchdog.last.document(),
+                )
+                with self._lock:
+                    self._message = (
+                        f"{report.code}: {report.message}. "
+                        "Base is stopped; inspect the depth-servo log and the "
+                        "status document."
+                    )
+                return
+            if unreadable_reason is not None:
+                # Deliberately do NOT feed ``{}`` to the watchdog.  An empty
+                # document defaults the phase to ``idle``, which REARMS the
+                # per-phase timer and marks the decision terminal -- an
+                # unreadable status would launder a real stall into a fresh
+                # idle on every tick.  Hold instead; ``report`` above is what
+                # bounds the hold, and its expiry is terminal.
+                #
+                # The two holds are reported differently on purpose.  CLOCK A
+                # (nothing has EVER been readable) is the launcher still coming
+                # up and must not be labelled a fault; CLOCK C (it was readable
+                # and stopped being) is one.
+                if first_status_s is not None:
+                    self._set_workflow(phase=WORKFLOW_STATUS_UNAVAILABLE)
+                with self._lock:
+                    self._message = (
+                        f"Depth servo status is unreadable ({unreadable_reason}); "
+                        "holding until its bounded deadline."
+                        if first_status_s is not None
+                        else "Waiting for the depth servo's first status document."
+                    )
+                continue
             phase = runtime.get("phase")
             supervision = self._reactive_watchdog.observe(
                 runtime,
-                now_s=time.monotonic(),
+                now_s=now,
                 now_unix_ns=time.time_ns(),
             )
-            if supervision.timed_out:
+            # Dispatch on the phase table's declared expiry ACTION.  A
+            # deadline whose expiry only logs is the defect this table
+            # replaces, so every expiry lands in one of exactly two arms:
+            # stop the servo and degrade, or spend one bounded view-recovery
+            # attempt (which itself terminates in ``blocked`` when the
+            # reacquisition budget runs out).
+            escalate_recovery = (
+                supervision.timed_out
+                and supervision.on_expiry
+                == ExpiryAction.ESCALATE_VIEW_RECOVERY.value
+            )
+            if supervision.timed_out and not escalate_recovery:
                 self._terminate_process(process, keep_status=True)
                 self._set_workflow(
                     active=False,
@@ -2041,9 +2500,12 @@ class DepthServoRunner:
                     terminal_phase=str(phase),
                 )
                 return
-            if phase in {"view_recovery", "search_required"}:
-                now = time.monotonic()
-                if now - servo_started_s < self._acquisition_grace_s:
+            if escalate_recovery or phase in _EAGER_VIEW_RECOVERY_PHASES:
+                if within_acquisition_grace(
+                    now_s=now,
+                    acquisition_anchor_s=acquisition_anchor_s,
+                    acquisition_grace_s=self._acquisition_grace_s,
+                ):
                     # A freshly seeded track needs grounding + EdgeTAM seeding
                     # + the first depth-joined bundle (~2-3s measured live)
                     # before the servo can see any 3-D target.  Reacting to
@@ -2051,6 +2513,12 @@ class DepthServoRunner:
                     # startup coin flip; acquisition is not loss, so hold the
                     # base and let the stream arrive before spending a
                     # reacquisition attempt on a wrist sweep.
+                    #
+                    # The anchor is the servo's FIRST NON-"starting" status
+                    # document.  It used to be the Popen return, ~11.2 s of
+                    # launcher before that document exists, so the entire
+                    # window was spent before the servo could report and this
+                    # branch never held anything.
                     continue
                 with self._lock:
                     attempts = int(self._workflow["reacquisition_attempts"])
@@ -2075,11 +2543,10 @@ class DepthServoRunner:
                 ):
                     return
                 continue
-            if phase != "tracking_lost":
+            if phase != ServoPhase.TRACKING_LOST.value:
                 if phase:
                     self._set_workflow(phase=str(phase))
                 continue
-            now = time.monotonic()
             with self._lock:
                 attempts = int(self._workflow["reacquisition_attempts"])
             if attempts >= self._max_reacquisitions:
@@ -2093,6 +2560,9 @@ class DepthServoRunner:
             last_reacquisition_s = now
             if self._run_perception(target, reacquisition=True):
                 self._set_workflow(phase="waiting_for_track")
+                # Same reason as the wrist-search path: a tracker reseed is a
+                # counted, bounded recovery that moves no wheels.
+                self._reactive_watchdog.note_supervisor_progress()
 
     def _terminate_process(self, process: subprocess.Popen[bytes], *, keep_status: bool) -> None:
         if process.poll() is None:

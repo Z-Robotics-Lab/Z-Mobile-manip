@@ -2589,3 +2589,241 @@ def test_perception_does_not_retry_grasp_geometry_failure_with_valid_seed(
     assert attempts == [1]
     assert result.exit_code == 4
     assert "Retrying perception" not in log.read_text(encoding="utf-8")
+
+
+# ===========================================================================
+# R9 -- THE DEPLOYMENT IS THE WORKING TREE.
+#
+# Editing this checkout is a live deploy: go2w_depth_servo.sh bind-mounts
+# $STACK_ROOT read-only and runs from it, and the resident perception/planning
+# workers import their modules once at startup.  The recorded chain is
+#
+#   edit -> resident-worker fingerprint mismatch (rc=70)
+#        -> component self-heal
+#        -> RETRY THAT INHERITED THE PREVIOUS SUB-ATTEMPT'S PASSIVE WINDOW
+#        -> passive_capture_count 0, 900-1200 rejections, whole budget burnt
+#        -> PERCEPTION_PROCESS_FAILED on a plainly detected object
+#        -> _perception_seeded_target false -> phase "wrist_search"
+#
+# Measured 6 self-heals out of 6 with passive_capture_count exactly 0, against
+# 2-21 captures on the SAME sessions' first sub-attempts.
+# ===========================================================================
+
+
+def test_the_selfheal_retry_starts_from_an_empty_output_directory(tmp_path):
+    """THE DEFECT.  ``run_perception`` retried into a dirty directory.
+
+    The second ``_run_perception_once`` re-enters the attempt loop at
+    ``attempt == 0``, so the loop's own ``if attempt:`` cleanup never runs.  The
+    rc=70 sub-attempt's ``selected_passive_joint_report.json`` therefore
+    survived, ``_selected_passive_report_valid`` stayed true, the supervision
+    loop never opened another window, and the dry run kept matching fresh
+    bundles against an observation that had closed ~18 s earlier.
+    """
+
+    module = _integration_module()
+    output = tmp_path / "perception"
+    output.mkdir()
+    log = tmp_path / "perception.log"
+
+    seen: list[dict[str, bool]] = []
+
+    def fake_once(self, *, target, output_dir, log_path):
+        seen.append({
+            "selected": (output_dir / "selected_passive_joint_report.json").exists(),
+            "live": (output_dir / "live_passive_joint_report.json").exists(),
+            "report": (output_dir / "report.json").exists(),
+            # THE CAUSAL LINK to the recorded symptom.  The supervision loop
+            # inside _run_perception_once skips opening a passive window for as
+            # long as this is True, which is exactly why every self-healed retry
+            # recorded passive_capture_count of 0 against 2-21 on its own first
+            # sub-attempt.
+            "would_skip_capture": self._selected_passive_report_valid(output_dir),
+        })
+        if len(seen) == 1:
+            # Exactly what the rc=70 sub-attempt leaves behind: a window it
+            # captured and selected before the transport failed.
+            (output_dir / "selected_passive_joint_report.json").write_text(
+                json.dumps(_passive_report()), encoding="utf-8",
+            )
+            (output_dir / "live_passive_joint_report.json").write_text(
+                json.dumps(_passive_report()), encoding="utf-8",
+            )
+            (output_dir / "report.json").write_text("{}", encoding="utf-8")
+            return BackendResult(70, "PERCEPTION_PROCESS_FAILED", "stale worker"), True
+        return BackendResult(0), False
+
+    backend = module.FixedReadOnlyBackend(module.ServerRuntimeConfig())
+    module.FixedReadOnlyBackend._run_perception_once = fake_once
+    try:
+        backend._heal_stale_perception_worker = lambda log_path: True
+        backend._persist_fingerprint_selfheal_cost = (
+            lambda *args, **kwargs: None
+        )
+        result = backend.run_perception(
+            target="charger", output_dir=output, log_path=log,
+        )
+    finally:
+        del module.FixedReadOnlyBackend._run_perception_once
+
+    assert result.exit_code == 0
+    assert len(seen) == 2, "the self-heal must actually retry"
+    # The whole point: the healed retry sees NOTHING from the failed one.  If
+    # any of these is True the retry is judged on the previous attempt's
+    # evidence, which is the recorded passive_capture_count == 0 deadlock.
+    assert seen[1] == {
+        "selected": False, "live": False, "report": False,
+        "would_skip_capture": False,
+    }
+
+
+def test_the_inner_fresh_seed_retry_also_clears_the_live_passive_window(tmp_path):
+    """The inner retry cleared seven artifacts and left the eighth.
+
+    ``live_passive_joint_report.json`` is what ``--passive-window`` points at.
+    Deleting the SELECTED report without deleting the LIVE one makes the
+    supervision loop open a new window (good) while the dry run keeps reading
+    the old one until the first fresh capture lands (bad, and invisible).
+    """
+
+    module = _integration_module()
+    output = tmp_path / "perception"
+    output.mkdir()
+    for name in (
+        "report.json",
+        "edgetam_mask.png",
+        "edgetam_overlay.png",
+        "grasp_candidates.npz",
+        "grasp_candidates_overlay.png",
+        "scene_collision_points.npy",
+        "selected_passive_joint_report.json",
+        "target_points.npy",
+        "live_passive_joint_report.json",
+    ):
+        (output / name).write_bytes(b"stale")
+
+    module.FixedReadOnlyBackend._clear_inherited_attempt_outputs(output)
+
+    assert sorted(p.name for p in output.iterdir()) == []
+    # And the source of truth is one list, not two: the inner retry must go
+    # through the same helper rather than keeping its own copy.
+    source = INTEGRATION.read_text(encoding="utf-8")
+    assert source.count('"live_passive_joint_report.json",') == 1
+
+
+def test_a_stale_passive_window_is_its_own_error_code(tmp_path):
+    """It used to arrive as PERCEPTION_PROCESS_FAILED -- "the worker died"."""
+
+    module = _integration_module()
+    output = tmp_path / "perception"
+    output.mkdir()
+    (output / "report.json").write_text(json.dumps({
+        "read_only": True,
+        "instruction": "charger",
+        "seed_accepted": True,
+        "largest_bundle_target_points": 781,
+        "passive_window_rejections": 911,
+        "widest_rejected_overlap_margin_s": -17.807681,
+        "perception_failure": (
+            "passive_window_stale: the passive window closed 17.808 s before "
+            "this bundle wait began and 17.900 s before the oldest bundle in "
+            "hand; no fresh capture can overlap it, so it must be re-captured"
+        ),
+    }), encoding="utf-8")
+
+    result = module.FixedReadOnlyBackend._perception_failure_result(output, 5)
+    assert result.error_code == "PERCEPTION_PASSIVE_WINDOW_STALE"
+    assert "must be re-captured" in result.message
+    # RE-CAPTURE, NEVER RELAXATION: the wrapper must spend a retry on it, and
+    # the retry's cleanup is what supplies a window that can overlap.
+    assert module.FixedReadOnlyBackend._perception_retryable(output, 5) is True
+
+
+def test_a_stale_window_must_not_be_confused_with_a_tracker_or_camera_fault(
+    tmp_path,
+):
+    module = _integration_module()
+    output = tmp_path / "perception"
+    output.mkdir()
+    for failure, code in (
+        ("camera_frame_timeout: no synchronized frame",
+         "PERCEPTION_CAMERA_FRAME_TIMEOUT"),
+        ("grounding_failed: no detection", "PERCEPTION_TARGET_NOT_FOUND"),
+        ("tracker_reported_loss: mask lost", "PERCEPTION_TRACKER_LOST"),
+    ):
+        (output / "report.json").write_text(json.dumps({
+            "read_only": True,
+            "perception_failure": failure,
+        }), encoding="utf-8")
+        assert (
+            module.FixedReadOnlyBackend._perception_failure_result(
+                output, 5,
+            ).error_code
+            == code
+        )
+
+
+def test_perception_attempt_records_the_runtime_fingerprint_at_both_ends(
+    tmp_path,
+):
+    """An attempt must be able to say which bytes produced it.
+
+    Recorded: commits a0f9e10 (10:38) and 0124a20 (12:10) each produced a
+    resident-worker fingerprint mismatch minutes later and a failed perception,
+    2 of 2 -- and every attempt.json written in that window is silent about it.
+    """
+
+    backend = FakeBackend()
+    fingerprints = iter(["before-the-edit", "after-the-edit"])
+    backend.runtime_fingerprint = lambda: next(fingerprints)
+    service = _service(tmp_path, backend)
+
+    attempt = service.run_perception("charger")
+    block = attempt["runtime_fingerprint"]
+    assert block["started"] == "before-the-edit"
+    assert block["finished"] == "after-the-edit"
+    assert block["changed_during_attempt"] is True
+
+
+def test_a_stable_tree_reports_changed_false_and_a_missing_probe_reports_none(
+    tmp_path,
+):
+    backend = FakeBackend()
+    backend.runtime_fingerprint = lambda: "stable"
+    stable = _service(tmp_path / "stable", backend).run_perception("charger")
+    assert stable["runtime_fingerprint"] == {
+        "started": "stable",
+        "finished": "stable",
+        "changed_during_attempt": False,
+    }
+
+    # A backend without the optional probe must degrade to "unknown", never to
+    # "unchanged": absence of a stamp is not evidence of a stable tree.
+    bare = _service(tmp_path / "bare", FakeBackend()).run_perception("charger")
+    assert bare["runtime_fingerprint"] == {
+        "started": None,
+        "finished": None,
+        "changed_during_attempt": None,
+    }
+
+
+def test_a_failing_fingerprint_probe_cannot_fail_the_perception_action(tmp_path):
+    """A diagnostic may never take down the action it is diagnosing."""
+
+    def explode():
+        raise RuntimeError("the tree vanished mid-hash")
+
+    backend = FakeBackend()
+    backend.runtime_fingerprint = explode
+    attempt = _service(tmp_path, backend).run_perception("charger")
+    assert attempt["status"] == "succeeded"
+    assert attempt["runtime_fingerprint"]["changed_during_attempt"] is None
+
+
+def test_the_production_backend_exposes_a_live_runtime_fingerprint():
+    module = _integration_module()
+    value = module.FixedReadOnlyBackend.runtime_fingerprint()
+    assert isinstance(value, str) and len(value) == 64
+    # Recomputed per call rather than cached: this checkout IS the deployment,
+    # so a cached value would describe the tree as it was at process start.
+    assert value == module.FixedReadOnlyBackend.runtime_fingerprint()

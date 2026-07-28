@@ -56,7 +56,32 @@ REMOTE
 
 if [[ "$(transport_state)" != ready ]]; then
   printf 'Go2W WebRTC transport is stale; restarting the fixed NUC service\n' >&2
-  "${SSH[@]}" "systemctl --user restart '$SERVICE'"
+  # H5.  THIS LINE USED TO BE THE SILENT ABORT.  Under `set -euo pipefail` a
+  # `systemctl restart` that fails because the unit hit its start limiter exits
+  # this script immediately, and go2w_depth_servo.sh calls it under `set -e`, so
+  # the servo launch dies with the operator holding a message about a stale
+  # transport -- not about systemd refusing to start anything.  Nothing in this
+  # repository has ever called reset-failed.
+  #
+  # Diagnose first, clear only start-limit-hit, at most once per preflight.  The
+  # readiness loop below is untouched, so a bridge that is genuinely broken
+  # still fails this preflight and still stops the servo; it just says why.
+  limiter="$(
+    "${SSH[@]}" "systemctl --user show '$SERVICE' -p Result --value" 2>/dev/null || true
+  )"
+  if [[ "$limiter" == start-limit-hit ]]; then
+    restarts="$(
+      "${SSH[@]}" "systemctl --user show '$SERVICE' -p NRestarts --value" 2>/dev/null || true
+    )"
+    printf '%s tripped its systemd start limiter (Result=start-limit-hit, NRestarts=%s); clearing it once so this preflight reports the real transport fault\n' \
+      "$SERVICE" "${restarts:-unknown}" >&2
+    "${SSH[@]}" "systemctl --user reset-failed '$SERVICE'" >/dev/null 2>&1 || true
+  fi
+  if ! "${SSH[@]}" "systemctl --user restart '$SERVICE'"; then
+    printf 'Go2W transport preflight failed: could not restart %s on the NUC (check `systemctl --user status %s` there)\n' \
+      "$SERVICE" "$SERVICE" >&2
+    exit 1
+  fi
 fi
 
 for _ in $(seq 1 24); do

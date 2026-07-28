@@ -2,6 +2,29 @@
 Description=Z-Mobile Manip PiPER reactive view executor (single CAN owner)
 After=network-online.target
 Conflicts=z-manip-piper-passive-feedback.service
+# H5.  KEEP A LIMITER, BUT AN EXPLICIT AND WIDER ONE.
+#
+# Inherited default is 5 starts / 10 s.  With RestartSec=1 a genuine crash loop
+# reaches it in 4 s, which is CORRECT for this unit and must be preserved: it is
+# the single CAN owner (see Conflicts= above), a crash loop here fights the
+# passive feedback bridge for the bus, and the launcher's acquire_arm_owner
+# checks is-active afterwards, so a latched unit fails the servo launch CLOSED.
+#
+# What the default gets wrong is that operator-driven starts count too.  Every
+# live go2w_depth_servo.sh launch starts this unit once, and an operator
+# retrying a task several times a minute could trip a limiter sized for a crash
+# loop.  60 s / 10 separates the two populations: it latches a crash loop whose
+# failed starts survive up to 60/9 - 1 = 5.67 s, while ten operator launches per
+# minute never do.  RestartSec=1 is what buys that headroom -- the two
+# RestartSec=3 units beside this one had to come down to a burst of 8 for the
+# same guarantee, because a crash cycle is uptime + RestartSec, not RestartSec.
+#
+# NOT StartLimitIntervalSec=0 (the d435i/ffs-ir-throttle choice).  Those units
+# own no exclusive resource and their characteristic failure is an early-boot
+# race that retrying cures.  This one owns the CAN bus, and "retry forever"
+# there means fighting whichever process currently holds it.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple

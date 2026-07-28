@@ -5,6 +5,7 @@ import pytest
 
 from z_manip.control.reactive_servo import (
     ArmViewMode,
+    BaseMotionIntent,
     PostureIntent,
     ReactivePhase,
     ReactiveServoConfig,
@@ -762,3 +763,50 @@ def test_view_damping_can_be_disabled_for_a_transparent_passthrough():
         commanded_rate_rps=_MAX_QDOT_RPS,
         update_period_s=0.133,
     ) == pytest.approx(1.0)
+
+
+def test_acquisition_is_not_loss_and_holds_the_seeded_view():
+    """``_last_geometry is None`` is "not yet", not "lost past the grace".
+
+    Before this stage both answers were SEARCH_REQUIRED.  A controller on its
+    very first tick was therefore indistinguishable from one that had tracked
+    a target and lost it past the full ``tracking_loss_grace_s``, and the
+    supervisor spent a bounded reacquisition attempt sweeping the wrist camera
+    away from a target perception had just seeded (symptom B).
+    """
+
+    controller = ReactiveTargetController(ReactiveServoConfig())
+
+    decision = controller.update(
+        None,
+        now_s=1.0,
+        tracking=False,
+        body_settled=True,
+    )
+
+    assert decision.phase is ReactivePhase.ACQUIRING
+    assert decision.phase is not ReactivePhase.SEARCH_REQUIRED
+    assert controller.phase is ReactivePhase.ACQUIRING
+    # Stationary in every channel: base, body posture and wrist.
+    assert decision.base == BaseMotionIntent()
+    assert decision.posture == PostureIntent()
+    assert decision.arm_view.mode is ArmViewMode.HOLD
+    assert decision.arm_view.mode is not ArmViewMode.SEARCH
+    assert decision.geometry is None
+    assert "yet" in decision.reason
+
+
+def test_a_real_loss_past_the_grace_still_requests_the_bounded_search():
+    """The split must not weaken the genuine terminal-loss verdict."""
+
+    controller = ReactiveTargetController(
+        ReactiveServoConfig(tracking_loss_grace_s=0.50)
+    )
+    geometry = _geometry()
+    controller.update(geometry, now_s=4.0, tracking=True, body_settled=True)
+
+    decision = controller.update(None, now_s=4.60, tracking=False, body_settled=True)
+
+    assert decision.phase is ReactivePhase.SEARCH_REQUIRED
+    assert decision.arm_view.mode is ArmViewMode.SEARCH
+    assert decision.base == BaseMotionIntent()

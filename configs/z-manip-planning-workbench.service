@@ -1,6 +1,28 @@
 [Unit]
 Description=Z-Manip loopback planning-only workbench
 After=default.target docker.service
+# H5.  THE ONE UNIT THAT SHOULD RETRY FOREVER, following the deliberate
+# StartLimitIntervalSec=0 precedent already set by d435i.service:4 and
+# ffs-ir-throttle.service:4.
+#
+# Differences from the three NUC units, each of which keeps a limiter:
+#   * it owns no exclusive hardware -- no CAN bus, no WebRTC channel -- so
+#     "retry forever" cannot fight another owner for a resource;
+#   * its characteristic failure is a start-order race, not a fault.  It is
+#     ``After=docker.service`` and binds port 8766, so a docker socket that is
+#     not ready yet, or a previous instance that has not released the port, both
+#     produce a short burst of failed starts that a retry cures.  With
+#     RestartSec=2 the inherited 5-per-10 s latches on exactly that burst;
+#   * IT IS THE OPERATOR'S ONLY INTERFACE.  Every other unit that latches
+#     announces itself by failing an action the operator just requested.  This
+#     one announces itself as a browser tab that stops updating, and there is no
+#     second channel through which they would learn the limiter had tripped.
+#
+# The failure this does NOT protect against -- a workbench that is genuinely
+# broken and restarts every 2 s forever -- is loud in `systemctl --user status`
+# and costs nothing but log lines, whereas a latched workbench costs the whole
+# session.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

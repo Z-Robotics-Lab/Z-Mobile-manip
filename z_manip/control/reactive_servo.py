@@ -118,11 +118,30 @@ class TargetGeometry:
 
 
 class ReactivePhase(str, Enum):
+    """Controller-internal phases.
+
+    Every value here MUST also be a ``z_manip.control.servo_phase.ServoPhase``
+    member; that module checks the parity at import time.  These strings leave
+    the process in the depth-servo status document, so a value that no
+    consumer spells is a silently dead transition.
+    """
+
+    # No 3-D target has EVER reached this controller instance.  Distinct from
+    # SEARCH_REQUIRED, which means a target WAS held and the full
+    # ``tracking_loss_grace_s`` has since been spent.  See ``_lost``.
+    ACQUIRING = "acquiring"
     WAITING_TARGET = "waiting_target"
     TRANSFORM_UNAVAILABLE = "transform_unavailable"
     BASE_APPROACH = "base_approach"
     POSTURE_ADJUST = "posture_adjust"
-    REACQUIRE = "reacquire"
+    # Spelled "reacquiring", not "reacquire".  The emitted value used to be
+    # "reacquire" while EVERY consumer -- the servo's LOSS_STAIR_PHASES, the
+    # whole-body branch's inline bail-out set, and the legacy branch's own
+    # emission -- spelled "reacquiring".  No consumer matched the emitted
+    # string, so a reacquiring servo was indistinguishable from a healthy
+    # tracking one and the whole-body branch kept solving on a target the
+    # controller had just declared unstable after posture motion.
+    REACQUIRE = "reacquiring"
     TRACKING_HOLD = "tracking_hold"
     VIEW_RECOVERY = "view_recovery"
     SEARCH_REQUIRED = "search_required"
@@ -465,16 +484,43 @@ class ReactiveTargetController:
         )
 
     def _lost(self, *, now_s: float) -> ReactiveServoDecision:
+        """Answer the loss stair, distinguishing "not yet" from "lost".
+
+        ACQUISITION IS NOT LOSS.  This branch used to answer with the most
+        severe verdict the stair had -- SEARCH_REQUIRED -- for a controller
+        that had simply never been handed a geometry.  That is the first tick
+        of every session, and in the recorded corpus every row at
+        ``bundle_count == 1`` is ``phase=search_required`` with
+        ``tracking=null`` (12 of 12, artifacts/go2w_real/latest/
+        depth-servo.trace.jsonl{,.1}).  The supervisor read that as a terminal
+        loss and spent a reacquisition attempt sweeping the wrist camera AWAY
+        from a target perception had just seeded: symptom B.
+
+        ACQUIRING is a real table row with a finite deadline
+        (``DEFAULT_DEADLINE_S``) and a terminal, stationary expiry
+        (``STOP_AND_DEGRADE``).  It is NOT an open hold: emitting a phase with
+        no bounded exit here would have been a hard fail-open, because nothing
+        else in either process ends it.
+
+        The arm-view mode is HOLD, not SEARCH.  There is no last-known viewing
+        ray to sweep back to, and the pose the wrist is holding is the one
+        perception seeded the tracker from -- sweeping off it is the single
+        action guaranteed to make acquisition harder.
+        """
+
         geometry = self._last_geometry
         if geometry is None or self._last_seen_s is None:
-            self.phase = ReactivePhase.SEARCH_REQUIRED
+            self.phase = ReactivePhase.ACQUIRING
             return ReactiveServoDecision(
                 phase=self.phase,
                 base=BaseMotionIntent(),
                 posture=PostureIntent(),
-                arm_view=ArmViewIntent(mode=ArmViewMode.SEARCH),
+                arm_view=ArmViewIntent(mode=ArmViewMode.HOLD),
                 geometry=None,
-                reason="no 3-D target is available; start bounded search",
+                reason=(
+                    "no 3-D target has been received yet; hold the base and "
+                    "the seeded view while acquisition completes"
+                ),
             )
         age_s = max(0.0, now_s - self._last_seen_s)
         if age_s <= self.config.tracking_hold_s:

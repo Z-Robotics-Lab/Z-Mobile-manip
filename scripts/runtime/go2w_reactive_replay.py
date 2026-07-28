@@ -31,7 +31,11 @@ def main() -> int:
         stall_threshold_s=args.stall_threshold_s,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
-    has_stall = bool(report["stalls"])
+    # Both detectors count.  A trace that FLAPS between two parked phases
+    # produces no per-span stall (every span is one sample) while parking the
+    # robot for minutes; reading only ``stalls`` would exit 0 on exactly the
+    # input the deployed watchdog now stops.
+    has_stall = bool(report["stalls"]) or bool(report["no_progress_stalls"])
     return 0 if has_stall == bool(args.expect_stall) else 1
 
 

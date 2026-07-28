@@ -284,10 +284,29 @@ def test_base_stays_stopped_and_locked_across_the_transient_retry(tmp_path):
 
 
 def test_retry_codes_are_exactly_the_transient_perception_faults():
+    # PERCEPTION_PASSIVE_WINDOW_STALE was CARVED OUT of PERCEPTION_PROCESS_FAILED
+    # in R9; it was already retried here under that older, less specific code.
+    # Adding it keeps the handoff's behaviour identical while making the reason
+    # legible.  What this test still pins is the boundary that matters: the
+    # deterministic geometry/grounding/tracker failures below stay out.
     assert CONTROL.MOBILE_HANDOFF_PERCEPTION_RETRY_CODES == frozenset({
         "PERCEPTION_PROCESS_FAILED",
         "PERCEPTION_CAMERA_FRAME_TIMEOUT",
+        "PERCEPTION_PASSIVE_WINDOW_STALE",
     })
+    assert CONTROL.MOBILE_HANDOFF_PERCEPTION_RETRY_CODES.isdisjoint({
+        "GRASP_GEOMETRY_FAILED",
+        "PERCEPTION_TARGET_NOT_FOUND",
+        "PERCEPTION_TRACKER_LOST",
+    })
+    # And the brief's explicit prohibition, pinned where somebody adding a code
+    # will see it: the zero-TX gate's own failure must never seed the approach.
+    assert "PERCEPTION_PROCESS_FAILED" not in (
+        CONTROL.DepthServoRunner._SEED_VALID_FAILURE_CODES
+    )
+    assert "PERCEPTION_PASSIVE_WINDOW_STALE" not in (
+        CONTROL.DepthServoRunner._SEED_VALID_FAILURE_CODES
+    )
 
 
 # ---------------------------------------------------------------------------

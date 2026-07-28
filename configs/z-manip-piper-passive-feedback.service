@@ -2,6 +2,38 @@
 Description=PiPER receive-only CAN to ROS joint telemetry
 After=network-online.target
 Wants=network-online.target
+# H5.  KEEP A LIMITER, EXPLICIT AND MUCH WIDER, because this unit is RESTARTED
+# BY HAND MORE THAN ANY OTHER IN THE SYSTEM.
+#
+# Five separate call sites stop it and start it again around every arm motion:
+# go2w_depth_servo.sh (acquire/release_arm_owner), piper_home_remote.sh (twice),
+# piper_wrist_search_remote.sh, piper_grasp_stage_remote.py and
+# piper_full_grasp_remote.py, plus two unconditional restarts in
+# go2w_component_manager.sh.  A single mobile pick->hold->place-back cycle
+# therefore starts it several times, and a run of short operator actions can
+# plausibly exceed the inherited 5-per-10 s.  When it latches, the ZERO-TX
+# EVIDENCE PRODUCER is gone and every perception fails closed on
+# PASSIVE_JOINT_GATE_FAILED -- with no message anywhere saying "start request
+# repeated too quickly".
+#
+# 60 s / 8.  IT WAS FIRST WRITTEN 60 s / 15 AND THAT NEVER LATCHED AT ALL.  A
+# crash cycle is uptime + RestartSec, not RestartSec: 15 starts at RestartSec=3
+# fit inside 60 s only if every failed start dies within 60/14 - 3 = 1.29 s.
+# The fail-loud path this unit is meant to latch -- the "can0 TX counter
+# changed" RuntimeError in piper_passive_joint_state_bridge.py -- cannot fire
+# until 1.0 s after its first accepted frame, on top of /bin/bash -lc, source
+# ros_env.sh and import rclpy.  So 60/15 asserted a latch it did not have.
+#
+# 60 s / 8 latches a crash loop whose failed starts survive up to
+# 60/7 - 3 = 5.57 s, and still admits eight operator-driven starts per minute
+# against the inherited five per ten seconds -- the burst shape that actually
+# failed.  A latch is also no longer silent: go2w_depth_servo.sh's
+# acquire_arm_owner diagnoses Result=start-limit-hit on this unit, prints
+# NRestarts and clears it once.  Not StartLimitIntervalSec=0: this is a CAN
+# owner and an unbounded retry loop against a down can0 competes with whichever
+# executor currently holds the bus.
+StartLimitIntervalSec=60
+StartLimitBurst=8
 
 [Service]
 Type=simple

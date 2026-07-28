@@ -35,13 +35,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STACK_ROOT = SCRIPT_DIR.parent.parent
 WORKSPACE_ROOT = STACK_ROOT.parent
 sys.path.insert(0, str(STACK_ROOT))
+# ``z_manip_runtime_fingerprint`` below is a SIBLING FILE imported by top-level
+# name, which used to work only because ``sys.path[0]`` happened to be this
+# directory -- true when the server runs the script, false under a test that
+# loads this file through an importlib spec.  The result was 39 failures in
+# tests/test_read_only_sessions.py when that file is run ALONE and none when it
+# is run after any test that had already inserted this directory: a suite whose
+# verdict depended on collection order.  Name the directory explicitly.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 from z_manip.read_only_sessions import (  # noqa: E402
     BackendResult,
     ReadOnlySessionService,
     SessionContractError,
 )
-from z_manip_runtime_fingerprint import runtime_fingerprint  # noqa: E402
+from z_manip_runtime_fingerprint import (  # noqa: E402
+    runtime_fingerprint,
+    try_runtime_fingerprint,
+)
 
 
 RUN_ROOT = WORKSPACE_ROOT / "artifacts" / "go2w_real" / "interactive_sessions"
@@ -107,6 +119,11 @@ PASSIVE_REPORT_REQUIRED_FIELDS = (
     "joint_snapshot_span_s",
 )
 PERCEPTION_ATTEMPTS = 2
+# The exact prefix ``go2w_perception_dry_run.py`` writes into
+# ``report.perception_failure`` when it refuses a passive window that closed
+# before its own bundle wait began.  Written once here and matched once below,
+# so the producer and the consumer cannot drift into two spellings.
+PASSIVE_WINDOW_STALE_FAILURE_PREFIX = "passive_window_stale"
 MAX_PASSIVE_REPORT_BYTES = 1024 * 1024
 MAX_SESSION_GATE_REPORT_BYTES = 256 * 1024
 MAX_PLANNING_REPORT_BYTES = 4 * 1024 * 1024
@@ -668,6 +685,20 @@ class FixedReadOnlyBackend:
         self._fingerprint_selfheal_cost_s = 0.0
 
     @staticmethod
+    def runtime_fingerprint() -> str | None:
+        """Fingerprint of the exact bytes the resident workers load right now.
+
+        Recomputed per call, never cached: the whole point is that this checkout
+        is the deployment (``go2w_depth_servo.sh`` bind-mounts it read-only and
+        runs from it), so a cached value would report the tree as it was when
+        this process started rather than as it is.  ``try_runtime_fingerprint``
+        never raises -- a file can vanish between the ``is_file`` check and the
+        read while somebody is saving.
+        """
+
+        return try_runtime_fingerprint()[0]
+
+    @staticmethod
     def _ssh_prefix() -> tuple[str, ...]:
         # Reuse the authenticated fixed-host transport across the short passive
         # probe and report fetch.  This removes repeated SSH handshakes while
@@ -963,6 +994,61 @@ class FixedReadOnlyBackend:
         except subprocess.TimeoutExpired:
             return 1
 
+    @classmethod
+    def _clear_inherited_attempt_outputs(cls, output_dir: Path) -> None:
+        """Delete EVERY artifact a previous sub-attempt left in ``output_dir``.
+
+        THE DEFECT.  A retry -- the inner fresh-seed retry below, or the rc=70
+        resident-worker self-heal in ``run_perception`` -- reuses the SAME
+        ``output_dir``.  The self-heal path cleared nothing at all, and the
+        inner path cleared everything EXCEPT ``live_passive_joint_report.json``.
+        Two things then went wrong at once:
+
+        1. ``_selected_passive_report_valid`` saw the previous sub-attempt's
+           selected report, so the supervision loop below never opened another
+           passive window.  Recorded, RE-COUNTED over all 923 sessions rather
+           than the handful first noticed: 50 sessions log a resident-worker
+           fingerprint mismatch, 13 of them go on to record a second
+           sub-attempt, and 12 of those 13 recorded ``passive_capture_count: 0``
+           on the healed retry against 2-20 captures on their own first
+           sub-attempt (20260724-012158, -041752, -042159, -042700, -042928,
+           -043016, 20260727-080308, 20260728-030239, -041144, -062834,
+           -070233, -081128).  An earlier version of this docstring said "6 of
+           6"; the real figure is 12 of 13, and the one exception --
+           20260724-041832, which captured 22 -- is the only recorded evidence
+           that the inherited report is not ALWAYS still valid on the retry.
+        2. The dry run's ``--passive-window`` therefore still pointed at a
+           window that had closed ~18 s earlier, so its stamp-overlap gate
+           rejected every fresh bundle: 911 and 1127 rejections with
+           ``widest_rejected_overlap_margin_s`` of -17.8 s and -18.4 s, the full
+           15 s budget burnt, and ``PERCEPTION_PROCESS_FAILED`` on a run whose
+           own report says ``seed_accepted: true`` with 781 target points.
+
+        Deleting is the fail-CLOSED direction: it can only force a fresh
+        capture and a fresh grounding.  It can never make an invalid run look
+        valid, because ``_perception_outputs_valid`` still requires every one of
+        these files to exist and the selected report to pass the unchanged
+        zero-TX gate before the attempt is called a success.
+
+        ``live_passive_joint_report.json`` is listed here and NOT in
+        ``_perception_outputs_valid``'s required set on purpose: it is the
+        wrapper's inflight evidence, not a session artifact, and it is precisely
+        the file whose survival poisoned the retry.
+        """
+
+        for name in (
+            "report.json",
+            "edgetam_mask.png",
+            "edgetam_overlay.png",
+            "grasp_candidates.npz",
+            "grasp_candidates_overlay.png",
+            "scene_collision_points.npy",
+            "selected_passive_joint_report.json",
+            "target_points.npy",
+            "live_passive_joint_report.json",
+        ):
+            (output_dir / name).unlink(missing_ok=True)
+
     @staticmethod
     def _selected_passive_report_valid(output_dir: Path) -> bool:
         """Return whether the dry run already selected its zero-TX evidence."""
@@ -1083,6 +1169,19 @@ class FixedReadOnlyBackend:
         grasp_error = cls._bounded_perception_detail(
             report.get("grasp_generation_error"),
         )
+        if failure.startswith(PASSIVE_WINDOW_STALE_FAILURE_PREFIX):
+            # NAMED, and deliberately its own code.  Before this existed the
+            # symptom was indistinguishable from a dead worker: the run burnt
+            # its whole budget rejecting bundles against a window nothing was
+            # refreshing and surfaced as PERCEPTION_PROCESS_FAILED, which routed
+            # a plainly detected object into a wrist search.  The remedy is a
+            # fresh capture and nothing else -- the zero-TX gate itself is
+            # untouched.
+            return BackendResult(
+                return_code,
+                "PERCEPTION_PASSIVE_WINDOW_STALE",
+                failure,
+            )
         if failure.startswith("camera_frame_timeout"):
             return BackendResult(
                 return_code,
@@ -1124,6 +1223,10 @@ class FixedReadOnlyBackend:
         frame, while an ambiguous contact mask may recover on a new seed.
         A camera timeout is retried only when CameraInfo proves that the RGB-D
         source is alive and DDS discovery, rather than hardware, raced startup.
+        A stale passive window is retried unconditionally: it is not a property
+        of the scene at all, it is this wrapper having handed the dry run an
+        already-closed observation, and the retry's own cleanup is what fixes
+        it.
         """
 
         report = cls._perception_report(output_dir)
@@ -1150,6 +1253,17 @@ class FixedReadOnlyBackend:
         if return_code != 5:
             return False
         failure = report.get("perception_failure")
+        if isinstance(failure, str) and failure.startswith(
+            PASSIVE_WINDOW_STALE_FAILURE_PREFIX
+        ):
+            # FIX BY RE-CAPTURE, NEVER BY RELAXATION.  The next attempt runs
+            # through ``_clear_inherited_attempt_outputs``, which deletes the
+            # stale window, which is exactly what makes the supervision loop
+            # open a fresh one.  Nothing about the zero-TX gate or the
+            # stamp-overlap gate changes; the retry simply gets evidence that
+            # can satisfy them.  Bounded by PERCEPTION_ATTEMPTS like every
+            # other retryable class.
+            return True
         if isinstance(failure, str) and failure.startswith("tracker_reported_loss"):
             return True
         if not (
@@ -1276,6 +1390,14 @@ class FixedReadOnlyBackend:
                 healed_return_code=None,
             )
             return result
+        # THE SELF-HEAL IS A RETRY AND MUST START FROM AN EMPTY DIRECTORY.
+        # This second ``_run_perception_once`` re-enters the attempt loop at
+        # attempt==0, so the loop's own ``if attempt:`` cleanup never fires and
+        # every artifact of the rc=70 sub-attempt -- including its already
+        # closed passive window -- would be inherited.  That is the recorded
+        # ``passive_capture_count: 0`` deadlock; see
+        # ``_clear_inherited_attempt_outputs``.
+        self._clear_inherited_attempt_outputs(output_dir)
         healed, _mismatch_again = self._run_perception_once(
             target=target,
             output_dir=output_dir,
@@ -1493,17 +1615,7 @@ class FixedReadOnlyBackend:
                 attempt_command = (
                     command_prefix + dry_run_program + attempt_args
                 )
-                for name in (
-                    "report.json",
-                    "edgetam_mask.png",
-                    "edgetam_overlay.png",
-                    "grasp_candidates.npz",
-                    "grasp_candidates_overlay.png",
-                    "scene_collision_points.npy",
-                    "selected_passive_joint_report.json",
-                    "target_points.npy",
-                ):
-                    (output_dir / name).unlink(missing_ok=True)
+                self._clear_inherited_attempt_outputs(output_dir)
                 with log_path.open("ab") as log:
                     log.write(
                         b"Retrying perception with a fresh grounding seed"
