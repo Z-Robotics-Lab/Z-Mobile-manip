@@ -188,6 +188,13 @@ def _open_gripper(
         static_accept_after_s=0.5,
     )
     stage_executor.verify_gripper_ready(opened)
+    # The arm is provably empty from here.  Clearing the flag re-arms the
+    # electronic e-stop for the retreat legs, which
+    # ``emergency_stop_after_failure`` suppresses while holding so a fault
+    # cannot drop the payload.  Only a VERIFIED release clears it: if the
+    # gripper did not open, the object is still in it and suppression is still
+    # the correct behaviour.
+    guard.holding_load = False
 
 
 def _verify_holding_object(
@@ -510,6 +517,12 @@ def execute_full_grasp(
                 static_accept_after_s=0.5,
             )
             stage_executor.verify_gripper_ready(opened)
+            # Provably empty: re-arm the e-stop for the retreat legs.  Left set,
+            # it would suppress the stop for the rest of the run on an arm that
+            # is holding nothing.  Deliberately inside the try -- degraded
+            # release feedback means the object may still be in the gripper,
+            # and suppression is the right behaviour then.
+            guard.holding_load = False
         except Exception as error:
             print(
                 f"WARNING: release feedback degraded; continuing checked Home return: {error}",

@@ -1443,3 +1443,56 @@ def test_extra_npz_keys_do_not_disturb_the_existing_stage_loader(tmp_path):
     artifact = load_artifact(report_path, npz_path)
 
     np.testing.assert_allclose(EXECUTOR.carry_path(artifact), Q_CARRY)
+
+
+# ---------------------------------------------------------------------------
+# The e-stop gate.  ``emergency_stop_after_failure`` suppresses the electronic
+# e-stop while the arm is holding, because the stop unloads this installation
+# and drops the object.  That makes ``CommandGuard.holding_load`` a safety
+# variable in BOTH directions: left set after a release, it disarms the stop
+# for the rest of the run on an arm that is holding nothing.
+
+
+class _EstopRobot:
+    def __init__(self) -> None:
+        self.stops = 0
+
+    def electronic_emergency_stop(self) -> None:
+        self.stops += 1
+
+
+def test_the_estop_is_suppressed_while_holding_and_rearmed_after_release():
+    holding = EXECUTOR.CommandGuard()
+    holding.mark_before_path_motion()
+    holding.holding_load = True
+    robot = _EstopRobot()
+    EXECUTOR.emergency_stop_after_failure(robot, holding)
+    assert robot.stops == 0, "a fault while holding must not unload and drop the object"
+
+    released = EXECUTOR.CommandGuard()
+    released.mark_before_path_motion()
+    released.holding_load = True
+    released.holding_load = False  # what a verified release does
+    robot = _EstopRobot()
+    EXECUTOR.emergency_stop_after_failure(robot, released)
+    assert robot.stops == 1, "an empty arm must still get its emergency stop"
+
+
+def test_every_release_in_the_full_workflow_clears_the_holding_flag():
+    """Bind the flag's lifecycle to the file that owns the release.
+
+    ``holding_load`` is set in piper_full_grasp_executor and consumed by the
+    e-stop gate in this module, so a set with no matching clear is invisible
+    from either file alone -- and the retreat legs that run after a release
+    would silently lose their emergency stop with the suite green.
+    """
+
+    source = (
+        ROOT / "scripts" / "runtime" / "piper_full_grasp_executor.py"
+    ).read_text(encoding="utf-8")
+    assert source.count("guard.holding_load = True") == source.count(
+        "guard.holding_load = False"
+    ), (
+        "every leg that marks the guard as holding must clear it at its "
+        "release; an unmatched set disarms the e-stop for the rest of the run"
+    )
