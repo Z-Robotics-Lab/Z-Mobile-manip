@@ -1,4 +1,17 @@
 {
+  "comment": [
+    "THIS FILE IS THE ONLY ENFORCED MODEL OF THE GO2-W HEAD.",
+    "The <collision> geometry on base/Head_upper/Head_lower/mid360_link/",
+    "mid360_bracket_link/mount_plate/nuc_weight/regulator in go2w_sensored.urdf is",
+    "INERT: PinocchioSelfCollisionChecker reduces the model to the six active arm",
+    "joints, so every base-fixed geometry is dropped by the frame/joint filter in its",
+    "__init__ before a single collision pair is built (z_manip/collision/",
+    "pinocchio_self.py).  Commit e4be019 'enlarge envelope' edited that URDF and had",
+    "ZERO runtime effect; commit a8ecd46 then shrank the mid360 capsule here from 0.042",
+    "to 0.0325 and silently reverted the enforced envelope.  Head geometry changes must",
+    "land HERE, and tests/test_lidar_keepout.py pins this file to the URDF so the two",
+    "can never drift apart again."
+  ],
   "scene_clearance_m": 0.01,
   "point_radius_m": 0.003,
   "capsules": [
@@ -10,7 +23,7 @@
       "start_offset": [0.156473401, 0.0, -0.116794287],
       "end_offset": [0.156473401, 0.0, -0.026794287],
       "check_scene": false,
-      "check_target": false,
+      "check_target": true,
       "supplemental_self_collision": true
     },
     {
@@ -21,7 +34,7 @@
       "start_offset": [0.164473401, 0.0, -0.141794287],
       "end_offset": [0.164473401, 0.0, -0.141794287],
       "check_scene": false,
-      "check_target": false,
+      "check_target": true,
       "supplemental_self_collision": true
     },
     {
@@ -37,13 +50,43 @@
     },
     {
       "name": "mid360",
+      "comment": [
+        "Livox Mid-360 puck.  Segment = the two face centres of the URDF cylinder",
+        "(r=0.042, length=0.075 on mid360_link) with mid360_joint at base",
+        "xyz=(0.330, 0, 0.140) rpy=(0, 0.3490658503988659, 0), expressed in",
+        "piper_base_link by subtracting piper_mount_joint (0.128526599, 0, 0.081794287).",
+        "radius 0.050 = the 0.042 hardware envelope plus 8 mm of deliberate margin.",
+        "check_target MUST stay true: it is the only path that tests the CARRIED",
+        "OBJECT against the sensor (the accident the operator reported)."
+      ],
+      "radius": 0.050,
+      "start_offset": [0.188648, 0.0, 0.022967],
+      "end_offset": [0.214299, 0.0, 0.093444],
       "start_frame": "piper_base_link",
       "end_frame": "piper_base_link",
-      "radius": 0.0325,
-      "start_offset": [0.13036, 0.0, -0.01233],
-      "end_offset": [0.15259, 0.0, 0.04875],
       "check_scene": false,
-      "check_target": false,
+      "check_target": true,
+      "supplemental_self_collision": true
+    },
+    {
+      "name": "mid360_bracket",
+      "comment": [
+        "70 x 70 x 83 mm mounting post between the torso deck (base z=+0.057) and the",
+        "sensor origin (base z=0.140), directly under the puck's bottom face centre",
+        "(base x=0.317174).  radius 0.0495 = half-diagonal of the 70x70 section.",
+        "Previously it had no collision representation at all.",
+        "UNVERIFIED AGAINST CAD: the post's x is assumed to be under the sensor's",
+        "bottom face.  If the photograph shows it centred under the head cylinder at",
+        "base x=0.285, change both x offsets here and mid360_bracket_joint in the URDF",
+        "to 0.156473 / 0.285 and nothing else; the consistency test recomputes the rest."
+      ],
+      "start_frame": "piper_base_link",
+      "end_frame": "piper_base_link",
+      "radius": 0.0495,
+      "start_offset": [0.188648, 0.0, -0.024794],
+      "end_offset": [0.188648, 0.0, 0.058206],
+      "check_scene": false,
+      "check_target": true,
       "supplemental_self_collision": true
     },
     {
@@ -157,6 +200,14 @@
       ["mid360", "gripper_camera_plate"],
       ["mid360", "finger_left_proximal"], ["mid360", "finger_left_mid"], ["mid360", "finger_left_pad"], ["mid360", "finger_left_tip"],
       ["mid360", "finger_right_proximal"], ["mid360", "finger_right_mid"], ["mid360", "finger_right_pad"], ["mid360", "finger_right_tip"],
+      ["mid360_bracket", "upper_arm"],
+      ["mid360_bracket", "forearm"],
+      ["mid360_bracket", "wrist"],
+      ["mid360_bracket", "palm"],
+      ["mid360_bracket", "d435_body"],
+      ["mid360_bracket", "gripper_camera_plate"],
+      ["mid360_bracket", "finger_left_proximal"], ["mid360_bracket", "finger_left_mid"], ["mid360_bracket", "finger_left_pad"], ["mid360_bracket", "finger_left_tip"],
+      ["mid360_bracket", "finger_right_proximal"], ["mid360_bracket", "finger_right_mid"], ["mid360_bracket", "finger_right_pad"], ["mid360_bracket", "finger_right_tip"],
       ["nuc", "upper_arm"],
       ["nuc", "forearm"],
       ["nuc", "wrist"],
