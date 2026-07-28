@@ -10,6 +10,11 @@ R7  Only three phase strings ever carried a deadline, and the deployed servo
 R11 ``ReactivePhase.REACQUIRE`` emitted "reacquire" while every consumer
     spelled "reacquiring"; the vocabulary was hand-written six times.
 R10 The handoff latch was set by one tick and had no reset and no expiry.
+R7b The per-phase deadline added by R7 was itself defeated by phase
+    FLAPPING: ``_phase_started_s`` was rearmed by any phase-group change, and
+    the recorded corpus flaps between two phases that both publish (0, 0) at
+    0.05-0.75 s intervals.  A single injected ``transform_unavailable`` tick
+    made the recorded 23.1 s stall stop timing out again.
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ import pytest
 
 from z_manip.control.reactive_servo import ReactivePhase
 from z_manip.control.servo_phase import (
+    MIN_EFFECTIVE_BASE_COMMAND,
+    NO_PROGRESS_DEADLINE_S,
     PHASE_POLICY,
     BaseOwner,
     ExpiryAction,
@@ -563,3 +570,468 @@ def test_ik_probe_still_has_no_producer_in_this_repository():
         "scripts/runtime/go2w_depth_servo.py",
         "tests/test_servo_phase_table.py",
     ], f"unexpected ik_probe references: {sorted(hits)}"
+
+
+# ---------------------------------------------------------------------------
+# R7b -- the deadline must survive phase FLAPPING.
+#
+# The per-phase deadline is measured from the phase transition, so it is
+# rearmed by ANY phase change -- including a change between two phases that
+# both publish (0, 0).  Every test below drives a base that never moves and
+# asserts the watchdog still stops it.  Each one passes with a single
+# contiguous phase and FAILS the moment the phase string alternates, which is
+# the defect: the value that decided the transition (phase-string identity)
+# was not the value the guard claimed to measure (a zero-command span).
+# ---------------------------------------------------------------------------
+
+
+def _parked_row(phase: str, index: int, *, linear: float = 0.0) -> dict:
+    """One status document: mode live, tracking green, base at ``linear``."""
+
+    return {
+        "phase": phase,
+        "mode": "live",
+        "tracking": True,
+        "updated_unix_ns": 10_000_000_000 + index * 50_000_000,
+        "output": {
+            "published_linear_x": linear,
+            "published_angular_z": 0.0,
+            "proposed_linear_x": linear,
+            "proposed_angular_z": 0.0,
+        },
+    }
+
+
+def _first_timeout(phase_at, *, seconds: float = 90.0, hz: float = 20.0):
+    """Drive the watchdog with a parked base and return the first timeout."""
+
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        # The heartbeat advances every tick in these sequences; it is not the
+        # mechanism under test, and leaving it at 1.5 s would let a heartbeat
+        # timeout mask whether the PHASE bound works.
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=600.0)
+    )
+    last = None
+    for index in range(int(seconds * hz)):
+        now_s = index / hz
+        row = _parked_row(phase_at(index), index)
+        last = watchdog.observe(
+            row, now_s=now_s, now_unix_ns=row["updated_unix_ns"] + 10_000_000
+        )
+        if last.timed_out:
+            return now_s, last
+    return None, last
+
+
+#: Every pair below is two phases the deployed servo can emit back to back
+#: while publishing exactly (0, 0).
+_FLAP_SEQUENCES = {
+    # ``whole_body_approach`` and ``whole_body_shadow`` are the two arms of
+    # ONE ternary on ``command.executable`` (go2w_depth_servo.py
+    # ``_whole_body_output``), and the recorded live trace flips between them
+    # 15 times with inter-flip intervals of 0.05-0.75 s.  The approach arm can
+    # publish (0, 0) too: the forward clip returns 0.0 while the yaw deadband
+    # zeroes the turn -- the same reachability the ownership fix rests on.
+    "whole_body_executable_gate": (
+        lambda i: ServoPhase.WHOLE_BODY_SHADOW.value
+        if i % 2
+        else ServoPhase.WHOLE_BODY_APPROACH.value
+    ),
+    # The handoff corridor: ``_whole_body_output`` emits ``whole_body_posture``
+    # if executable else ``whole_body_shadow``, both parked BY DESIGN.  They
+    # sit in different groups (posture wait vs driving), so the flip rearmed
+    # the watchdog AND reset ``whole_body_handoff_settle_cycles`` -- an
+    # unbounded close-range park with tracking green.
+    "handoff_corridor_gate": (
+        lambda i: ServoPhase.WHOLE_BODY_POSTURE.value
+        if (i // 20) % 2
+        else ServoPhase.WHOLE_BODY_SHADOW.value
+    ),
+    # A single ``transform_unavailable`` tick splitting a long run: this
+    # happens six times in the recorded corpus.
+    "single_tick_transform_hiccup": (
+        lambda i: ServoPhase.TRANSFORM_UNAVAILABLE.value
+        if i % 180 == 0
+        else ServoPhase.WHOLE_BODY_SHADOW.value
+    ),
+    # The loss stair rotating slowly.  None of these three had an eager
+    # handler either, so this was an unbounded park with no diagnosis at all.
+    "loss_stair_rotation": (
+        lambda i: (
+            ServoPhase.TRACKING_HOLD.value,
+            ServoPhase.REACQUIRE.value,
+            ServoPhase.TRANSFORM_UNAVAILABLE.value,
+        )[(i // 100) % 3]
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FLAP_SEQUENCES))
+def test_phase_flapping_cannot_rearm_the_stall_timer(name):
+    """A parked base must be bounded however the phase string moves."""
+
+    fired_at, decision = _first_timeout(_FLAP_SEQUENCES[name])
+
+    assert fired_at is not None, (
+        f"{name}: the base published (0, 0) for 90s with tracking green and "
+        "the watchdog never timed out; phase flapping rearmed every deadline"
+    )
+    # It must be bounded by the CROSS-PHASE budget, and the diagnosis must say
+    # so rather than blaming whichever phase happened to be current.
+    assert decision.code == "BASE_PROGRESS_STALL_TIMEOUT"
+    assert decision.no_progress_s >= NO_PROGRESS_DEADLINE_S
+    assert decision.no_progress_deadline_s == NO_PROGRESS_DEADLINE_S
+    assert fired_at <= NO_PROGRESS_DEADLINE_S + 1.0
+    # An expiry that does nothing is the defect the table exists to remove.
+    assert decision.on_expiry in {
+        ExpiryAction.STOP_AND_DEGRADE.value,
+        ExpiryAction.ESCALATE_VIEW_RECOVERY.value,
+    }
+
+
+def test_one_injected_hiccup_tick_cannot_hide_the_recorded_23s_stall():
+    """The regression, driven from the real fixture.
+
+    ``test_watchdog_bounds_the_recorded_23s_zero_command_stall`` passes on the
+    contiguous recording.  Change ONE row's phase in the middle of that stall
+    -- exactly what a single ``transform_unavailable`` tick does, six times in
+    the recorded corpus -- and the per-phase deadline is rearmed and never
+    expires again.  The recording is 23.1 s of a live, parked, tracking-green
+    base, so it must still be caught.
+    """
+
+    rows = _fixture_rows()
+    stall_rows = [
+        index
+        for index, row in enumerate(rows)
+        if row.get("phase") == ServoPhase.WHOLE_BODY_SHADOW.value
+    ]
+    assert len(stall_rows) > 50, "fixture no longer contains the recorded stall"
+    injected = rows[stall_rows[len(stall_rows) // 2]]
+    injected["phase"] = ServoPhase.TRANSFORM_UNAVAILABLE.value
+
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=60.0)
+    )
+    base_ns = rows[0]["updated_unix_ns"]
+    fired = None
+    for row in rows:
+        now_s = (row["updated_unix_ns"] - base_ns) / 1e9
+        decision = watchdog.observe(
+            row, now_s=now_s, now_unix_ns=row["updated_unix_ns"] + 20_000_000
+        )
+        if decision.timed_out:
+            fired = (now_s, decision)
+            break
+
+    assert fired is not None, (
+        "one injected phase tick made the recorded 23.1s zero-command stall "
+        "stop timing out"
+    )
+    elapsed_s, decision = fired
+    assert elapsed_s <= 23.0, "the stall must be caught inside the recording"
+    assert decision.no_progress_s >= NO_PROGRESS_DEADLINE_S
+
+
+def test_replay_trace_flags_a_flapping_zero_command_run():
+    """A green replay must transfer to the deployed guard.
+
+    ``replay_trace``'s per-span detector groups by phase STRING, so a flapping
+    trace splits into short spans and reads healthy -- while the same input
+    parks the robot.  The cross-phase detector mirrors the live bound exactly,
+    so a replay verdict now means what it says.
+    """
+
+    rows = [
+        _parked_row(
+            ServoPhase.WHOLE_BODY_SHADOW.value
+            if index % 2
+            else ServoPhase.WHOLE_BODY_APPROACH.value,
+            index,
+        )
+        for index in range(int(40 * 20))  # 40 s at 20 Hz
+    ]
+
+    report = SUPERVISION.replay_trace(rows, stall_threshold_s=5.0)
+
+    assert report["passed"] is False, (
+        "replay declared a 40s parked, flapping base healthy"
+    )
+    assert report["no_progress_stalls"], "no cross-phase stall was reported"
+    stall = report["no_progress_stalls"][0]
+    assert stall["code"] == "BASE_PROGRESS_STALL"
+    assert stall["duration_s"] >= NO_PROGRESS_DEADLINE_S
+    assert set(stall["phases"]) == {
+        ServoPhase.WHOLE_BODY_APPROACH.value,
+        ServoPhase.WHOLE_BODY_SHADOW.value,
+    }
+    # The per-span detector alone is blind to this input: every span is one
+    # 0.05 s sample.  That is the whole point of the second detector.
+    assert report["stalls"] == []
+
+
+def test_a_terminal_row_does_not_launder_a_zero_command_run():
+    """A non-counting phase PAUSES the budget; it must not clear it.
+
+    Clearing on a phase change is the defect.  If an interleaved terminal (or
+    ``starting``) row reset the accumulator, the same flap that this fix
+    closes would reopen through the exempt rows instead.
+    """
+
+    def phase_at(index: int) -> str:
+        if index % 200 == 199:
+            return ServoPhase.STARTING.value
+        return ServoPhase.WHOLE_BODY_SHADOW.value
+
+    fired_at, decision = _first_timeout(phase_at)
+
+    assert fired_at is not None, (
+        "an interleaved non-counting phase laundered a continuous "
+        "zero-command run into short ones"
+    )
+    assert decision.no_progress_s >= NO_PROGRESS_DEADLINE_S
+
+
+def test_starting_does_not_spend_the_cross_phase_budget():
+    """...but the pause must be real, or a slow spawn is killed.
+
+    ``starting`` carries its own 30 s spawn backstop and publishes zero
+    because that is the CORRECT output while the container, rclpy and the
+    first TF read come up.  If it accumulated the 20 s cross-phase budget it
+    would be stopped at 20 s by a bound meant for a stalled approach.
+    """
+
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=600.0)
+    )
+    decision = None
+    for index in range(int(25 * 20)):  # 25 s, inside the 30 s spawn backstop
+        row = _parked_row(ServoPhase.STARTING.value, index)
+        decision = watchdog.observe(
+            row, now_s=index / 20.0, now_unix_ns=row["updated_unix_ns"] + 10_000_000
+        )
+        assert decision.timed_out is False, f"spawn killed at {index / 20.0:.1f}s"
+    assert decision.no_progress_s == 0.0
+    assert decision.no_progress_deadline_s is None
+
+
+def test_the_cross_phase_bound_is_never_tighter_than_a_phase_deadline():
+    """The invariant that makes the new bound safe to add.
+
+    If some row legitimately needs a deadline longer than the cross-phase
+    budget then that row's own claim is that a parked base is tolerable for
+    that long, and the cross-phase bound would cut it short mid-phase.  The
+    module raises at import time rather than letting that invert silently.
+    """
+
+    for phase, policy in PHASE_POLICY.items():
+        if not policy.counts_no_progress or policy.deadline_s is None:
+            continue
+        assert policy.deadline_s <= NO_PROGRESS_DEADLINE_S, (
+            f"{phase.value} tolerates {policy.deadline_s}s of a parked base "
+            f"but the cross-phase bound is {NO_PROGRESS_DEADLINE_S}s, so it "
+            "would be stopped before its own deadline"
+        )
+    # A terminal phase is acted on immediately; it must never accumulate.
+    for phase, policy in PHASE_POLICY.items():
+        if policy.is_terminal:
+            assert policy.counts_no_progress is False, phase.value
+
+
+def test_a_commanding_approach_survives_the_cross_phase_bound():
+    """The new bound must not kill a healthy, actually-moving approach.
+
+    A real command clears the accumulator, so an approach that keeps driving
+    runs arbitrarily long even while its phase flaps between the two arms of
+    the executable gate.
+    """
+
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=600.0)
+    )
+    for index in range(int(120 * 20)):  # 120 s, 6x the cross-phase bound
+        row = _parked_row(
+            ServoPhase.WHOLE_BODY_SHADOW.value
+            if index % 2
+            else ServoPhase.WHOLE_BODY_APPROACH.value,
+            index,
+            linear=0.12,
+        )
+        decision = watchdog.observe(
+            row, now_s=index / 20.0, now_unix_ns=row["updated_unix_ns"] + 10_000_000
+        )
+        assert decision.timed_out is False, f"healthy approach killed at {index}"
+    assert decision.no_progress_s == 0.0
+
+
+def test_a_sub_deadzone_command_is_not_progress():
+    """0.001 m/s forever is not driving; it must not rearm the timer.
+
+    The shipped settings snap any non-trivial forward command up to
+    ``min_forward_mps = 0.10`` precisely because of the Go2W dead zone, and
+    the yaw slew step is 0.015 rad/s, so nothing the servo legitimately holds
+    is anywhere near this floor.
+    """
+
+    assert MIN_EFFECTIVE_BASE_COMMAND > 0.001
+
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=600.0)
+    )
+    fired = False
+    for index in range(int(60 * 20)):
+        row = _parked_row(ServoPhase.APPROACH.value, index, linear=0.001)
+        decision = watchdog.observe(
+            row, now_s=index / 20.0, now_unix_ns=row["updated_unix_ns"] + 10_000_000
+        )
+        if decision.timed_out:
+            fired = True
+            break
+    assert fired, "a 0.001 m/s command rearmed the stall timer forever"
+    # ...and the reported owner must agree with the timer, or the operator
+    # reads ``visual_servo`` next to a stall diagnosis.
+    assert decision.owners["base"] == BaseOwner.ZERO_HOLD.value
+
+    # A command at the floor IS progress, and is reported as such.
+    owners = SUPERVISION.ownership_snapshot(
+        _parked_row(
+            ServoPhase.APPROACH.value, 0, linear=MIN_EFFECTIVE_BASE_COMMAND
+        )
+    )
+    assert owners["base"] == BaseOwner.VISUAL_SERVO.value
+
+
+def test_a_counted_recovery_clears_only_the_cross_phase_budget():
+    """A stationary recovery is supervisory progress.
+
+    A wrist search moves no wheels, so without this the accumulator is full
+    when the servo restarts and expires on the first observation of the
+    recovered run -- collapsing the whole (bounded) reacquisition budget into
+    a few seconds instead of giving each attempt its own bound.
+    """
+
+    watchdog = SUPERVISION.ReactivePhaseWatchdog(
+        SUPERVISION.ReactiveWatchdogConfig(state_heartbeat_timeout_s=600.0)
+    )
+    for index in range(int(15 * 20)):
+        row = _parked_row(ServoPhase.TRACKING_LOST.value, index)
+        watchdog.observe(
+            row, now_s=index / 20.0, now_unix_ns=row["updated_unix_ns"] + 10_000_000
+        )
+    assert watchdog.last.no_progress_s > 10.0
+
+    watchdog.note_supervisor_progress()
+    row = _parked_row(ServoPhase.WAITING_TARGET.value, 300)
+    decision = watchdog.observe(
+        row, now_s=15.0, now_unix_ns=row["updated_unix_ns"] + 10_000_000
+    )
+    # One tick's worth of fresh accumulation, not the 15 s that preceded it.
+    assert decision.no_progress_s < 0.2
+    assert decision.timed_out is False
+    # It must NOT be a general amnesty: the heartbeat state is untouched, so a
+    # dead servo is still caught.
+    assert decision.heartbeat_required is True
+
+
+# ---------------------------------------------------------------------------
+# R10 follow-up -- an abandoned handoff must not still read as a request.
+# ---------------------------------------------------------------------------
+
+
+def test_abandoned_handoff_scrubs_the_frozen_reactive_request():
+    """The latch cleared the OUTPUT but not the status document's block.
+
+    During the latch ``_tick`` returns before ``core.tick`` runs, so
+    ``reactive_status`` stays frozen at the handoff decision with
+    ``needs_ik_probe: True``.  ``_runtime_requests_handoff`` reads that block
+    as a fallback, so an abandoned latch still answered "open a close-range
+    grasp transaction".  It was safe only because ``_supervise`` evaluates the
+    timeout first -- a live-motion guarantee resting on statement order in a
+    different file.
+    """
+
+    servo = _load("go2w_depth_servo_reactive_scrub", SERVO_PATH)
+    planning = _load(
+        "go2w_planning_control_scrub",
+        ROOT / "scripts" / "runtime" / "go2w_planning_control.py",
+    )
+    frozen = {
+        "phase": ServoPhase.HANDOFF_PROBE.value,
+        "needs_ik_probe": True,
+        "handoff_ready": False,
+        "reason": "close-range corridor reached",
+    }
+
+    # Before the latch expires the request must survive untouched.
+    held = servo._abandoned_reactive_status(
+        dict(frozen), phase=ServoPhase.HANDOFF_PROBE.value
+    )
+    assert held == frozen
+
+    scrubbed = servo._abandoned_reactive_status(
+        dict(frozen), phase=ServoPhase.HANDOFF_ABANDONED.value
+    )
+    assert scrubbed["needs_ik_probe"] is False
+    assert scrubbed["handoff_ready"] is False
+    assert scrubbed["phase"] == ServoPhase.HANDOFF_ABANDONED.value
+
+    runtime = {
+        "phase": ServoPhase.HANDOFF_ABANDONED.value,
+        "mode": "live",
+        "output": {
+            "phase": ServoPhase.HANDOFF_ABANDONED.value,
+            "needs_ik_probe": False,
+            "reactive_phase": None,
+            "published_linear_x": 0.0,
+            "published_angular_z": 0.0,
+        },
+        "reactive": scrubbed,
+    }
+    assert planning.DepthServoRunner._runtime_requests_handoff(runtime) is False
+
+    # Guard the claim: with the UNSCRUBBED block the answer is yes, which is
+    # what made the safety depend on statement order.
+    runtime["reactive"] = frozen
+    assert planning.DepthServoRunner._runtime_requests_handoff(runtime) is True
+
+
+def test_only_no_target_phases_escalate_into_the_wrist_search():
+    """Bound the NEW arm motion this stage makes reachable.
+
+    ``ExpiryAction.ESCALATE_VIEW_RECOVERY`` routes into
+    ``_recover_view_with_stationary_base``, which COMMANDS WRIST MOTION.
+    Before this stage only ``view_recovery``/``search_required`` could reach
+    it.  Adding deadlines -- and especially adding a cross-phase bound that
+    actually fires -- makes every escalating phase a new trigger for an arm
+    sweep that has not been exercised on hardware from that phase.
+
+    So the escalating set is restricted to phases that mean "there is no
+    usable target", which is what the bounded wrist search was written for.
+    ``tracking_hold`` and ``reacquiring`` are excluded on purpose: both mean
+    the target IS in view and the tracker is the thing that is not producing
+    (``tracking_hold_s`` defaults to 0.0 and is validated below the 0.75 s
+    loss grace, and REACQUIRE is "rebuilding a stable 3-D track after posture
+    motion"), so sweeping the camera away from it cannot help.
+    """
+
+    escalating = {
+        phase.value
+        for phase, policy in PHASE_POLICY.items()
+        if policy.on_expiry is ExpiryAction.ESCALATE_VIEW_RECOVERY
+    }
+
+    assert escalating == {
+        ServoPhase.WAITING_TARGET.value,
+        ServoPhase.TRACKING_LOST.value,
+        ServoPhase.VIEW_RECOVERY.value,
+        ServoPhase.SEARCH_REQUIRED.value,
+    }, (
+        "a phase gained the power to start an unexercised wrist sweep; "
+        "justify it against the recorded corpus before widening this set"
+    )
+    for phase in (ServoPhase.TRACKING_HOLD, ServoPhase.REACQUIRE):
+        assert PHASE_POLICY[phase].on_expiry is ExpiryAction.STOP_AND_DEGRADE
+    # Every escapee must still have a real action; none may silently park.
+    for policy in PHASE_POLICY.values():
+        if policy.deadline_s is not None:
+            assert policy.on_expiry is not ExpiryAction.NONE

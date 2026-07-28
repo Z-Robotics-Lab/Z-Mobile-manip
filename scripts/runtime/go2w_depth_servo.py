@@ -366,6 +366,38 @@ def _handoff_latch_output(
     )
 
 
+def _abandoned_reactive_status(
+    reactive: dict[str, Any] | None,
+    *,
+    phase: str,
+) -> dict[str, Any] | None:
+    """Strip the handoff REQUEST out of the reactive block once abandoned.
+
+    ``_handoff_latch_output`` clears ``needs_ik_probe``/``reactive_phase`` on
+    the OUTPUT, but the status document's ``reactive`` block is rendered from
+    ``DepthServoCore.reactive_status``, and during the latch ``_tick`` returns
+    before ``core.tick`` runs -- so the core's last decision stays frozen with
+    ``needs_ik_probe: True`` and ``phase: handoff_probe``.
+
+    ``DepthServoRunner._runtime_requests_handoff`` reads that block as a
+    fallback, so an abandoned latch still answered "yes, open a close-range
+    grasp transaction".  That was safe only because ``_supervise`` happens to
+    evaluate ``supervision.timed_out`` before the handoff check -- a
+    live-motion guarantee resting on statement order in a different file.
+    Clear it at the source instead, so the answer does not depend on who asks
+    first.
+    """
+
+    if reactive is None or phase != ServoPhase.HANDOFF_ABANDONED.value:
+        return reactive
+    return {
+        **reactive,
+        "phase": ServoPhase.HANDOFF_ABANDONED.value,
+        "needs_ik_probe": False,
+        "handoff_ready": False,
+    }
+
+
 def _whole_body_posture_rate_converged(
     command: WholeBodyRuntimeCommand,
 ) -> bool:
@@ -1925,11 +1957,12 @@ def _run_ros(args: argparse.Namespace) -> int:
                 if self.ik_probe_status_received_s is None
                 else max(0.0, time.monotonic() - self.ik_probe_status_received_s)
             )
+            published_phase = state or self.last_output.phase
             document = {
                 "schema": STATUS_SCHEMA,
                 "running": running,
                 "mode": settings.mode,
-                "phase": state or self.last_output.phase,
+                "phase": published_phase,
                 "tracking": self.tracking,
                 "target": None if target is None else {
                     "x_m": target[0],
@@ -1942,7 +1975,10 @@ def _run_ros(args: argparse.Namespace) -> int:
                     if geometry is not None
                     else self.core.camera_geometry
                 ),
-                "reactive": self.core.reactive_status,
+                "reactive": _abandoned_reactive_status(
+                    self.core.reactive_status,
+                    phase=published_phase,
+                ),
                 "transforms": {
                     "valid": transform_fresh,
                     "error": (

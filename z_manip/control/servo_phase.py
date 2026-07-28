@@ -50,6 +50,31 @@ The measured command is the *published* one in ``live`` mode and the
 *proposed* one otherwise: a shadow-mode servo publishes zero by construction,
 so judging it on published values would bound every healthy shadow run.
 
+Why a per-phase deadline is not sufficient on its own
+-----------------------------------------------------
+A per-phase deadline is measured from the moment the phase is entered, so it
+is reset by any phase change -- INCLUDING a change from one zero-command
+phase to another zero-command phase.  Phase flapping is not hypothetical: it
+is the dominant pattern in the recorded corpus.  ``whole_body_approach`` and
+``whole_body_shadow`` are the two arms of ONE ternary on
+``command.executable`` (go2w_depth_servo.py), and the recorded trace contains
+15 flips between them with inter-flip intervals of 0.05-0.75 s; the same trace
+shows single ``transform_unavailable`` ticks splitting long
+``whole_body_approach`` runs six times.  All of ``whole_body_shadow``,
+``whole_body_approach``, ``whole_body_blocked``, ``whole_body_posture``,
+``transform_unavailable`` and ``tracking_hold`` can publish exactly (0, 0), so
+a base parked with tracking green can hop between them forever and reset every
+per-phase timer on the way.
+
+:data:`NO_PROGRESS_DEADLINE_S` closes that.  It bounds a base-command stall
+that SURVIVES phase changes: one accumulator, cleared only by a real base
+command, paused (never cleared) while the servo sits in a phase for which a
+zero command is not evidence of a stall (:attr:`PhasePolicy.counts_no_progress`
+is False -- the terminal phases and ``starting``).  It is pinned at import
+time to be >= every counting phase's own deadline, so it can never fire
+earlier than a contiguous span of that phase would have: it only removes the
+flapping escape hatch, it does not tighten any single-phase bound.
+
 This module is pure: stdlib only, no ROS/CAN/WebRTC/pinocchio/casadi, so the
 supervisor's decisions stay testable on a host that cannot build the robot
 stack.
@@ -163,6 +188,16 @@ class PhasePolicy:
     #: Members of the posture bounded wait; they share one budget so a
     #: sub-phase flip cannot rearm the timer.
     is_posture_wait: bool = False
+    #: Whether time spent in this phase with the base at zero counts toward
+    #: the cross-phase :data:`NO_PROGRESS_DEADLINE_S` accumulator.
+    #:
+    #: True for every phase where a parked base means the run is not
+    #: advancing -- which is every non-terminal phase except ``starting``,
+    #: where a zero command is the CORRECT output while the container, rclpy
+    #: and the first TF read come up.  A False row PAUSES the accumulator; it
+    #: never clears it, because clearing on a phase change is exactly the
+    #: flapping escape hatch this field exists to close.
+    counts_no_progress: bool = True
 
     def __post_init__(self) -> None:
         if self.deadline_s is not None:
@@ -178,6 +213,11 @@ class PhasePolicy:
             raise ValueError(
                 "only a terminal phase may be exempt from a deadline; "
                 "every non-terminal phase must carry one"
+            )
+        if self.is_terminal and self.counts_no_progress:
+            raise ValueError(
+                "a terminal phase must not accumulate the cross-phase "
+                "no-progress budget; the supervisor acts on it immediately"
             )
 
 
@@ -196,6 +236,7 @@ def _terminal(*, heartbeat_required: bool, is_handoff: bool = False) -> PhasePol
         expected_base_owner=_HOLD,
         is_terminal=True,
         is_handoff=is_handoff,
+        counts_no_progress=False,
     )
 
 
@@ -203,6 +244,29 @@ def _terminal(*, heartbeat_required: bool, is_handoff: bool = False) -> PhasePol
 #: matches the shipped ``posture_wait_timeout_s`` and sits well below the
 #: recorded 23.1 s zero-command stall.
 DEFAULT_DEADLINE_S = 12.0
+
+#: The cross-phase bound on a base-command stall.  Unlike ``deadline_s`` this
+#: budget is NOT reset by a phase change; only a real base command clears it.
+#: It exists because ``deadline_s`` alone is defeated by phase flapping, which
+#: the recorded corpus shows happening at 0.05-0.75 s intervals between two
+#: phases that both publish (0, 0).
+#:
+#: The value is pinned by ``_check_no_progress_bound`` below to be >= every
+#: counting phase's own ``deadline_s``, so this bound can only fire in a
+#: situation no single contiguous phase would have tolerated either.  Raising
+#: any per-phase deadline above it is an import-time error, not a silent
+#: inversion.
+NO_PROGRESS_DEADLINE_S = 20.0
+
+#: A published/proposed base command below this magnitude is not motion.
+#:
+#: The shipped Go2W settings snap any non-trivial forward command up to
+#: ``min_forward_mps = 0.10`` precisely because of the chassis dead zone, and
+#: the yaw slew limiter steps by ``max_yaw_step_rps = 0.015``, so the smallest
+#: command the servo can legitimately hold is two orders of magnitude above
+#: this floor.  Without a floor the stall timer is rearmed forever by a servo
+#: publishing 0.001 m/s -- a number that moves nothing.
+MIN_EFFECTIVE_BASE_COMMAND = 5e-3
 
 #: A phase string this table does not know is a fail-closed condition, not a
 #: free pass: it gets a short bounded life and a hard stop.  The previous
@@ -229,12 +293,16 @@ PHASE_POLICY: Mapping[ServoPhase, PhasePolicy] = {
     # Container spawn + rclpy init + the first TF/runtime-state read is
     # measured in seconds, not tens of seconds; 30 s is a spawn backstop on
     # top of (not instead of) the state heartbeat.
+    # ``counts_no_progress=False``: a zero base command during spawn is the
+    # correct output, not a stall, and 30 s of it must not consume the 20 s
+    # cross-phase budget before the approach has issued its first command.
     ServoPhase.STARTING: PhasePolicy(
         deadline_s=30.0,
         on_expiry=_STOP,
         heartbeat_required=True,
         expected_base_owner=_HOLD,
         is_terminal=False,
+        counts_no_progress=False,
     ),
 
     # ---- acquisition / loss stair ---------------------------------------
@@ -267,17 +335,29 @@ PHASE_POLICY: Mapping[ServoPhase, PhasePolicy] = {
     ),
     # Frozen on stale data.  The supervisor had NO handler for this phase at
     # all: it fell into the "just mirror the phase" branch and hung.
+    #
+    # STOP, not RECOVER.  ``ReactiveServoConfig`` bounds this phase itself:
+    # ``tracking_hold_s`` defaults to 0.0 and is validated ``<
+    # tracking_loss_grace_s`` (0.75 s), after which the controller steps to
+    # VIEW_RECOVERY on its own.  So an 8 s ``tracking_hold`` means the
+    # reactive FSM has stopped stepping -- and a wrist search cannot fix a
+    # frozen FSM, it just sweeps the camera off a target that is still in
+    # view.  Same reasoning as ``transform_unavailable`` below.
     ServoPhase.TRACKING_HOLD: PhasePolicy(
         deadline_s=8.0,
-        on_expiry=_RECOVER,
+        on_expiry=_STOP,
         heartbeat_required=True,
         expected_base_owner=_HOLD,
         is_terminal=False,
         is_loss_stair=True,
     ),
+    # STOP for the same reason: REACQUIRE means "rebuilding a stable 3-D track
+    # after posture motion" (reactive_servo.py), i.e. the target IS in view
+    # and the tracker is re-converging on it.  Pointing the wrist somewhere
+    # else is the one action guaranteed not to help.
     ServoPhase.REACQUIRE: PhasePolicy(
         deadline_s=12.0,
-        on_expiry=_RECOVER,
+        on_expiry=_STOP,
         heartbeat_required=True,
         expected_base_owner=_HOLD,
         is_terminal=False,
@@ -409,6 +489,7 @@ PHASE_POLICY: Mapping[ServoPhase, PhasePolicy] = {
         heartbeat_required=True,
         expected_base_owner=_HOLD,
         is_terminal=True,
+        counts_no_progress=False,
     ),
 
     # ---- workflow terminals mirrored into the same field -----------------
@@ -439,6 +520,41 @@ if _UNKNOWN_REACTIVE:
         "ReactivePhase emits strings ServoPhase does not know: "
         + ", ".join(_UNKNOWN_REACTIVE)
     )
+
+
+def _check_no_progress_bound() -> None:
+    """The cross-phase budget must never be tighter than a phase's own bound.
+
+    If some phase legitimately needs ``deadline_s = 25.0`` then 25 s of a
+    parked base is, by that row's own claim, tolerable -- and a 20 s
+    cross-phase budget would kill it mid-phase.  Raising a per-phase deadline
+    above this bound must therefore be an import-time error that forces the
+    author to raise the cross-phase bound with it, not a silent inversion.
+    """
+
+    offenders = sorted(
+        f"{phase.value}={policy.deadline_s}"
+        for phase, policy in PHASE_POLICY.items()
+        if policy.counts_no_progress
+        and policy.deadline_s is not None
+        and policy.deadline_s > NO_PROGRESS_DEADLINE_S
+    )
+    if offenders:
+        raise RuntimeError(
+            "NO_PROGRESS_DEADLINE_S="
+            f"{NO_PROGRESS_DEADLINE_S} is tighter than the per-phase deadline "
+            "of a counting phase, so the cross-phase budget would cut a phase "
+            "short: " + ", ".join(offenders)
+        )
+    # ``UNKNOWN_PHASE_POLICY`` counts too: an unlisted phase must not be able
+    # to out-live the cross-phase budget either.
+    assert UNKNOWN_PHASE_POLICY.counts_no_progress
+    assert UNKNOWN_PHASE_POLICY.deadline_s is not None
+    if UNKNOWN_PHASE_POLICY.deadline_s > NO_PROGRESS_DEADLINE_S:
+        raise RuntimeError("the unknown-phase deadline exceeds the no-progress bound")
+
+
+_check_no_progress_bound()
 
 
 def phase_policy(phase: object) -> PhasePolicy:
@@ -487,6 +603,8 @@ DRIVING_PHASES: frozenset[str] = _select(
 RECOVERY_ESCALATION_PHASES: frozenset[str] = _select(
     lambda p: p.on_expiry is ExpiryAction.ESCALATE_VIEW_RECOVERY
 )
+#: Phases whose zero-command time accumulates the cross-phase stall budget.
+NO_PROGRESS_PHASES: frozenset[str] = _select(lambda p: p.counts_no_progress)
 
 #: Phase strings that runtime scripts must reference through :class:`ServoPhase`
 #: rather than quoting.  The grep guard in ``tests/test_servo_phase_table.py``
@@ -517,6 +635,9 @@ __all__ = [
     "HANDOFF_TERMINAL_PHASES",
     "HEARTBEAT_EXEMPT_PHASES",
     "LOSS_STAIR_PHASES",
+    "MIN_EFFECTIVE_BASE_COMMAND",
+    "NO_PROGRESS_DEADLINE_S",
+    "NO_PROGRESS_PHASES",
     "PHASE_POLICY",
     "POSTURE_WAIT_PHASES",
     "PhasePolicy",

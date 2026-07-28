@@ -1892,6 +1892,14 @@ class DepthServoRunner:
                 return False
             self._workflow["phase"] = "waiting_for_track"
             self._message = "Target recovered with the base stationary; visual approach restarted."
+        # A wrist search moves no wheels, so the watchdog's cross-phase
+        # no-progress budget is already full when the servo restarts and would
+        # expire on the first observation of the recovered run -- collapsing
+        # the whole reacquisition budget into a few seconds instead of giving
+        # each attempt its own bound.  A COMPLETED, counted recovery is
+        # supervisory progress, so clear that budget only; the per-phase timer
+        # and the heartbeat state are deliberately left alone.
+        self._reactive_watchdog.note_supervisor_progress()
         return True
 
     def _wait_for_joint_feedback(self, cancel: threading.Event) -> str | None:
@@ -2128,6 +2136,9 @@ class DepthServoRunner:
             last_reacquisition_s = now
             if self._run_perception(target, reacquisition=True):
                 self._set_workflow(phase="waiting_for_track")
+                # Same reason as the wrist-search path: a tracker reseed is a
+                # counted, bounded recovery that moves no wheels.
+                self._reactive_watchdog.note_supervisor_progress()
 
     def _terminate_process(self, process: subprocess.Popen[bytes], *, keep_status: bool) -> None:
         if process.poll() is None:

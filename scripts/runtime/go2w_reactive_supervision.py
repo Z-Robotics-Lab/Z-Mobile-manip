@@ -27,6 +27,8 @@ if str(STACK_ROOT) not in sys.path:
     sys.path.insert(0, str(STACK_ROOT))
 
 from z_manip.control.servo_phase import (  # noqa: E402
+    MIN_EFFECTIVE_BASE_COMMAND,
+    NO_PROGRESS_DEADLINE_S,
     BaseOwner,
     ExpiryAction,
     ServoPhase,
@@ -58,6 +60,15 @@ from z_manip.control.servo_phase import (  # noqa: E402
 #
 # The table inverts that: EVERY phase carries a deadline and the exemptions
 # are the enumerated terminal states.
+#
+# A per-phase deadline is still not enough on its own, because it is measured
+# from the phase transition and so is rearmed by ANY phase change -- including
+# a change between two phases that both publish (0, 0).  The recorded corpus
+# flaps ``whole_body_approach``/``whole_body_shadow`` at 0.05-0.75 s intervals
+# (they are the two arms of one ``command.executable`` ternary) and splits long
+# approach runs with single ``transform_unavailable`` ticks.  So the watchdog
+# ALSO carries a cross-phase accumulator, ``no_progress_s``, which is cleared
+# only by a real base command and bounded by ``NO_PROGRESS_DEADLINE_S``.
 __all__ = [
     "HANDOFF_PHASES",
     "HEARTBEAT_EXEMPT_PHASES",
@@ -131,6 +142,18 @@ def base_command_magnitude(runtime: Mapping[str, Any]) -> float:
     return max(abs(linear), abs(yaw))
 
 
+def base_is_commanding(runtime: Mapping[str, Any]) -> bool:
+    """True only when the base command is large enough to move the chassis.
+
+    The threshold is ``MIN_EFFECTIVE_BASE_COMMAND``, not zero: a servo
+    publishing 0.001 m/s forever is not driving anything (the shipped
+    ``min_forward_mps`` is 0.10 precisely because of the Go2W dead zone), and
+    treating it as progress would rearm every stall timer indefinitely.
+    """
+
+    return base_command_magnitude(runtime) >= MIN_EFFECTIVE_BASE_COMMAND
+
+
 def ownership_snapshot(runtime: Mapping[str, Any]) -> dict[str, str]:
     """Return one inspectable owner per actuator group.
 
@@ -163,7 +186,7 @@ def ownership_snapshot(runtime: Mapping[str, Any]) -> dict[str, str]:
     arm_feedback = _mapping(runtime.get("arm_view_status"))
     base_owner = (
         BaseOwner.VISUAL_SERVO.value
-        if base_command_magnitude(runtime) > 1e-9
+        if base_is_commanding(runtime)
         else BaseOwner.ZERO_HOLD.value
     )
     arm_owner = str(arm_feedback.get("owner", ""))
@@ -245,6 +268,13 @@ class ReactiveWatchdogDecision:
     #: False when the phase string is not in ``ServoPhase``; such a phase is
     #: NOT exempt, it inherits the fail-closed unknown-phase policy.
     phase_known: bool = True
+    #: Seconds the base has gone without an effective command, ACROSS phase
+    #: changes.  ``phase_elapsed_s`` is rearmed by any phase transition; this
+    #: is not.  It is the value that actually bounds a flapping stall.
+    no_progress_s: float = 0.0
+    #: The bound on ``no_progress_s``; None while the current phase does not
+    #: accumulate it (terminal phases and ``starting``).
+    no_progress_deadline_s: float | None = None
 
     def document(self) -> dict[str, Any]:
         return asdict(self)
@@ -270,9 +300,32 @@ class ReactivePhaseWatchdog:
             return self.config.posture_wait_timeout_s
         return policy.deadline_s
 
+    def note_supervisor_progress(self) -> None:
+        """Clear the cross-phase no-progress budget after a bounded recovery.
+
+        A stationary wrist search or a tracker reseed moves no wheels, so the
+        base-command accumulator would otherwise still be full when the servo
+        restarts and would fire on the first observation of the recovered run
+        -- burning the whole reacquisition budget in a few seconds instead of
+        giving each attempt its bound.  The supervisor's recovery attempts are
+        themselves counted against ``max_reacquisitions``, so this cannot
+        become an unbounded rearm loop.
+
+        It deliberately does NOT touch the heartbeat state or the per-phase
+        timer: only the cross-phase budget is a supervisor-level quantity.
+        """
+
+        self._no_progress_s = 0.0
+
     def reset(self) -> None:
         self._phase: str | None = None
         self._phase_started_s: float | None = None
+        #: Cross-phase accumulator.  Cleared only by an effective base command
+        #: (or an explicit supervisor recovery); PAUSED, never cleared, by a
+        #: non-counting phase.  Deliberately not keyed on the phase string:
+        #: keying it on the phase is the flapping hole this closes.
+        self._no_progress_s: float = 0.0
+        self._last_observe_s: float | None = None
         self._heartbeat_stamp_ns: int | None = None
         self._heartbeat_progress_s: float | None = None
         self._last = ReactiveWatchdogDecision(
@@ -326,13 +379,41 @@ class ReactivePhaseWatchdog:
         # the recorded 23.1 s ``whole_body_shadow`` hold with tracking green
         # -- accumulates until it expires.  A parked phase measures plain
         # time in phase, because for it a zero command is correct.
-        commanding = base_command_magnitude(runtime) > 1e-9
+        commanding = base_is_commanding(runtime)
         expects_drive = policy.expected_base_owner is BaseOwner.VISUAL_SERVO
         base_owner_mismatch = expects_drive and not commanding
         if expects_drive and commanding:
             self._phase_started_s = now
         assert self._phase_started_s is not None
         elapsed = max(0.0, now - self._phase_started_s)
+
+        # The cross-phase accumulator.  ``elapsed`` above is rearmed by any
+        # phase transition, which is why it alone cannot bound the recorded
+        # flapping stall: ``whole_body_approach``/``whole_body_shadow`` are
+        # two arms of one ternary and flip at 0.05-0.75 s in the live trace,
+        # and a single ``transform_unavailable`` tick splits an approach run
+        # six times in the same trace.  This accumulator is cleared ONLY by an
+        # effective base command; a non-counting phase (terminal, or
+        # ``starting``) pauses it rather than clearing it, because clearing on
+        # a phase change is the hole.
+        delta_s = (
+            0.0
+            if self._last_observe_s is None
+            else max(0.0, now - self._last_observe_s)
+        )
+        self._last_observe_s = now
+        if commanding:
+            self._no_progress_s = 0.0
+        elif policy.counts_no_progress:
+            self._no_progress_s += delta_s
+        no_progress_s = self._no_progress_s
+        no_progress_deadline_s = (
+            NO_PROGRESS_DEADLINE_S if policy.counts_no_progress else None
+        )
+        no_progress_timed_out = (
+            no_progress_deadline_s is not None
+            and no_progress_s >= no_progress_deadline_s
+        )
 
         deadline_s = self.deadline_for(phase)
         phase_timed_out = deadline_s is not None and elapsed >= deadline_s
@@ -390,7 +471,7 @@ class ReactivePhaseWatchdog:
                 heartbeat_timed_out = True
                 heartbeat_invalid_reason = "state heartbeat stopped advancing"
 
-        timed_out = phase_timed_out or heartbeat_timed_out
+        timed_out = phase_timed_out or no_progress_timed_out or heartbeat_timed_out
         code: str | None = None
         message = "phase is progressing within its bounded wait"
         # Keep the more specific posture diagnosis when both deadlines expire
@@ -451,6 +532,17 @@ class ReactivePhaseWatchdog:
                     f"wait ({elapsed:.2f}s elapsed) without reaching a "
                     "terminal state"
                 )
+        elif no_progress_timed_out:
+            # The flapping case: no single phase held long enough to expire,
+            # but the base has not moved across all of them.
+            code = "BASE_PROGRESS_STALL_TIMEOUT"
+            message = (
+                f"the base has issued no effective command for "
+                f"{no_progress_s:.2f}s across phase changes (bound "
+                f"{no_progress_deadline_s:.2f}s); the current phase "
+                f"{phase!r} has only been held {elapsed:.2f}s, so no "
+                "per-phase deadline expired -- the run is not advancing"
+            )
         self._last = ReactiveWatchdogDecision(
             phase=phase,
             phase_elapsed_s=elapsed,
@@ -474,15 +566,70 @@ class ReactivePhaseWatchdog:
             on_expiry=(
                 ExpiryAction.STOP_AND_DEGRADE.value
                 if heartbeat_timed_out
-                else policy.on_expiry.value if phase_timed_out
+                else policy.on_expiry.value
+                if (phase_timed_out or no_progress_timed_out)
                 else ExpiryAction.NONE.value
             ),
             expected_base_owner=policy.expected_base_owner.value,
             base_owner_mismatch=base_owner_mismatch,
             is_terminal=policy.is_terminal,
             phase_known=is_known_phase(phase),
+            no_progress_s=no_progress_s,
+            no_progress_deadline_s=no_progress_deadline_s,
         )
         return self._last
+
+
+def _no_progress_runs(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Find zero-command runs that SURVIVE phase changes.
+
+    This is the offline twin of the deployed watchdog's cross-phase
+    accumulator, and uses the same rule so an offline verdict transfers: a run
+    is broken only by an effective base command, and a non-counting phase
+    (terminal, or ``starting``) pauses it rather than breaking it.
+    """
+
+    runs: list[dict[str, Any]] = []
+    active: dict[str, Any] | None = None
+    for record in rows:
+        stamp_ns = record.get("updated_unix_ns")
+        if isinstance(stamp_ns, bool) or not isinstance(stamp_ns, int) or stamp_ns < 0:
+            continue
+        phase = str(record.get("phase", "unknown"))
+        policy = phase_policy(phase)
+        if base_is_commanding(record):
+            active = None
+            continue
+        if not policy.counts_no_progress:
+            # Paused, not broken: an interleaved terminal/starting row must
+            # not be able to launder a stall into two short runs.
+            continue
+        if active is None:
+            active = {
+                "start_unix_ns": stamp_ns,
+                "end_unix_ns": stamp_ns,
+                "samples": 1,
+                "phases": [phase],
+            }
+            runs.append(active)
+        else:
+            active["end_unix_ns"] = stamp_ns
+            active["samples"] += 1
+            if phase not in active["phases"]:
+                active["phases"].append(phase)
+    stalls: list[dict[str, Any]] = []
+    for run in runs:
+        duration_s = max(0.0, (run["end_unix_ns"] - run["start_unix_ns"]) / 1e9)
+        if duration_s < NO_PROGRESS_DEADLINE_S:
+            continue
+        stalls.append({
+            **run,
+            "duration_s": duration_s,
+            "deadline_s": NO_PROGRESS_DEADLINE_S,
+            "code": "BASE_PROGRESS_STALL",
+            "recommended_terminal_phase": ServoPhase.DEGRADED.value,
+        })
+    return stalls
 
 
 def replay_trace(
@@ -492,15 +639,29 @@ def replay_trace(
 ) -> dict[str, Any]:
     """Summarize contiguous phase spans and identify zero-command stalls.
 
-    A stall is any NON-TERMINAL phase that held the base at exactly zero for
-    longer than the smaller of ``stall_threshold_s`` and the phase's own
-    deadline.  It used to be restricted to ``POSTURE_WAIT_PHASES``, whose
-    three strings the deployed servo never emits -- which is why replaying
-    the live trace that contains a 23.1 s zero-command ``whole_body_shadow``
-    span reported ``passed: True``.
+    Two detectors run, and both must be clean for ``passed``:
+
+    ``stalls``
+        The per-span heuristic: any NON-TERMINAL phase that held the base at
+        exactly zero for longer than the smaller of ``stall_threshold_s`` and
+        the phase's own deadline.  It used to be restricted to
+        ``POSTURE_WAIT_PHASES``, whose three strings the deployed servo never
+        emits -- which is why replaying the live trace that contains a 23.1 s
+        zero-command ``whole_body_shadow`` span reported ``passed: True``.
+        This detector is per-span, so a trace that FLAPS between two parked
+        phases splits into short spans and hides from it.
+
+    ``no_progress_stalls``
+        The cross-phase detector, which mirrors the deployed watchdog's
+        ``NO_PROGRESS_DEADLINE_S`` bound exactly: contiguous rows in counting
+        phases with no effective base command, regardless of how the phase
+        string changes underneath.  Without it a green replay did not
+        transfer to the live guard in the fail-open direction, and a red one
+        could name a stall the live guard would never stop.
     """
 
     rows = [record for record in records if isinstance(record, Mapping)]
+    no_progress_stalls = _no_progress_runs(rows)
     spans: list[dict[str, Any]] = []
     active: dict[str, Any] | None = None
     for record in rows:
@@ -563,7 +724,9 @@ def replay_trace(
         "span_count": len(spans),
         "spans": spans,
         "stalls": stalls,
-        "passed": not stalls,
+        "no_progress_stalls": no_progress_stalls,
+        "no_progress_deadline_s": NO_PROGRESS_DEADLINE_S,
+        "passed": not stalls and not no_progress_stalls,
     }
 
 
