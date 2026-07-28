@@ -315,12 +315,27 @@ VIEW_UPDATE_PERIOD_MAX_INTERVAL_S = 0.20
 # EVERY row at ``bundle_count == 1`` is ``phase=search_required`` with
 # ``tracking=null``: 12 of 12.
 #
-# Latching alone would be a fail-open: ``std_msgs/Bool`` is unstamped, so the
-# durability cache can hand the servo a ``True`` from a session that ended
-# before this process existed and nothing in the message can date it.  Receipt
-# time is therefore recorded alongside the flag and the flag expires against it
-# (``_tracking_flag_ttl_s`` / ``_aged_tracking_flag``).  Landing the QoS change
-# without the expiry is the fail-open half of a two-part fix.
+# WHAT LATCHING COSTS, STATED HONESTLY.  ``std_msgs/Bool`` is unstamped, so a
+# ``True`` handed over from the durability cache is byte-identical to one
+# published this instant and NOTHING IN THIS PROCESS CAN DATE IT.  In
+# particular the receipt-time TTL below cannot: a historical sample is
+# delivered to a late-joining reader at MATCH time, so its receipt age is ~0 by
+# construction.  Do not read ``_aged_tracking_flag`` as the defence against a
+# stale latched True; it is not, and an earlier draft of this comment claimed
+# it was.
+#
+# What actually bounds the exposure is that the SELECTED-TARGET CLOUD is NOT
+# latched.  ``fresh_tracking`` requires a target received within
+# ``target_timeout_s``, and EdgeTAM publishes the flag from inside
+# ``_publish_observation``, in the same call as the cloud.  So a retained True
+# can only ever pair with a genuinely fresh target, and the widest window it
+# spans is the sub-frame gap between the two publishes of one bundle.
+#
+# The TTL is still here and still worth its keep, for the case it CAN see: a
+# live publisher that goes quiet after we matched.  It is fail-closed by
+# construction (it turns True into None, never None or False into True) and
+# floored at ``target_timeout_s`` so it can never become a new, tighter stop on
+# a decision the target timer already governs.
 TRACKING_FLAG_STALE_PERIODS = 3.0
 # Fallback ruler before ``view_update_period_s`` has two in-band arrivals to
 # measure: the shipped FFS bundle cadence (~7.5 Hz).
@@ -1405,12 +1420,13 @@ def _tracking_flag_ttl_s(
     that cadence) is the right ruler.  Three periods is one lost sample plus
     two of jitter; at the shipped ~0.133 s cadence that is ~0.40 s.
 
-    Floored at ``target_timeout_s`` on purpose.  This TTL exists to reject a
-    LATCHED HISTORICAL sample -- something seconds to minutes old, because a
-    live publisher would have refreshed it within one frame -- not to police
-    steady-state jitter.  Letting it drop below the target-freshness budget
-    that already governs the very same decision would manufacture new stops
-    without catching anything the target timer does not already catch.
+    Floored at ``target_timeout_s`` on purpose.  This TTL exists to notice a
+    publisher that went QUIET after we matched -- not to police steady-state
+    jitter, and (see ``_aged_tracking_flag``) not to date a latched historical
+    sample, which it structurally cannot do.  Letting it drop below the
+    target-freshness budget that already governs the very same decision would
+    manufacture new stops without catching anything the target timer does not
+    already catch.
     """
 
     period_s = view_update_period_s
@@ -1425,15 +1441,17 @@ def _aged_tracking_flag(
     age_s: float | None,
     ttl_s: float,
 ) -> bool | None:
-    """Degrade a stale tracking flag to UNKNOWN (``None``).
+    """Degrade a tracking flag we have not heard refreshed to UNKNOWN.
 
-    MANDATORY COMPANION TO TRANSIENT_LOCAL DURABILITY on this subscription.
-    ``std_msgs/Bool`` has no header, so a sample handed to a late-joining
-    subscriber by the publisher's durability cache is byte-identical to one
-    published this instant.  Subscribing TRANSIENT_LOCAL without this ages
-    nothing and the servo can act on a ``True`` from a tracking session that
-    ended before the process started -- a fail-open.  Receipt time is the only
-    clock available, so receipt time is what expires.
+    SCOPE, PRECISELY.  ``std_msgs/Bool`` has no header, so receipt time is the
+    only clock available -- and receipt time is NOT the sample's age.  A
+    TRANSIENT_LOCAL historical sample is delivered at match time, so this
+    function CANNOT catch a ``True`` retained from a session that ended before
+    the process started.  See the module comment above
+    ``TRACKING_FLAG_STALE_PERIODS`` for what does bound that (the un-latched
+    target cloud).  What this DOES catch is a publisher that went quiet after
+    we matched: the flag stops being refreshed, receipt age grows, and the gate
+    stops believing it.
 
     UNKNOWN, not ``False``: every consumer already spells the positive test
     (``tracking is True``), so ``None`` and ``False`` are equivalent at the
@@ -1493,6 +1511,48 @@ def _tick_should_skip(*, stop_requested: bool, ros_ok: bool) -> bool:
     """
 
     return stop_requested or not ros_ok
+
+
+def _publish_suppressed(
+    *,
+    stop_requested: bool,
+    ros_ok: bool,
+    final_stop: bool,
+) -> bool:
+    """Whether a publish attempt must be dropped on the floor.
+
+    THIS IS THE STOP MUTE, AND IT USED TO BE AN ACCIDENT.  Until this function
+    existed, ``_tick_should_skip`` at the TOP of ``_tick`` was the only thing
+    standing between SIGTERM and a full-speed base command, and it does not
+    stand there for a tick that has ALREADY STARTED.  Python delivers a signal
+    on the main thread at a bytecode boundary, and ``_tick`` runs on the main
+    thread under the executor; so a SIGTERM arriving after ``_tick`` passed its
+    skip check let the tick run to completion and publish
+    ``last_output.published_linear_x`` -- up to the 0.18 m/s ceiling -- plus a
+    posture intent and an arm-view intent, all AFTER the operator asked the
+    robot to stop.  The window is not the 50 ms poll interval: it is whatever
+    is left of the tick, including the whole-body solve and the status write.
+
+    That hazard did not exist before R8 -- by accident.  The old signal handler
+    called ``rclpy.shutdown()`` inline, which flipped ``rclpy.ok()`` false, and
+    every publish site gates on ``rclpy.ok()``; the handler therefore muted the
+    whole node through the back door.  R8 correctly reduced the handler to two
+    flag sets, and silently took the mute with it, because the publish sites
+    named only ``rclpy.ok()`` and never named the stop latch.  The mute has to
+    be SPELLED OUT to survive a change to the shutdown path.
+
+    ``final_stop`` is the deliberate escape hatch and the reason a blanket
+    ``stop_event`` gate would have been the worse bug: ``stop()`` runs after
+    the latch is set, and its three zero Twists are the entire point of the
+    teardown.  Only the terminal stop may pass; a tick may not.  ``ros_ok`` is
+    checked FIRST so even ``final_stop`` cannot publish into a dead context.
+    """
+
+    if not ros_ok:
+        return True
+    if final_stop:
+        return False
+    return stop_requested
 
 
 def _shutdown_phase(*, stop_requested: bool) -> str:
@@ -2174,7 +2234,13 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_arm_view_intent = document
             self.arm_view_intent_seq = max(self.arm_view_intent_seq, sequence + 1)
 
-        def _publish_guarded(self, publisher: Any, message: Any) -> None:
+        def _publish_guarded(
+            self,
+            publisher: Any,
+            message: Any,
+            *,
+            final_stop: bool = False,
+        ) -> None:
             """Publish, tolerating ONLY the rcl-context teardown race.
 
             A stop/restart can tear the rcl context down between the
@@ -2194,9 +2260,19 @@ def _run_ros(args: argparse.Namespace) -> int:
             reacquisition budget on wrist searches.  It presented as "detects
             the target but will not drive to it", i.e. a perception fault, and
             was nothing of the kind.
+
+            IT IS ALSO THE STOP MUTE.  Routing every publisher through one
+            function is only worth anything if that function knows about the
+            stop latch, so the ``rclpy.ok()`` gate is now
+            ``_publish_suppressed(...)`` -- see that function for why the
+            latch has to be named here and not only at the top of ``_tick``.
             """
 
-            if not rclpy.ok():
+            if _publish_suppressed(
+                stop_requested=self.stop_event.is_set(),
+                ros_ok=rclpy.ok(),
+                final_stop=final_stop,
+            ):
                 return
             try:
                 publisher.publish(message)
@@ -2204,15 +2280,27 @@ def _run_ros(args: argparse.Namespace) -> int:
                 if rclpy.ok():
                     raise
 
-        def _publish(self, linear_x: float, angular_z: float) -> None:
-            if not rclpy.ok():
+        def _publish(
+            self,
+            linear_x: float,
+            angular_z: float,
+            *,
+            final_stop: bool = False,
+        ) -> None:
+            # Gate here as well as in _publish_guarded: this builds a message
+            # off ``self.get_clock()``, which is itself an rcl handle.
+            if _publish_suppressed(
+                stop_requested=self.stop_event.is_set(),
+                ros_ok=rclpy.ok(),
+                final_stop=final_stop,
+            ):
                 return
             message = TwistStamped()
             message.header.stamp = self.get_clock().now().to_msg()
             message.header.frame_id = "base_link"
             message.twist.linear.x = float(linear_x)
             message.twist.angular.z = float(angular_z)
-            self._publish_guarded(self.publisher, message)
+            self._publish_guarded(self.publisher, message, final_stop=final_stop)
 
         def _write_status(self, state: str | None = None, *, running: bool = True) -> None:
             target = self.core.target
@@ -2651,7 +2739,12 @@ def _run_ros(args: argparse.Namespace) -> int:
         def stop(self, phase: str = ServoPhase.STOPPED.value) -> None:
             if settings.mode == "live":
                 for _ in range(3):
-                    self._publish(0.0, 0.0)
+                    # ``final_stop`` is what lets these three past the stop
+                    # mute the signal handler just latched.  It is the ONLY
+                    # place in this file that may pass it -- a test asserts
+                    # that -- because everything else publishing after the
+                    # latch is, by definition, a command nobody asked for.
+                    self._publish(0.0, 0.0, final_stop=True)
             self.last_output = DepthServoOutput(
                 phase=phase,
                 proposed_linear_x=0.0,
@@ -2689,11 +2782,20 @@ def _run_ros(args: argparse.Namespace) -> int:
         publishes, the final status write, ``destroy_node`` and ``shutdown``
         now all happen below, on the main thread, after the loop has returned
         and nothing is inside rcl.
+
+        THE FLAG SETS ARE LOAD-BEARING, NOT BOOKKEEPING.  Deleting the inline
+        ``rclpy.shutdown()`` also deleted the accidental mute it produced --
+        ``rclpy.ok()`` going false silenced every publisher, including one
+        inside a tick that had already passed its skip check.  ``stop_event``
+        is now read by ``_publish``/``_publish_guarded`` (via
+        ``_publish_suppressed``) as well as by ``_tick``, so the mute is
+        explicit and survives the next change to this block.
         """
 
         stopped.set()
         # Read by ``_tick_should_skip`` so an already-queued timer callback
-        # no-ops instead of publishing into a teardown.
+        # no-ops instead of publishing into a teardown -- AND by every publish
+        # site, so a tick already past that check cannot still emit a command.
         node.stop_event.set()
 
     signal.signal(signal.SIGTERM, request_stop)
@@ -2709,8 +2811,14 @@ def _run_ros(args: argparse.Namespace) -> int:
             executor.spin_once(timeout_sec=SHUTDOWN_POLL_INTERVAL_S)
     finally:
         # Main thread; the loop has returned; the context is still valid.
+        # ``stop`` publishes with final_stop=True, which is the one thing the
+        # stop mute lets through -- see _publish_suppressed.
         node.stop(_shutdown_phase(stop_requested=stopped.is_set()))
         executor.remove_node(node)
+        # Release the executor's own guard condition before the context goes;
+        # remove_node alone leaks it (the "'NoneType' object has no attribute
+        # 'trigger'" family of teardown noise).
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

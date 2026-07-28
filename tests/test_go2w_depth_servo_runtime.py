@@ -1249,15 +1249,21 @@ def test_publish_swallows_shutdown_race_but_reraises_a_live_fault():
     joint-state bridge convention.
     """
 
+    # Located by AST, not by an exact ``def`` line: the signature grew a
+    # keyword-only ``final_stop`` (the stop mute's escape hatch) and the old
+    # substring match broke on it, which is a brittle-test failure, not a
+    # behaviour failure.
     source = Path(SERVO.__file__).read_text(encoding="utf-8")
-    pub_marker = source.index("def _publish_guarded(self, publisher: Any, message: Any) -> None:")
-    pub_window = source[pub_marker:pub_marker + 1600]
-    assert "if not rclpy.ok():" in pub_window
+    pub_window = ast.unparse(_function_ast("_publish_guarded"))
+    # The context gate now lives in _publish_suppressed, which checks ros_ok
+    # first; see test_a_tick_already_past_its_skip_check_is_muted_by_the_stop_latch.
+    assert "ros_ok=rclpy.ok()" in pub_window
     assert "publisher.publish(message)" in pub_window
     assert "except Exception:" in pub_window
     # Genuine faults on a live context are re-raised, not hidden.
     assert "if rclpy.ok():" in pub_window
     assert "raise" in pub_window
+    assert "def _publish_guarded(" in source
 
 
 def test_every_publisher_goes_through_the_shutdown_guard():
@@ -1429,14 +1435,23 @@ def test_tracking_subscription_durability_matches_the_edgetam_publisher():
     assert servo_qos != _subscription_qos_name(servo, topic_attr="target_topic")
 
 
-def test_latched_tracking_flag_expires_so_a_historical_true_cannot_drive():
-    """R2(b), the mandatory companion.  Landing (a) alone is a fail-open.
+def test_tracking_flag_expires_when_the_publisher_goes_quiet():
+    """A flag we stop hearing refreshed degrades to UNKNOWN, never to True.
 
-    ``std_msgs/Bool`` carries no header.  Under TRANSIENT_LOCAL the durability
-    cache hands a late-joining subscriber the publisher's last sample, and a
-    ``True`` latched by a tracking session that ended before this process
-    started is byte-identical to one published this frame.  Receipt time is the
-    only clock the flag will ever have, so receipt time is what expires it.
+    RENAMED, and the rename is the point.  This was
+    ``..._so_a_historical_true_cannot_drive``, which claimed a property the
+    function does not have: ``_tracking`` stamps ``tracking_received_s`` at
+    CALLBACK time, and a TRANSIENT_LOCAL historical sample is delivered to a
+    late-joining reader at MATCH time, so its receipt age is ~0 by
+    construction.  The ``age_s=90.0`` row below is a value the deployed path
+    cannot produce for a latched sample; it is kept only as a monotonicity
+    check, not as evidence for a scenario the runtime can generate.
+
+    What bounds a retained ``True`` is that the selected-target cloud is NOT
+    latched, so it can never pair with stale geometry.  What THIS covers is the
+    case receipt time can genuinely see: a publisher that matched and then went
+    quiet.  Fail-closed in the only direction that matters -- it turns True
+    into None and can never turn None or False into True.
     """
 
     ttl_s = 0.40
@@ -1800,6 +1815,146 @@ def test_shutdown_work_happens_on_the_main_thread_after_the_spin_loop():
     assert 0.0 < SERVO.SHUTDOWN_POLL_INTERVAL_S <= 0.05
     assert SERVO._shutdown_phase(stop_requested=True) == "stopped"
     assert SERVO._shutdown_phase(stop_requested=False) == "exited"
+
+
+def _innermost_function_names(predicate) -> list[str]:
+    """Names of the innermost functions containing a node matching *predicate*."""
+
+    hits: list[str] = []
+
+    def visit(node: ast.AST, current: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if predicate(child):
+                hits.append(current)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child.name)
+            else:
+                visit(child, current)
+
+    visit(_module_ast(Path(SERVO.__file__)), "<module>")
+    return hits
+
+
+def _function_ast(name: str) -> ast.FunctionDef:
+    for node in ast.walk(_module_ast(Path(SERVO.__file__))):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} is gone")
+
+
+def test_a_tick_already_past_its_skip_check_is_muted_by_the_stop_latch():
+    """R8 REGRESSION.  SIGTERM must mute an IN-FLIGHT tick, not just a queued one.
+
+    The bug this pins: R8 reduced the signal handler to two flag sets, which is
+    right, but the inline ``rclpy.shutdown()`` it deleted had been doing a
+    second, unadvertised job -- flipping ``rclpy.ok()`` false, which every
+    publish site gates on.  Removing it removed the mute.  ``_tick`` checks
+    ``_tick_should_skip`` ONCE, as its first statement; Python delivers signals
+    on the main thread at a bytecode boundary and ``_tick`` runs on the main
+    thread under the executor.  So a SIGTERM landing after that check let the
+    tick run to completion and publish the full commanded base velocity (up to
+    --max-forward-mps 0.18) plus a posture intent and an arm-view intent, all
+    after the stop was requested -- and the delay to the final zero was bounded
+    by the remaining tick (whole-body solve + status write), not by
+    SHUTDOWN_POLL_INTERVAL_S.
+
+    Sequence, in order, with the values the runtime actually holds.
+    """
+
+    # 1. The tick starts.  Nothing has been requested; it proceeds.
+    assert SERVO._tick_should_skip(stop_requested=False, ros_ok=True) is False
+
+    # 2. SIGTERM lands mid-tick.  The handler sets the flags and returns; it is
+    #    forbidden from touching rcl, so rclpy.ok() STAYS TRUE.
+    stop_requested, ros_ok = True, True
+
+    # 3. The tick resumes and reaches its terminal publishes.  Every one of
+    #    them must now be dropped.
+    assert SERVO._publish_suppressed(
+        stop_requested=stop_requested, ros_ok=ros_ok, final_stop=False
+    ) is True, (
+        "a tick already past its skip check can still publish a motion command "
+        "after SIGTERM; the stop latch is not read at the publish sites"
+    )
+
+    # 4. ...but the teardown's own zero-Twist must still go out.  A blanket
+    #    stop_event gate would have silenced it and left the base to the
+    #    transport watchdog, which is the worse bug.
+    assert SERVO._publish_suppressed(
+        stop_requested=True, ros_ok=True, final_stop=True
+    ) is False, "the terminal stop can no longer publish its zero Twist"
+
+    # 5. A dead context wins over everything, final_stop included.
+    assert SERVO._publish_suppressed(
+        stop_requested=False, ros_ok=False, final_stop=True
+    ) is True
+    assert SERVO._publish_suppressed(
+        stop_requested=False, ros_ok=False, final_stop=False
+    ) is True
+
+    # 6. Steady state is unchanged.
+    assert SERVO._publish_suppressed(
+        stop_requested=False, ros_ok=True, final_stop=False
+    ) is False
+
+
+def test_every_publish_site_gates_on_the_stop_latch_not_only_on_rclpy_ok():
+    """The mute has to be SPELLED OUT, because that is how it got deleted.
+
+    This repo's characteristic failure: the value that decides the transition
+    lives in a file -- here, a function -- the transition never names.  The
+    publish sites named only ``rclpy.ok()``; ``stop_event`` was read solely at
+    the top of ``_tick``.  Asserting the source shape is the only check
+    available (rclpy is not importable here, so the node cannot be built), and
+    it is the check that would have caught the regression.
+    """
+
+    for name in ("_publish", "_publish_guarded"):
+        body = ast.unparse(_function_ast(name))
+        assert "_publish_suppressed(" in body, (
+            f"{name} no longer routes its gate through _publish_suppressed"
+        )
+        assert "self.stop_event.is_set()" in body, (
+            f"{name} does not consult the stop latch; a tick already past "
+            "_tick_should_skip can publish after SIGTERM"
+        )
+        assert "final_stop" in body, f"{name} lost the terminal-stop escape hatch"
+
+    # And nothing bypasses the guard: the raw .publish() call exists once, and
+    # only inside _publish_guarded.
+    raw = _innermost_function_names(
+        lambda node: isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "publish"
+    )
+    assert raw == ["_publish_guarded"], (
+        f"a publisher bypasses the guarded/muted path: {raw}"
+    )
+
+
+def test_only_the_terminal_stop_may_publish_through_the_stop_mute():
+    """``final_stop=True`` is an escape hatch; exactly one caller may use it.
+
+    If a tick path ever passes it, the mute is decorative again.
+    """
+
+    callers = _innermost_function_names(
+        lambda node: isinstance(node, ast.keyword)
+        and node.arg == "final_stop"
+        and isinstance(node.value, ast.Constant)
+        and node.value.value is True
+    )
+    assert sorted(set(callers)) == ["stop"], (
+        "final_stop=True is passed outside the terminal stop: "
+        f"{sorted(set(callers))}"
+    )
+    # ...and the teardown really does go through that one caller.
+    source = Path(SERVO.__file__).read_text(encoding="utf-8")
+    finally_block = source.split("    rclpy.init()", 1)[1].split("finally:", 1)[1]
+    assert "node.stop(_shutdown_phase(stop_requested=stopped.is_set()))" in finally_block
+    assert "executor.shutdown()" in finally_block, (
+        "the executor's guard condition is never released before the context goes"
+    )
 
 
 def test_atomic_status_write_scratch_path_is_unique_not_the_container_pid(
