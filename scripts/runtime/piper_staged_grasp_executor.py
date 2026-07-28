@@ -119,32 +119,59 @@ APPROACH_STREAM_REFERENCE_SPEED_PERCENT = 15
 # planned schedule is stretched, and is clamped on both sides, so a wrong
 # value costs smoothness and never safety.
 #
-# EVERY run behind this number was UNLOADED.  The corpus cannot extend it to a
-# holding arm: across 16 recorded grasps with stage receipts the achieved rate
-# on the loaded lift (p50 6.75, p90 15.83 deg/s) is not slower than the unloaded
-# approach (p50 3.08, p90 10.04 deg/s), but those runs were all commanded with
-# the OLD conservative stretch, and no receipt records speed_percent -- so they
-# say nothing about how a HOLDING arm tracks when asked for twice the rate.
-# ``stream_time_scale`` therefore refuses to apply this to a loaded leg.
+# EVERY run behind this number was UNLOADED, so it does not describe a holding
+# arm -- see PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT below.
 PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT = 1.70
+# The same regression, run on legs that were carrying the object.  The seven
+# recorded ``return-home-holding`` legs are the loaded analogue of the transits
+# above: one coalesced move_j, with holding_object=true, and with
+# executor_started_unix_ns / finished_unix_ns / speed_percent all recorded, so
+# leg_time = arc/(rate * speed) + overhead is solvable the same way.
+#
+#   run       speed  duration  chord     implied rate
+#   ...114366     5   18.993 s  98.10d   1.172 deg/s/%
+#   ...403866     5   21.452 s 128.87d   1.343
+#   ...352316    15    7.053 s  93.48d   1.299
+#   ...156297    15    7.228 s  92.51d   1.240
+#   ...660655    20    5.819 s  92.95d   1.304
+#   ...815652    20    5.851 s 105.75d   1.470
+#   ...195912    20    5.727 s  85.51d   1.232
+#
+# Least squares over all seven gives 1.278 deg/s per percent with a 2.255 s
+# fixed overhead (rms residual 0.676 s over 5.7-21.5 s legs).  As with the
+# unloaded constant the conservative floor is taken, below every observed
+# sample.  A holding arm is roughly three quarters the speed of an empty one,
+# which is why applying the unloaded 1.70 to a loaded leg asked for about twice
+# the rate the arm actually delivers.
+PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT = 1.15
 # Fraction of that rate a streamed schedule is allowed to demand.  Headroom
 # below 1.0 so the arm never saturates into tracking lag on a tick boundary.
 STREAM_RATE_UTILISATION = 0.90
 # Gross-deviation backstop for a streamed path.  This is NOT a precision gate:
 # the per-waypoint in-tolerance gate was removed because it stopped the arm at
-# every lift IK vertex.  It exists so a slip, a drop, or a controller that has
-# stopped accepting targets fails closed instead of streaming the remaining
-# schedule and reporting success.
+# every lift IK vertex.  It aborts a stalled or badly-lagging stream part way
+# through instead of commanding every remaining target into an arm that is not
+# following, which is what happened before -- the re-anchor keys on schedule lag,
+# which is TIME, so nothing in the loop ever compared a measured joint to a
+# commanded one.
 #
-# The bound is a fixed floor plus what the arm could physically have closed
-# since the last sample, so it does NOT scale with how far the profile intends
-# to travel.  A proportional bound cannot detect the failure that matters most:
-# a totally stalled arm deviates by exactly the intended distance, so any
-# multiple of it passes forever.
+# WHAT IT DOES NOT CATCH: a dropped or slipped payload while the joints keep
+# tracking perfectly.  It reads joints only.  Gripper aperture is verified before
+# the lift and after it, not during, so a mid-path drop still returns success.
+#
+# The bound must stay BELOW the path's own excursion or a total stall is
+# invisible -- the arm simply sits at the start and the deviation tops out at the
+# distance the profile intended.  A fixed 6 deg floor fails that test on the
+# majority of real lifts: across 162 recorded lift plans the max excursion is
+# p10 9.14 / p50 12.16 / p90 22.07 deg, so at speed 15-20 (the two most-used
+# recorded speeds) a 6 deg floor plus the reachable term never fires on more than
+# half of them.  Hence the excursion-relative term, and hence the floor is a CAP
+# rather than the bound itself.
 STREAM_TRACKING_ERROR_FLOOR_RAD = math.radians(6.0)
-# How often the stream samples feedback.  Every tick would add a CAN round trip
-# at 17 Hz to a bus this project has already deadlocked once.
-STREAM_TRACKING_SAMPLE_S = 0.25
+# Fraction of the path's own excursion that a healthy arm may lag by.  A real arm
+# trails the stream by about one tick of travel, an order of magnitude under
+# this; a stall crosses it before the path ends by construction.
+STREAM_TRACKING_EXCURSION_FRACTION = 0.5
 # 0.30 s at the 50 Hz stream keeps the arm within a bounded 15-sample drift
 # on a non-realtime host; the previous 0.15 s tripped on ordinary scheduler
 # jitter and its failure path unloaded a holding arm.
@@ -1553,23 +1580,26 @@ def stream_time_scale(
     bounded velocity/acceleration profile.  At ``speed_percent >= 15`` both
     bounds are 1.0 and the result is bit-identical to today.
 
-    A HOLDING arm keeps the legacy stretch.  The measured rate this speeds up to
-    was regressed from unloaded move_j legs only, and the judder it exists to
-    cure is on the UNLOADED approach descent -- the loaded lift legs would be
-    handed a 2x rate increase on evidence that does not cover them, with a
-    payload whose slip is not directly observable.  Gating on load keeps the
-    entire benefit where the complaint is and takes no unmeasured risk where it
-    is not.
+    A HOLDING arm is budgeted against its OWN measured rate, not the empty
+    arm's.  Both legs ratchet at 17 Hz under the shipped fixed ratio -- the lift
+    as visibly as the approach -- so refusing to retime the loaded leg at all
+    would forfeit most of the fix.  But a loaded arm delivers roughly three
+    quarters of the unloaded rate, so budgeting it at the unloaded constant
+    asks for about twice what it can track, on the one leg where losing the
+    profile means dropping the payload.
     """
 
     schedule = np.asarray(times_s, dtype=float)
     steps = np.abs(np.diff(np.asarray(positions, dtype=float), axis=0)).max(axis=1)
     peak_rate_rad_s = float(np.max(steps / np.diff(schedule)))
     legacy_scale = max(1.0, reference_speed_percent / float(speed_percent))
-    if holding_load:
-        return legacy_scale
+    rate_deg_s_per_percent = (
+        PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+        if holding_load
+        else PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+    )
     budget_rad_s = (
-        math.radians(PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT)
+        math.radians(rate_deg_s_per_percent)
         * float(speed_percent)
         * STREAM_RATE_UTILISATION
     )
@@ -1640,6 +1670,19 @@ def execute_timed_joint_path(
         reference_speed_percent=reference_speed_percent,
         holding_load=guard.holding_load,
     )
+    rate_deg_s_per_percent = (
+        PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+        if guard.holding_load
+        else PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+    )
+    # Keep the tracking bound under this path's own excursion, or a total stall
+    # never exceeds it: a stalled arm's deviation tops out at exactly the
+    # distance the profile intended to cover.
+    excursion_rad = float(np.max(np.abs(positions - positions[0])))
+    tracking_floor_rad = min(
+        STREAM_TRACKING_ERROR_FLOOR_RAD,
+        STREAM_TRACKING_EXCURSION_FRACTION * excursion_rad,
+    )
     started = monotonic()
     before_final_stamp = -math.inf
     before_final_status_stamp = -math.inf
@@ -1687,35 +1730,42 @@ def execute_timed_joint_path(
             before_final_status_stamp = status_stamp
         _command_joint_target(robot, target, guard)
 
-        # Gross-deviation backstop.  Sampled, not per-tick, so it costs one CAN
-        # round trip every STREAM_TRACKING_SAMPLE_S instead of one per target.
+        # Gross-deviation backstop, on every tick.  ``get_joint_angles`` returns
+        # the driver's cached joint frames and transmits nothing, and the
+        # ``check_arm_status`` call directly above is the same kind of cached
+        # read -- so this adds no CAN traffic and cannot interact with the bus
+        # deadlock or the passive-CAN gate.  An earlier revision throttled it to
+        # 0.25 s to "save a CAN round trip"; that rationale was false, and the
+        # throttle bought nothing but detection latency.
+        #
         # A healthy arm trails the stream by about one tick of travel; the floor
         # is an order of magnitude above that, so ordinary lag cannot trip it,
         # while a stall accumulates deviation at the profile rate and crosses
-        # the bound within roughly a second at the speeds this runs at.
+        # the bound within a couple of seconds at the speeds this runs at.
         now = monotonic()
-        if now - tracked_at >= STREAM_TRACKING_SAMPLE_S:
-            measured, _ = read_joint_feedback(robot)
-            deviation = float(np.max(np.abs(measured - positions[index])))
-            # What the arm could physically have closed since the last sample,
-            # so a slow feedback cadence is not read as a tracking failure.
-            reachable = (
-                math.radians(PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT)
-                * float(speed_percent)
-                * (now - tracked_at)
+        measured, _ = read_joint_feedback(robot)
+        deviation = float(np.max(np.abs(measured - positions[index])))
+        # What the arm could physically have closed since the previous tick, so
+        # a slow tick is never read as a tracking failure.  Budgeted at the
+        # arm's own rate for this load state -- using the unloaded rate here
+        # would make the bound most generous exactly where the payload risk is.
+        reachable = (
+            math.radians(rate_deg_s_per_percent)
+            * float(speed_percent)
+            * (now - tracked_at)
+        )
+        allowed = tracking_floor_rad + reachable
+        if deviation > allowed:
+            raise SafetyError(
+                "streamed path lost joint tracking: measured joints deviate "
+                f"{math.degrees(deviation):.2f}deg from the commanded target "
+                f"at waypoint {index}/{len(positions) - 1}, beyond the "
+                f"{math.degrees(allowed):.2f}deg bound; the arm moved "
+                f"{math.degrees(float(np.max(np.abs(measured - tracked_joints)))):.2f}"
+                f"deg since the previous tick",
             )
-            allowed = STREAM_TRACKING_ERROR_FLOOR_RAD + reachable
-            if deviation > allowed:
-                raise SafetyError(
-                    "streamed path lost joint tracking: measured joints deviate "
-                    f"{math.degrees(deviation):.2f}deg from the commanded target "
-                    f"at waypoint {index}/{len(positions) - 1}, beyond the "
-                    f"{math.degrees(allowed):.2f}deg bound; the arm moved "
-                    f"{math.degrees(float(np.max(np.abs(measured - tracked_joints)))):.2f}"
-                    f"deg since the last sample",
-                )
-            tracked_joints = measured
-            tracked_at = now
+        tracked_joints = measured
+        tracked_at = now
 
     max_delta_rad = float(np.max(np.abs(positions[-1] - actual_before_final)))
     conservative_rate_rad_s = math.radians(90.0) * speed_percent / 100.0

@@ -99,32 +99,45 @@ def test_an_unloaded_profile_is_stretched_only_as_far_as_the_arm_requires(peak_d
 
 
 @pytest.mark.parametrize("peak_deg_s", RECORDED_LIFT_PEAK_DEG_S)
-def test_a_holding_arm_keeps_the_legacy_stretch(peak_deg_s):
-    """The measured rate does not cover a loaded arm, so it is not applied.
+def test_a_holding_arm_is_budgeted_at_its_own_measured_rate(peak_deg_s):
+    """A loaded arm delivers about three quarters of the unloaded rate.
 
-    ``PIPER_JOINT_RATE_DEG_S_PER_SPEED_PERCENT`` was regressed from unloaded
-    move_j legs.  Applying it to the recorded lift peaks at speed 5 would raise
-    the commanded joint rate from 3.78 to 7.65 deg/s -- roughly double, at 90%
-    of a constant with no loaded evidence behind it, on the one leg where a
-    tracking failure means dropping the payload.  The judder this whole change
-    cures is on the UNLOADED approach descent, so gating on load costs nothing.
+    Regressed from the seven recorded ``return-home-holding`` legs, which are
+    the loaded analogue of the unloaded transits: one coalesced move_j, with
+    holding_object true and speed_percent recorded.  Budgeting a loaded leg at
+    the UNLOADED constant asks for roughly twice what the arm delivers, on the
+    one leg where losing the profile drops the payload.  Refusing to retime it
+    at all is also wrong -- the lift ratchets at 17 Hz exactly like the
+    approach -- so it gets its own budget, not the legacy fixed ratio.
     """
 
     loaded = scale(peak_deg_s, speed_percent=5, holding_load=True)
     unloaded = scale(peak_deg_s, speed_percent=5, holding_load=False)
+    loaded_budget = (
+        EXECUTOR.PIPER_LOADED_JOINT_RATE_DEG_S_PER_SPEED_PERCENT
+        * 5
+        * EXECUTOR.STREAM_RATE_UTILISATION
+    )
 
-    assert loaded == pytest.approx(max(1.0, 15 / 5.0))
-    assert loaded > unloaded
+    assert loaded == pytest.approx(
+        min(peak_deg_s / loaded_budget, max(1.0, 15 / 5.0)), rel=1e-9
+    )
+    assert loaded > unloaded, "a holding arm must be given more time, not less"
+    assert loaded < max(1.0, 15 / 5.0), "still an improvement on the fixed ratio"
 
 
 def test_a_holding_arm_is_never_commanded_faster_than_what_ships_today():
-    """Sweep the whole legal range; the loaded path must be exactly legacy."""
+    """Sweep the whole legal range: loaded is between unloaded and legacy."""
 
     for peak_deg_s in (0.01, 1.0, 5.72, 14.21, 60.0, 400.0):
         for speed_percent in range(1, EXECUTOR.MAX_SPEED_PERCENT + 1):
             legacy = max(1.0, 15 / float(speed_percent))
-            value = scale(peak_deg_s, speed_percent=speed_percent, holding_load=True)
-            assert value == pytest.approx(legacy), (peak_deg_s, speed_percent)
+            loaded = scale(peak_deg_s, speed_percent=speed_percent, holding_load=True)
+            unloaded = scale(peak_deg_s, speed_percent=speed_percent, holding_load=False)
+            assert 1.0 <= unloaded <= loaded <= legacy + 1e-12, (
+                peak_deg_s,
+                speed_percent,
+            )
 
 
 def test_no_op_at_or_above_the_reference_speed():
