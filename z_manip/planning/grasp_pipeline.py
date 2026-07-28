@@ -75,6 +75,20 @@ class GraspPlanConfig:
     """Hierarchical limits for deterministic anytime grasp search."""
 
     pregrasp_distance_m: float = 0.10
+    # Shorter standoff, tried ONLY when the preferred one cannot be solved for a
+    # given grasp.  e95d356 halved pregrasp_distance_m globally to rescue a
+    # far-low capture where every hypothesis was rejected (64 rejections -> 13
+    # valid plans).  That worked -- and it also halved the standoff on the
+    # ordinary in-reach grasps that never needed it.  With the TCP 116.675 mm
+    # behind the tool frame and the fingertips reaching 19.1 mm past it,
+    # fingertip clearance ahead of the grasp plane fell from 80.9 mm to 30.9 mm;
+    # over the recorded corpus the pregrasp-to-nearest-observed-object-point
+    # went 75.1 mm (07-17) to 26.9 mm (07-28), which is the operator's "the
+    # pregrasp is already right up against the object".  A per-hypothesis ladder
+    # keeps the rescue exactly where it is needed and nowhere else.  Set equal
+    # ``None`` disables the ladder entirely, which is the default so that no
+    # existing deployment or fixture changes behaviour by upgrading.
+    pregrasp_distance_fallback_m: float | None = None
     approach_steps: int = 6
     lift_distance_m: float = 0.10
     lift_steps: int = 5
@@ -110,6 +124,21 @@ class GraspPlanConfig:
     def __post_init__(self) -> None:
         if self.pregrasp_distance_m <= 0.0 or self.lift_distance_m <= 0.0:
             raise ValueError("grasp approach and lift distances must be positive")
+        if self.pregrasp_distance_fallback_m is not None and (
+            self.pregrasp_distance_fallback_m <= 0.0
+        ):
+            raise ValueError("the pregrasp fallback distance must be positive")
+        if (
+            self.pregrasp_distance_fallback_m is not None
+            and self.pregrasp_distance_fallback_m > self.pregrasp_distance_m
+        ):
+            # A "fallback" longer than the preferred standoff would silently
+            # make the ladder a promotion, handing the executor MORE approach
+            # travel on exactly the hypotheses that were already hard to solve.
+            raise ValueError(
+                "the pregrasp fallback distance must not exceed the preferred "
+                "standoff",
+            )
         if (
             self.fallback_lift_vertical_m <= 0.0
             or self.fallback_lift_retreat_m < 0.0
@@ -673,33 +702,63 @@ class GraspPlanGenerator:
     ) -> tuple[float, tuple[object, ...]]:
         """Fully validate one 6-DoF grasp under its local child budget."""
 
-        pregrasp = grasp_pregrasp_pose(grasp, self.config.pregrasp_distance_m)
-        try:
-            pregrasp_solution = self._solve(
-                self._tip_pose(pregrasp),
-                current=current,
-                control=control,
-            )
-        except PlanningAborted:
-            raise
-        except IKFailure as error:
-            raise _HypothesisRejected(
-                "ik",
-                f"pregrasp IK failed: {error}",
-            ) from error
-        try:
-            approach_joints, grasp_solution = self._cartesian_ik(
-                _interpolate_pose(pregrasp, grasp, self.config.approach_steps),
-                pregrasp_solution.joints,
-                control,
-            )
-        except PlanningAborted:
-            raise
-        except IKFailure as error:
-            raise _HypothesisRejected(
-                "ik",
-                f"approach IK failed: {error}",
-            ) from error
+        # Standoff ladder.  Take the preferred clearance whenever it solves, and
+        # drop to the shorter one only for the hypotheses that genuinely cannot
+        # be reached with it -- the far-low captures the fallback exists for.
+        # Shortening globally instead pulls the fingertips in on every ordinary
+        # grasp, which is what the operator sees as "the pregrasp is already
+        # touching the object".
+        distances = [self.config.pregrasp_distance_m]
+        fallback = self.config.pregrasp_distance_fallback_m
+        if fallback is not None and fallback < self.config.pregrasp_distance_m:
+            distances.append(fallback)
+
+        pregrasp_solution = None
+        rejection: _HypothesisRejected | None = None
+        for distance_m in distances:
+            pregrasp = grasp_pregrasp_pose(grasp, distance_m)
+            try:
+                pregrasp_solution = self._solve(
+                    self._tip_pose(pregrasp),
+                    current=current,
+                    control=control,
+                )
+            except PlanningAborted:
+                raise
+            except IKFailure as error:
+                # Keep the FIRST failure: it is the one at the standoff we
+                # wanted, so it is what explains the plan the operator gets.
+                # The phase must stay distinguishable -- "pregrasp" and
+                # "approach" fail for different reasons and are diagnosed
+                # differently.
+                if rejection is None:
+                    rejection = _HypothesisRejected(
+                        "ik",
+                        f"pregrasp IK failed: {error}",
+                    )
+                pregrasp_solution = None
+                continue
+            try:
+                approach_joints, grasp_solution = self._cartesian_ik(
+                    _interpolate_pose(pregrasp, grasp, self.config.approach_steps),
+                    pregrasp_solution.joints,
+                    control,
+                )
+            except PlanningAborted:
+                raise
+            except IKFailure as error:
+                if rejection is None:
+                    rejection = _HypothesisRejected(
+                        "ik",
+                        f"approach IK failed: {error}",
+                    )
+                pregrasp_solution = None
+                continue
+            break
+
+        if pregrasp_solution is None:
+            assert rejection is not None
+            raise rejection
         approach_path = np.vstack((pregrasp_solution.joints, approach_joints))
         if self.approach_path_valid is not None:
             checkpoint(control, "grasp approach collision checking")

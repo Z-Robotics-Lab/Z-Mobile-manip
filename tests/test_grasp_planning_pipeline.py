@@ -998,3 +998,121 @@ def test_ranker_exceptions_are_counted_not_swallowed_silently():
     )
 
     assert generator.ranker_exceptions > 0
+
+
+# ---------------------------------------------------------------------------
+# The standoff ladder.
+#
+# e95d356 halved pregrasp_distance_m from 0.10 to 0.05 globally, to rescue a
+# far-low capture where every hypothesis was rejected.  It did rescue it -- and
+# it halved the standoff on every ordinary grasp too.  With the TCP 116.675 mm
+# behind the tool frame and the fingertips reaching 19.1 mm past it, fingertip
+# clearance ahead of the grasp plane fell from 80.9 mm to 30.9 mm, and the
+# recorded pregrasp-to-nearest-observed-object-point went 75.1 mm (07-17) to
+# 26.9 mm (07-28) -- the operator's "the pregrasp is already up against the
+# object".  The ladder keeps the rescue and drops the collateral.
+
+
+class _StandoffRecordingIK:
+    """Solves only when the commanded standoff is at or below ``solvable_m``."""
+
+    def __init__(self, grasp_z: float, solvable_m: float) -> None:
+        self.grasp_z = float(grasp_z)
+        self.solvable_m = float(solvable_m)
+        self.standoffs: list[float] = []
+
+    def solve(self, target, current=None, *, control=None):
+        del current, control
+        standoff = self.grasp_z - float(np.asarray(target, dtype=float)[2, 3])
+        self.standoffs.append(standoff)
+        if standoff > self.solvable_m + 1e-9:
+            raise IKFailure(f"unreachable at {standoff * 1000:.0f}mm standoff")
+        return IKSolution(np.zeros(2), 0.0, 0.0, 0.2, 1, 0, 0.25)
+
+    def solve_continuation(
+        self, target, current, *, max_joint_step_rad, control=None
+    ):
+        del target, current, max_joint_step_rad, control
+        return IKSolution(np.zeros(2), 0.0, 0.0, 0.2, 1, 0, 0.25)
+
+
+def _ladder_config(**overrides):
+    base = dict(
+        pregrasp_distance_m=0.10,
+        pregrasp_distance_fallback_m=0.05,
+        approach_steps=2,
+        fallback_lift_vertical_m=0.10,
+        fallback_lift_retreat_m=0.0,
+        lift_steps=2,
+        symmetry_samples=1,
+        max_hypotheses=1,
+        tool_from_tip=np.eye(4),
+    )
+    base.update(overrides)
+    return GraspPlanConfig(**base)
+
+
+def test_the_preferred_standoff_is_used_when_it_solves():
+    """An ordinary grasp keeps its full clearance and never sees the fallback."""
+
+    ik = _StandoffRecordingIK(grasp_z=0.2, solvable_m=0.10)
+    generator = GraspPlanGenerator(ik, FakePlanner(), _ladder_config())
+    generator.plan(
+        _candidates((_pose((0.5, 0.0, 0.2)),)),
+        current_joints=np.zeros(2),
+    )
+
+    assert ik.standoffs, "the evaluator never reached pregrasp IK"
+    assert ik.standoffs[0] == pytest.approx(0.10)
+    assert all(value == pytest.approx(0.10) for value in ik.standoffs), (
+        f"the fallback was reached on a solvable grasp: {ik.standoffs}"
+    )
+
+
+def test_the_ladder_descends_only_for_a_hypothesis_that_needs_it():
+    """The far-low capture e95d356 rescued still gets rescued."""
+
+    ik = _StandoffRecordingIK(grasp_z=0.2, solvable_m=0.05)
+    generator = GraspPlanGenerator(ik, FakePlanner(), _ladder_config())
+    generator.plan(
+        _candidates((_pose((0.5, 0.0, 0.2)),)),
+        current_joints=np.zeros(2),
+    )
+
+    assert ik.standoffs[0] == pytest.approx(0.10), "must try the long one first"
+    assert any(value == pytest.approx(0.05) for value in ik.standoffs), (
+        "a grasp only reachable at the short standoff must still be planned"
+    )
+
+
+def test_without_the_ladder_an_unreachable_hypothesis_is_rejected():
+    """Control: the rescue comes from the ladder, not from something else."""
+
+    ik = _StandoffRecordingIK(grasp_z=0.2, solvable_m=0.05)
+    generator = GraspPlanGenerator(
+        ik, FakePlanner(), _ladder_config(pregrasp_distance_fallback_m=None)
+    )
+    with pytest.raises(PlanningError):
+        generator.plan(
+            _candidates((_pose((0.5, 0.0, 0.2)),)),
+            current_joints=np.zeros(2),
+        )
+    assert all(value == pytest.approx(0.10) for value in ik.standoffs)
+
+
+def test_the_ladder_is_off_by_default_so_upgrading_changes_nothing():
+    assert GraspPlanConfig().pregrasp_distance_fallback_m is None
+
+
+def test_a_fallback_longer_than_the_preferred_standoff_is_refused():
+    """Otherwise the 'fallback' silently becomes a promotion.
+
+    It would hand the executor MORE approach travel on exactly the hypotheses
+    that were already hard to solve.
+    """
+
+    with pytest.raises(ValueError, match="must not exceed"):
+        _ladder_config(pregrasp_distance_m=0.05, pregrasp_distance_fallback_m=0.10)
+
+    with pytest.raises(ValueError, match="must be positive"):
+        _ladder_config(pregrasp_distance_fallback_m=0.0)
