@@ -613,14 +613,14 @@
           </div>
           <div class="image-frame live-camera" data-testid="live-depth-frame" data-feed-key="live_depth">
             <div class="image-frame-toolbar">
-              <span class="image-label">D435 depth</span>
+              <span class="image-label" id="depth-label">Depth</span>
               <div class="image-frame-actions">
                 <span class="camera-state offline" id="depth-state" aria-live="polite">OFFLINE</span>
-                <button class="image-reorder-button" type="button" data-reorder="up" aria-label="Move D435 depth live up" title="Move up">&#8593;</button>
-                <button class="image-reorder-button" type="button" data-reorder="down" aria-label="Move D435 depth live down" title="Move down">&#8595;</button>
+                <button class="image-reorder-button" type="button" data-reorder="up" aria-label="Move depth live up" title="Move up">&#8593;</button>
+                <button class="image-reorder-button" type="button" data-reorder="down" aria-label="Move depth live down" title="Move down">&#8595;</button>
               </div>
             </div>
-            <img id="depth-image" alt="Live colorized D435 depth feed" hidden>
+            <img id="depth-image" alt="Live colorized depth feed" hidden>
             <div class="empty-image" id="depth-placeholder">Waiting for the subscribe-only depth observer.</div>
           </div>
           <div class="image-frame live-cloud" data-testid="live-cloud-frame" data-feed-key="live_cloud">

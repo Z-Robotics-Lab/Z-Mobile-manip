@@ -1606,28 +1606,66 @@ def _camera_info_callback(
     return observe
 
 
+def _ffs_owns_the_tile(cloud_builder: PointCloudWriter | None) -> bool:
+    """Has an FFS frame arrived recently enough to render the depth tile?"""
+
+    if cloud_builder is None:
+        return False
+    try:
+        return cloud_builder.active_source(time.monotonic()) == "ffs"
+    except Exception:
+        return False
+
+
+def _render_depth_tile(
+    state: RuntimeObserverState,
+    writer: DepthFrameWriter | None,
+    message: object,
+    source: str,
+) -> None:
+    """Write one depth frame to the operator's tile, labelled with its source."""
+
+    payload = summarize_image(message)
+    payload["depth_source"] = source
+    if writer is not None and payload.get("valid") is True:
+        try:
+            wrote = writer.write(message)
+            if wrote:
+                payload["depth_jpeg_available"] = True
+                payload["depth_jpeg_error"] = None
+        except Exception as error:  # Preserve the last known-good depth JPEG.
+            payload["depth_jpeg_available"] = False
+            payload["depth_jpeg_error"] = f"{type(error).__name__}: {error}"[:512]
+    state.observe("depth", payload, stamp_ns(message))
+
+
 def _depth_callback(
     state: RuntimeObserverState,
     writer: DepthFrameWriter | None,
     cloud_builder: PointCloudWriter | None = None,
 ) -> Callable[[object], None]:
+    """Raw aligned depth: always feeds the cloud, renders only as the fallback.
+
+    The tile used to show raw depth unconditionally while every consumer in the
+    grasp path reads FFS, so the operator was diagnosing grasp failures from a
+    stream that path never touches -- and raw is by far the noisier of the two
+    (mean |Laplacian| on hole-free support 22.0 mm raw against 6.1 mm FFS), so
+    it looked like the pipeline was broken when it was not.  The tile now
+    follows the same source policy the coloured cloud already used, and the
+    payload names the source so the label cannot go stale again.
+    """
+
     def observe(message: object) -> None:
-        payload = summarize_image(message)
-        if writer is not None and payload.get("valid") is True:
-            try:
-                wrote = writer.write(message)
-                if wrote:
-                    payload["depth_jpeg_available"] = True
-                    payload["depth_jpeg_error"] = None
-            except Exception as error:  # Preserve the last known-good depth JPEG.
-                payload["depth_jpeg_available"] = False
-                payload["depth_jpeg_error"] = f"{type(error).__name__}: {error}"[:512]
-        if cloud_builder is not None and payload.get("valid") is True:
+        payload_valid = summarize_image(message).get("valid") is True
+        if cloud_builder is not None and payload_valid:
             try:  # Raw D435 aligned depth feeds the cloud as the fallback source.
                 cloud_builder.observe_depth("d435_raw", message)
             except Exception:  # Preserve the last known-good cloud.
                 pass
-        state.observe("depth", payload, stamp_ns(message))
+        if _ffs_owns_the_tile(cloud_builder):
+            # FFS is flowing and renders the tile itself; do not fight it.
+            return
+        _render_depth_tile(state, writer, message, "d435_raw")
 
     return observe
 
@@ -1635,16 +1673,23 @@ def _depth_callback(
 def _cloud_depth_callback(
     cloud_builder: PointCloudWriter | None,
     source: str,
+    state: RuntimeObserverState | None = None,
+    writer: DepthFrameWriter | None = None,
 ) -> Callable[[object], None]:
-    """Feed a dedicated depth topic (e.g. FFS) into the cloud builder only."""
+    """Feed a dedicated depth topic (e.g. FFS) into the cloud builder.
+
+    When ``state`` is given, this source also renders the operator's depth tile,
+    so the tile shows what the perception stack actually consumes.
+    """
 
     def observe(message: object) -> None:
-        if cloud_builder is None:
-            return
-        try:
-            cloud_builder.observe_depth(source, message)
-        except Exception:  # Preserve the last known-good cloud.
-            pass
+        if cloud_builder is not None:
+            try:
+                cloud_builder.observe_depth(source, message)
+            except Exception:  # Preserve the last known-good cloud.
+                pass
+        if state is not None:
+            _render_depth_tile(state, writer, message, source)
 
     return observe
 
@@ -1855,15 +1900,16 @@ def run_ros_observer(args: argparse.Namespace) -> int:
         ),
     ]
     if cloud_builder is not None:
-        # The learned-stereo FFS depth topic feeds only the colored-cloud
-        # builder; it is not part of the runtime-state topic accounting.  The
-        # builder prefers it whenever it is flowing and falls back to the raw
-        # aligned depth otherwise.
+        # The learned-stereo FFS depth topic feeds the coloured cloud AND the
+        # operator's depth tile; it is not part of the runtime-state topic
+        # accounting.  Both prefer it whenever it is flowing and fall back to
+        # the raw aligned depth otherwise, so what the operator sees is what
+        # the grasp path consumes.
         subscriptions.append(
             node.create_subscription(
                 Image,
                 args.ffs_depth_topic,
-                _cloud_depth_callback(cloud_builder, "ffs"),
+                _cloud_depth_callback(cloud_builder, "ffs", state, depth_writer),
                 qos_profile_sensor_data,
             )
         )
