@@ -348,7 +348,20 @@ def test_candidate_diversity_never_runs_lower_global_rank_first():
     np.testing.assert_allclose(ik.calls[1], expected_second)
 
 
-def test_first_feasible_search_uses_reachability_after_top_score_fails():
+def test_reachability_only_demotes_unreachable_poses_it_does_not_reorder_by_cost():
+    """The ranker may say WHETHER a pose is reachable, never WHICH to prefer.
+
+    Its cost includes an orientation term against a fixed set of canned seed
+    rotations, so ordering by its magnitude means "prefer whatever points most
+    like a stock seed" -- which discards the lateral-approach prior for every
+    candidate after the first, and with max_feasible_plans=1 that ordering IS
+    the grasp selection.  Measured over 183 recorded plans: a lateral grasp was
+    rank 1 in 91-100% of sessions, but the executed grasp was lateral in 9% of
+    07-28 sessions, with 102 better-ranked candidates (82 lateral) never
+    evaluated at all.  This is the operator's "it no longer adjusts posture and
+    twist to suit the object -- everything is top-down".
+    """
+
     class TopCandidateFails(FakeIK):
         def solve(self, target, current=None, *, control=None):
             self.calls.append(np.asarray(target).copy())
@@ -390,8 +403,11 @@ def test_first_feasible_search_uses_reachability_after_top_score_fails():
         pose_ranker=pose_ranker,
     )
 
-    assert result.candidate_index == 3
-    assert [round(float(call[0, 3]), 2) for call in ik.calls[:2]] == [0.40, 0.70]
+    # Candidate 1 is the best-SCORED reachable candidate.  The ranker would
+    # have put candidate 3 first (cost 1.0 vs 8.0); that preference is exactly
+    # what must not survive.
+    assert result.candidate_index == 1
+    assert [round(float(call[0, 3]), 2) for call in ik.calls[:2]] == [0.40, 0.50]
     # The advisory batch ranking is cached for the per-candidate symmetry
     # ordering instead of repeating the same FK work during exact search.
     assert len(rank_calls) == 4
@@ -1147,3 +1163,57 @@ def test_the_contact_approach_step_does_not_grow_with_the_standoff():
         FakeIK(), FakePlanner(), _ladder_config(approach_steps=6)
     )
     assert legacy._approach_steps_for(0.10) == 6
+
+
+def test_an_unreachable_pose_is_still_demoted_behind_reachable_ones():
+    """The anytime win the ranker legitimately buys must survive the fix."""
+
+    class TrackingIK(FakeIK):
+        def solve(self, target, current=None, *, control=None):
+            self.calls.append(np.asarray(target).copy())
+            x = float(target[0, 3])
+            # 0.40 is rank 1 and fails, so the ordering of the REMAINDER -- the
+            # thing this test is about -- actually gets exercised.
+            if round(x, 2) in (0.40, 0.50):
+                raise IKFailure("unreachable")
+            return IKSolution(np.full(2, x), 0.0, 0.0, 0.2, 1, 0, 0.25)
+
+    poses = tuple(
+        _pose((x, 0.0, 0.2), approach=(0.0, 0.0, 1.0))
+        for x in (0.40, 0.50, 0.60, 0.70)
+    )
+    # Candidate 1 (x=0.50) scores second but the ranker knows it is hopeless.
+    infinite = {0.40: 0.0, 0.50: float("inf"), 0.60: 4.0, 0.70: 1.0}
+
+    ik = TrackingIK()
+    result = GraspPlanGenerator(
+        ik,
+        FakePlanner(),
+        GraspPlanConfig(
+            pregrasp_distance_m=0.02,
+            approach_steps=2,
+            lift_steps=2,
+            symmetry_samples=1,
+            max_candidates=4,
+            max_hypotheses=4,
+            max_feasible_plans=1,
+            tool_from_tip=np.eye(4),
+        ),
+    ).plan(
+        _candidates(poses),
+        current_joints=np.zeros(2),
+        pose_ranker=lambda target, *, control=None: infinite[
+            round(float(target[0, 3]), 2)
+        ],
+    )
+
+    # 0.50 is skipped for being unreachable, NOT for pointing the wrong way, so
+    # the next best-SCORED candidate wins rather than the ranker's favourite.
+    tried = [round(float(call[0, 3]), 2) for call in ik.calls]
+    assert tried[0] == 0.40, "rank 1 is always tried first"
+    assert tried[1] == 0.60, (
+        "the ranker's favourite (0.70, cost 1.0) must NOT jump the better-scored "
+        f"0.60 (cost 4.0); order was {tried}"
+    )
+    assert 0.50 not in tried[:3], "an unreachable pose must still go last"
+    assert result.candidate_index == 2

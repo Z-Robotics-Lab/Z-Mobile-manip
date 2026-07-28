@@ -584,11 +584,35 @@ class GraspPlanGenerator:
 
         first = int(order[0])
         original_rank = {int(index): rank for rank, index in enumerate(order)}
+        # Partition the hopeless poses to the back, and keep SCORE order among
+        # the rest.
+        #
+        # The ranker is a seed-pose FK distance and it carries no grasp quality
+        # at all -- worse, its cost includes an ORIENTATION term measured against
+        # a fixed set of canned seed rotations (robust_ik.make_seed_pose_ranker),
+        # so sorting by its magnitude means "prefer whichever grasp points most
+        # like a stock seed".  Because the costs are continuous floats the score
+        # tie-break below effectively never fires, so ranking by magnitude
+        # discarded the global score outright for every candidate after the
+        # first -- and with it the lateral-approach prior that is the only thing
+        # asking the arm to twist to suit the object.  With max_feasible_plans=1
+        # this ordering IS the grasp selection.
+        #
+        # Measured over 183 recorded plans: a lateral grasp is rank 1 in 91-100%
+        # of sessions on every day, while the EXECUTED grasp was lateral in only
+        # 9% of 07-28 sessions; 102 better-ranked candidates (82 of them lateral)
+        # were never evaluated at all, against 37 that were tried and rejected.
+        # The executed pose sat in the 21st-31st percentile of its own pool's
+        # required reach every single day -- the signature of picking whatever is
+        # nearest a canned seed.
+        #
+        # Finiteness is still worth keeping: an unreachable pose should not be
+        # tried before a reachable one, and that is all this ranker can honestly
+        # tell us.
         remainder = sorted(
             (int(index) for index in order[1:]),
             key=lambda index: (
                 not np.isfinite(candidate_costs.get(index, float("inf"))),
-                candidate_costs.get(index, float("inf")),
                 original_rank[index],
             ),
         )
