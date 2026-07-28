@@ -194,7 +194,7 @@ JOINT_LIMIT_TOLERANCE_RAD = 1e-5
 # Bounded low-speed convergence from a checked-corridor endpoint to the
 # calibrated software Home.  These mirror the standalone Home action exactly as
 # the operator's Home wrapper invokes it (piper_home_recovery.py with
-# --max-recovery-deg 20 --max-step-deg 5): a checked path leaves the arm at its
+# --max-recovery-deg 30 --max-step-deg 5): a checked path leaves the arm at its
 # recorded planning-start pose, and the final short hop to calibrated Home must
 # never sweep a large unplanned joint-space chord.  Deltas beyond the envelope
 # fail closed so the caller can stop safely at the corridor endpoint instead;

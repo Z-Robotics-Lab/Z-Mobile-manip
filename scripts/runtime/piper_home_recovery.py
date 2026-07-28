@@ -50,8 +50,17 @@ def main() -> int:
         )
     if not 0.5 <= args.max_step_deg <= 5.0:
         raise executor.SafetyError("Home recovery step must be within 0.5-5 degrees")
-    if not 1.0 <= args.max_recovery_deg <= 20.0:
-        raise executor.SafetyError("Home recovery envelope must be within 1-20 degrees")
+    # 30 deg, raised from 20 at operator request 2026-07-28 after a live recovery
+    # was refused at 25.322 deg.  What this bound does and does NOT do: the path
+    # below is a straight line in joint space with NO collision check at all, so
+    # this envelope is the only thing limiting it.  Widening it does not make any
+    # individual step riskier -- --max-step-deg still subdivides at 5 deg and the
+    # per-step geometry is unchanged -- it allows the recovery to START further
+    # from Home.  The real gap is that nothing checks the corridor at all; see
+    # tests/test_return_corridor_execution.py for the measurement showing an
+    # unsynchronised move_j leaving a validated corridor.
+    if not 1.0 <= args.max_recovery_deg <= 30.0:
+        raise executor.SafetyError("Home recovery envelope must be within 1-30 degrees")
     if not args.execute:
         print(json.dumps({
             "schema": "z_manip.piper_home_recovery.v1",
