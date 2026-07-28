@@ -329,3 +329,38 @@ __all__ = [
     "CollisionGateSelection",
     "select_collision_safe_arm_step",
 ]
+
+
+# The number of leading control DOFs the fixed-fixture gate has no information
+# about: base_forward_mps, base_yaw_rps, body_roll_rps, body_pitch_rps.
+CHASSIS_CONTROL_DOF = 4
+
+
+def hold_arm_release_chassis(velocity_vector: object) -> np.ndarray:
+    """Zero the arm block of a control vector and preserve the chassis block.
+
+    This is the whole-body runtime's response when
+    ``select_collision_safe_arm_step`` authorizes nothing. The gate judges the
+    ARM alone -- it is handed the six arm joints and the arm block of the
+    primary velocity, and every capsule it measures against is anchored to
+    ``piper_base_link``. The chassis DOFs are not inputs to it, and the Mid-360
+    is body-fixed on the same rigid chassis, so no base or body motion can
+    change any distance it measures. Zeroing them too stopped the entire robot
+    on evidence about the arm.
+
+    Recorded 2026-07-28: 147 of 251 trace rows sat blocked on
+    ["finger_left_tip", "mid360"] with tracking TRUE and the base commanded to
+    exactly 0.0, one stall running 23.3 s with the target still a metre away.
+
+    The arm block really is zeroed: when this runs, the measured margin is at or
+    below zero and no arm step is authorized.
+    """
+
+    vector = np.asarray(velocity_vector, dtype=float)
+    if vector.ndim != 1 or vector.size <= CHASSIS_CONTROL_DOF:
+        raise ValueError("control vector must be 1-D and carry an arm block")
+    if not np.all(np.isfinite(vector)):
+        raise ValueError("control vector must be finite")
+    held = vector.copy()
+    held[CHASSIS_CONTROL_DOF:] = 0.0
+    return held

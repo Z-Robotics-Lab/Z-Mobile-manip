@@ -24,7 +24,7 @@ from .whole_body_model import (
     ReducedWholeBodyVelocity,
 )
 from .reactive_servo import ViewMeasurementDampingConfig
-from .whole_body_collision import select_collision_safe_arm_step
+from .whole_body_collision import hold_arm_release_chassis, select_collision_safe_arm_step
 from .whole_body_optimizer import (
     CasadiBoxQP,
     WholeBodyOptimizerConfig,
@@ -339,20 +339,48 @@ class WholeBodyRuntimeController:
                         failure_code=None,
                     )
             else:
-                zero = ReducedWholeBodyVelocity.from_vector(np.zeros(CONTROL_DOF))
+                # HOLD THE ARM, NOT THE ROBOT.  This gate judges the arm alone:
+                # ``select_collision_safe_arm_step`` above is handed
+                # ``current_joints`` (the six arm joints) and
+                # ``primary_value[4:]``, and every capsule in the model is
+                # anchored to ``piper_base_link``.  base_forward, base_yaw,
+                # body_roll and body_pitch are not inputs to it, and the Mid-360
+                # is body-fixed on the same rigid chassis, so no base motion can
+                # change any distance it measures.  Zeroing indices 0-3 stopped
+                # the entire robot on evidence about the arm alone.
+                #
+                # Recorded 2026-07-28: 147 of 251 trace rows sat in
+                # whole_body_shadow with tracking TRUE and both proposed and
+                # published base velocity exactly 0.0, blocked on
+                # ["finger_left_tip", "mid360"].  One stall ran 23.3 s with the
+                # target still a metre away, nowhere near a handoff corridor.
+                # From the outside that is "the servo stopped although tracking
+                # is still alive", and the base was the one group of DOFs the
+                # gate had no information about.
+                #
+                # The arm is still held to zero -- the margin really was negative
+                # (-0.7 mm on that approach), so no arm step is authorized. Only
+                # the base keeps the authority the gate never evaluated.
                 result = replace(
                     result,
-                    velocity=zero,
-                    predicted_state=state,
-                    backend="fixed-fixture-collision-gate",
+                    velocity=ReducedWholeBodyVelocity.from_vector(
+                        hold_arm_release_chassis(result.velocity.as_vector()),
+                    ),
+                    backend="fixed-fixture-arm-hold",
                     objective_after=result.objective_before,
                     residual_after=result.residual_before,
-                    success=False,
+                    # An arm held stationary inside the envelope while the base
+                    # continues its evaluated intent IS a legal command, so this
+                    # stays executable.  ``failure_code`` still names the gate so
+                    # the condition remains visible instead of reading as an
+                    # ordinary approach.
+                    success=True,
                     reason=(
                         "no continuous fixed-fixture-safe arm step also lowered "
-                        "the nonlinear whole-body objective; stationary intent returned"
+                        "the nonlinear whole-body objective; arm held stationary "
+                        "while the base keeps its evaluated intent"
                     ),
-                    failure_code="FIXED_FIXTURE_COLLISION",
+                    failure_code="FIXED_FIXTURE_ARM_HOLD",
                 )
         else:
             collision_document = {

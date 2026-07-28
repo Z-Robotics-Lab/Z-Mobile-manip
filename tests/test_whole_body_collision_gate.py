@@ -185,3 +185,78 @@ def test_geometry_safe_candidate_is_rejected_when_task_replay_does_not_improve()
     assert selected.strategy == "fail_closed"
     assert all(not attempt.task_improved for attempt in selected.attempts)
     assert np.count_nonzero(selected.arm_velocity_rps) == 0
+
+
+# ---------------------------------------------------------------------------
+# What the runtime does when the gate authorizes nothing.
+#
+# The gate judges the ARM: select_collision_safe_arm_step is handed the six arm
+# joints and the arm block of the primary velocity, and every capsule it
+# measures is anchored to piper_base_link. Zeroing the chassis DOFs too stopped
+# the whole robot on evidence about the arm -- recorded 2026-07-28 as 147 of 251
+# trace rows with tracking TRUE and base velocity exactly 0.0, one stall of
+# 23.3 s with the target a metre away.
+#
+# These run without casadi or pinocchio, which the whole-body runtime needs and
+# which are not importable on this host -- that is the point of testing the
+# decision as a pure function rather than through the controller.
+
+from z_manip.control.whole_body_collision import (  # noqa: E402
+    CHASSIS_CONTROL_DOF,
+    hold_arm_release_chassis,
+)
+from z_manip.control.whole_body_model import CONTROL_DOF, CONTROL_NAMES  # noqa: E402
+
+
+def test_a_blocked_gate_holds_the_arm_and_keeps_the_chassis_intent():
+    velocity = np.asarray([0.18, -0.05, 0.01, -0.02, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8])
+    held = hold_arm_release_chassis(velocity)
+
+    np.testing.assert_array_equal(held[:CHASSIS_CONTROL_DOF], velocity[:CHASSIS_CONTROL_DOF])
+    np.testing.assert_array_equal(held[CHASSIS_CONTROL_DOF:], np.zeros(CONTROL_DOF - CHASSIS_CONTROL_DOF))
+    # The input must not be mutated: the caller still reports the primary intent.
+    assert velocity[4] == 0.3
+
+
+def test_the_split_matches_the_control_vector_layout():
+    """The load-bearing assumption, pinned against the model.
+
+    If the control vector is ever reordered, a fixed index-4 split would zero
+    the wrong half -- silently commanding the arm while freezing the base, which
+    is the exact inverse of this gate's intent and would drive the arm into the
+    fixture the gate exists to protect.
+    """
+
+    assert len(CONTROL_NAMES) == CONTROL_DOF
+    chassis = CONTROL_NAMES[:CHASSIS_CONTROL_DOF]
+    arm = CONTROL_NAMES[CHASSIS_CONTROL_DOF:]
+    assert chassis == (
+        "base_forward_mps",
+        "base_yaw_rps",
+        "body_roll_rps",
+        "body_pitch_rps",
+    )
+    assert all(name.startswith("piper_joint") for name in arm), arm
+    assert len(arm) == 6
+
+
+def test_a_blocked_gate_never_leaves_arm_authority():
+    """Whatever the optimizer wanted, the arm goes to zero.
+
+    When this path runs the measured margin is at or below zero, so no arm step
+    is authorized at all -- including the one the QP preferred.
+    """
+
+    for magnitude in (0.0, 0.01, 1.0, 1e3):
+        velocity = np.full(CONTROL_DOF, magnitude)
+        held = hold_arm_release_chassis(velocity)
+        assert not np.any(held[CHASSIS_CONTROL_DOF:]), magnitude
+
+
+def test_a_malformed_control_vector_is_rejected():
+    for bad in (np.zeros((2, 10)), np.zeros(4), np.full(10, np.nan)):
+        try:
+            hold_arm_release_chassis(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted a malformed control vector: {bad!r}")
