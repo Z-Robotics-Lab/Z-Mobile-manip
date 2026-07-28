@@ -150,9 +150,31 @@ fi
 # them to bypass the check.  The warning is unconditional and the fingerprint it
 # prints is the same value the servo stamps into depth-servo.json and every
 # trace row, so an after-the-fact analysis can prove which bytes ran.
-RUNTIME_FINGERPRINT="$(
-  /usr/bin/env python3 "$SCRIPT_DIR/z_manip_runtime_fingerprint.py" 2>/dev/null || true
-)"
+#
+# THE FINGERPRINT MUST BE MEASURABLE OVER THE SAME FILES ON BOTH SIDES OF THE
+# CONTAINER BOUNDARY, AND ONCE IT WAS NOT.  runtime_inputs() hashes one file
+# that lives OUTSIDE $STACK_ROOT ($WORKSPACE_ROOT/go2W_Sim/.../go2w_sensored.urdf).
+# The docker run below mounts $STACK_ROOT at its own path but mounted that URDF
+# only at /robot/go2w_sensored.urdf, so the servo's in-container re-measure saw
+# 98 files where this launcher saw 99, differed by construction, and reported
+# runtime_fingerprint_mutated: true on every trace row of every run against a
+# frozen tree.  --launch-manifest returns the digest AND every hashed path
+# outside $STACK_ROOT; each is mounted below at its own absolute path so the
+# two measurements enumerate the same set.  ONE python3 call, so the digest and
+# the mount list cannot describe different measurements.
+RUNTIME_FINGERPRINT=""
+FINGERPRINT_INPUT_MOUNTS=()
+while IFS= read -r fingerprint_input; do
+  [[ -n "$fingerprint_input" ]] || continue
+  if [[ -z "$RUNTIME_FINGERPRINT" ]]; then
+    RUNTIME_FINGERPRINT="$fingerprint_input"
+  else
+    FINGERPRINT_INPUT_MOUNTS+=(-v "$fingerprint_input:$fingerprint_input:ro")
+  fi
+done < <(
+  /usr/bin/env python3 "$SCRIPT_DIR/z_manip_runtime_fingerprint.py" \
+    --launch-manifest 2>/dev/null || true
+)
 if [[ -z "$RUNTIME_FINGERPRINT" ]]; then
   # Not fatal: the fingerprint is diagnostic, not a gate.  But say so, because
   # an absent stamp reads identically to "checked and clean" downstream.
@@ -215,6 +237,7 @@ docker run --rm \
   -v "$DDS_CONFIG:/config/cyclonedds.xml:ro" \
   -v "$STACK_ROOT:$STACK_ROOT:ro" \
   -v "$WHOLE_BODY_URDF:/robot/go2w_sensored.urdf:ro" \
+  ${FINGERPRINT_INPUT_MOUNTS[@]+"${FINGERPRINT_INPUT_MOUNTS[@]}"} \
   -v "$WHOLE_BODY_CALIBRATION:/robot/piper_wrist_camera_calibration.json:ro" \
   -v "$WHOLE_BODY_COLLISION_MODEL:/robot/piper_collision_capsules.json:ro" \
   -v "$(dirname -- "$STATUS_PATH"):$(dirname -- "$STATUS_PATH"):rw" \

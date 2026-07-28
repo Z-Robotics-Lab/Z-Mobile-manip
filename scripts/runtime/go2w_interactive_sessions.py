@@ -1006,10 +1006,17 @@ class FixedReadOnlyBackend:
 
         1. ``_selected_passive_report_valid`` saw the previous sub-attempt's
            selected report, so the supervision loop below never opened another
-           passive window.  Recorded: ``passive_capture_count: 0`` on 6 of 6
-           self-healed retries (20260727-080308, 20260728-030239, -041144,
-           -062834, -070233, -081128), against 2-21 captures on their own first
-           sub-attempts.
+           passive window.  Recorded, RE-COUNTED over all 923 sessions rather
+           than the handful first noticed: 50 sessions log a resident-worker
+           fingerprint mismatch, 13 of them go on to record a second
+           sub-attempt, and 12 of those 13 recorded ``passive_capture_count: 0``
+           on the healed retry against 2-20 captures on their own first
+           sub-attempt (20260724-012158, -041752, -042159, -042700, -042928,
+           -043016, 20260727-080308, 20260728-030239, -041144, -062834,
+           -070233, -081128).  An earlier version of this docstring said "6 of
+           6"; the real figure is 12 of 13, and the one exception --
+           20260724-041832, which captured 22 -- is the only recorded evidence
+           that the inherited report is not ALWAYS still valid on the retry.
         2. The dry run's ``--passive-window`` therefore still pointed at a
            window that had closed ~18 s earlier, so its stamp-overlap gate
            rejected every fresh bundle: 911 and 1127 rejections with

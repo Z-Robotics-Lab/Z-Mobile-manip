@@ -412,6 +412,21 @@ Three things now make that visible instead of mysterious:
   re-measured every 2 s), and **every trace row** carries the short live
   fingerprint plus a `runtime_fingerprint_mutated` flag. A trace whose rows
   change fingerprint part-way through is a trace of two different programs.
+
+  This only works because the launcher and the servo hash the **same files**,
+  and the first version of it did not. `runtime_inputs()` includes
+  `$WORKSPACE_ROOT/go2W_Sim/assets/urdf/go2w_sensored.urdf`, the one hashed file
+  outside the checkout, and the container was given it only at
+  `/robot/go2w_sensored.urdf`. The servo hashed 98 files where the launcher
+  hashed 99 (`834e35138ae0` vs `87e820e6b6c2` against the live tree) and
+  reported `runtime_fingerprint_mutated: true` on every row of every run against
+  a frozen tree — an alarm that is always on, which is worse than no alarm. The
+  launcher now asks the tool for its digest *and* its out-of-tree inputs in one
+  `--launch-manifest` call and bind-mounts each of them at its own absolute
+  path. **If you add a hashed input outside `$STACK_ROOT`, it must be mounted at
+  its own path**; `tests/test_runtime_fingerprint_mounts.py` builds a synthetic
+  container view from the launcher's own mount list and fails if the two digests
+  diverge.
 * The approach status endpoint carries a `deployment` block and the dashboard
   shows it as **Runtime deployment**. A mutation seen by *either* the servo or
   the workbench raises `RUNTIME_TREE_MUTATED_DURING_RUN`. It stops nothing — a
@@ -452,12 +467,22 @@ the repository ever called `reset-failed`; under `set -e` a tripped limiter
 aborted the launcher with no message saying so. Each unit now declares its own
 choice, with the reason written in the unit file:
 
-| unit | limiter | why |
-| --- | --- | --- |
-| `z-mobile-manip-piper-reactive-view` | 60 s / 10 | single CAN owner; a crash loop must latch, operator launches must not trip it |
-| `z-manip-piper-passive-feedback` | 60 s / 15 | zero-TX evidence producer, hand-restarted by seven call sites around every arm motion |
-| `z-mobile-manip-go2w-reactive-live` | 60 s / 10 | single owner of the only channel that reaches the base |
-| `z-manip-planning-workbench` | `StartLimitIntervalSec=0` | owns no exclusive hardware and *is* the operator's only interface; follows the `d435i` / `ffs-ir-throttle` precedent |
+| unit | limiter | `RestartSec` | still latches a crash loop whose failed starts survive | why |
+| --- | --- | --- | --- | --- |
+| `z-mobile-manip-piper-reactive-view` | 60 s / 10 | 1 s | 5.67 s | single CAN owner; a crash loop must latch, operator launches must not trip it |
+| `z-manip-piper-passive-feedback` | 60 s / 8 | 3 s | 5.57 s | zero-TX evidence producer, hand-restarted by seven call sites around every arm motion |
+| `z-mobile-manip-go2w-reactive-live` | 60 s / 8 | 3 s | 5.57 s | single owner of the only channel that reaches the base |
+| `z-manip-planning-workbench` | `StartLimitIntervalSec=0` | — | never (deliberate) | owns no exclusive hardware and *is* the operator's only interface; follows the `d435i` / `ffs-ir-throttle` precedent |
+
+The fourth column is the point of the table and it was missing. A systemd crash
+cycle is `uptime + RestartSec`, not `RestartSec`: the passive-feedback and
+reactive-live units were first written at 60 s / 15 and 60 s / 10, which latch
+only a loop whose failed starts die within 1.29 s and 3.67 s respectively — less
+than the 1.0 s TX-counter sampling window in
+`piper_passive_joint_state_bridge.py` plus `bash -lc`, `source ros_env.sh` and
+`import rclpy`. Both units claimed a latch they did not have. A burst of 8
+restores it. `tests/test_runtime_deployment_contract.py` recomputes this column
+from each unit's own keys and fails if the unit file's stated number goes stale.
 
 `go2w_depth_servo.sh` and `go2w_base_transport_preflight.sh` now detect
 `Result=start-limit-hit`, print the unit and its `NRestarts`, and clear that

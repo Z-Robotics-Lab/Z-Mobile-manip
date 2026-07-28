@@ -48,6 +48,16 @@
 # Matched to the publisher exactly.  Do not "simplify" it back to best_effort
 # to look like its neighbours: the neighbours are sensor_data publishers and
 # this one is not.
+#
+# WHAT THIS COSTS, STATED PLAINLY.  A RELIABLE subscriber is not a passive
+# observer: it joins the writer's history and acknowledgement accounting, so a
+# recorder that cannot keep up can apply back-pressure to the LIVE EdgeTAM
+# publisher instead of silently dropping.  This change was first described as
+# touching "no live control path"; that was wrong.  The marginal risk is
+# bounded -- both RELIABLE clouds already carry reliable subscribers in normal
+# operation, and these publishers are host-local -- but a bag started on a
+# loaded disk is now capable of affecting its producer, and that was not
+# measured.
 /track_3d/selected_target_pointcloud:
   history: keep_last
   depth: 10

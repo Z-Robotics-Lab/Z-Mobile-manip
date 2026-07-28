@@ -15,10 +15,17 @@ Conflicts=z-manip-go2w-base-control.service z-mobile-manip-go2w-reactive-shadow.
 # RESTARTS this unit itself.  Before the InvocationID fix that was every ~12 min
 # on a perfectly healthy bridge; it is now rare, but an operator retrying a live
 # task still drives one restart per launch, and the 12 s the preflight waits for
-# readiness makes a burst of retries easy.  60 s / 10 leaves a 3 s crash loop
-# latching in ~30 s while ten operator launches per minute never trip it.
+# readiness makes a burst of retries easy.
+#
+# 60 s / 8, NOT the 60 s / 10 first written here.  "A 3 s crash loop latches in
+# ~30 s" counted RestartSec alone and modelled every failed start as taking zero
+# time; the real cycle is uptime + RestartSec, and at 60/10 this unit only
+# latched a loop whose failed starts died within 60/9 - 3 = 3.67 s.  60 s / 8
+# latches a crash loop whose failed starts survive up to 60/7 - 3 = 5.57 s.
+# Eight operator launches per minute is still unreachable in practice: the
+# preflight waits up to 12 s for readiness on each one.
 StartLimitIntervalSec=60
-StartLimitBurst=10
+StartLimitBurst=8
 
 [Service]
 Type=simple

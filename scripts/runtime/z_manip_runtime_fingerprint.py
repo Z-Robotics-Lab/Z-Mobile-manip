@@ -41,6 +41,67 @@ def runtime_inputs() -> tuple[Path, ...]:
     return tuple(path for path in (*fixed, *discovered, external_urdf) if path.is_file())
 
 
+def external_runtime_inputs() -> tuple[Path, ...]:
+    """Hashed inputs that do NOT live under ``STACK_ROOT``.
+
+    THE DEFECT THIS EXISTS FOR, AND IT SHIPPED.  ``runtime_inputs`` ends with
+    ``$WORKSPACE_ROOT/go2W_Sim/assets/urdf/go2w_sensored.urdf`` -- the ONE input
+    of 99 that is outside the checkout.  ``go2w_depth_servo.sh`` measures the
+    fingerprint on the HOST (where that file exists) and exports it as the
+    servo's launch baseline, but its ``docker run`` mounted ``$STACK_ROOT`` at
+    its own path and the URDF only at the UNRELATED path
+    ``/robot/go2w_sensored.urdf``.  ``runtime_inputs``'s ``if path.is_file()``
+    filter then silently dropped it inside the container, so the servo's live
+    re-measure hashed 98 files where the launcher hashed 99.  Measured on this
+    machine against the live checkout:
+
+        launcher (host, 99 files) : 834e35138ae0...
+        servo    (container, 98)  : 87e820e6b6c2...
+
+    ``runtime_fingerprint_state`` asserts ``mutated`` whenever both values are
+    known and differ, so EVERY live and shadow servo run reported
+    ``runtime_fingerprint_mutated: true`` on every trace row and raised
+    ``RUNTIME_TREE_MUTATED_DURING_RUN`` on the operator's dashboard, on a
+    completely frozen tree.  A deploy alarm that is always on is the exact
+    thing ``runtime_fingerprint_state``'s own docstring argues against.
+
+    The fix is a contract, not a special case: the launcher self-mounts every
+    path this returns (``--launch-manifest`` below), so the container resolves
+    the identical set at the identical absolute paths.  ``unmounted_runtime_inputs``
+    is the pure check, and tests/test_runtime_fingerprint_mounts.py runs it
+    against the mount list parsed out of the launcher.  Adding a new input
+    outside ``STACK_ROOT`` therefore cannot silently re-open this.
+    """
+
+    return tuple(
+        path for path in runtime_inputs() if not path.is_relative_to(STACK_ROOT)
+    )
+
+
+def unmounted_runtime_inputs(
+    mount_sources: Any,
+    *,
+    inputs: Any = None,
+) -> tuple[Path, ...]:
+    """Pure: which hashed inputs a container with these bind mounts cannot see.
+
+    ``mount_sources`` is the set of host paths that ``docker run`` mounts AT
+    THEIR OWN ABSOLUTE PATH (``-v "$X:$X:ro"``).  A mount that remaps the
+    destination (``-v "$URDF:/robot/...:ro"``) does not count and must not: the
+    in-container ``runtime_inputs`` looks the file up by the host path, and the
+    digest's per-file name key is derived from that path too, so a remapped
+    copy changes both the presence test and the name.
+    """
+
+    sources = [Path(source) for source in mount_sources]
+    candidates = runtime_inputs() if inputs is None else tuple(Path(p) for p in inputs)
+    return tuple(
+        path
+        for path in candidates
+        if not any(path == source or path.is_relative_to(source) for source in sources)
+    )
+
+
 def runtime_fingerprint() -> str:
     digest = hashlib.sha256()
     for path in runtime_inputs():
@@ -181,7 +242,50 @@ class RuntimeFingerprintWatch:
         return state
 
 
-def main() -> int:
+#: Argument that makes ``main`` print the fingerprint AND, on the following
+#: lines, every hashed input a container must be given at its own absolute path.
+#:
+#: ONE invocation, not two, on purpose: the digest and the mount list have to
+#: describe the same measurement.  Two calls would let the URDF appear or vanish
+#: between them and hand the servo a baseline measured over a set the mounts do
+#: not reproduce -- which is the very failure this argument exists to close.
+LAUNCH_MANIFEST_FLAG = "--launch-manifest"
+
+
+def main(argv: Any = None) -> int:
+    import sys
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args == [LAUNCH_MANIFEST_FLAG]:
+        # Order matters and the launcher depends on it: line 1 is the digest,
+        # every later line is a mount source.  A failure here prints nothing,
+        # which the launcher reads as "no fingerprint" -> the servo reports
+        # ``unverified`` rather than a fabricated mismatch.
+        external = external_runtime_inputs()
+        unmountable = [
+            path for path in external if ":" in str(path) or "\n" in str(path)
+        ]
+        if unmountable:
+            # ``docker run -v SRC:DST:MODE`` is colon-delimited and the launcher
+            # reads this output line by line, so such a path cannot be handed
+            # across the boundary at all.  Emitting NOTHING is the fail-closed
+            # answer: the launcher exports no fingerprint and the servo reports
+            # ``unverified``.  Printing the digest and silently dropping the
+            # mount would put back exactly the permanent false ``mutated`` this
+            # flag exists to remove.
+            print(
+                "cannot express these hashed inputs as bind mounts: "
+                + ", ".join(str(path) for path in unmountable),
+                file=sys.stderr,
+            )
+            return 3
+        print(runtime_fingerprint())
+        for path in external:
+            print(path)
+        return 0
+    if args:
+        print(f"usage: {__file__} [{LAUNCH_MANIFEST_FLAG}]", file=sys.stderr)
+        return 2
     print(runtime_fingerprint())
     return 0
 

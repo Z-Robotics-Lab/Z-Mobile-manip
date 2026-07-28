@@ -2349,7 +2349,10 @@ def test_the_launcher_measures_the_tree_and_hands_it_to_the_servo():
     # Measured BEFORE docker run, and exported into the container.
     assert 'z_manip_runtime_fingerprint.py' in launcher
     assert '-e Z_MANIP_RUNTIME_FINGERPRINT="$RUNTIME_FINGERPRINT" \\' in launcher
-    fingerprint_at = launcher.index("RUNTIME_FINGERPRINT=\"$(")
+    # The measurement is the --launch-manifest read whose FIRST line is the
+    # digest; see tests/test_runtime_fingerprint_mounts.py for why the same
+    # invocation must also produce the container's mount list.
+    fingerprint_at = launcher.index('RUNTIME_FINGERPRINT="$fingerprint_input"')
     docker_run_at = launcher.index("docker run --rm")
     assert fingerprint_at < docker_run_at, (
         "the fingerprint must be measured before the container starts, or it "

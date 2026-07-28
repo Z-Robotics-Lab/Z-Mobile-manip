@@ -170,11 +170,23 @@ DEFAULT_NO_SEED_TIMEOUT_S = 8.0
 #: How long a demonstrably stale passive window must persist before the run
 #: fails fast with ``passive_window_stale`` instead of burning its whole budget.
 #:
-#: The wrapper re-opens a window whenever no valid SELECTED report exists, and a
-#: measured capture cycle is ~0.32 s end to end (4.52 s / 14 captures in the
-#: recorded 20260723-043621 attempt).  2 s is ~6 cycles: a window that is about
-#: to be replaced always wins, and only a window nothing is refreshing -- the
-#: inherited-report deadlock -- reaches the verdict.
+#: The wrapper re-opens a window whenever no valid SELECTED report exists.
+#: SIZED ON THE CORPUS, NOT ON ONE ATTEMPT.  An earlier version of this comment
+#: cited "~0.32 s end to end (4.52 s / 14 captures in the recorded
+#: 20260723-043621 attempt)" -- a single sample.  Over all 1108 recorded
+#: attempts that report both ``passive_capture_count`` and
+#: ``passive_capture_s``, the per-capture cycle is:
+#:
+#:     p50 0.361 s   p90 0.597 s   p95 1.008 s   max 19.033 s
+#:
+#: 2 s is ~5 median cycles, so a window that is about to be replaced normally
+#: wins.  BUT 25 of those 1108 attempts exceed 2.25 s per capture (tail: 6.8,
+#: 7.5, 12.7, 16.8, 19.0 s).  A stall in that tail that straddles the dry run's
+#: ``bundle_wait_started`` while depth-supported bundles keep arriving WILL trip
+#: this verdict on an otherwise healthy run.  That costs one extra attempt
+#: (PERCEPTION_ATTEMPTS = 2) plus the single mobile-handoff recapture, not a
+#: hard block -- but it is a real false-positive path, it is ~2% of recorded
+#: capture attempts by rate, and it has not been exercised against hardware.
 PASSIVE_WINDOW_STALE_GRACE_S = 2.0
 # Perception-contract phases (published as the DiagnosticStatus message) that
 # prove a segmentation seed was accepted: grounding has produced a box and

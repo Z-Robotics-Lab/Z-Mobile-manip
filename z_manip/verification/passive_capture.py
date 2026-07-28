@@ -21,17 +21,39 @@ PASSIVE_WINDOW_OVERLAP_TOLERANCE_NS = 250_000_000
 #: How far BEFORE a run's bundle wait began a bundle's sensor stamp may still
 #: legitimately be.
 #:
-#: The perception dry run clears every bundle cache immediately before it takes
-#: ``bundle_wait_started``, so every stamp it can ever select arrives during the
-#: wait -- but a message DELIVERED during the wait may have been STAMPED before
-#: it, because DDS buffers (depth 5 sensor-data / depth 10 reliable at the
-#: measured 7.5-8.1 Hz EdgeTAM mask rate, i.e. ~0.6-1.3 s) hold frames captured
-#: before the subscription drained.  2 s is ~1.6x the widest of those buffers.
+#: The perception dry run clears its bundle caches immediately before it takes
+#: ``bundle_wait_started`` ON THE PATH THAT RE-GROUNDS.  CORRECTION TO AN
+#: EARLIER VERSION OF THIS COMMENT, WHICH CLAIMED IT ALWAYS DOES: the clear at
+#: go2w_perception_dry_run.py sits under ``if not grounding_reused:``, and
+#: ``infos`` is never cleared at all, so on the ``--reuse-valid-tracking`` path
+#: -- which is what attempt 0 and the healed retry both take -- ``min(common)``
+#: can be an entry that predates the wait.  The consequence is a FALSE NEGATIVE
+#: only (condition 2 returns and the verdict is suppressed), never a false
+#: positive; but the invariant as written was not true and the sizing argument
+#: below must not rest on it.
 #:
-#: This allowance exists only to keep the staleness verdict below CONSERVATIVE.
-#: The two recorded instances of the defect it detects missed by 17.8 s and
-#: 18.4 s (``widest_rejected_overlap_margin_s`` in the 20260728-030239 and
-#: 20260728-070233 reports), an order of magnitude outside it.
+#: A message DELIVERED during the wait may still have been STAMPED before it,
+#: because DDS buffers (depth 5 sensor-data / depth 10 reliable at the measured
+#: 7.5-8.1 Hz EdgeTAM mask rate, i.e. ~0.6-1.3 s) hold frames captured before
+#: the subscription drained.  2 s is ~1.6x the widest of those buffers.
+#:
+#: THE MARGIN, RE-DERIVED FROM THE RIGHT QUANTITY.  An earlier version of this
+#: comment justified 2 s with "the recorded instances missed by 17.8 s and
+#: 18.4 s".  That cites ``widest_rejected_overlap_margin_s``, which is the worst
+#: margin over the whole 15 s wait -- NOT the quantity condition 1 tests, which
+#: is ``bundle_wait_started - window_end``.  Measured properly over all 749
+#: recorded sessions that hold a selected passive report
+#: (``report.mtime - elapsed_s`` against ``observation_end_unix_ns``):
+#:
+#:     min -27.716  p50 -0.971  p95 +0.044  p99 4.086  max 4.640 s
+#:
+#: Exactly 10 sessions exceed 1 s and all 10 are the pathological ones (4.014 -
+#: 4.640 s); every one of them failed, five on the full 15 s wait.  So the
+#: 2.25 s trip point (this allowance plus the overlap tolerance) sits in an
+#: empty band between 0.044 s and 4.014 s: no recorded healthy approach comes
+#: near it, and the real margin on the recorded defect is ~1.8-2.4 s -- about
+#: 2x, not the order of magnitude previously claimed.  A self-heal ~2 s faster
+#: than the recorded restart would simply not produce the named error.
 PASSIVE_WINDOW_BUFFERED_BUNDLE_ALLOWANCE_NS = 2_000_000_000
 
 
@@ -51,10 +73,21 @@ def stale_passive_window_reason(
     and ``live_passive_joint_report.json``.  The wrapper's capture loop skips
     opening a window while a valid selected report exists, so the retry ran with
     ``passive_capture_count == 0`` against a window that had already closed, and
-    the stamp-overlap gate then rejected every single fresh bundle.  Recorded 6
-    times out of 6 self-heals: 911 and 1127 rejections, the full 15 s budget
-    burnt, ``PERCEPTION_PROCESS_FAILED``, and a plainly detected object routed
-    into a wrist search.
+    the stamp-overlap gate then rejected every single fresh bundle.  Recorded on
+    12 of the 13 self-heals that reached a second sub-attempt (an earlier
+    version of this docstring said "6 of 6"; see
+    ``_clear_inherited_attempt_outputs`` for the full re-count): 911 and 1127
+    rejections, the full 15 s budget burnt, ``PERCEPTION_PROCESS_FAILED``, and a
+    plainly detected object routed into a wrist search.
+
+    IT IS NOW A RARE PATH, AND SAYING SO IS PART OF THE RECORD.  The commit that
+    added this predicate ALSO made both retry paths clear the inherited window,
+    which removes the only producer of it that has ever been observed.  What is
+    left is the unobserved one: a capture cycle that stalls long enough for the
+    live report to age past the trip point while fresh bundles keep arriving.
+    The recorded per-capture time is 0.36 s median / 0.60 s p90 but its tail
+    reaches 6.8-19.0 s, so the path is not closed -- but this verdict has never
+    been seen to fire, and no test here can make it fire on real hardware.
 
     This predicate turns that into a NAMED, immediate verdict.  It never widens
     the gate: a window it accepts is still subject to the unchanged exact

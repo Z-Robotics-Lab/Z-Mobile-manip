@@ -112,9 +112,9 @@ _START_LIMITS = {
     "z-mobile-manip-piper-reactive-view.service": ("60", "10"),
     # NUC, zero-TX evidence producer, stopped/started by seven call sites
     # around every arm motion -- the highest hand-restart rate in the system.
-    "z-manip-piper-passive-feedback.service": ("60", "15"),
+    "z-manip-piper-passive-feedback.service": ("60", "8"),
     # NUC, single owner of the ONLY channel that reaches the base.
-    "z-mobile-manip-go2w-reactive-live.service": ("60", "10"),
+    "z-mobile-manip-go2w-reactive-live.service": ("60", "8"),
     # PC, owns no exclusive hardware, and IS the operator's only interface: a
     # latched workbench is a browser tab that stops updating with no second
     # channel to notice it through.  Follows the d435i / ffs-ir-throttle
@@ -143,22 +143,90 @@ def test_a_start_limiter_decision_is_justified_where_it_is_written(name):
     )
 
 
+#: How long a FAILING start of these units may survive before it dies, for the
+#: purpose of deciding whether a widened limiter still latches.
+#:
+#: THE DEFECT THIS CONSTANT REPAIRS.  The first version of the test below used
+#: ``RestartSec * (burst - 1) < interval`` -- it modelled every failed start as
+#: taking ZERO time, which is the one assumption that makes any widening look
+#: safe.  Under it, ``z-manip-piper-passive-feedback.service`` at 60 s / 15 with
+#: RestartSec=3 "latched in 42 s".  A crash cycle is ``uptime + RestartSec``, so
+#: with any uptime above 60/14 - 3 = 1.29 s that unit never latches at all, and
+#: its own comment claiming "not StartLimitIntervalSec=0: this is a CAN owner"
+#: would have been false.  The test passed both before and after the widening --
+#: exactly the shape of coverage this programme keeps finding.
+#:
+#: WHERE 5.0 s COMES FROM, AND WHAT IS GUESSED.  Two parts are read out of this
+#: repository: ``piper_passive_joint_state_bridge.py``'s fail-loud path (the
+#: ``can0 TX counter changed`` RuntimeError, which is the crash loop the unit
+#: file names) cannot fire until ``now - last_tx_check >= 1.0``, and its
+#: socket-open retry sleeps 0.5 s per attempt.  The third part -- ``/bin/bash
+#: -lc`` plus ``source ros_env.sh`` plus ``import rclpy`` before any of that --
+#: is NOT measured: rclpy does not import on this development host and the NUC
+#: was not driven.  3.5 s is allowed for it.  If the real cost is larger these
+#: limiters latch less readily than asserted here; the error direction is
+#: stated rather than hidden, and it is bounded by ``interval``.
+CRASH_LOOP_START_COST_S = 5.0
+
+
 def test_a_crash_loop_still_latches_under_every_kept_limiter():
     """A wider limiter must not become no limiter.
 
-    Restart= plus RestartSec= gives the crash-loop start rate; the limiter must
-    still be reachable from it, or these units would retry a broken CAN bus or a
-    broken WebRTC bridge forever.
+    systemd counts STARTS in a sliding ``StartLimitIntervalSec`` window, and a
+    crash loop produces one start every ``uptime + RestartSec``.  The limiter is
+    reachable only if ``burst`` of those fit inside the window.
     """
 
-    for name, (interval, burst) in _START_LIMITS.items():
-        if burst is None:
+    for name, (_expected_interval, expected_burst) in _START_LIMITS.items():
+        if expected_burst is None:
             continue
-        restart_sec = float(_unit(name)["Service"]["RestartSec"])
-        # Time for ``burst`` crash-loop starts, which must fit in the window.
-        assert restart_sec * (int(burst) - 1) < float(interval), (
-            f"{name} widened its limiter past its own crash-loop rate, so a "
-            "genuine fault would restart forever"
+        # READ FROM THE UNIT, NOT FROM _START_LIMITS.  A limiter check that
+        # takes its own numbers from the test's expectation table can only ever
+        # confirm the table's arithmetic; it can never tell you that the file
+        # systemd loads has drifted.
+        unit = _unit(name)
+        interval = unit["Unit"]["StartLimitIntervalSec"]
+        burst = unit["Unit"]["StartLimitBurst"]
+        restart_sec = float(unit["Service"]["RestartSec"])
+        cycle_s = restart_sec + CRASH_LOOP_START_COST_S
+        assert cycle_s * (int(burst) - 1) < float(interval), (
+            f"{name}: a crash loop whose failed starts survive "
+            f"{CRASH_LOOP_START_COST_S} s produces a start every {cycle_s} s, so "
+            f"{burst} of them span {cycle_s * (int(burst) - 1)} s and never fit "
+            f"inside the {interval} s window -- this unit would restart forever "
+            "while its own file claims it latches"
+        )
+
+
+def test_each_kept_limiter_states_the_uptime_it_still_latches():
+    """The weakened guarantee has to be legible where the number is written.
+
+    ``StartLimitIntervalSec``/``StartLimitBurst`` alone do not say how slow a
+    crash loop may be before the limiter stops applying.  That number is the
+    whole content of the widening, so it belongs in the unit, not only here.
+    """
+
+    for name, (_expected_interval, expected_burst) in _START_LIMITS.items():
+        if expected_burst is None:
+            continue
+        unit = _unit(name)
+        interval = unit["Unit"]["StartLimitIntervalSec"]
+        burst = unit["Unit"]["StartLimitBurst"]
+        restart_sec = float(unit["Service"]["RestartSec"])
+        headroom = float(interval) / (int(burst) - 1) - restart_sec
+        # Comment wrapping is not part of the contract; the sentence and the
+        # number are.  Asserting the NUMBER is what makes a later change to
+        # interval/burst/RestartSec that leaves the prose stale fail here.
+        text = " ".join(
+            (CONFIGS / name).read_text(encoding="utf-8").replace("#", " ").split()
+        )
+        assert "latches a crash loop whose failed starts survive" in text, (
+            f"{name} does not record that it only latches a crash loop with up "
+            f"to {headroom:.2f} s of uptime per failed start"
+        )
+        assert f"{headroom:.2f} s" in text, (
+            f"{name} records a crash-loop uptime headroom that its own "
+            f"interval/burst/RestartSec no longer produce ({headroom:.2f} s)"
         )
 
 
