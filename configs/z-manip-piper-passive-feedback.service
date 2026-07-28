@@ -2,6 +2,26 @@
 Description=PiPER receive-only CAN to ROS joint telemetry
 After=network-online.target
 Wants=network-online.target
+# H5.  KEEP A LIMITER, EXPLICIT AND MUCH WIDER, because this unit is RESTARTED
+# BY HAND MORE THAN ANY OTHER IN THE SYSTEM.
+#
+# Five separate call sites stop it and start it again around every arm motion:
+# go2w_depth_servo.sh (acquire/release_arm_owner), piper_home_remote.sh (twice),
+# piper_wrist_search_remote.sh, piper_grasp_stage_remote.py and
+# piper_full_grasp_remote.py, plus two unconditional restarts in
+# go2w_component_manager.sh.  A single mobile pick->hold->place-back cycle
+# therefore starts it several times, and a run of short operator actions can
+# plausibly exceed the inherited 5-per-10 s.  When it latches, the ZERO-TX
+# EVIDENCE PRODUCER is gone and every perception fails closed on
+# PASSIVE_JOINT_GATE_FAILED -- with no message anywhere saying "start request
+# repeated too quickly".
+#
+# 60 s / 15 covers the busiest recorded operator sequence with margin while
+# still latching a real crash loop (RestartSec=3 -> ~45 s).  Not
+# StartLimitIntervalSec=0: this is a CAN owner and an unbounded retry loop
+# against a down can0 competes with whichever executor currently holds the bus.
+StartLimitIntervalSec=60
+StartLimitBurst=15
 
 [Service]
 Type=simple

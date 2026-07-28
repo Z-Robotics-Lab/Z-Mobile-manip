@@ -38,6 +38,11 @@ import go2w_debug_ui
 import go2w_interactive_sessions
 import go2w_reactive_supervision
 import go2w_wrist_search
+from z_manip_runtime_fingerprint import (
+    RUNTIME_FINGERPRINT_ENV,
+    RuntimeFingerprintWatch,
+    try_runtime_fingerprint,
+)
 from go2w_live_perception import LivePerceptionRenderer
 from go2w_runtime_state import (
     MAX_RUNTIME_CANDIDATES,
@@ -233,6 +238,17 @@ MOBILE_HANDOFF_CAPTURE_MAX_SKEW_S = 1.0
 MOBILE_HANDOFF_PERCEPTION_RETRY_CODES = frozenset({
     "PERCEPTION_PROCESS_FAILED",
     "PERCEPTION_CAMERA_FRAME_TIMEOUT",
+    # PERCEPTION_PASSIVE_WINDOW_STALE was carved OUT of
+    # PERCEPTION_PROCESS_FAILED, which is already in this set: a perception
+    # attempt that failed because its passive window had closed before its own
+    # bundle wait began reached this code path as PERCEPTION_PROCESS_FAILED and
+    # was retried.  Omitting it here would silently convert a retried failure
+    # into a hard block -- a behaviour change nobody asked for, hidden inside a
+    # renaming.  It is also the most obviously transient member of the set: the
+    # remedy is a fresh receive-only capture, which is exactly what the one
+    # recapture this budget buys performs, and the recapture is validated by
+    # every unchanged gate before anything moves.
+    "PERCEPTION_PASSIVE_WINDOW_STALE",
 })
 MAX_HANDOFF_EVIDENCE_BYTES = 512 * 1024
 # Default dwell at Home while holding the object between the carry-home and
@@ -1295,6 +1311,64 @@ class PlanningOnlyRunner:
 #: ``idle``.
 WORKFLOW_STATUS_UNAVAILABLE = "status_unavailable"
 
+#: Operator-visible event code for "the working tree changed under a running
+#: process".  Not a workflow phase and not a failure: it stops nothing, because
+#: stopping on it would hand an operator a robot that halts every time they save
+#: a file.  It is an EVENT the dashboard renders, and it is the only thing that
+#: makes the recorded failure chain (edit -> resident-worker fingerprint
+#: mismatch -> component self-heal -> inherited passive window -> 900-1200
+#: rejections -> PERCEPTION_PROCESS_FAILED -> wrist_search on a detected object)
+#: legible at the moment it starts rather than an hour later in a log.
+DEPLOYMENT_EVENT_TREE_MUTATED = "RUNTIME_TREE_MUTATED_DURING_RUN"
+
+
+def deployment_event(
+    *,
+    servo_state: object,
+    supervisor_state: dict[str, object],
+) -> dict[str, Any]:
+    """Fold the servo's and the supervisor's fingerprint views into one block.
+
+    Two independent processes observe the same tree: the servo from inside its
+    read-only bind mount, the supervisor from the host.  Either of them seeing a
+    mutation is a mutation -- they measure the same bytes, so a disagreement
+    between them is itself evidence and must not be averaged away.
+
+    Pure, and takes ``servo_state`` as ``object`` on purpose: it is read
+    straight out of a JSON document written by another process, so it may be
+    absent, ``None``, or any type at all.  An unusable servo block degrades to
+    "the supervisor's own view only", never to "clean".
+    """
+
+    servo = servo_state if isinstance(servo_state, dict) else {}
+    servo_mutated = servo.get("mutated") is True
+    supervisor_mutated = supervisor_state.get("mutated") is True
+    mutated = servo_mutated or supervisor_mutated
+    event: dict[str, Any] | None = None
+    if mutated:
+        source = servo if servo_mutated else supervisor_state
+        event = {
+            "code": DEPLOYMENT_EVENT_TREE_MUTATED,
+            "observed_by": "depth_servo" if servo_mutated else "supervisor",
+            "message": (
+                "The Z-Mobile-manip working tree changed while this run was in "
+                f"flight: launched with runtime fingerprint "
+                f"{source.get('launch_short')}, now {source.get('live_short')}. "
+                "The launcher bind-mounts that tree read-only and runs from it, "
+                "so the running code is no longer the code that started. "
+                "Expect a resident-worker fingerprint mismatch and a component "
+                "self-heal; restart the affected components before trusting "
+                "this run."
+            ),
+        }
+    return {
+        "schema": "z_manip.runtime_deployment.v1",
+        "mutated": mutated,
+        "servo": servo or None,
+        "supervisor": supervisor_state,
+        "event": event,
+    }
+
 
 class ServoReportVerdict(NamedTuple):
     """Whether the spawn/report clocks have expired, and why.
@@ -1500,6 +1574,18 @@ class DepthServoRunner:
         #: CLOCK C anchor: when the document stopped being readable, after it
         #: had been.  None while it is readable.
         self._servo_status_unreadable_since_s: float | None = None
+        #: R9: the supervisor's own view of the tree it and the servo both run
+        #: out of.  The launch baseline is this PROCESS's own start, taken once
+        #: and never re-taken -- re-taking it would adopt every mutation as the
+        #: new normal, which is exactly the failure mode being closed.  The env
+        #: var lets a launcher pin it explicitly; absent, the workbench measures
+        #: itself at construction.
+        self._fingerprint_watch = RuntimeFingerprintWatch(
+            launch=(
+                os.environ.get(RUNTIME_FINGERPRINT_ENV)
+                or try_runtime_fingerprint()[0]
+            ),
+        )
         self._workflow: dict[str, Any] = {
             "active": False,
             "phase": "idle",
@@ -1634,6 +1720,14 @@ class DepthServoRunner:
             "exit_code": exit_code,
             "runtime": runtime,
             "supervision": self._reactive_watchdog.last.document(),
+            # R9: THE DEPLOYMENT IS THE WORKING TREE.  The servo's own view
+            # travels inside its status document; the supervisor adds its own so
+            # a mutation is still visible when the servo is not running (which
+            # is when an operator is most likely to be editing).
+            "deployment": deployment_event(
+                servo_state=runtime.get("runtime_fingerprint"),
+                supervisor_state=self._fingerprint_watch.state(),
+            ),
             "workflow": workflow,
             "wrist_search": wrist_search,
         }

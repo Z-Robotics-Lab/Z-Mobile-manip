@@ -28,20 +28,51 @@
   reliability: best_effort
   durability: volatile
 
+# H7.  THIS OVERRIDE USED TO CONTRADICT ITS OWN PUBLISHER.
+#
+# ros2/z_manip_edgetam/z_manip_edgetam/node.py builds ``_cloud_pub`` for this
+# topic from ``reliable = QoSProfile(depth=10, reliability=RELIABLE)``.  Every
+# other entry in this file overrides a genuinely BEST_EFFORT sensor stream; this
+# one forced rosbag2's subscription down to BEST_EFFORT depth 5 against a
+# RELIABLE depth 10 writer.  The subscription still CONNECTS -- reliability is
+# request<=offered -- so nothing ever errored; it simply stopped NACKing, and
+# samples lost to Wi-Fi contention (the NUC ships everything over wlp7s0,
+# measured RTT avg 16 ms / max 119 ms) were never retransmitted into the bag.
+#
+# The consequence is a false negative in exactly the analysis this bag exists
+# for: a replay of a recorded hang reads a thin or empty selected-target cloud
+# and concludes "perception never reached the controller", when perception did
+# reach it and the RECORDER dropped the evidence.  This is the one topic in the
+# file that carries the controller's actual input.
+#
+# Matched to the publisher exactly.  Do not "simplify" it back to best_effort
+# to look like its neighbours: the neighbours are sensor_data publishers and
+# this one is not.
 /track_3d/selected_target_pointcloud:
   history: keep_last
-  depth: 5
-  reliability: best_effort
+  depth: 10
+  reliability: reliable
   durability: volatile
 
+# CORRECT AS BEST_EFFORT: ``_scene_cloud_pub`` in z_manip_edgetam/node.py uses
+# ``qos_profile_sensor_data``.  Kept here to make the contrast with the two
+# RELIABLE clouds explicit rather than incidental.
 /z_manip/perception/scene_pointcloud:
   history: keep_last
   depth: 5
   reliability: best_effort
   durability: volatile
 
+# THE SAME H7 DEFECT AS /track_3d/selected_target_pointcloud, on the same file,
+# not named in the audit.  ``_target_cloud_pub`` (``validated_cloud_topic``) in
+# ros2/z_manip_ros/z_manip_ros/vlm_edgetam_bridge.py is built from the bridge's
+# ``reliable`` profile, depth 10.  This is the VALIDATED cloud -- the one a
+# replay uses to decide whether the bridge forwarded anything at all -- so a
+# recording that silently drops it produces the identical false negative.
+# Fixing one and leaving the other would have left the audit's own conclusion
+# reachable from a different topic.
 /z_manip/perception/target_pointcloud:
   history: keep_last
-  depth: 5
-  reliability: best_effort
+  depth: 10
+  reliability: reliable
   durability: volatile

@@ -829,6 +829,11 @@
             <div class="approach-metric wide"><span>Posture execution proof</span><strong id="approach-posture-proof">CALCULATED — · GATED — · ACKED — · MEASURED —</strong></div>
             <div class="approach-metric wide"><span>Arm execution proof</span><strong id="approach-arm-proof">CALCULATED — · GATED — · ACKED — · MEASURED —</strong></div>
             <div class="approach-metric wide"><span>Fixed fixture guard</span><strong id="approach-fixed-guard">UNAVAILABLE · forwarding evidence —</strong></div>
+            <!-- R9: the launcher bind-mounts the working tree read-only and runs
+                 the servo out of it, so editing the checkout mid-task is a live
+                 deploy.  This is the only place an operator learns that the code
+                 changed under the run they are watching. -->
+            <div class="approach-metric wide"><span>Runtime deployment</span><strong id="approach-deployment">—</strong></div>
           </div>
         </section>
         <section class="section">
@@ -3171,6 +3176,42 @@
       byId("approach-fixed-guard").title = guard?.reason || "";
     }
 
+    // R9. THE DEPLOYMENT IS THE WORKING TREE.  go2w_depth_servo.sh bind-mounts
+    // $STACK_ROOT read-only and runs the servo straight out of it, so editing
+    // the checkout during a task is a deploy to a powered-up robot.  Recorded:
+    // one session's traceback holds _tick at five different line numbers, and
+    // two commits each produced a resident-worker fingerprint mismatch, a
+    // component self-heal, 900-1200 passive-window rejections and a detected
+    // object routed into a wrist search.  Nothing in this UI said so.
+    //
+    // "unverified" is rendered as its own state and NOT as an alarm: replays,
+    // shadow runs and any launch without the fingerprint env var land there,
+    // and an alarm on all of them would train the operator to ignore the one
+    // mutation that matters.
+    function renderDeployment(approach = state.approach) {
+      const deployment = approach?.deployment || {};
+      const event = deployment.event || null;
+      const supervisor = deployment.supervisor || {};
+      const servo = deployment.servo || {};
+      const shown = servo.live_short || supervisor.live_short || null;
+      let text;
+      let tone;
+      if (event) {
+        text = `TREE CHANGED DURING RUN · ${event.observed_by} saw `
+          + `${servo.launch_short || supervisor.launch_short || "—"} → `
+          + `${servo.live_short || supervisor.live_short || "—"}`;
+        tone = "waiting";
+      } else if (supervisor.unverified === true && !shown) {
+        text = "fingerprint unverified";
+        tone = "unavailable";
+      } else {
+        text = `stable · ${shown || "—"}`;
+        tone = "ready";
+      }
+      setApproachMetric("approach-deployment", text, tone);
+      byId("approach-deployment").title = event?.message || supervisor.error || "";
+    }
+
     function renderApproachStatus(approach = state.approach) {
       state.approach = approach || state.approach;
       state.approachWorkflow = state.approach?.workflow?.active ? state.approach.workflow : null;
@@ -3337,6 +3378,7 @@
         optimizer,
         armView,
       });
+      renderDeployment(state.approach);
       const confidence = finiteNumber(search.confidence) ? `${(search.confidence * 100).toFixed(0)}%` : "—";
       const view = Number.isInteger(search.view_index) ? `${search.view_index + 1}/${search.view_count || "?"}` : "—";
       byId("approach-search").textContent = search.live_enabled === false

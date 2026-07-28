@@ -2195,3 +2195,187 @@ def test_acquiring_is_emitted_before_the_first_bundle_not_search_required():
     assert core.reactive_status["arm_view"]["mode"] == "hold"
     # The controller's own phase, not just the presentation remap.
     assert core.reactive_status["phase"] == ReactivePhase.ACQUIRING.value
+
+
+# ===========================================================================
+# R9 -- THE DEPLOYMENT IS THE WORKING TREE.
+#
+# go2w_depth_servo.sh bind-mounts $STACK_ROOT read-only and runs this file out
+# of it, so an edit on the host is a deploy into a running servo.  Recorded in
+# artifacts/go2w_real/planning_sessions/go2w-depth-servo.log: ONE session's
+# tracebacks place ``_tick`` at lines 1835, 1954, 2043, 2045 and 2183 -- five
+# different programs inside one run -- and nothing in depth-servo.json or in a
+# single trace row said which of them produced any given tick.
+# ===========================================================================
+
+
+def test_the_servo_stamps_the_tree_it_is_actually_running_from():
+    watch = SERVO.RuntimeFingerprintWatch(
+        launch="a" * 64,
+        clock=lambda: 0.0,
+        probe=lambda: ("a" * 64, None),
+    )
+    state = watch.state()
+    assert state["launch"] == "a" * 64
+    assert state["live"] == "a" * 64
+    assert state["mutated"] is False
+    assert state["unverified"] is False
+    assert state["launch_short"] == "a" * 12
+
+
+def test_a_tree_that_changes_mid_run_is_reported_as_mutated():
+    live = ["a" * 64]
+    watch = SERVO.RuntimeFingerprintWatch(
+        launch="a" * 64,
+        recheck_s=1.0,
+        clock=lambda: watch_clock[0],
+        probe=lambda: (live[0], None),
+    )
+    watch_clock = [0.0]
+    assert watch.state()["mutated"] is False
+    # The operator saves a file.  Inside the recheck period nothing changes;
+    # after it, the servo must say so.
+    live[0] = "b" * 64
+    watch_clock[0] = 0.5
+    assert watch.state()["mutated"] is False
+    watch_clock[0] = 1.5
+    state = watch.state()
+    assert state["mutated"] is True
+    assert state["live_short"] == "b" * 12
+
+
+def test_an_unknown_fingerprint_is_unverified_and_never_a_false_mutation():
+    """Absence must not manufacture an alarm.
+
+    Every replay, every shadow run and any launch without the environment
+    variable lands here.  Reporting all of them as "the tree changed" would
+    train an operator to ignore the one case that matters -- but reporting them
+    as clean would hide that nothing was checked, so ``unverified`` is carried.
+    """
+
+    watch = SERVO.RuntimeFingerprintWatch(
+        launch=None, clock=lambda: 0.0, probe=lambda: ("a" * 64, None),
+    )
+    state = watch.state()
+    assert state["mutated"] is False
+    assert state["unverified"] is True
+
+    broken = SERVO.RuntimeFingerprintWatch(
+        launch="a" * 64,
+        clock=lambda: 0.0,
+        probe=lambda: (None, "FileNotFoundError: reactive_servo.py"),
+    )
+    state = broken.state()
+    assert state["mutated"] is False
+    assert state["unverified"] is True
+    assert state["error"].startswith("FileNotFoundError")
+
+
+def test_a_vanishing_source_file_cannot_kill_a_servo_tick():
+    """The hashed set IS the set an operator is editing.
+
+    ``runtime_inputs`` checks ``is_file`` and then ``read_bytes``; every editor
+    that saves through a temp file plus ``os.replace`` opens a window between
+    the two.  A servo may not die because somebody hit save.
+    """
+
+    import z_manip_runtime_fingerprint as fingerprint_module
+
+    original = fingerprint_module.runtime_fingerprint
+    try:
+        fingerprint_module.runtime_fingerprint = lambda: (_ for _ in ()).throw(
+            FileNotFoundError("z_manip/control/reactive_servo.py"),
+        )
+        value, error = fingerprint_module.try_runtime_fingerprint()
+    finally:
+        fingerprint_module.runtime_fingerprint = original
+    assert value is None
+    assert "FileNotFoundError" in error
+
+
+def test_every_trace_row_carries_the_fingerprint_that_produced_it():
+    """A trace whose rows change fingerprint is a trace of two programs."""
+
+    document = {
+        "updated_unix_ns": 1_700_000_000_000_000_000,
+        "mode": "live",
+        "phase": "whole_body_approach",
+        "tracking": True,
+        "target": None,
+        "source_stamp_ns": 42,
+        "output": {"phase": "whole_body_approach"},
+        "filter": {},
+        "posture_status": {},
+        "arm_view_status": {},
+        "whole_body": {},
+        "runtime_fingerprint": {
+            "launch": "a" * 64,
+            "live": "b" * 64,
+            "launch_short": "a" * 12,
+            "live_short": "b" * 12,
+            "mutated": True,
+            "unverified": False,
+            "error": None,
+        },
+    }
+    row = SERVO._trace_row(document, view_update_period_s=None, bundle_count=1)
+    assert row["runtime_fingerprint"] == "b" * 12
+    assert row["runtime_fingerprint_mutated"] is True
+
+    # A document from a producer that predates the block must still trace.
+    legacy = dict(document)
+    legacy.pop("runtime_fingerprint")
+    legacy_row = SERVO._trace_row(
+        legacy, view_update_period_s=None, bundle_count=1,
+    )
+    assert legacy_row["runtime_fingerprint"] is None
+    assert legacy_row["runtime_fingerprint_mutated"] is None
+
+
+def test_the_status_writer_publishes_the_fingerprint_block():
+    """Pinned at the source, because DepthServoNode needs rclpy to build."""
+
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert '"runtime_fingerprint": self.fingerprint_watch.state(),' in source
+    # The LAUNCHER's value, not a self-measurement: by the first tick the tree
+    # may already have moved, and hashing here would adopt the mutation as the
+    # baseline and then report a clean match forever.
+    assert "os.environ.get(RUNTIME_FINGERPRINT_ENV)" in source
+    assert "self.fingerprint_watch = RuntimeFingerprintWatch(" in source
+
+
+def test_the_launcher_measures_the_tree_and_hands_it_to_the_servo():
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    # Measured BEFORE docker run, and exported into the container.
+    assert 'z_manip_runtime_fingerprint.py' in launcher
+    assert '-e Z_MANIP_RUNTIME_FINGERPRINT="$RUNTIME_FINGERPRINT" \\' in launcher
+    fingerprint_at = launcher.index("RUNTIME_FINGERPRINT=\"$(")
+    docker_run_at = launcher.index("docker run --rm")
+    assert fingerprint_at < docker_run_at, (
+        "the fingerprint must be measured before the container starts, or it "
+        "describes a tree the servo never ran"
+    )
+    # The recommendation and the reason it was not taken are recorded IN the
+    # launcher, next to the bind mount they are about.
+    assert "content-addressed copy" in launcher.lower()
+    assert '-v "$STACK_ROOT:$STACK_ROOT:ro"' in launcher
+
+
+def test_the_launcher_warns_loudly_on_a_dirty_tree_instead_of_refusing():
+    """Refusing to launch would block this operator on the NORMAL case.
+
+    The tree is dirty for most of a working session by design -- that is how
+    the servo gets new code at all -- so a refusal would fire constantly and be
+    bypassed.  The brief's sanctioned alternative is a loud warning carrying the
+    fingerprint, which is what this pins.
+    """
+
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    assert "git -C \"$STACK_ROOT\" status --porcelain" in launcher
+    assert "LIVE DEPLOY WARNING" in launcher
+    assert "runtime fingerprint: %s" in launcher
+    # It must NOT exit: a warning that stops the launch is a refusal.
+    warning_block = launcher[
+        launcher.index("LIVE DEPLOY WARNING"):launcher.index("A user service can")
+    ]
+    assert "exit 1" not in warning_block

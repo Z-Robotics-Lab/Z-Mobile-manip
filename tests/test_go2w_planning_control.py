@@ -5230,3 +5230,106 @@ def test_named_combo_is_echoed_into_the_live_approach_workflow(tmp_path):
     assert workflow["place_back"] is False
     assert workflow["hold_seconds"] == 0.0
     runner.stop()
+
+
+# ===========================================================================
+# R9 -- an operator-visible event for "the working tree changed under this run".
+# ===========================================================================
+
+
+def test_a_mutation_seen_by_either_process_is_one_operator_event():
+    """Two processes watch the same bytes; either seeing it is seeing it.
+
+    The servo watches from inside its read-only bind mount, the supervisor from
+    the host.  They measure the same files, so a DISAGREEMENT is itself evidence
+    and must not be averaged away into "probably fine".
+    """
+
+    from_servo = CONTROL.deployment_event(
+        servo_state={
+            "launch_short": "a" * 12,
+            "live_short": "b" * 12,
+            "mutated": True,
+        },
+        supervisor_state={"mutated": False, "launch_short": "a" * 12},
+    )
+    assert from_servo["mutated"] is True
+    assert from_servo["event"]["code"] == "RUNTIME_TREE_MUTATED_DURING_RUN"
+    assert from_servo["event"]["observed_by"] == "depth_servo"
+    assert "a" * 12 in from_servo["event"]["message"]
+    assert "b" * 12 in from_servo["event"]["message"]
+
+    from_supervisor = CONTROL.deployment_event(
+        servo_state={"mutated": False},
+        supervisor_state={
+            "mutated": True, "launch_short": "c" * 12, "live_short": "d" * 12,
+        },
+    )
+    assert from_supervisor["event"]["observed_by"] == "supervisor"
+
+
+def test_an_unusable_servo_fingerprint_degrades_to_the_supervisor_view():
+    """The servo block arrives from another process's JSON: assume nothing."""
+
+    for junk in (None, "starting", 7, [], {}):
+        block = CONTROL.deployment_event(
+            servo_state=junk,
+            supervisor_state={
+                "mutated": True, "launch_short": "a" * 12, "live_short": "b" * 12,
+            },
+        )
+        assert block["mutated"] is True
+        assert block["event"]["observed_by"] == "supervisor"
+    clean = CONTROL.deployment_event(
+        servo_state="not-a-dict", supervisor_state={"mutated": False},
+    )
+    assert clean["event"] is None
+    assert clean["servo"] is None
+
+
+def test_the_approach_status_endpoint_carries_the_deployment_block(tmp_path):
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+    )
+    deployment = runner.status()["deployment"]
+    assert deployment["schema"] == "z_manip.runtime_deployment.v1"
+    # The supervisor always has a view of its own, even with no servo running --
+    # which is exactly when an operator is most likely to be editing.
+    assert deployment["supervisor"]["live"] is not None
+    assert deployment["mutated"] is False
+    assert deployment["event"] is None
+
+
+def test_the_supervisors_launch_baseline_is_never_re_taken(tmp_path):
+    """Re-taking it would adopt every edit as the new normal."""
+
+    runner = CONTROL.DepthServoRunner(
+        _servo_status_script(tmp_path / "servo.py", "approach"),
+        tmp_path / "status.json",
+        tmp_path / "servo.log",
+    )
+    baseline = runner.status()["deployment"]["supervisor"]["launch"]
+    runner._fingerprint_watch = CONTROL.RuntimeFingerprintWatch(
+        launch=baseline,
+        recheck_s=0.0,
+        probe=lambda: ("mutated" * 8, None),
+    )
+    deployment = runner.status()["deployment"]
+    assert deployment["supervisor"]["launch"] == baseline
+    assert deployment["mutated"] is True
+    assert deployment["event"]["code"] == "RUNTIME_TREE_MUTATED_DURING_RUN"
+
+
+def test_the_dashboard_renders_the_deployment_event():
+    """An event nothing displays is not operator-visible."""
+
+    html = HTML.read_text(encoding="utf-8")
+    assert 'id="approach-deployment"' in html
+    assert "function renderDeployment(" in html
+    assert "renderDeployment(state.approach);" in html
+    assert "TREE CHANGED DURING RUN" in html
+    # "unverified" must be its own neutral state, not an alarm: replays and
+    # shadow runs land there and an alarm on all of them hides the real one.
+    assert "fingerprint unverified" in html

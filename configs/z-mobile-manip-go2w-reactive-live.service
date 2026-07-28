@@ -3,6 +3,22 @@ Description=Z-Mobile-Manip Go2W single-owner reactive WebRTC control
 After=network-online.target
 Wants=network-online.target
 Conflicts=z-manip-go2w-base-control.service z-mobile-manip-go2w-reactive-shadow.service
+# H5.  KEEP A LIMITER, EXPLICIT AND WIDER.
+#
+# This is the single owner of the ONLY channel that reaches the base.  A
+# crash-looping WebRTC bridge is precisely the "ROS accepts /cmd_vel but the
+# robot never receives it" state go2w_base_transport_preflight.sh exists to
+# catch, so latching it is right: the preflight then fails loudly instead of
+# handing the servo an authority it does not have.
+#
+# The inherited 5-per-10 s is nevertheless wrong here, because the preflight
+# RESTARTS this unit itself.  Before the InvocationID fix that was every ~12 min
+# on a perfectly healthy bridge; it is now rare, but an operator retrying a live
+# task still drives one restart per launch, and the 12 s the preflight waits for
+# readiness makes a burst of retries easy.  60 s / 10 leaves a 3 s crash loop
+# latching in ~30 s while ten operator launches per minute never trip it.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple

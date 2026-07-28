@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import signal
 import statistics
+import sys
 import threading
 import time
 from typing import Any
@@ -25,7 +26,22 @@ import uuid
 
 import numpy as np
 
-from z_manip.control.reactive_servo import (
+# ``z_manip_runtime_fingerprint`` is a SIBLING FILE, not a package module, and
+# it must stay one: it anchors STACK_ROOT on its own location, so importing it
+# from ``z_manip`` would resolve to whichever copy of the package won the path
+# (the container has a second one baked in at /opt/z_manip/python) and would
+# fingerprint the wrong tree.  Inside the container ``sys.path[0]`` is already
+# this directory; under a test that loads this file through an importlib spec it
+# is not, so name it explicitly.
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from z_manip_runtime_fingerprint import (  # noqa: E402
+    RUNTIME_FINGERPRINT_ENV,
+    RuntimeFingerprintWatch,
+)
+from z_manip.control.reactive_servo import (  # noqa: E402
     ArmViewIntent,
     BaseMotionIntent,
     PostureIntent,
@@ -1494,13 +1510,27 @@ def _trace_row(
     ``view_update_period_s`` (the live FFS-rate damping period) and the
     monotonic ``bundle_count`` are promoted to first-class fields so a trace can
     be read for cadence health without cross-referencing the status file.
+
+    ``runtime_fingerprint``/``runtime_fingerprint_mutated`` are on EVERY ROW, not
+    just in the status file, because the status file holds one instant and the
+    trace is what anybody analysing a hang actually reads.  A trace whose rows
+    change fingerprint part-way through is a trace of two different programs,
+    and nothing else in the row says so -- the recorded evidence for this stage
+    is a session whose ``_tick`` frame moved through five line numbers while its
+    trace looked continuous.  The short form is used: 12 hex characters on a
+    ~1-2 KiB row against a 2 MB rotation cap, and it is the width
+    ``go2w_component_manager.sh`` already prints.
     """
 
+    fingerprint = document.get("runtime_fingerprint")
+    fingerprint_block = fingerprint if isinstance(fingerprint, dict) else {}
     return {
         "schema": "z_manip.depth_servo_trace.v1",
         "updated_unix_ns": document["updated_unix_ns"],
         "mode": document["mode"],
         "phase": document["phase"],
+        "runtime_fingerprint": fingerprint_block.get("live_short"),
+        "runtime_fingerprint_mutated": fingerprint_block.get("mutated"),
         "tracking": document["tracking"],
         "target": document["target"],
         "source_stamp_ns": document["source_stamp_ns"],
@@ -1788,6 +1818,15 @@ def _run_ros(args: argparse.Namespace) -> int:
             self.last_output = self.core.tick(now_s=time.monotonic(), tracking=False)
             self.last_trace_phase: str | None = None
             self.last_trace_s = 0.0
+            # The launcher measures the tree immediately before ``docker run``
+            # and exports it.  Taking the LAUNCHER'S value rather than hashing
+            # here is the whole point: by the time this process reaches its
+            # first tick the tree may already have moved, and a self-measured
+            # "launch" fingerprint would silently adopt the mutation as its own
+            # baseline and then report a clean match forever.
+            self.fingerprint_watch = RuntimeFingerprintWatch(
+                launch=(os.environ.get(RUNTIME_FINGERPRINT_ENV) or None),
+            )
             qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
             # MUST match the EdgeTAM publisher's ``tracking_state_qos``
             # (ros2/z_manip_edgetam/z_manip_edgetam/node.py).  A VOLATILE
@@ -2370,6 +2409,16 @@ def _run_ros(args: argparse.Namespace) -> int:
                     "tracking_hold_s": settings.tracking_hold_s,
                     "tracking_loss_grace_s": settings.tracking_loss_grace_s,
                 },
+                # WHICH BYTES IS THIS PROCESS ACTUALLY RUNNING?  The launcher
+                # bind-mounts the working tree read-only and executes out of it,
+                # so the answer changes without a restart.  ``launch`` is the
+                # fingerprint the launcher measured immediately before
+                # ``docker run`` and handed over in the environment; ``live`` is
+                # re-measured here at RUNTIME_FINGERPRINT_RECHECK_S.  The
+                # supervisor turns ``mutated`` into an operator-visible event;
+                # this file just reports it.  ~200 bytes against the reader's
+                # 64 KiB cap on a measured 11.8 KiB max document.
+                "runtime_fingerprint": self.fingerprint_watch.state(),
                 "tracking": self.tracking,
                 "target": None if target is None else {
                     "x_m": target[0],

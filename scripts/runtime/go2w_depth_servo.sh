@@ -55,6 +55,27 @@ acquire_arm_owner() {
       systemctl --user stop z-mobile-manip-piper-reactive-view.service >/dev/null 2>&1 || true
       systemctl --user restart z-manip-piper-passive-feedback.service
     }
+    # H5.  NOTHING IN THIS REPOSITORY EVER CALLED reset-failed.  A unit that hit
+    # its start limiter stays in failed/start-limit-hit until something clears
+    # it, and the ONLY thing an operator saw was `systemctl start` returning
+    # non-zero under `set -eu`, which aborts this whole launcher.  "The arm
+    # owner could not be acquired" and "systemd is refusing to try" are not the
+    # same fault and must not look the same.
+    #
+    # This is a DIAGNOSIS first and a clear second.  The clear is scoped to
+    # start-limit-hit only, happens at most once per launcher invocation, and
+    # does NOT weaken anything: the is-active postcondition below is unchanged,
+    # so a unit that is genuinely broken still fails this function and still
+    # stops the servo.  What changes is that the operator is told why.
+    for unit in z-mobile-manip-piper-reactive-view.service z-manip-piper-passive-feedback.service; do
+      result="$(systemctl --user show "$unit" -p Result --value 2>/dev/null || true)"
+      if [ "$result" = start-limit-hit ]; then
+        restarts="$(systemctl --user show "$unit" -p NRestarts --value 2>/dev/null || true)"
+        printf "%s tripped its systemd start limiter (Result=start-limit-hit, NRestarts=%s); clearing it once so this launch reports the REAL fault instead of systemd refusing to try\n" \
+          "$unit" "${restarts:-unknown}" >&2
+        systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+      fi
+    done
     if ! systemctl --user start z-mobile-manip-piper-reactive-view.service; then
       restore_passive
       exit 1
@@ -102,6 +123,59 @@ if ! docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1; then
     -f "$STACK_ROOT/docker/whole_body_runtime/Dockerfile" "$STACK_ROOT"
 fi
 
+# THE DEPLOYMENT IS THE WORKING TREE.  The `-v "$STACK_ROOT:$STACK_ROOT:ro"`
+# line in the docker run below mounts this checkout INTO the container and the
+# servo runs straight out of it, so editing the checkout while a task is live
+# is a deploy to a powered-up robot.  Recorded
+# consequences: one session's traceback holds _tick at 1835, 1954, 2043, 2045
+# and 2183 -- five different programs inside one run -- and commits a0f9e10
+# (10:38) and 0124a20 (12:10) each produced a resident-worker fingerprint
+# mismatch minutes later, a component self-heal, 900-1200 passive-window
+# rejections and PERCEPTION_PROCESS_FAILED on a plainly detected object, 2 of 2,
+# while the same sparse target succeeded 5 times with 0 rejections.
+#
+# WHAT I RECOMMEND AND DID NOT DO: bind-mount a CONTENT-ADDRESSED COPY of
+# $STACK_ROOT (rsync into artifacts/go2w_real/.deploy/<fingerprint>/ and mount
+# that instead).  It is the only option that makes a running task genuinely
+# immune to an edit, and it also makes the traceback line numbers meaningful
+# again.  It is not implemented here because it rewrites the launch path of a
+# robot this change cannot be executed against, and a mistake in it does not
+# degrade the servo, it prevents the servo from starting at all.
+#
+# WHAT IS IMPLEMENTED: the other option in the pair -- refuse to launch on a
+# dirty tree -- DOWNGRADED TO A LOUD WARNING CARRYING THE FINGERPRINT, and said
+# so here.  Refusing would be wrong for this operator: the tree is dirty for
+# most of a working session by design (that is how the servo gets new code at
+# all), so a refusal would block them mid-session on the normal case and teach
+# them to bypass the check.  The warning is unconditional and the fingerprint it
+# prints is the same value the servo stamps into depth-servo.json and every
+# trace row, so an after-the-fact analysis can prove which bytes ran.
+RUNTIME_FINGERPRINT="$(
+  /usr/bin/env python3 "$SCRIPT_DIR/z_manip_runtime_fingerprint.py" 2>/dev/null || true
+)"
+if [[ -z "$RUNTIME_FINGERPRINT" ]]; then
+  # Not fatal: the fingerprint is diagnostic, not a gate.  But say so, because
+  # an absent stamp reads identically to "checked and clean" downstream.
+  printf 'warning: could not measure the runtime fingerprint; depth-servo.json and its trace will report unverified\n' >&2
+fi
+printf 'z_manip_runtime_fingerprint=%s\n' "${RUNTIME_FINGERPRINT:-unknown}" >&2
+if git -C "$STACK_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  RUNTIME_TREE_STATUS="$(git -C "$STACK_ROOT" status --porcelain 2>/dev/null || true)"
+  RUNTIME_TREE_COMMIT="$(git -C "$STACK_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  if [[ -n "$RUNTIME_TREE_STATUS" ]]; then
+    printf '\n' >&2
+    printf '!! LIVE DEPLOY WARNING: %s is DIRTY at commit %s.\n' \
+      "$STACK_ROOT" "$RUNTIME_TREE_COMMIT" >&2
+    printf '!! This launcher bind-mounts that tree read-only and runs the servo from it.\n' >&2
+    printf '!! Editing it during this task IS a deploy to a powered-up robot, and the\n' >&2
+    printf '!! resident perception/planning workers will self-heal on the fingerprint change.\n' >&2
+    printf '!! runtime fingerprint: %s\n' "${RUNTIME_FINGERPRINT:-unknown}" >&2
+    printf '!! modified paths:\n' >&2
+    printf '%s\n' "$RUNTIME_TREE_STATUS" | sed 's/^/!!   /' >&2
+    printf '\n' >&2
+  fi
+fi
+
 # A user service can remain active after Unitree's WebRTC data channel has
 # closed. In that state ROS accepts /cmd_vel but the robot never receives it.
 # Refuse to start a live servo until the fixed NUC transport has either been
@@ -136,6 +210,7 @@ docker run --rm \
   -e ROS_DOMAIN_ID=20 \
   -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   -e CYCLONEDDS_URI=file:///config/cyclonedds.xml \
+  -e Z_MANIP_RUNTIME_FINGERPRINT="$RUNTIME_FINGERPRINT" \
   -e PYTHONPATH="$STACK_ROOT:/opt/z_manip/python" \
   -v "$DDS_CONFIG:/config/cyclonedds.xml:ro" \
   -v "$STACK_ROOT:$STACK_ROOT:ro" \

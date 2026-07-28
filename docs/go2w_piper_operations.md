@@ -378,6 +378,105 @@ out and every new task was refused with `APPROACH_ACTION_BUSY`.
 `handoff_ready`, and the legacy `reached` phase all use the same zero-speed
 fresh-grasp handoff; no far-field perception or trajectory is reused.
 
+### Editing the checkout during a task IS a deploy
+
+`scripts/runtime/go2w_depth_servo.sh` bind-mounts `$STACK_ROOT` read-only into
+the servo container and runs `go2w_depth_servo.py` straight out of it, and the
+resident perception/planning workers import their modules once at startup. A
+`git commit`, a `git checkout`, or an editor save while a task is in flight is
+therefore a live deploy to a powered-up robot.
+
+What that looked like before it was instrumented: one recorded session's
+tracebacks place `_tick` at five different line numbers (1835, 1954, 2043, 2045,
+2183) inside a single run, and commits `a0f9e10` (10:38) and `0124a20` (12:10)
+each produced a resident-worker fingerprint mismatch minutes later, a perception
+component self-heal, and a retry that reused the previous sub-attempt's already
+closed passive window — 900-1200 stamp-overlap rejections, the whole 15 s budget
+burnt, `PERCEPTION_PROCESS_FAILED`, and a plainly detected object routed into a
+wrist search. Twice out of two, against five clean runs of the same sparse
+target with zero rejections.
+
+Three things now make that visible instead of mysterious:
+
+* The launcher measures `scripts/runtime/z_manip_runtime_fingerprint.py` before
+  `docker run`, prints it, and hands it to the servo in
+  `Z_MANIP_RUNTIME_FINGERPRINT`. If the tree is dirty it prints a `LIVE DEPLOY
+  WARNING` block naming the fingerprint and every modified path. **It warns, it
+  does not refuse.** This tree is dirty for most of a working session by design,
+  so a refusal would fire on the normal case and be bypassed. The stronger fix —
+  bind-mounting a content-addressed copy so a running task cannot be changed at
+  all — is the recommendation, and is *not* implemented: it rewrites the launch
+  path of a robot that cannot be tested against here, and a mistake in it stops
+  the servo from starting rather than degrading it.
+* `depth-servo.json` carries a `runtime_fingerprint` block (launch vs live,
+  re-measured every 2 s), and **every trace row** carries the short live
+  fingerprint plus a `runtime_fingerprint_mutated` flag. A trace whose rows
+  change fingerprint part-way through is a trace of two different programs.
+* The approach status endpoint carries a `deployment` block and the dashboard
+  shows it as **Runtime deployment**. A mutation seen by *either* the servo or
+  the workbench raises `RUNTIME_TREE_MUTATED_DURING_RUN`. It stops nothing — a
+  robot that halted every time you saved a file would be unusable — it tells you
+  to restart the affected components before trusting the run.
+
+`unverified` is its own neutral state, not an alarm: replays, shadow runs and
+any launch without the environment variable land there.
+
+Perception and planning attempts record the same thing at both ends.
+`attempt.json` carries `runtime_fingerprint.started` / `.finished` /
+`.changed_during_attempt`, so an attempt that began on one tree and finished on
+another says so.
+
+### Passive windows are never inherited by a retry
+
+Both perception retry paths — the inner fresh-seed retry and the rc=70
+resident-worker self-heal — now clear **every** artifact of the previous
+sub-attempt, including `live_passive_joint_report.json`, which the older code
+left behind. While a valid `selected_passive_joint_report.json` exists the
+wrapper does not open a new passive window at all, which is why all six recorded
+self-heals show `passive_capture_count: 0` against 2-21 captures on their own
+first sub-attempt.
+
+If the dry run nevertheless finds itself matching fresh bundles against a window
+that closed before its own bundle wait began, it now fails after 2 s with
+`PERCEPTION_PASSIVE_WINDOW_STALE` and a message giving both distances, instead
+of burning its full budget and surfacing as `PERCEPTION_PROCESS_FAILED`. The
+remedy is always a fresh capture. **The zero-TX gate itself is unchanged**: the
+overlap tolerance is still ±250 ms, `_SEED_VALID_FAILURE_CODES` still contains
+only `GRASP_GEOMETRY_FAILED`, and no perception failure lacking zero-TX evidence
+can start base motion.
+
+### systemd start limiters
+
+Four units used to inherit the default 5-starts-per-10 s limiter, and nothing in
+the repository ever called `reset-failed`; under `set -e` a tripped limiter
+aborted the launcher with no message saying so. Each unit now declares its own
+choice, with the reason written in the unit file:
+
+| unit | limiter | why |
+| --- | --- | --- |
+| `z-mobile-manip-piper-reactive-view` | 60 s / 10 | single CAN owner; a crash loop must latch, operator launches must not trip it |
+| `z-manip-piper-passive-feedback` | 60 s / 15 | zero-TX evidence producer, hand-restarted by seven call sites around every arm motion |
+| `z-mobile-manip-go2w-reactive-live` | 60 s / 10 | single owner of the only channel that reaches the base |
+| `z-manip-planning-workbench` | `StartLimitIntervalSec=0` | owns no exclusive hardware and *is* the operator's only interface; follows the `d435i` / `ffs-ir-throttle` precedent |
+
+`go2w_depth_servo.sh` and `go2w_base_transport_preflight.sh` now detect
+`Result=start-limit-hit`, print the unit and its `NRestarts`, and clear that
+specific latch once per launch. Their postconditions (`is-active`, and the
+bounded readiness loop) are unchanged, so a genuinely broken unit still fails the
+launch — it just says why.
+
+### Bag QoS must match the publisher
+
+`configs/rosbag_sensor_qos.yaml` recorded `/track_3d/selected_target_pointcloud`
+and `/z_manip/perception/target_pointcloud` as `best_effort` while both
+publishers are `RELIABLE`. The subscription still connects (QoS is
+request ≤ offered), so nothing errored — it simply stopped NACKing, and every
+sample lost to Wi-Fi contention was gone from the bag. Both are now recorded
+`reliable` at the publishers' depth 10, so a replay of a hang can no longer
+conclude "perception never reached the controller" about a run in which it did.
+`/z_manip/perception/scene_pointcloud` stays `best_effort`, correctly: its
+publisher uses `qos_profile_sensor_data`.
+
 **Full stop** cancels the server-side workflow, terminates the depth-servo
 process, clears its task context, and interrupts a pending local wrist-search
 subprocess. The fixed NUC wrist command is still finite and must never replace

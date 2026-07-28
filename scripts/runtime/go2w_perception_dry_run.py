@@ -48,6 +48,7 @@ from z_manip.perception.tracked_reuse import (
 from z_manip.perception.seed_gate import BundleGateConfig, min_points_for_depth
 from z_manip.verification.passive_capture import (
     PassiveCaptureWindow,
+    stale_passive_window_reason,
     validate_passive_capture,
 )
 
@@ -166,6 +167,15 @@ def _freshness_summary(samples_s: list[float]) -> dict[str, float | int | None]:
 # 8 s clears a genuinely slow-but-real seed while collapsing the p95=15 s no-seed
 # tail.  0 disables the fast-fail (full timeout is used).
 DEFAULT_NO_SEED_TIMEOUT_S = 8.0
+#: How long a demonstrably stale passive window must persist before the run
+#: fails fast with ``passive_window_stale`` instead of burning its whole budget.
+#:
+#: The wrapper re-opens a window whenever no valid SELECTED report exists, and a
+#: measured capture cycle is ~0.32 s end to end (4.52 s / 14 captures in the
+#: recorded 20260723-043621 attempt).  2 s is ~6 cycles: a window that is about
+#: to be replaced always wins, and only a window nothing is refreshing -- the
+#: inherited-report deadlock -- reaches the verdict.
+PASSIVE_WINDOW_STALE_GRACE_S = 2.0
 # Perception-contract phases (published as the DiagnosticStatus message) that
 # prove a segmentation seed was accepted: grounding has produced a box and
 # EdgeTAM is initialising/tracking.  Reaching either disables the no-seed
@@ -687,6 +697,10 @@ def main(
         floor_points=int(args.bundle_gate_floor_points),
     )
     bundle_wait_started = time.monotonic()
+    # UNIX anchor for the SAME instant.  The passive report's observation
+    # interval is unix-epoch nanoseconds and ``bundle_wait_started`` is
+    # monotonic, so a staleness verdict needs both clocks read together.
+    bundle_wait_started_unix_ns = time.time_ns()
     # Fail fast when no segmentation seed is accepted; keep the full --timeout
     # wait once a seed exists so the EdgeTAM depth-dropout coast is unaffected.
     no_seed_budget = min(args.no_seed_timeout, args.timeout)
@@ -699,6 +713,8 @@ def main(
     supported_bundle_at: float | None = None
     passive_window_rejections = 0
     widest_rejected_margin_s: float | None = None
+    stale_passive_window_since: float | None = None
+    stale_passive_window_detail: str | None = None
     while time.monotonic() < deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
         if perception_failure:
@@ -810,6 +826,7 @@ def main(
                             bundle_gate_cfg,
                         )
                         selected_passive_report = candidate_report
+                        stale_passive_window_since = None
                         break
                     passive_window_rejections += 1
                     margin_s = _widest_passive_overlap_margin_s(supported, capture)
@@ -821,6 +838,32 @@ def main(
                     passive_window_error = (
                         "no exact perception bundle overlaps the latest passive window"
                     )
+                    # A window that closed before this run's bundle wait could
+                    # begin is not a near miss that another observation period
+                    # will fix -- nothing is refreshing it.  Name it, bound it,
+                    # and let the caller RE-CAPTURE.  The overlap gate above is
+                    # untouched: this only decides how long a doomed wait runs.
+                    stale_reason = stale_passive_window_reason(
+                        window_end_unix_ns=capture.end_unix_ns,
+                        bundle_wait_started_unix_ns=bundle_wait_started_unix_ns,
+                        oldest_bundle_stamp_ns=min(common),
+                    )
+                    if stale_reason is None:
+                        # The CLOCK resets on any window that can still overlap;
+                        # the OBSERVATION is sticky so a run that recovered
+                        # still reports the near miss it survived.
+                        stale_passive_window_since = None
+                    else:
+                        stale_passive_window_detail = stale_reason
+                        if stale_passive_window_since is None:
+                            stale_passive_window_since = time.monotonic()
+                        elif (
+                            time.monotonic() - stale_passive_window_since
+                            >= PASSIVE_WINDOW_STALE_GRACE_S
+                        ):
+                            perception_failure = stale_reason
+                            passive_window_error = stale_reason
+                            break
                 except (
                     OSError,
                     UnicodeError,
@@ -863,6 +906,12 @@ def main(
             "passive_window_error": passive_window_error,
             "passive_window_rejections": passive_window_rejections,
             "widest_rejected_overlap_margin_s": widest_rejected_margin_s,
+            # Present (non-null) whenever the run OBSERVED a window that closed
+            # before its own bundle wait began, whether or not the observation
+            # persisted long enough to become the failure.  A report carrying
+            # this with a different ``perception_failure`` is the near-miss
+            # sample the grace was sized against.
+            "stale_passive_window": stale_passive_window_detail,
             "perception_failure": perception_failure or None,
             "seed_accepted": seed_ever_accepted,
             "no_seed_fast_fail": no_seed_fast_fail,
@@ -1185,6 +1234,11 @@ def main(
         # defeats the point of recording them.
         "passive_window_rejections": passive_window_rejections,
         "widest_rejected_overlap_margin_s": widest_rejected_margin_s,
+        # Same field, same shape, on both reports -- for the same reason as the
+        # two above.  A SUCCESS carrying a non-null value here is a run that saw
+        # a stale window and then recovered inside the grace: the only
+        # uncensored sample from which that grace can ever be re-sized.
+        "stale_passive_window": stale_passive_window_detail,
         "timings": stage_timings,
     }
     if args.soak_duration > 0.0:
