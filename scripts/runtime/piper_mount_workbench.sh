@@ -13,7 +13,9 @@ URDF="${Z_MANIP_ROBOT_URDF:-$WORKSPACE_ROOT/go2W_Sim/assets/urdf/go2w_sensored.u
 REPORT="${PIPER_MOUNT_REPORT:-$MOUNT_DIR/piper_mount_calibration.json}"
 PORT="${PIPER_MOUNT_UI_PORT:-8768}"
 UI_CONTAINER="${PIPER_MOUNT_UI_CONTAINER:-piper-mount-report-ui}"
-IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:jazzy}"
+# Default to the canonical :pinocchio runtime (built by go2w_perception_lab.sh build);
+# :jazzy is the stale pre-Pinocchio image. Override via Z_MANIP_RUNTIME_IMAGE if needed.
+IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:pinocchio}"
 
 stop_report_ui() {
   docker rm -f "$UI_CONTAINER" >/dev/null 2>&1 || true

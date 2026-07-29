@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 WORKSPACE_ROOT="$(cd -- "$ROOT_DIR/.." && pwd)"
-IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:jazzy}"
+# Default to the canonical :pinocchio runtime (built by go2w_perception_lab.sh build);
+# :jazzy is the stale pre-Pinocchio image. Override via Z_MANIP_RUNTIME_IMAGE if needed.
+IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:pinocchio}"
 CONTAINER="${Z_MANIP_RUNTIME_OBSERVER_CONTAINER:-z-manip-runtime-observer}"
 DOMAIN_ID="${ROS_DOMAIN_ID:-20}"
 DDS_CONFIG="${Z_MANIP_DDS_CONFIG:-$ROOT_DIR/docker/runtime/cyclonedds-go2w-pc.xml}"

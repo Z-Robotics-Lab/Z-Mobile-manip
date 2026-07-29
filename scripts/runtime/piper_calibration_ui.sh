@@ -5,7 +5,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STACK_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 WORKSPACE_ROOT="$(cd -- "$STACK_ROOT/.." && pwd)"
-IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:jazzy}"
+# Default to the canonical :pinocchio runtime (built by go2w_perception_lab.sh build);
+# :jazzy is the stale pre-Pinocchio image. Override via Z_MANIP_RUNTIME_IMAGE if needed.
+IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:pinocchio}"
 CONTAINER="${Z_MANIP_CALIBRATION_UI_CONTAINER:-z-manip-calibration-ui}"
 PORT="${Z_MANIP_CALIBRATION_UI_PORT:-8767}"
 ARTIFACT_ROOT="${Z_MANIP_REAL_ARTIFACT_ROOT:-$WORKSPACE_ROOT/artifacts/go2w_real}"

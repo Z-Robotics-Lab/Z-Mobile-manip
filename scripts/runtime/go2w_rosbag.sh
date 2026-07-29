@@ -9,7 +9,9 @@ STACK_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 WORKSPACE_ROOT="$(cd -- "$STACK_ROOT/.." && pwd)"
 
 DOCKER="${Z_MANIP_DOCKER_BIN:-docker}"
-IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:jazzy}"
+# Default to the canonical :pinocchio runtime (built by go2w_perception_lab.sh build);
+# :jazzy is the stale pre-Pinocchio image. Override via Z_MANIP_RUNTIME_IMAGE if needed.
+IMAGE="${Z_MANIP_RUNTIME_IMAGE:-z-manip-runtime:pinocchio}"
 CONTAINER="${Z_MANIP_ROSBAG_CONTAINER:-z-mobile-manip-rosbag}"
 BAG_ROOT="${Z_MANIP_ROSBAG_ROOT:-$WORKSPACE_ROOT/artifacts/go2w_real/rosbags}"
 QOS_CONFIG="${Z_MANIP_ROSBAG_QOS:-$STACK_ROOT/configs/rosbag_sensor_qos.yaml}"
