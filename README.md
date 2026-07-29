@@ -61,7 +61,7 @@ Two chains run on real hardware today:
 - **Fixed base** — `perception → planning → grasp → return Home`
 - **Mobile** — `find/track → depth approach → stop → close-range grasp`
 
-![Go2-W with PiPER arm](docs/images/robot.jpg)
+![Go2-W with PiPER arm](docs/images/robot.webp)
 
 This is a supervised laboratory system, not an unattended product. Keep clearance around the
 robot and the physical e-stop in reach during any motion test.
