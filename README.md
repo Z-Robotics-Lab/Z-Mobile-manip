@@ -80,6 +80,33 @@ target text → RGB-D grounding → EdgeTAM tracking → target point cloud
 
 ![Pipeline](docs/images/pipeline.png)
 
+## NUC thin-deploy contract
+
+The two hosts do not run the same Python package. The 4090 imports the full `z_manip`
+(Pinocchio IK, CasADi QP, planning); the onboard NUC runs a **thin package** that carries only
+what a short-lived executor needs and **deliberately omits Pinocchio and casadi**. The decision
+loop lives on the 4090 — the NUC only executes.
+
+`scripts/runtime/install_go2w_reactive_runtime.sh` provisions the NUC by SCP-ing the reactive
+executors plus a reduced `z_manip/` tree into `~/.local/lib/z-mobile-manip/`, and — this is the
+contract — it copies `configs/nuc-kinematics-init.py` and `configs/nuc-control-init.py` and
+**renames them to `__init__.py`** inside `z_manip/kinematics/` and `z_manip/control/`. Those stub
+`__init__` files export only the light surface (`KinematicChain` from `chain.py`, the posture
+transport marker) instead of the full package `__init__`, so importing `z_manip.kinematics` /
+`z_manip.control` on the NUC never pulls Pinocchio/casadi. This keeps the robot's onboard host
+free of the heavy IK/QP dependency chain while the executors still resolve the modules they need.
+
+- **Do not** deploy the full package `__init__.py` to the NUC — it would drag in Pinocchio/casadi
+  and break the thin-host assumption.
+- The stub sources live in `configs/nuc-{kinematics,control}-init.py`; edit them there, not on the
+  NUC (the deploy renames them in place).
+- Rationale and the cross-machine picture are distilled in go2w-integration
+  [`docs/reproduction.md` §A.5](https://github.com/Z-Robotics-Lab/go2w-integration/blob/main/docs/reproduction.md)
+  and [`docs/modules.md` module C](https://github.com/Z-Robotics-Lab/go2w-integration/blob/main/docs/modules.md).
+
+Passive CAN telemetry (read-only `/piper/state` at 20 Hz) is a separate, non-owning deploy:
+`scripts/runtime/install_nuc_passive_access.sh`.
+
 ## Requirements
 
 - Ubuntu 24.04, ROS 2 Jazzy, CycloneDDS, Docker with the NVIDIA Container Toolkit
