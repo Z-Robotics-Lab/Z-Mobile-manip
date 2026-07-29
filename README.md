@@ -28,11 +28,33 @@ long-lived process. Seven ROS 2 packages (`z_manip_edgetam`, `z_manip_motion`,
 `z_manip_navigation`, `z_manip_place`, `z_manip_rgbd_bridge`, `z_manip_ros`, `z_manip_task`)
 carry the bridges, and separate Docker images isolate the GPU workloads
 (`z-manip-runtime:pinocchio` for ROS 2 + Pinocchio + the baked ROS packages, plus EdgeTAM,
-YOLOE, AnyGrasp, FFS and whole-body runtimes). Every stage is **fail-closed**: a missing
-calibration, a stale transform, an unproven collision corridor or an unreported servo phase
-stops the robot rather than proceeding, and each stop carries a named reason into the operator's
-status document. Thresholds and guards are commented with the incident that motivated them —
-treat those comments as normative, because several are not derivable from the code alone.
+YOLOE, AnyGrasp, FFS and whole-body runtimes).
+
+The integration seam is `z_manip_navigation`, which owns coarse approach as its own state
+machine (`NavPhase`: idle → wait_observation → navigating → reacquire → ready/failed) and hands
+over at `near_target_depth_m = 1.4` once the base has settled below `still_speed_mps = 0.035`.
+From there the near-field servo owns the base. Everything crossing a process boundary is a
+versioned JSON document — 79 `z_manip.*.vN` schemas, of which `depth_servo_status.v1` is the
+one the supervisor polls (the servo rewrites it at 20 Hz) and `depth_servo_trace.v1` is the
+per-tick record to reach for first when something misbehaves, because it carries the phase, the
+reason string, the target age, the collision witness and both the proposed and the published
+command on every row. Servo state is a single enum with one policy table (`z_manip/control/servo_phase.py`): every
+phase carries a deadline, an expiry action, an expected base owner and a terminal flag, and a
+phase string nobody declared inherits a fail-closed policy rather than running unbounded.
+Execution leaves an audit trail of stage receipts (start, per-stage joints, gripper verdicts,
+final pose) that the offline tests replay, which is why most regressions here are caught against
+recorded runs rather than in simulation.
+
+Every stage is **fail-closed**: a missing calibration, a stale transform, an unproven collision
+corridor or an unreported servo phase stops the robot rather than proceeding, and each stop
+carries a named reason into the status document. Two things an integrator should know before
+trusting anything: the Go2-W `wheeled_sport` interface exposes no `Euler` or `BodyHeight`
+service, so the whole-body QP's body roll/pitch DOFs are locked to zero on this platform and
+posture control is effectively unavailable; and `pinocchio`/`casadi` are absent from some hosts,
+so a green test suite does not mean the IK or QP numerical paths ran. Thresholds and guards are
+commented with the incident that motivated them — treat those comments as normative, because
+several are not derivable from the code alone, and more than one has been silently reverted by
+someone who assumed otherwise.
 
 Two chains run on real hardware today:
 
