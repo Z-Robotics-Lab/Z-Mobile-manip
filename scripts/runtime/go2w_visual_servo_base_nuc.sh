@@ -43,4 +43,20 @@ ros2 launch unitree_webrtc_ros unitree_control.launch.py \
   device_type:=Go2 &
 control_pid=$!
 
+# Neither cmd_vel_guard nor unitree_control is expected to exit while this
+# unit is live, so "wait -n" finishing at all is already the failure signal
+# -- but its own reported code cannot be trusted: `ros2 launch` swallows a
+# died child and still exits 0 (same startup-race class fixed in
+# go2w_reactive_control_nuc.sh, where CycloneDDS init lost the wlo1 DHCP
+# race and the unit latched inactive with status=0/SUCCESS). Force a
+# nonzero status whenever the race resolves as "success" so systemd always
+# retries a co-process death, regardless of which side raced first.
+set +e
 wait -n "$guard_pid" "$control_pid"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]]; then
+  printf 'go2w_visual_servo_base_nuc: a co-process exited reporting success while the base transport should still be running; treating as a failure so systemd retries\n' >&2
+  rc=1
+fi
+exit "$rc"
