@@ -62,7 +62,24 @@ python3 "$SCRIPT_DIR/go2w_reactive_control_nuc.py" \
 control_pid=$!
 
 if [[ "$MODE" == live ]]; then
+  # Neither cmd_vel_guard nor the control node is expected to exit while this
+  # unit is live, so "wait -n" finishing at all is already the failure signal
+  # -- but its own reported code cannot be trusted: `ros2 launch` swallows a
+  # died child and still exits 0 (observed on the NUC as "wlo1: does not
+  # match an available interface" killing cmd_vel_guard_node during the wlo1
+  # DHCP startup race, while go2w_reactive_control_nuc.sh reported
+  # status=0/SUCCESS and Restart=on-failure never fired). Force a nonzero
+  # status whenever the race resolves as "success" so systemd always retries
+  # a co-process death, regardless of which side raced first.
+  set +e
   wait -n "$guard_pid" "$control_pid"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    printf 'go2w_reactive_control_nuc: a live co-process exited reporting success while the bridge was still starting/running; treating as a failure so systemd retries\n' >&2
+    rc=1
+  fi
+  exit "$rc"
 else
   wait "$control_pid"
 fi
