@@ -7,6 +7,7 @@ SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 COMPONENT_MANAGER="${Z_MANIP_COMPONENT_MANAGER:-$SCRIPT_DIR/go2w_component_manager.sh}"
 ROSBAG_MANAGER="${Z_MANIP_ROSBAG_MANAGER:-$SCRIPT_DIR/go2w_rosbag.sh}"
+FSM_MANAGER="${Z_MANIP_FSM_MANAGER:-$SCRIPT_DIR/go2w_task_fsm.sh}"
 UI_UNIT="${Z_MANIP_UI_UNIT:-z-manip-planning-workbench.service}"
 UI_URL="${Z_MANIP_UI_URL:-http://127.0.0.1:8766}"
 SYSTEMCTL="${Z_MANIP_SYSTEMCTL_BIN:-systemctl}"
@@ -17,21 +18,35 @@ PGREP="${Z_MANIP_PGREP_BIN:-pgrep}"
 usage() {
   cat <<'EOF'
 Usage:
-  manip start                    Start the local UI/API only
-  manip stop                     Stop the whole stack (UI + PC vision + NUC robot services)
+  manip start                    ZERO-MOTION bringup: task FSM + planning-workbench UI
+                                 (no base chain -> chassis has no /cmd_vel consumer)
+  manip start ui                 Start the local UI/API only (lightweight lifecycle)
+  manip start-base               MOTION-ENABLING: bring up the NUC base chain
+                                 (alias for `manip component restart reactive-control`)
+  manip down                     Stop only the task FSM (leave perception, UI, base)
+  manip stop                     Stop the whole stack (FSM + UI + PC vision + NUC robot services)
   manip stop ui                  Safely stop only the local UI/API
   manip restart                  Safely restart the local UI/API
-  manip bringup                  Bring up the complete PC/NUC vision stack
+  manip bringup                  Bring up the complete PC/NUC vision stack (INCLUDES base chain)
   manip status [component]       Show all or one component status
   manip logs [component] [N]     Show bounded logs (default: ui, 100 lines)
   manip component restart NAME   Restart one fixed vision component
+  manip fsm start|status|down    Task-FSM lifecycle (start = FSM container only, no UI)
   manip bag start [LABEL]        Start a read-only full-chain tuning rosbag
   manip bag stop                 Stop and finalize the active tuning rosbag
   manip bag status               Show recorder path, state, and free disk
   manip url                      Print the UI address
 
+Motion tiers (deliberate, graded):
+  * start      = ZERO base-motion risk. Perception + task FSM + UI only. The FSM's
+                 velocity output has no chassis consumer until a base chain is up.
+  * start-base = SEPARATE, deliberate, motion-enabling step (reactive-control). Only
+                 after this can an approach actually drive the chassis. Stay beside
+                 the emergency stop.
+  * bringup    = full cold stack INCLUDING the base chain (motion-enabling).
+
 Components: ui, nuc-camera, passive-feedback, observer, rgbd, grounding, edgetam,
-            perception, perception-all
+            perception, perception-all, task
 
 Home and grasp are intentionally not CLI commands. Use the UI while beside
 the emergency stop for any operation that can move the arm.
@@ -92,6 +107,26 @@ start_ui() {
   printf 'Z-Manip UI is ready: %s/\n' "$UI_URL"
 }
 
+# ZERO-MOTION default bringup honoured by the z-agent manip_bringup(action=start)
+# contract: the perception-fed task FSM + the planning-workbench UI, and NEVER
+# the NUC base chain. The FSM singleton (via its supervisor) publishes velocity
+# only to the platform local_velocity topic, which has no chassis consumer until
+# `manip start-base` is run, so this bringup is motion-inert on its own. The UI
+# comes up first so the operator always gets the dashboard address, even if the
+# FSM's fail-closed graph preflight refuses (e.g. a conflicting lab perception
+# runtime already owns the graph).
+start_zero_motion() {
+  start_ui
+  if "$FSM_MANAGER" start; then
+    printf 'Zero-motion mobile-manipulation is ready (task FSM + UI): %s/\n' "$UI_URL"
+    printf 'The chassis stays inert until you run `manip start-base` (motion-enabling).\n'
+  else
+    printf 'UI is up at %s/ but the task FSM did not come up; see the message above.\n' \
+      "$UI_URL" >&2
+    return 1
+  fi
+}
+
 stop_stack() {
   # Battery swaps and shutdowns must never hard-kill a process that is
   # holding a lock (a SIGKILLed JACK registry init poisoned /dev/shm on
@@ -99,6 +134,9 @@ stop_stack() {
   if "$SYSTEMCTL" --user is-active --quiet "$UI_UNIT" 2>/dev/null; then
     require_idle_ui
   fi
+  # Stop the task FSM first so nothing new can be dispatched mid-teardown; this
+  # is a clean supervisor SIGTERM that only touches the container we own.
+  "$FSM_MANAGER" down || true
   "$COMPONENT_MANAGER" shutdown
   printf 'Full Z-Manip stack stopped (PC + NUC robot services).\n'
   printf 'Infra containers (navstack, sim) were left untouched.\n'
@@ -128,8 +166,32 @@ restart_ui() {
 command="${1:-help}"
 case "$command" in
   start)
+    if [[ $# -eq 1 ]]; then
+      # Bare `manip start` is the ZERO-MOTION contract: task FSM + UI, no base.
+      start_zero_motion
+    elif [[ $# -eq 2 && "$2" == ui ]]; then
+      start_ui
+    else
+      usage >&2
+      exit 2
+    fi
+    ;;
+  start-base)
+    # The SEPARATE, deliberate, motion-enabling step. Kept distinct from `start`
+    # so bringing up perception/FSM never implies a live chassis. This is only a
+    # thin, named alias for the existing fixed component restart; it adds no new
+    # actuator surface of its own.
     [[ $# -eq 1 ]] || { usage >&2; exit 2; }
-    start_ui
+    "$COMPONENT_MANAGER" restart reactive-control
+    ;;
+  down)
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    "$FSM_MANAGER" down
+    ;;
+  fsm)
+    [[ $# -eq 2 && ( "$2" == start || "$2" == status || "$2" == down ) ]] \
+      || { usage >&2; exit 2; }
+    "$FSM_MANAGER" "$2"
     ;;
   stop)
     if [[ $# -eq 1 ]]; then
@@ -153,7 +215,15 @@ case "$command" in
     ;;
   status)
     [[ $# -le 2 ]] || { usage >&2; exit 2; }
-    "$COMPONENT_MANAGER" status "${2:-all}"
+    if [[ "${2:-all}" == task ]]; then
+      "$FSM_MANAGER" status
+    elif [[ $# -eq 1 ]]; then
+      # The full board includes the task FSM row after the vision components.
+      "$COMPONENT_MANAGER" status all
+      "$FSM_MANAGER" status
+    else
+      "$COMPONENT_MANAGER" status "$2"
+    fi
     ;;
   logs)
     [[ $# -le 3 ]] || { usage >&2; exit 2; }
