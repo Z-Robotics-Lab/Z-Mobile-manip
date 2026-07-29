@@ -7,59 +7,56 @@ Supervised mobile manipulation for a Unitree Go2-W EDU quadruped carrying an Agi
 
 ## What this repository is
 
-Z-Mobile-Manip is the **near-field half** of a three-repository stack: an external navigation
-layer drives the robot to a coarse standoff, and this system takes over from roughly a metre
-out and runs through to a completed grasp and return. Compute is split between an RTX 4090
-workstation (perception, grasp synthesis, IK, planning, operator UI) and the robot's onboard
-NUC (D435 driver, PiPER `can0`, passive joint feedback, Go2-W WebRTC base transport), joined
-over `ROS_DOMAIN_ID=20`. The perception chain grounds an open-vocabulary text target with
-**YOLOE**, tracks it with **EdgeTAM**, and back-projects it against **Fast-FoundationStereo**
-depth rather than the D435's raw stream; the resulting target cloud feeds both a reactive depth
-servo and grasp synthesis. Grasps come from **AnyGrasp** with a local antipodal generator as
-fallback, are solved by a damped Gauss-Newton **Pinocchio** IK over the six arm joints, and are
-checked against two collision models — a capsule model of the platform's own fixed fixtures
-(`configs/piper_collision_capsules.json`, the only enforced representation of the chassis, NUC
-and Mid-360 LiDAR) and an observed point-cloud model of the scene. Approach and lift
-trajectories come from **RRT-Connect** with quintic time parameterisation, optionally refined
-by **CasADi**, which also solves the 10-DoF whole-body QP coupling base forward/yaw and body
-roll/pitch to the six arm joints during the servo approach. Motion is executed by short-lived,
-content-addressed executors copied to the NUC per run, so the arm is never driven by a
-long-lived process. Seven ROS 2 packages (`z_manip_edgetam`, `z_manip_motion`,
-`z_manip_navigation`, `z_manip_place`, `z_manip_rgbd_bridge`, `z_manip_ros`, `z_manip_task`)
-carry the bridges, and separate Docker images isolate the GPU workloads
-(`z-manip-runtime:pinocchio` for ROS 2 + Pinocchio + the baked ROS packages, plus EdgeTAM,
-YOLOE, AnyGrasp, FFS and whole-body runtimes).
+Z-Mobile-Manip is the **near-field half** of a three-repository stack: navigation drives the
+robot to a coarse standoff, and this system takes over from about a metre out and runs through
+to a completed grasp and return. An RTX 4090 workstation does perception, grasp synthesis, IK,
+planning and the operator UI; the robot's onboard NUC owns the D435, PiPER `can0`, joint
+feedback and the Go2-W WebRTC base transport, joined over `ROS_DOMAIN_ID=20`.
 
-The integration seam is `z_manip_navigation`, which owns coarse approach as its own state
-machine (`NavPhase`: idle → wait_observation → navigating → reacquire → ready/failed) and hands
-over at `near_target_depth_m = 1.4` once the base has settled below `still_speed_mps = 0.035`.
-From there the near-field servo owns the base. Everything crossing a process boundary is a
-versioned JSON document — 79 `z_manip.*.vN` schemas, of which `depth_servo_status.v1` is the
-one the supervisor polls (the servo rewrites it at 20 Hz) and `depth_servo_trace.v1` is the
-per-tick record to reach for first when something misbehaves, because it carries the phase, the
-reason string, the target age, the collision witness and both the proposed and the published
-command on every row. Servo state is a single enum with one policy table (`z_manip/control/servo_phase.py`): every
-phase carries a deadline, an expiry action, an expected base owner and a terminal flag, and a
-phase string nobody declared inherits a fail-closed policy rather than running unbounded.
-Execution leaves an audit trail of stage receipts (start, per-stage joints, gripper verdicts,
-final pose) that the offline tests replay, which is why most regressions here are caught against
-recorded runs rather than in simulation.
-
-Every stage is **fail-closed**: a missing calibration, a stale transform, an unproven collision
-corridor or an unreported servo phase stops the robot rather than proceeding, and each stop
-carries a named reason into the status document. Two things an integrator should know before
-trusting anything: the Go2-W `wheeled_sport` interface exposes no `Euler` or `BodyHeight`
-service, so the whole-body QP's body roll/pitch DOFs are locked to zero on this platform and
-posture control is effectively unavailable; and `pinocchio`/`casadi` are absent from some hosts,
-so a green test suite does not mean the IK or QP numerical paths ran. Thresholds and guards are
-commented with the incident that motivated them — treat those comments as normative, because
-several are not derivable from the code alone, and more than one has been silently reverted by
-someone who assumed otherwise.
+The pipeline grounds an open-vocabulary text target with **YOLOE**, tracks it with **EdgeTAM**,
+and back-projects it against **Fast-FoundationStereo** depth rather than the D435's raw stream.
+Grasps come from **AnyGrasp** with a local antipodal generator as fallback, are solved by a
+damped Gauss-Newton **Pinocchio** IK, and are checked against two collision models: a capsule
+model of the platform's own fixtures (`configs/piper_collision_capsules.json`, the only enforced
+representation of the chassis, NUC and Mid-360 LiDAR) and an observed point cloud of the scene.
+Trajectories come from **RRT-Connect** with quintic time parameterisation; **CasADi** refines
+them and solves the 10-DoF whole-body QP coupling base forward/yaw and body roll/pitch to the
+arm during the servo approach. Motion runs in short-lived, content-addressed executors copied to
+the NUC per run, so the arm is never driven by a long-lived process. Seven ROS 2 packages carry
+the bridges, and GPU workloads are isolated per image — `z-manip-runtime:pinocchio` bakes ROS 2,
+Pinocchio and `ros2/**`; EdgeTAM, YOLOE, AnyGrasp and FFS each run in their own.
 
 Two chains run on real hardware today:
 
 - **Fixed base** — `perception → planning → grasp → return Home`
 - **Mobile** — `find/track → depth approach → stop → close-range grasp`
+
+### Before you change anything
+
+- **Editing this checkout is a live deploy.** `z_manip/**` and `scripts/runtime/**` are
+  bind-mounted read-only into the running robot and execute from here. `ros2/**` is baked into
+  `z-manip-runtime:pinocchio` and rebuilt with `scripts/runtime/go2w_perception_lab.sh build` —
+  not with `docker compose`, which targets a stale `:jazzy` tag.
+- **Integration seam.** `z_manip_navigation` owns coarse approach as its own state machine
+  (`NavPhase`) and hands over at `near_target_depth_m = 1.4` once the base settles below
+  `still_speed_mps = 0.035`. From there the near-field servo owns the base.
+- **Every process boundary is a versioned JSON document** — 79 `z_manip.*.vN` schemas. Open
+  `depth_servo_trace.v1` first when something misbehaves: one row per tick carrying the phase,
+  the reason string, the target age, the collision witness, and both the proposed and the
+  published command. Execution leaves stage receipts that the offline tests replay, which is why
+  regressions here are caught against recorded runs rather than in simulation.
+- **Servo state is one enum and one policy table** (`z_manip/control/servo_phase.py`). Every
+  phase carries a deadline, an expiry action, an expected base owner and a terminal flag; a
+  phase nobody declared inherits a fail-closed policy instead of running unbounded.
+- **Fail-closed throughout.** A missing calibration, a stale transform or an unproven collision
+  corridor stops the robot, with a named reason in the status document.
+- **Posture control is unavailable.** The Go2-W `wheeled_sport` interface exposes no `Euler` or
+  `BodyHeight`, so the QP's body roll/pitch DOFs are locked to zero on this platform.
+- **A green test suite does not mean IK or the QP ran.** `pinocchio` and `casadi` are absent
+  from some hosts and those tests skip rather than fail.
+- **Threshold comments are normative.** Each records the incident that motivated it; several are
+  not derivable from the code, and more than one has been silently reverted by someone who
+  assumed otherwise.
 
 ![Go2-W with PiPER arm](docs/images/robot.webp)
 
@@ -82,14 +79,6 @@ target text → RGB-D grounding → EdgeTAM tracking → target point cloud
 ```
 
 ![Pipeline](docs/images/pipeline.png)
-
-Two deployment properties matter before changing anything:
-
-- `z_manip/**` and `scripts/runtime/**` are **bind-mounted read-only from this checkout** and
-  run directly from it. Editing the working tree is a live deploy to a powered-up robot.
-- `ros2/**` is **baked** into `z-manip-runtime:pinocchio`, rebuilt with
-  `scripts/runtime/go2w_perception_lab.sh build` — not with `docker compose`, which targets a
-  stale `:jazzy` tag.
 
 ## Requirements
 
