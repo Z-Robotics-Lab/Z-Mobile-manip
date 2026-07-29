@@ -5,7 +5,7 @@
   <version>0.1.0</version>
   <description>Fail-closed RGB-D ROS 2 adapter for the external EdgeTAM service.</description>
   <maintainer email="robotics@invalid.local">Z Robotics Lab</maintainer>
-  <license>Apache-2.0</license>
+  <license>PolyForm-Noncommercial-1.0.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 

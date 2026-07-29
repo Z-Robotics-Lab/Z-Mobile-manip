@@ -4,7 +4,7 @@
   <version>0.1.0</version>
   <description>Fail-closed MoveIt 2 planning bridge for the six-axis PiPER arm.</description>
   <maintainer email="robotics@z-robotics.local">Z Robotics Lab</maintainer>
-  <license>Apache-2.0</license>
+  <license>PolyForm-Noncommercial-1.0.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 

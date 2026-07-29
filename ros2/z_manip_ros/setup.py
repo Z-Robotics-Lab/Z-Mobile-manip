@@ -20,7 +20,7 @@ setup(
     maintainer='Z Robotics Lab',
     maintainer_email='robotics@invalid.local',
     description='ROS 2 bridge from one-shot VLM grounding to persistent EdgeTAM tracking',
-    license='Apache-2.0',
+    license='PolyForm-Noncommercial-1.0.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [

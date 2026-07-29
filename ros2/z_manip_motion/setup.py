@@ -20,7 +20,7 @@ setup(
     maintainer="Z Robotics Lab",
     maintainer_email="robotics@z-robotics.local",
     description="Fail-closed MoveIt 2 planning bridge for PiPER.",
-    license="Apache-2.0",
+    license="PolyForm-Noncommercial-1.0.0",
     entry_points={
         "console_scripts": [
             "complete_joint_state = z_manip_motion.joint_state_assembler:main",
