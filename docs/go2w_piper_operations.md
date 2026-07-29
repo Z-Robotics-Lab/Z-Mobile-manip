@@ -61,18 +61,81 @@ artifact rather than only a running container. `passive-feedback` also requires
 `can0` to be `ERROR-ACTIVE`. A live process without its real input is reported
 as `degraded`, not healthy.
 
+### Graded motion tiers
+
+Bringup is deliberately graded so that starting perception or the task FSM can
+never, by itself, put the chassis at motion risk:
+
+```bash
+manip start        # ZERO-MOTION: task FSM + planning-workbench UI, no base chain
+manip start-base   # MOTION-ENABLING: NUC base chain (reactive-control) only
+manip bringup      # full cold stack INCLUDING the base chain
+```
+
+* `manip start` brings up the loopback UI and the mobile-manipulation task FSM
+  (see section 2.1). The FSM's velocity output goes to the platform
+  `local_velocity` topic, which has no chassis consumer until the base chain is
+  up, so this tier is motion-inert by construction. This is the tier the
+  z-agent `manip_bringup(action='start')` contract maps to.
+* `manip start-base` is the one separate, deliberate motion-enabling verb (an
+  alias for `manip component restart reactive-control`). Run it only beside
+  the emergency stop. Only after this can an approach actually drive the base.
+* `manip start ui` keeps the old UI-only lifecycle; `manip down` stops only
+  the task FSM; `manip status task` reports its health row.
+
 For UI-only lifecycle control, use:
 
 ```bash
-manip start
+manip start ui
 manip stop
 manip restart
 manip logs ui
 ```
 
 `manip stop` refuses to stop the workbench while Home, perception, planning,
-or grasp execution is active. It stops only the loopback UI/API and leaves the
-camera, perception, and passive telemetry components unchanged.
+or grasp execution is active. It stops the task FSM first (a clean supervisor
+SIGTERM), then only the loopback UI/API, and leaves the camera, perception,
+and passive telemetry components unchanged when invoked as `manip stop ui`.
+
+### 2.1 The mobile-manipulation task FSM
+
+The task FSM (`ros2/z_manip_task`, node `z_manip_task_runtime`) is the
+`/z_manip/task/request` → `/z_manip/task/status` state machine that owns a
+mobile pick end-to-end (phases: `idle → pose_settle → grounding/visual_search →
+standoff → coarse_nav → … → approach → closing → lift → verify → carry →
+place_* → complete`, with terminal `canceled`/`failed`). Its status publisher
+is latched (RELIABLE, TRANSIENT_LOCAL, depth 1), so a late subscriber — the
+z-agent bridge, `ros2 topic echo` — always receives the current phase
+immediately.
+
+Where it is built: the package is compiled by `colcon` **inside the runtime
+image** (`docker/runtime/Dockerfile` builds all seven `ros2/` packages into
+`/opt/z_manip_ws`). The build persists as an image layer, not in any
+container, so restarts and container recreation never lose it. After changing
+any `ros2/` package, rebuild the image from the repository root and re-tag the
+deployment image the runtime scripts use:
+
+```bash
+docker build --file docker/runtime/Dockerfile --tag z-manip-runtime:pinocchio .
+manip down && manip fsm start        # pick up the new layer
+```
+
+Lifecycle: `scripts/runtime/go2w_task_fsm.sh` (via `manip fsm start|status|
+down`) runs the fail-closed singleton supervisor
+(`z-manip-mobile-manipulation`) in one dedicated container (`z-manip-task`).
+The supervisor takes a deployment-scoped `flock`, requires an *empty* critical
+graph before launching (it refuses to start, and never terminates, a critical
+producer it did not own — e.g. the lab perception `z_manip_edgetam` container),
+launches `mobile_manipulation.launch.py`, and requires every critical
+node/topic to be *uniquely* present before reporting
+`[z-manip-supervisor] uniquely ready`. `manip status task` is healthy only
+when that marker has been printed and `/z_manip/task/status` has a live
+publisher.
+
+Because the full launch owns the perception nodes too, the FSM singleton and
+the lab perception bringup (`manip component restart perception`) are mutually
+exclusive on one ROS domain by design: stop one before starting the other.
+The supervisor's preflight enforces this instead of silently double-publishing.
 
 After changing perception, IK, planning code, configuration, or the robot
 URDF, use the following safe reload while no UI action is active:
