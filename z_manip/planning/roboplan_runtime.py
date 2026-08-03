@@ -92,11 +92,26 @@ class RoboplanConfig:
     home_path: Path = _REPO_ROOT / "configs/piper_home.json"
     group: str = "piper_arm"
 
-    # IK (roboplan SimpleIk).  Tolerances mirror ``IKConfig`` so a solution
-    # accepted by either backend is accepted by both; measured 0.82 ms mean /
-    # 1.65 ms p95 per solve, so the budget below is ~360 p95 solves.
-    ik_position_tolerance_m: float = 0.003
-    ik_orientation_tolerance_rad: float = 0.03
+    # IK (roboplan SimpleIk).  SimpleIk STOPS at the tolerance, it does not keep
+    # polishing, so here the tolerance IS the achieved accuracy.  RobustIKSolver
+    # behaves the opposite way: its least_squares overshoots its own gate and
+    # lands at 0.118 mm mean, but spends 62.5 ms doing it.
+    #
+    # 2026-08-03, 120 FK-of-collision-free targets on the real model, cold home
+    # seed, collision-checked, 12 restarts:
+    #     tol      solved   err mean   mean ms   p95 ms
+    #     3.0 mm   119/120   2.700 mm    0.86     1.81   <- was here
+    #     1.0 mm   119/120   0.908 mm    0.90     2.02   <- is here
+    #     0.3 mm   111/120   0.273 mm    1.07     2.86
+    #     0.1 mm   104/120   0.091 mm    1.23     3.00
+    # 1.0 mm is the knee: 3x the accuracy for 5% more time and NO solve-rate
+    # loss.  Tighter starts costing candidates, and candidate count is the whole
+    # reason this backend exists (grasp_pipeline.py:588-611).  Both values stay
+    # 6x inside the deployed gate (ik.position_tolerance_m 0.006,
+    # ik.orientation_tolerance_rad 0.06), so a solution accepted here is still
+    # accepted downstream.
+    ik_position_tolerance_m: float = 0.001
+    ik_orientation_tolerance_rad: float = 0.01
     ik_max_iterations: int = 220
     ik_restarts: int = 12
     ik_timeout_s: float = 0.60

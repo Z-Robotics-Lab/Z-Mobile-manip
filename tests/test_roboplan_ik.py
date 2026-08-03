@@ -378,10 +378,16 @@ def test_importing_the_module_does_not_import_roboplan():
 
 
 def test_stopping_norm_looser_than_acceptance_fails_closed(env):
-    """Otherwise every attempt 'succeeds' into a rejection and the ladder burns."""
+    """Otherwise every attempt 'succeeds' into a rejection and the ladder burns.
+
+    0.0005 m, not 0.001: the roboplan stopping norm IS 0.001 (see
+    ``RoboplanConfig.ik_position_tolerance_m`` and the sweep recorded there), so
+    an acceptance gate of 0.001 is equal, not looser, and would not trip this
+    guard.  This value has to stay strictly tighter than that default.
+    """
 
     with pytest.raises(ValueError, match="must not be looser"):
-        _solver(env, _ik_config(position_tolerance_m=0.001))
+        _solver(env, _ik_config(position_tolerance_m=0.0005))
 
 
 def test_a_disabled_backend_reports_disabled_and_not_a_config_error(env):
