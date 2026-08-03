@@ -69,8 +69,15 @@ RUN test "${ROS_DISTRO}" = "jazzy" \
 # Python surface is numpy arrays and URDF paths -- no Pinocchio object ever
 # crosses the boundary.  Verified: `import pinocchio` and `import roboplan` coexist
 # in one process, in either order.
+#
+# The import check sources ROS because apt's pinocchio lives under
+# /opt/ros/${ROS_DISTRO} and is not on the bare build-stage path.  It imports
+# pinocchio FIRST on purpose: that is the ordering the running stack uses, and
+# it is the order that would surface an ABI clash between apt's libpinocchio
+# and the wheel's vendored one.
 RUN python3 -m pip install --no-cache-dir --break-system-packages --no-deps \
         roboplan==0.6.0 \
+    && source "/opt/ros/${ROS_DISTRO}/setup.bash" \
     && python3 -c "import pinocchio, roboplan.core, roboplan.simple_ik, roboplan.rrt, \
                           roboplan.optimal_ik, roboplan.toppra, roboplan.cartesian_planning"
 
