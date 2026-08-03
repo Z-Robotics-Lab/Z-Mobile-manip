@@ -32,6 +32,7 @@ of 22 the residual is zero; ``wrist`` costs 0.18 mm.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
@@ -45,6 +46,7 @@ __all__ = [
     "CapsuleBody",
     "capsule_bodies",
     "write_planning_model",
+    "write_joint_limits",
     "build_scene",
 ]
 
@@ -232,6 +234,50 @@ def write_planning_model(
     return out_urdf, out_srdf
 
 
+def write_joint_limits(
+    joint_names: Sequence[str],
+    acceleration_limits: object,
+    out_dir: str | Path,
+) -> Path:
+    """Write the joint-limit YAML that teaches the Scene its acceleration caps.
+
+    ``go2w_sensored.urdf`` declares no acceleration limits, and Pinocchio does
+    not parse URDF 1.2 extended limits anyway, so a Scene built from the URDF
+    alone reports ``DBL_MAX`` (measured: 1.798e308 on every arm joint).  That is
+    not a cosmetic gap: ``roboplan.toppra`` reads its limits FROM the Scene and
+    accepts only a scalar scale, so an unbounded Scene means TOPP-RA runs with
+    no acceleration constraint at all and the caller is left auditing the output
+    after the fact.  Measured that way, 1 path in 8 came back 1.72x over the
+    requested cap and had to be rejected.
+
+    roboplan's own answer is the Scene ctor's ``yaml_config_path`` override, so
+    that is what this emits, from ``robot.acceleration_limits`` in the stack
+    config -- the same vector ``retime_path`` has always been handed.
+
+    Written by hand rather than via PyYAML: the file is six deterministic lines
+    and the package is not a declared dependency of this repo.
+    """
+
+    limits = np.asarray(acceleration_limits, dtype=float)
+    names = tuple(str(name) for name in joint_names)
+    if limits.shape != (len(names),):
+        raise ValueError(
+            f"acceleration limits {limits.shape} do not match {len(names)} joints",
+        )
+    if not np.all(np.isfinite(limits)) or np.any(limits <= 0.0):
+        raise ValueError("acceleration limits must be finite and positive")
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["joint_limits:"]
+    for name, value in zip(names, limits):
+        lines.append(f"  {name}:")
+        lines.append(f"    max_acceleration: [{value:.9g}]")
+    out_yaml = out_dir / "planning_limits.yaml"
+    out_yaml.write_text("\n".join(lines) + "\n")
+    return out_yaml
+
+
 def build_scene(
     urdf_path: str | Path,
     srdf_path: str | Path,
@@ -240,10 +286,17 @@ def build_scene(
     base_link: str,
     tip_link: str,
     out_dir: str | Path,
+    acceleration_limits: object | None = None,
     package_paths: tuple[str, ...] = (),
     name: str = "z_manip",
 ):
     """Build a roboplan ``Scene`` carrying the enforced capsule model.
+
+    ``acceleration_limits`` is ``robot.acceleration_limits`` from the stack
+    config.  Omitting it leaves the Scene reporting ``DBL_MAX`` and any
+    TOPP-RA built on it unconstrained in acceleration -- see
+    :func:`write_joint_limits`.  It stays optional so a caller that only wants
+    collision queries need not invent one.
 
     Imported lazily: roboplan lives on the 4090 only, never on the NUC thin
     deploy (see the NUC thin-deploy contract in README.md).
@@ -256,4 +309,8 @@ def build_scene(
     bodies = capsule_bodies(chain, model)
     out_urdf, out_srdf = write_planning_model(urdf_path, srdf_path, model, bodies, out_dir)
     urdf_dir = str(Path(urdf_path).resolve().parent)
-    return rc.Scene(name, str(out_urdf), str(out_srdf), [urdf_dir, *package_paths])
+    packages = [urdf_dir, *package_paths]
+    if acceleration_limits is None:
+        return rc.Scene(name, str(out_urdf), str(out_srdf), packages)
+    out_yaml = write_joint_limits(chain.joint_names, acceleration_limits, out_dir)
+    return rc.Scene(name, str(out_urdf), str(out_srdf), packages, str(out_yaml))

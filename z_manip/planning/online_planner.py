@@ -41,8 +41,18 @@ from z_manip.planning.grasp_pipeline import (
     CandidateFailure,
     grasp_pregrasp_pose,
     GraspPlanGenerator,
+    JointPlanner,
     PlannedGrasp,
     tool_tip_pose,
+)
+from z_manip.planning.roboplan_ik import RoboplanIKSolver
+from z_manip.planning.roboplan_planner import RoboplanJointPlanner
+from z_manip.planning.roboplan_runtime import scene_handle
+from z_manip.planning.roboplan_timing import ToppraRetimer
+from z_manip.planning.roboplan_wiring import (
+    env_backend,
+    RoboplanBackends,
+    SceneVerifiedJointPlanner,
 )
 from z_manip.planning.rrt_connect import JointSpaceRRTConnect
 from z_manip.planning.standoff import ReachabilityStandoffOptimizer
@@ -455,9 +465,12 @@ class OnlinePlanner:
             base_link=config.robot.base_link,
             tip_link=config.robot.tip_link,
         )
+        # Default OFF twice over: a config without the section selects nothing,
+        # and a section that selects a subsystem must also set `enabled`.
+        self.roboplan = config.roboplan or RoboplanBackends()
         self.ik_backend = os.environ.get(
             'Z_MANIP_IK_BACKEND',
-            'robust',
+            'roboplan' if self.roboplan.ik else 'robust',
         ).strip().lower()
         if self.ik_backend == 'pinocchio':
             self.ik = PinocchioIKSolver(
@@ -472,10 +485,87 @@ class OnlinePlanner:
         elif self.ik_backend == 'robust':
             self.ik = RobustIKSolver(self.chain, config.ik)
             self.mesh_self_collision = None
+        elif self.ik_backend == 'roboplan':
+            self.ik = RoboplanIKSolver(
+                self.roboplan.runtime,
+                config.robot,
+                config.ik,
+            )
+            # None, like 'robust' and unlike 'pinocchio'.  Setting this is not
+            # an addition but a SUBSTITUTION: it demotes the point-cloud
+            # checker's own capsule self-collision to supplemental pairs only
+            # (_check_self_collision(supplemental_only=True)) and hands the arm
+            # pairs to the mesh backend.
+            # roboplan's Scene is built from the same ENFORCED capsule file, but
+            # it is NOT the same check, and routing the arm pairs through it
+            # would SHRINK the enforced envelope by 10 mm.  roboplan_scene.py
+            # emits each capsule at radius + rigidity inflation (measured: max
+            # 0.112 mm, on `wrist`; exactly 0 for the other 21), while the
+            # capsule pass thresholds a self pair at r1 + r2 + scene_clearance_m
+            # = r1 + r2 + 0.010 (pointcloud.py, `threshold =` in
+            # _check_self_collision).  The Scene's self envelope is therefore a
+            # strict SUBSET, ~10 mm tighter to the metal on every one of the 112
+            # pairs -- including mount/palm, mount/finger_* and the ten
+            # `shoulder` pairs that keep the gripper out of its own base.
+            # Measured 2026-08-03 against the Scene these adapters actually
+            # build: over 600 random in-limit arm configs the Scene rejected 0
+            # that the deployed checker accepted (the checker rejected 12 the
+            # Scene accepted), and the Scene accepts configs/piper_home.json,
+            # which the checker rejects on ('mount','wrist') by 6.25 mm
+            # (tests/test_lidar_keepout.py records the same pair and margin).
+            # So the point-cloud checker keeps the last word on self-collision
+            # and the Scene may only ever ADD a check.  a8ecd46 shrank the
+            # Mid-360 capsule on exactly this reasoning -- another model was
+            # believed to cover it.  The Scene still collision-checks inside the
+            # IK solver itself; this attribute only decides who owns
+            # self-collision for the point-cloud checker.
+            self.mesh_self_collision = None
         else:
             raise ValueError(
                 f'unsupported Z_MANIP_IK_BACKEND: {self.ik_backend!r}',
             )
+        # Ordering only: a cheap FK distance over canned seeds that decides
+        # which grasp candidate is tried first.  roboplan's SimpleIk has no
+        # such thing, and PinocchioIKSolver already answers this by delegating
+        # to a RobustIKSolver, so roboplan borrows the same one rather than
+        # changing which grasp wins when the backend changes.
+        self.ik_ranker = (
+            self.ik
+            if hasattr(self.ik, 'make_seed_pose_ranker')
+            else RobustIKSolver(self.chain, config.ik)
+        )
+        # Both default OFF.  The RRT knobs stay in `config.rrt` for both
+        # backends -- deliberately not remapped from RoboplanConfig.rrt_*, so
+        # step size and collision resolution cannot drift apart or get swapped.
+        self.joint_planner_backend = env_backend(
+            'Z_MANIP_JOINT_PLANNER_BACKEND',
+            'rrt',
+            self.roboplan.joint_planner,
+        )
+        self.timing_backend = env_backend(
+            'Z_MANIP_TIMING_BACKEND',
+            'quintic',
+            self.roboplan.timing,
+        )
+        # One Scene for both, so the 618 ms build is paid once.  Built here so
+        # a disabled or missing roboplan fails at construction with a named
+        # reason instead of somewhere inside the first plan.
+        scene = (
+            scene_handle(self.roboplan.runtime, config.robot)
+            if 'roboplan' in (self.joint_planner_backend, self.timing_backend)
+            else None
+        )
+        self._roboplan_planner = (
+            RoboplanJointPlanner(scene, config=config.rrt)
+            if self.joint_planner_backend == 'roboplan'
+            else None
+        )
+        # Same signature as retime_path, so both call sites stay one token.
+        self.retime = (
+            ToppraRetimer(scene).retime_path
+            if self.timing_backend == 'roboplan'
+            else retime_path
+        )
         self.standoff = ReachabilityStandoffOptimizer(config.standoff)
         self.work_pose = BoundedSE2WorkPoseOptimizer(config.work_pose)
         self.T_platform_piper = fixed_transform_from_urdf(
@@ -484,6 +574,25 @@ class OnlinePlanner:
             config.robot.base_link,
         )
         self.grasp_generate = grasp_generate
+
+    def _joint_planner(
+        self,
+        state_valid: Callable[[object], bool],
+    ) -> JointPlanner:
+        """Build the configured joint planner over one validity predicate."""
+
+        checked = JointSpaceRRTConnect(
+            joint_names=self.chain.joint_names,
+            lower_limits=self.chain.lower_limits,
+            upper_limits=self.chain.upper_limits,
+            state_valid=state_valid,
+            config=self.config.rrt,
+        )
+        if self._roboplan_planner is None:
+            return checked
+        # roboplan searches self-collision only; `checked` is the one that
+        # carries the perceived scene, so it verifies what roboplan returns.
+        return SceneVerifiedJointPlanner(self._roboplan_planner, checked)
 
     def _fixed_fixture_state_valid(self, joints: object) -> bool:
         """Planner callback for immutable robot-mounted fixture geometry."""
@@ -752,15 +861,12 @@ class OnlinePlanner:
                 and transit_checker.is_state_valid(joints)
             )
 
-        joint_planner = JointSpaceRRTConnect(
-            joint_names=self.chain.joint_names,
-            lower_limits=self.chain.lower_limits,
-            upper_limits=self.chain.upper_limits,
-            state_valid=transit_state_valid,
-            config=self.config.rrt,
-        )
+        joint_planner = self._joint_planner(transit_state_valid)
         if pose_ranker is None:
-            pose_ranker = self.ik.make_seed_pose_ranker(current_joints, control)
+            pose_ranker = self.ik_ranker.make_seed_pose_ranker(
+                current_joints,
+                control,
+            )
         planned = GraspPlanGenerator(
             self.ik,
             joint_planner,
@@ -1037,7 +1143,7 @@ class OnlinePlanner:
                     self.config.time_parameterization.min_segment_time_s,
                 )),
             )
-        return retime_path(
+        return self.retime(
             waypoints,
             self.chain.velocity_limits,
             np.asarray(self.config.robot.acceleration_limits, dtype=float),
@@ -1543,13 +1649,7 @@ class OnlinePlanner:
                 and checker.is_state_valid(joints)
             )
 
-        planner = JointSpaceRRTConnect(
-            joint_names=self.chain.joint_names,
-            lower_limits=self.chain.lower_limits,
-            upper_limits=self.chain.upper_limits,
-            state_valid=attached_state_valid,
-            config=self.config.rrt,
-        )
+        planner = self._joint_planner(attached_state_valid)
         path = planner.plan_joint(
             current,
             goal,
@@ -1557,7 +1657,7 @@ class OnlinePlanner:
             control=control,
         )
         checkpoint(control, 'attached-object trajectory retiming')
-        return retime_path(
+        return self.retime(
             path.waypoints,
             self.chain.velocity_limits,
             self.config.robot.acceleration_limits,

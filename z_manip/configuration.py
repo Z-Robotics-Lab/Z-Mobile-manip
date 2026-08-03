@@ -20,6 +20,7 @@ from z_manip.kinematics.robust_ik import IKConfig
 from z_manip.orchestration.mobile_manipulation import RetryBudget
 from z_manip.planning.grasp_pipeline import GraspPlanConfig
 from z_manip.planning.placement import PlacementDeploymentConfig
+from z_manip.planning.roboplan_wiring import RoboplanBackends
 from z_manip.planning.rrt_connect import RRTConnectConfig
 from z_manip.planning.standoff import ReachabilityStandoffConfig
 from z_manip.planning.time_parameterization import TimeParameterizationConfig
@@ -32,7 +33,7 @@ _SCHEMA_VERSION = 2
 # planning container as a single file, so a checkout that adds a section
 # reaches the loader through the hot-reloaded package long before the stale
 # mount is replaced; requiring one would take the running stack down.
-_OPTIONAL_SECTIONS = frozenset({"placement"})
+_OPTIONAL_SECTIONS = frozenset({"placement", "roboplan"})
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,8 @@ class StackConfig:
     time_parameterization: TimeParameterizationConfig
     retry_budget: RetryBudget
     placement: PlacementDeploymentConfig | None
+    #: ``None`` for a config without the section: every backend stays numpy.
+    roboplan: RoboplanBackends | None
     collision_model_path: Path
     vlm_models: tuple[str, ...]
 
@@ -495,6 +498,13 @@ def load_stack_config(
                     _mapping(values["placement"], "placement"),
                 )
                 if "placement" in values
+                else None
+            ),
+            roboplan=(
+                RoboplanBackends.from_mapping(
+                    _mapping(values["roboplan"], "roboplan"),
+                )
+                if "roboplan" in values
                 else None
             ),
             collision_model_path=collision,

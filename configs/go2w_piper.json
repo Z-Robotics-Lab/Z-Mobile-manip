@@ -261,6 +261,12 @@
       ]
     ]
   },
+  "roboplan": {
+    "enabled": false,
+    "ik": false,
+    "joint_planner": false,
+    "timing": false
+  },
   "collision_model": "piper_collision_capsules.json",
   "vlm_models": [
     "qwen/qwen3-vl-8b-instruct:nitro",

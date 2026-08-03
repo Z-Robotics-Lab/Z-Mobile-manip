@@ -211,3 +211,68 @@ def test_acm_leaves_exactly_the_configured_pairs_enabled(fixtures, tmp_path):
     }
     # The source SRDF's arm group must survive so roboplan can plan for it.
     assert srdf.find(".//group[@name='piper_arm']") is not None
+
+
+# ---------------------------------------------------------------------------
+# The joint-limit YAML.  The URDF declares no acceleration limits, so without
+# this the Scene answers DBL_MAX and roboplan.toppra -- which reads its limits
+# FROM the Scene and takes only a scalar scale -- runs with no acceleration
+# constraint at all.  Measured that way, 1 densified path in 8 came back 1.72x
+# over the requested cap.
+# ---------------------------------------------------------------------------
+
+def test_joint_limits_yaml_matches_the_chain(fixtures, tmp_path):
+    from z_manip.planning.roboplan_scene import write_joint_limits
+
+    _, chain, _ = fixtures
+    limits = [1.5, 1.5, 1.5, 2.0, 2.0, 2.0]
+    text = write_joint_limits(chain.joint_names, limits, tmp_path).read_text()
+    for name, value in zip(chain.joint_names, limits):
+        assert f"  {name}:" in text
+        assert f"max_acceleration: [{value:g}]" in text
+
+
+@pytest.mark.parametrize(
+    "limits, match",
+    [
+        ([1.5, 1.5, 1.5], "do not match"),
+        ([1.5, 1.5, 1.5, 2.0, 2.0, 0.0], "finite and positive"),
+        ([1.5, 1.5, 1.5, 2.0, 2.0, np.inf], "finite and positive"),
+    ],
+)
+def test_bad_acceleration_limits_fail_closed(fixtures, tmp_path, limits, match):
+    from z_manip.planning.roboplan_scene import write_joint_limits
+
+    _, chain, _ = fixtures
+    with pytest.raises(ValueError, match=match):
+        write_joint_limits(chain.joint_names, limits, tmp_path)
+
+
+def test_the_scene_reports_the_configured_acceleration_not_dbl_max(tmp_path):
+    """The regression that motivated the YAML: an unbounded Scene.
+
+    This is the assertion that would have caught it -- ``getAccelerationLimit
+    Vectors`` answering 1.798e308 is what let TOPP-RA ignore the cap.
+    """
+
+    pytest.importorskip("roboplan.core", reason="roboplan is a 4090-only dependency")
+    from z_manip.planning.roboplan_scene import build_scene
+
+    limits = [1.5, 1.5, 1.5, 2.0, 2.0, 2.0]
+    scene = build_scene(
+        URDF, SRDF, MODEL,
+        base_link="piper_base_link", tip_link="piper_gripper_base",
+        out_dir=tmp_path / "with", acceleration_limits=limits,
+    )
+    _, upper = scene.getAccelerationLimitVectors("piper_arm")
+    assert np.all(np.isfinite(upper))
+    np.testing.assert_allclose(upper, limits)
+
+    # And without: still DBL_MAX, so the caller cannot mistake one for the other.
+    bare = build_scene(
+        URDF, SRDF, MODEL,
+        base_link="piper_base_link", tip_link="piper_gripper_base",
+        out_dir=tmp_path / "bare",
+    )
+    _, unbounded = bare.getAccelerationLimitVectors("piper_arm")
+    assert np.all(unbounded > 1e300)
