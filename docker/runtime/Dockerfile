@@ -58,6 +58,22 @@ RUN test "${ROS_DISTRO}" = "jazzy" \
         ros-${ROS_DISTRO}-visualization-msgs \
     && rm -rf /var/lib/apt/lists/*
 
+# roboplan (planning/IK, see z_manip/planning/roboplan_scene.py).  Pinned: it is
+# pre-1.0 and 0.6.0 swapped the OInK QP backend from OSQP to ProxQP.
+#
+# --no-deps is load-bearing, twice over.  Its `pin >=4.1` requirement would pull
+# a second, pip-installed Pinocchio alongside apt's ros-jazzy-pinocchio 4.0, and
+# its numpy>=2 would try to uninstall Debian's numpy 1.26 (which fails, and would
+# take rclpy with it if it succeeded).  Neither is needed: the wheel vendors its
+# own libpinocchio/coal under an RPATH, its bindings are nanobind, and its whole
+# Python surface is numpy arrays and URDF paths -- no Pinocchio object ever
+# crosses the boundary.  Verified: `import pinocchio` and `import roboplan` coexist
+# in one process, in either order.
+RUN python3 -m pip install --no-cache-dir --break-system-packages --no-deps \
+        roboplan==0.6.0 \
+    && python3 -c "import pinocchio, roboplan.core, roboplan.simple_ik, roboplan.rrt, \
+                          roboplan.optimal_ik, roboplan.toppra, roboplan.cartesian_planning"
+
 # The core is intentionally copied without refs, models, evidence, or secrets.
 # It remains a normal importable package while avoiding a system pip mutation.
 WORKDIR /opt/z_manip
