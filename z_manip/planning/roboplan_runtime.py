@@ -56,6 +56,37 @@ __all__ = [
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _deployed(*candidates: Path) -> Path:
+    """First candidate that exists, else the first (so the error names the repo).
+
+    The package sits in two different layouts and the defaults have to resolve
+    in both.  In a checkout, ``configs/`` and ``ros2/`` are siblings of
+    ``z_manip/``.  In the runtime container they are not: the lab script mounts
+    only the package (``$ROOT_DIR/z_manip -> /opt/z_manip/python/z_manip``,
+    go2w_perception_lab.sh:291), while ``configs/`` is baked one level up at
+    ``/opt/z_manip/configs`` and ``ros2/`` is installed into the colcon prefix
+    at ``/opt/z_manip_ws/install/share``.  Deriving every default from
+    ``_REPO_ROOT`` therefore pointed at three paths that exist only on a
+    developer host -- found by running it in the live planning runner, not by
+    any offline test, because no offline test mounts the package that way.
+    """
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+_SRDF_DEFAULT = _deployed(
+    _REPO_ROOT / "ros2/z_manip_motion/config/piper.srdf",
+    Path("/opt/z_manip_ws/install/share/z_manip_motion/config/piper.srdf"),
+)
+_CONFIGS_DEFAULT = _deployed(
+    _REPO_ROOT / "configs",
+    _REPO_ROOT.parent / "configs",
+)
+
+
 class RoboplanUnavailable(RuntimeError):
     """roboplan was selected but this runtime cannot provide it.
 
@@ -87,9 +118,9 @@ class RoboplanConfig:
     #: Where the derived capsule-only URDF/SRDF pair is written.  These are
     #: build products of ``roboplan_scene.write_planning_model``, not inputs.
     scene_cache_dir: Path = Path("/tmp/z_manip_roboplan")
-    srdf_path: Path = _REPO_ROOT / "ros2/z_manip_motion/config/piper.srdf"
-    collision_model_path: Path = _REPO_ROOT / "configs/piper_collision_capsules.json"
-    home_path: Path = _REPO_ROOT / "configs/piper_home.json"
+    srdf_path: Path = _SRDF_DEFAULT
+    collision_model_path: Path = _CONFIGS_DEFAULT / "piper_collision_capsules.json"
+    home_path: Path = _CONFIGS_DEFAULT / "piper_home.json"
     group: str = "piper_arm"
 
     # IK (roboplan SimpleIk).  SimpleIk STOPS at the tolerance, it does not keep

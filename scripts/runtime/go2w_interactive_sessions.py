@@ -62,7 +62,15 @@ PERCEPTION = SCRIPT_DIR / "go2w_perception_dry_run.py"
 SESSION_GATE = SCRIPT_DIR / "piper_planning_session_gate.py"
 PLANNER = SCRIPT_DIR / "piper_planning_dry_run.py"
 PLANNING_WORKER = SCRIPT_DIR / "piper_planning_worker.py"
-STACK_CONFIG = STACK_ROOT / "configs" / "go2w_piper.json"
+# Overridable so a session can be run against an alternative stack config
+# without editing the deployed one -- configs/go2w_piper.roboplan.json is the
+# opt-in that turns the roboplan backends on.  It is bind-mounted OVER
+# /opt/z_manip/configs/go2w_piper.json in the runner (see the mount below), so
+# whatever this points at is what the planner reads, image contents aside.
+STACK_CONFIG = Path(
+    os.environ.get("Z_MANIP_STACK_CONFIG_HOST")
+    or STACK_ROOT / "configs" / "go2w_piper.json"
+)
 DEBUG_BUNDLE = SCRIPT_DIR / "go2w_debug_bundle.py"
 SAFETY_GATE = SCRIPT_DIR / "go2w_debug_safety_gate.py"
 COMPONENT_MANAGER = SCRIPT_DIR / "go2w_component_manager.sh"

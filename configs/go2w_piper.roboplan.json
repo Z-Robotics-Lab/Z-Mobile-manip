@@ -265,7 +265,6 @@
     "enabled": true,
     "ik": true,
     "joint_planner": true,
-    "_timing": "OFF on purpose: TOPP-RA misses the acceleration cap on 1 in 8 densified paths (measured 1.90x). It fails closed, so the symptom is a refused retiming, not a fast arm -- but 1/8 refusals is not fit to run.",
     "timing": false
   },
   "collision_model": "piper_collision_capsules.json",
