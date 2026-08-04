@@ -172,6 +172,7 @@ class AntipodalGraspSource:
         symmetry_span_deg: float = 110.0,
         symmetry_rms_ratio: float = 0.08,
         symmetry_min_slab_points: int = 40,
+        round_diameter_band_max: float = 1.20,
         support_radius_m: float = 0.25,
         support_bin_m: float = 0.005,
         support_clearance_m: float = 0.035,
@@ -219,6 +220,25 @@ class AntipodalGraspSource:
         self.symmetry_span_cos_bins = max(1, int(round(float(symmetry_span_deg) / 10.0)))
         self.symmetry_rms_ratio = max(1e-3, float(symmetry_rms_ratio))
         self.symmetry_min_slab_points = max(12, int(symmetry_min_slab_points))
+        # How far the fitted circle may exceed the widest horizontal extent that
+        # was actually OBSERVED, and still be believed.  A real circle cannot be
+        # meaningfully wider than the footprint it was measured in; a misfit on
+        # a non-round object can, and does.  Measured over the single-view rig
+        # at 30 and 50 deg elevation, three seeds each, as diameter/extent:
+        #
+        #   true cylinder d85 / d80 / d66     1.04 1.05 1.04 1.06 1.03 1.05
+        #   carton, 4 mm and 8 mm fillet      1.31 1.39
+        #
+        # The inherited 1.4 sat above BOTH clusters, so it never separated them.
+        # 1.20 is near the log-midpoint of the gap and is the same statement as
+        # ``symmetry_span_deg``: for an arc of half-angle a the diameter is
+        # 1/sin(a) times the chord, so 1.20 admits arcs down to 111 deg and 110
+        # is the configured span floor.  Cylinders measure ~1.0 rather than the
+        # chord ratio because a look-down view sees the TOP DISC, which fills
+        # the footprint in both directions -- which is exactly the regime this
+        # robot works in.  Open this knob if a real cylinder is ever refused on
+        # hardware; the cost is that a badly-occluded box may be believed round.
+        self.round_diameter_band_max = max(1.0, float(round_diameter_band_max))
         # Support-plane anchor.  ``support_radius_m`` is the neighbourhood the
         # support is looked for in (0 disables the anchor entirely and restores
         # the observed-cloud behaviour); ``support_clearance_m`` is the lowest
@@ -715,7 +735,14 @@ class AntipodalGraspSource:
                 diameter_band=diameter_band,
             )
 
-        reference = fit_at(mass_center_h, detect_half, (0.6, 1.4))
+        # The upper band is what keeps a rounded-corner carton from being
+        # completed into an 87 mm "cylinder": its fitted circle overshoots the
+        # observed 67 mm footprint by 1.31x, a true cylinder by at most 1.06x.
+        # Since the caller now REFUSES a round object too wide for the jaw
+        # instead of falling through to the OBB faces, that misfit is no longer
+        # harmless -- it is a total grasp failure on the only objects on this
+        # bench the jaw can close around.
+        reference = fit_at(mass_center_h, detect_half, (0.6, self.round_diameter_band_max))
         if reference is None:
             return None
 
@@ -741,7 +768,7 @@ class AntipodalGraspSource:
                 # A validated round detection anchors the evaluation slabs, so
                 # a genuinely narrower neck (well under the body diameter) may
                 # pass; the centre-footprint and inlier floors still apply.
-                fit = fit_at(float(height), eval_half, (0.3, 1.4))
+                fit = fit_at(float(height), eval_half, (0.3, self.round_diameter_band_max))
                 if fit is None:
                     continue
                 cost = 2.0 * fit[2] + self.height_margin_weight * offset

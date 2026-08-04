@@ -497,3 +497,38 @@ def test_retime_reach_refuses_a_disjoint_approach(deployed):
     approach = approach + 0.05
     with pytest.raises(PlanningError, match="transit endpoint"):
         deployed.retime_reach(transit, approach)
+
+
+def test_the_staged_transit_rollback_flag_reaches_every_phase():
+    """``--staged-transit-stop`` must not silently do nothing.
+
+    ``execute_full_grasp`` took ``direct_transit`` from the start; the durable
+    workflow phases (``pick-hold`` and friends) did not, and ``main`` did not
+    pass it to them.  So the documented way to roll the new streamed transit
+    back was accepted on the command line, printed no warning, and streamed
+    anyway -- on a powered arm, for an operator who believed they had disabled
+    it.  Signature-level, because exercising the real path needs hardware.
+    """
+
+    import importlib.util
+    import inspect
+    from pathlib import Path
+
+    import sys
+
+    runtime = Path(__file__).resolve().parents[1] / "scripts/runtime"
+    sys.path.insert(0, str(runtime))          # it imports piper_staged_grasp_executor
+    path = runtime / "piper_full_grasp_executor.py"
+    spec = importlib.util.spec_from_file_location("full_grasp_flag_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    for name in ("execute_full_grasp", "execute_workflow_phase"):
+        assert "direct_transit" in inspect.signature(getattr(module, name)).parameters, (
+            f"{name} cannot honour --staged-transit-stop"
+        )
+
+    # ...and main forwards it to BOTH, not just the one-shot path.
+    source = inspect.getsource(module.main)
+    assert source.count("direct_transit=direct_transit") == 2
+    assert "direct_transit = not args.staged_transit_stop" in source

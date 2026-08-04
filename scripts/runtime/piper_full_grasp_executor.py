@@ -600,6 +600,7 @@ def execute_workflow_phase(
     gripper_force_n: float,
     executor_start: tuple[int, int] | None = None,
     direct_approach: bool = True,
+    direct_transit: bool = True,
 ) -> dict[str, object]:
     """Execute one durable pick/hold/return/place-back workflow transition."""
     if workflow_phase == "pick-hold":
@@ -620,6 +621,7 @@ def execute_workflow_phase(
             speed_percent=speed_percent,
             segment_timeout_s=segment_timeout_s,
             gripper_force_n=gripper_force_n,
+            direct_transit=direct_transit,
         )
         pregrasp_receipt = _receipt(
             artifact=artifact, stage="pregrasp", prior=None, started_ns=started,
@@ -964,6 +966,7 @@ def main() -> int:
                     gripper_force_n=args.gripper_force_n,
                     executor_start=executor_start,
                     direct_approach=direct_approach,
+                    direct_transit=direct_transit,
                 )
             print(json.dumps(result, indent=2))
             return 0

@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pytest
 from types import SimpleNamespace
@@ -618,6 +620,90 @@ def test_a_carton_is_not_completed_into_a_cylinder(wall_depth_m):
     assert open_gate._round_cross_section(
         carton, obb, open_gate.up_axis, anchor_h=anchor
     ) is None
+
+
+def _rounded_carton(fillet_m, elevation_deg=30.0, half=(0.0225, 0.0325, 0.050),
+                    noise_m=0.0008, seed=0):
+    """ONE wrist view of an upright carton with rounded vertical edges.
+
+    ``_look_down_carton`` is a perfectly sharp box, and the sharp case is the
+    easy one -- its corners are what the roundness residual keys on.  Real juice
+    boxes are filleted, and the misfit only appears in a genuine single view
+    with real depth noise, so this reproduces both.
+    """
+
+    hx, hy, hz = half
+    ax, ay = hx - fillet_m, hy - fillet_m
+    profile = []
+    for cx, cy, a0 in ((ax, ay, 0.0), (-ax, ay, 0.5 * np.pi),
+                       (-ax, -ay, np.pi), (ax, -ay, 1.5 * np.pi)):
+        for a in np.linspace(a0, a0 + 0.5 * np.pi, 50):
+            profile.append((cx + fillet_m * np.cos(a), cy + fillet_m * np.sin(a)))
+    for t in np.linspace(-ax, ax, 100):
+        profile += [(t, hy), (t, -hy)]
+    for t in np.linspace(-ay, ay, 100):
+        profile += [(hx, t), (-hx, t)]
+
+    rng = np.random.default_rng(seed)
+    base = np.array([0.48, 0.0, 0.0])
+    elevation = math.radians(elevation_deg)
+    camera = base + np.array([0.0, 0.0, hz]) + 0.55 * np.array(
+        [-math.cos(elevation), 0.0, math.sin(elevation)]
+    )
+    points, normals = [], []
+    for z in np.linspace(0.002, 2.0 * hz, 70):                      # walls
+        for (x, y) in profile:
+            outward = np.array([x, y, 0.0])
+            points.append(base + np.array([x, y, z]))
+            normals.append(outward / max(float(np.linalg.norm(outward)), 1e-9))
+    for t in np.linspace(0.0, 1.0, 26):                             # top face
+        for (x, y) in profile:
+            points.append(base + np.array([x * t, y * t, 2.0 * hz]))
+            normals.append(np.array([0.0, 0.0, 1.0]))
+    points, normals = np.asarray(points), np.asarray(normals)
+    ray = camera - points
+    ray /= np.linalg.norm(ray, axis=1)[:, None]
+    keep = np.einsum("ij,ij->i", normals, ray) > 0.15
+    return points[keep] + rng.normal(0.0, noise_m, (int(keep.sum()), 3))
+
+
+def test_a_rounded_corner_carton_is_not_completed_into_a_cylinder():
+    # test_a_carton_is_not_completed_into_a_cylinder proves it for a SHARP box
+    # and generalises to "boxes stay out on the roundness residual".  That
+    # generalisation is false: a filleted carton in one noisy view passes both
+    # the residual AND the arc-bin gate -- its corners scatter inliers right
+    # around the circle -- and gets completed into an ~87 mm cylinder.  Since
+    # the caller now REFUSES a too-wide round object rather than falling
+    # through to the OBB faces, that misfit is a total grasp failure on the
+    # only objects on this bench the jaw can actually close around.
+    #
+    # What catches it is that the fitted circle overshoots the observed
+    # footprint (1.31x measured) where a true cylinder does not (1.03-1.06x).
+    # 8 mm of fillet on a 45x65 mm carton.  A 4 mm fillet is a milder misfit
+    # that stays inside the band, so it is not claimed here.
+    carton = _rounded_carton(0.008)
+    source = AntipodalGraspSource(max_candidates=8)
+    obb = source._fit_obb(carton, source.up_axis)
+    anchor = source._support_anchored_height(carton, _bench(), source.up_axis)
+
+    assert source._round_cross_section(
+        carton, obb, source.up_axis, anchor_h=anchor
+    ) is None
+
+    # Guard the guard: with the inherited 1.4 band it IS mistaken for a
+    # cylinder, so this test fails for the reason it claims to.
+    loose = AntipodalGraspSource(max_candidates=8, round_diameter_band_max=1.4)
+    section = loose._round_cross_section(
+        carton, obb, loose.up_axis, anchor_h=anchor
+    )
+    assert section is not None
+    assert section.diameter > 1.2 * max(
+        obb.full_extent[i] for i in range(3) if i != obb.vertical_index
+    )
+
+    # ...and with the gate in place the carton still gets its real 45 mm face.
+    grasps = source.generate(_context(carton))
+    assert grasps.widths[int(np.argmax(grasps.scores))] == pytest.approx(0.045, abs=0.006)
 
 
 def test_a_carton_seen_from_above_is_also_anchored_to_the_bench():
