@@ -110,6 +110,14 @@ LIFT_STREAM_REFERENCE_SPEED_PERCENT = 15
 # (b) removes the stop-and-go halt at the pregrasp standoff (now a via).  The
 # reference speed is deliberately gentle so the tool creeps into contact.
 APPROACH_STREAM_REFERENCE_SPEED_PERCENT = 15
+# The transit was the last leg still executed as stepped point-to-point move_j
+# behind a per-waypoint in-tolerance gate, which halts the arm at EVERY vertex
+# however smooth the planned profile is -- a controller-enforced stop-and-go no
+# retiming can remove.  Stream it from the artifact's own retimed trajectory,
+# exactly like the approach and the lift.  The planner now gives transit and
+# approach ONE continuous profile, so streaming both is what makes the standoff
+# a via in wall time rather than only on paper.
+TRANSIT_STREAM_REFERENCE_SPEED_PERCENT = 15
 # Measured PiPER S-V1.8-8 continuous joint rate, in degrees per second per
 # percent of set_speed_percent.  Regressed from the recorded pregrasp transits,
 # which execute as ONE coalesced move_j edge so leg_time = arc/rate + fixed
@@ -1920,6 +1928,7 @@ def execute_stage(
     feedback_tolerance_rad: float = DEFAULT_FEEDBACK_TOLERANCE_RAD,
     gripper_force_n: float = 1.0,
     direct_approach: bool = True,
+    direct_transit: bool = True,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[np.ndarray, GripperFeedback | None]:
@@ -1928,6 +1937,12 @@ def execute_stage(
     ``direct_approach`` (default) streams the ``approach_close`` descent from the
     artifact's retimed quintic as one continuous move into the exact grasp pose;
     ``direct_approach=False`` restores the legacy stepped, stop-and-go approach.
+
+    ``direct_transit`` (default) streams the ``pregrasp`` transit from the same
+    artifact instead of stepping its vertices point-to-point, so the arm does
+    not halt at every transit waypoint on its way to the standoff;
+    ``direct_transit=False`` restores the legacy stepped transit.  A transit
+    needing joint-limit start reconciliation always takes the stepped path.
     """
     guard = CommandGuard()
     gripper_result: GripperFeedback | None = None
@@ -1967,6 +1982,35 @@ def execute_stage(
                 monotonic=monotonic,
                 sleep=sleep,
             )
+            if not artifact.requires_start_reconciliation and direct_transit:
+                # Stream the planner's own transit profile.  Its dense samples
+                # are proven to ride the same collision-checked raw polyline
+                # inside ``timed_stage_path``, and the profile now carries a
+                # non-zero velocity through every interior via.
+                timed_transit, transit_times_s = timed_stage_path(artifact, "transit")
+                if (
+                    float(np.max(np.abs(timed_transit[0] - path[0]))) > 1e-5
+                    or float(np.max(np.abs(timed_transit[-1] - path[-1]))) > 1e-5
+                ):
+                    raise SafetyError(
+                        "timed transit path differs from authorized raw transit",
+                    )
+                return (
+                    execute_timed_joint_path(
+                        robot,
+                        timed_transit,
+                        transit_times_s,
+                        guard,
+                        speed_percent=speed_percent,
+                        segment_timeout_s=segment_timeout_s,
+                        start_tolerance_rad=start_tolerance_rad,
+                        feedback_tolerance_rad=feedback_tolerance_rad,
+                        reference_speed_percent=TRANSIT_STREAM_REFERENCE_SPEED_PERCENT,
+                        monotonic=monotonic,
+                        sleep=sleep,
+                    ),
+                    gripper_result,
+                )
             transit_path = path
             if artifact.requires_start_reconciliation:
                 execute_joint_path(
@@ -2335,6 +2379,15 @@ def build_parser() -> argparse.ArgumentParser:
             "contact (the accurate default)"
         ),
     )
+    parser.add_argument(
+        "--staged-transit-stop",
+        action="store_true",
+        help=(
+            "legacy fallback: step the pregrasp transit point-to-point, "
+            "halting at every waypoint, instead of streaming the planner's "
+            "continuous transit profile (the smooth default)"
+        ),
+    )
     return parser
 
 
@@ -2421,6 +2474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             robot, effector = connect_real_arm(args.channel, args.firmware)
             started_ns = time.time_ns()
             direct_approach = not args.staged_approach_stop
+            direct_transit = not args.staged_transit_stop
             final_joints, gripper = execute_stage(
                 robot,
                 effector,
@@ -2431,6 +2485,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 segment_timeout_s=args.segment_timeout_s,
                 gripper_force_n=args.gripper_force_n,
                 direct_approach=direct_approach,
+                direct_transit=direct_transit,
             )
             finished_ns = time.time_ns()
             receipt = build_receipt(

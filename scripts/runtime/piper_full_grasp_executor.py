@@ -400,6 +400,7 @@ def execute_full_grasp(
     executor_start: tuple[int, int] | None = None,
     planning_session_id: str = "",
     direct_approach: bool = True,
+    direct_transit: bool = True,
 ) -> dict[str, object]:
     """Run the complete pick, visible lift, place-back and checked return."""
 
@@ -428,6 +429,7 @@ def execute_full_grasp(
         speed_percent=speed_percent,
         segment_timeout_s=segment_timeout_s,
         gripper_force_n=gripper_force_n,
+        direct_transit=direct_transit,
     )
     pregrasp_receipt = _receipt(
         artifact=artifact,
@@ -861,6 +863,15 @@ def build_parser() -> argparse.ArgumentParser:
             "default)"
         ),
     )
+    parser.add_argument(
+        "--staged-transit-stop",
+        action="store_true",
+        help=(
+            "legacy fallback: step the pregrasp transit point-to-point, "
+            "halting at every waypoint, instead of streaming the planner's "
+            "continuous transit profile (the smooth default)"
+        ),
+    )
     return parser
 
 
@@ -929,6 +940,7 @@ def main() -> int:
             # yet been emitted.
             executor_start = (time.time_ns(), time.monotonic_ns())
             direct_approach = not args.staged_approach_stop
+            direct_transit = not args.staged_transit_stop
             if args.workflow_phase == "full":
                 result = execute_full_grasp(
                     robot, effector, artifact, receipt_dir=args.receipt_dir,
@@ -939,6 +951,7 @@ def main() -> int:
                     executor_start=executor_start,
                     planning_session_id=args.planning_session_id or "",
                     direct_approach=direct_approach,
+                    direct_transit=direct_transit,
                 )
             else:
                 result = execute_workflow_phase(

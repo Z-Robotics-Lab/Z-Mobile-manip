@@ -1150,6 +1150,69 @@ class OnlinePlanner:
             self.config.time_parameterization,
         )
 
+    def retime_reach(
+        self,
+        transit_path: object,
+        approach_path: object,
+    ) -> tuple[TimedJointTrajectory, TimedJointTrajectory]:
+        """Retime transit+approach as ONE profile, sliced back at the standoff.
+
+        The standoff is the sharpest corner of the whole reach (measured 56.6
+        deg in joint space against 1.2 deg at every other approach vertex), so
+        retiming the two legs separately is what forces a full stop there and
+        another at each interior via.  Concatenating first makes the standoff
+        an interior via of one continuous profile; the dense samples are then
+        sliced back at that via so the staged artifact, its per-stage
+        authorization and its collision coverage are all unchanged.
+
+        The slice endpoints are pinned to the exact checked joints, so the
+        executor's transit-to-approach continuity assertion still holds.
+        """
+
+        transit = np.asarray(transit_path, dtype=float)
+        approach = np.asarray(approach_path, dtype=float)
+        if float(np.max(np.abs(approach[0] - transit[-1]))) > 1e-7:
+            raise PlanningError('approach does not start at the transit endpoint')
+        fused = np.vstack((transit, approach[1:]))
+        if len(fused) < 2 or np.all(
+            np.linalg.norm(np.diff(fused, axis=0), axis=1) < 1e-12
+        ):
+            # Nothing to fuse (a stationary hold); keep the per-leg behaviour.
+            return (
+                self._retime_joint_path(transit, allow_stationary_hold=True),
+                self._retime_joint_path(approach),
+            )
+        timed = self._retime_joint_path(fused)
+        via = int(np.argmin(
+            np.max(np.abs(timed.positions - transit[-1]), axis=1),
+        ))
+        # The retimer places a sample exactly on every vertex it was handed, so
+        # a via that is not ON the standoff means the profile no longer rides
+        # the checked polyline.  Fail here rather than ship a plan whose stage
+        # boundary is a joint the operator never authorized.
+        drift = float(np.max(np.abs(timed.positions[via] - transit[-1])))
+        if drift > 1e-6 or not 0 < via < len(timed.positions) - 1:
+            raise PlanningError(
+                'retimed reach does not pass through the pregrasp standoff '
+                f'(closest sample {via} off by {drift:.2e} rad)',
+            )
+        transit_positions = timed.positions[: via + 1].copy()
+        approach_positions = timed.positions[via:].copy()
+        transit_positions[0] = transit[0]
+        transit_positions[-1] = transit[-1]
+        approach_positions[0] = approach[0]
+        approach_positions[-1] = approach[-1]
+        return (
+            TimedJointTrajectory(
+                positions=transit_positions,
+                times_s=timed.times_s[: via + 1].copy(),
+            ),
+            TimedJointTrajectory(
+                positions=approach_positions,
+                times_s=timed.times_s[via:] - timed.times_s[via],
+            ),
+        )
+
     def pregrasp_program(
         self,
         observation: PerceptionObservation,
@@ -1262,10 +1325,13 @@ class OnlinePlanner:
         transit_path = np.asarray(planned.transit.waypoints, dtype=float)
         approach_path = np.vstack((transit_path[-1], planned.approach_joints))
         lift_path = np.vstack((approach_path[-1], planned.lift_joints))
+        transit, approach = self.retime_reach(transit_path, approach_path)
         return MotionProgram(
             planned=planned,
-            transit=self._retime_joint_path(transit_path),
-            approach=self._retime_joint_path(approach_path),
+            transit=transit,
+            approach=approach,
+            # The lift starts after the gripper has closed, which is a real
+            # stop no retimer can remove, so it keeps its own profile.
             lift=self._retime_joint_path(lift_path),
         )
 
