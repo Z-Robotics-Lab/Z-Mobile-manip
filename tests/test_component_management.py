@@ -135,7 +135,10 @@ def test_component_manager_is_syntax_checked_singleton_and_motion_free():
     assert 'd435 usb device is absent' in source
     assert 'camera_artifact_fresh' in source
     assert '/dev/v4l/by-id/*realsense*' in source
-    assert 'reconnect its usb cable before restarting' in source
+    assert 'reconnect its usb cable before %s' in source
+    # ...and its counterpart, so a refactor cannot collapse the two causes back
+    # into one message.  See the 2026-08-04 note on report_camera_unavailable.
+    assert 'is unreachable, so the d435 was never probed' in source
     assert 'container_running z-manip-rgbd && camera_artifact_fresh' in source
     assert "sudo -n /usr/local/sbin/z-manip-piper-passive-can-gate can0 8" in source
     assert "bringup_rgbd_with_retry" in source
@@ -171,6 +174,11 @@ def test_cold_bringup_rgbd_self_heals_with_single_container_restart(tmp_path):
         script = (
             "set -uo pipefail\n"
             f'source "{MANAGER}"\n'
+            # The helper probes the camera over ssh before retrying.  Without
+            # this stub the test result depends on whether the robot happens to
+            # be powered and on the network, which is how it came to be red on
+            # a developer host with the NUC down.
+            "remote_camera_device_ready() { return 0; }\n"
             f'LAB_SCRIPT="{lab}"\n'
             f'export LAB_LOG="{lab_log}"\n'
             f"{body}\n"
@@ -204,6 +212,42 @@ def test_cold_bringup_rgbd_self_heals_with_single_container_restart(tmp_path):
     healthy = _drive("restart_one() { return 0; }")
     assert "RESULT=healed" in healthy.stdout, healthy.stderr
     assert lab_log.read_text(encoding="utf-8").split() == []
+
+
+def test_camera_failure_separates_an_absent_d435_from_an_unreachable_nuc():
+    # `remote_camera_device_ready` returns non-zero both when the D435 is off the
+    # NUC's USB bus and when the NUC was never reached, and the restart/bringup
+    # arms used to report the first for the second.  On 2026-08-04 that told the
+    # operator to reseat a USB cable across eight consecutive bringups while the
+    # NUC was off the network entirely.  The two causes must not share a message,
+    # and both must stay fail-closed.
+    def _drive(remote: str) -> subprocess.CompletedProcess:
+        script = (
+            "set -uo pipefail\n"
+            'export GO2W_NUC_HOST="operator@nuc.example"\n'
+            f'source "{MANAGER}"\n'
+            f"{remote}\n"
+            'report_camera_unavailable "bringup"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+        )
+
+    # The bare probe reaches the NUC, so the camera really is off its USB bus.
+    absent = _drive("remote_command() { return 0; }")
+    assert "reconnect its USB cable" in absent.stderr
+    assert "unreachable" not in absent.stderr
+    assert absent.returncode == 1
+
+    # The bare probe never reached the NUC, so nothing at all is known about the
+    # camera -- and the operator needs the host name, not a cable instruction.
+    unreachable = _drive("remote_command() { return 255; }")
+    assert "unreachable" in unreachable.stderr
+    assert "operator@nuc.example" in unreachable.stderr
+    assert "USB cable" not in unreachable.stderr
+    assert unreachable.returncode == 1
 
 
 def test_component_api_has_bounded_status_logs_restart_and_bringup(tmp_path):
