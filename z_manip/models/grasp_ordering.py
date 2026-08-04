@@ -18,8 +18,9 @@ def lateral_approach_scores(
 
     The grasp pose's tool-Z axis is the contact approach direction.  A lateral
     approach keeps the pregrasp/contact segment away from fixtures on the
-    Go2W centreline (notably Mid360), while a negative up projection denotes
-    an overhead, downward approach.  This is deliberately a *soft* ordering:
+    Go2W centreline (notably Mid360), while a nonzero up projection denotes a
+    vertical approach -- downward (overhead) or upward (from under whatever
+    the object stands on).  This is deliberately a *soft* ordering:
     IK and continuous collision checks remain authoritative and may select a
     non-lateral candidate when both side approaches are infeasible.
     """
@@ -73,9 +74,18 @@ def lateral_approach_scores(
     bonuses = side_weight * (
         0.75 * lateral_alignment + 0.25 * horizontal_alignment
     )
-    # Negative up projection means pregrasp lies above contact: the exact path
-    # that tends to sweep the wrist camera plate over the centreline lidar.
-    penalties = overhead_weight * np.maximum(0.0, -vertical_projection)
+    # A negative up projection means pregrasp lies above contact: the exact
+    # path that tends to sweep the wrist camera plate over the centreline
+    # lidar.  A POSITIVE one means pregrasp lies below contact, which on a
+    # bench object means reaching up through the bench -- measured on an
+    # open cup seen at 70 deg elevation, the top-ranked candidate had
+    # approach.up = +1.000 with its TCP 2.0 mm above the bench surface and
+    # its pregrasp 98 mm below it, inside the flight case.  Penalising only
+    # the negative side scored that grasp exactly ``overhead_weight`` (0.4 as
+    # deployed) ABOVE its own mirror image, so the penalty is on |projection|:
+    # both vertical directions are equally not what this term wants, and the
+    # horizontal bonus above still separates them from a side entry.
+    penalties = overhead_weight * np.abs(vertical_projection)
     return values + bonuses - penalties, bonuses, penalties
 
 

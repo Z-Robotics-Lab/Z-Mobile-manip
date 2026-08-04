@@ -467,3 +467,193 @@ def test_a_scaled_transform_is_refused():
     source = AntipodalGraspSource()
     up = source._gravity_in_cloud_frame(SimpleNamespace(t_target_src=scaled))
     np.testing.assert_allclose(up, source.up_axis)
+
+
+def _bench(z=0.0, half=0.30, step=0.006):
+    """A flat support patch, as the scene cloud delivers it."""
+
+    grid = np.arange(-half, half + step, step)
+    return np.array([[0.48 + u, v, z] for u in grid for v in grid])
+
+
+def test_top_only_view_anchors_the_grasp_to_the_support_not_the_lid():
+    # A steep wrist view of a 0.12 m can on a bench returns its top face and
+    # almost nothing else, so the cloud's own mid-plane IS the lid.  The
+    # support is still visible all around it and fixes the height.
+    top_z, radius = 0.12, 0.033
+    angles = np.linspace(0.0, 2.0 * np.pi, 60, endpoint=False)
+    lid = np.array([
+        [0.48 + r * np.cos(a), r * np.sin(a), top_z - 0.001 * (r / radius)]
+        for r in np.linspace(0.0, radius, 12) for a in angles
+    ])
+    source = AntipodalGraspSource(max_candidates=8)
+
+    blind = source.generate(_context(lid))
+    assert float(blind.grasps[0, 2, 3]) > top_z - 0.005          # on the lid
+
+    anchored = source.generate(_context(lid, scene_points=_bench()))
+    assert abs(float(anchored.grasps[0, 2, 3]) - 0.5 * top_z) < 0.01
+
+
+def test_a_round_object_wider_than_the_aperture_refuses_instead_of_guessing():
+    # The OBB fallback would re-measure the visible arc's DEPTH as a closing
+    # width and centre the grasp on the front surface, so a genuinely too-wide
+    # round object must fail loudly.
+    wide = _upright_half_cylinder(radius=0.055, z0=0.05, height=0.20)
+    source = AntipodalGraspSource(max_candidates=8)
+    with pytest.raises(GraspGenerationError, match="outside the usable aperture"):
+        source.generate(_context(wide, scene_points=_bench()))
+
+
+def _look_down_cylinder(radius=0.033, height=0.120, arc_deg=137.0,
+                        wall_depth_m=0.010, lid_rings=14, n_angle=48, n_wall=3):
+    """One steep wrist view of an upright can standing on the bench.
+
+    The lid faces the camera and samples densely; the wall is foreshortened to
+    a sliver near the rim, which is what the D435 returns once the base drives
+    close and the arm looks down on the bench (the can's observed vertical
+    extent collapses from 0.117 m at eye level to 0.0037 m at 70 degrees).
+    ``arc_deg`` defaults to the visible side-wall arc measured on this can at
+    low elevation, 137 degrees, which occupies 14 of the 36 ten-degree bins.
+    """
+
+    lid_angles = np.linspace(0.0, 2.0 * np.pi, n_angle, endpoint=False)
+    lid = np.array([
+        [0.48 + r * np.cos(a), r * np.sin(a), height]
+        for r in np.linspace(0.0, radius, lid_rings) for a in lid_angles
+    ])
+    half = np.radians(arc_deg) / 2.0
+    wall_angles = np.linspace(-np.pi - half, -np.pi + half, n_angle)
+    wall = np.array([
+        [0.48 + radius * np.cos(a), radius * np.sin(a), z]
+        for a in wall_angles
+        for z in np.linspace(height - wall_depth_m, height - 0.001, n_wall)
+    ])
+    return np.vstack((lid, wall))
+
+
+def _look_down_carton(half=(0.0225, 0.0325, 0.050), wall_depth_m=0.099, n=11, n_wall=8):
+    """The same view of an upright juice carton: top face plus the two near walls."""
+
+    hx, hy, hz = half
+    us = np.linspace(-1.0, 1.0, n)
+    zs = np.linspace(2.0 * hz - wall_depth_m, 2.0 * hz - 0.001, n_wall)
+    return np.asarray(
+        [(0.48 + u * hx, v * hy, 2.0 * hz) for u in us for v in us]
+        + [(0.48 + u * hx, -hy, z) for u in us for z in zs]
+        + [(0.48 - hx, v * hy, z) for v in us for z in zs],
+        dtype=np.float64,
+    )
+
+
+def test_top_down_view_of_a_cylinder_is_grasped_on_its_side_not_its_lid():
+    # The complaint this whole anchor exists for: after the servo the robot is
+    # tall, the reconstructed surface is nearly all top face, and the grasp
+    # lands on the lid -- useless on a cup, on the cap of a bottle, and it
+    # drives the fingers down toward the bench.
+    can = _look_down_cylinder()
+    source = AntipodalGraspSource(max_candidates=8)
+
+    blind = source.generate(_context(can))
+    # 0.115 m: the mid-plane of the observed 0.110-0.120 m sliver, 55 mm above
+    # the can's true 0.060 m mid-height and 5 mm under the rim.
+    assert float(blind.grasps[0, 2, 3]) > 0.110
+
+    anchored = source.generate(_context(can, scene_points=_bench()))
+    pose = anchored.grasps[0]
+    assert abs(float(pose[2, 3]) - 0.060) < 0.005
+    # A side grasp is BOTH: the jaw closes across a horizontal diameter and the
+    # tool drives in horizontally.  A vertical closing axis would be a rim
+    # pinch and a vertical approach a lid press, at the same TCP height.
+    assert _angle_to_vertical_deg(pose[:3, 0]) > 80.0
+    assert _angle_to_vertical_deg(pose[:3, 2]) > 80.0
+    assert 0.012 <= float(anchored.widths[0]) <= source.graspable_extent_m
+
+
+def test_a_partial_arc_still_recovers_the_true_diameter():
+    # A single camera sees at most 180 degrees of a cylinder, and grazing
+    # dropout takes that to 137 degrees on this can -- 14 of the 36 bins.  The
+    # old 165-degree span asked for 16, so the arc gate was the sole binding
+    # rejection and every cylinder fell through to the OBB path, to be grasped
+    # across the visible chord (0.062 m) instead of the diameter (0.066 m).
+    # 110 degrees is 11 bins, 3 below the measured arc.  Boxes stay out on the
+    # roundness residual rather than on this gate (see the carton test).
+    can = _look_down_cylinder(wall_depth_m=0.118, n_wall=6, n_angle=56)
+    source = AntipodalGraspSource(max_candidates=8)
+    obb = source._fit_obb(can, source.up_axis)
+    anchor = source._support_anchored_height(can, _bench(), source.up_axis)
+
+    section = source._round_cross_section(can, obb, source.up_axis, anchor_h=anchor)
+    assert section is not None
+    assert section.diameter == pytest.approx(0.066, abs=0.002)
+
+    strict = AntipodalGraspSource(max_candidates=8, symmetry_span_deg=165.0)
+    assert strict._round_cross_section(can, obb, strict.up_axis, anchor_h=anchor) is None
+
+
+@pytest.mark.parametrize("wall_depth_m", [0.099, 0.030, 0.008])
+def test_a_carton_is_not_completed_into_a_cylinder(wall_depth_m):
+    # Lowering the arc gate must not let a box become a cylinder -- but the arc
+    # gate was never what kept boxes out.  On the full-height view (the only
+    # one here whose mid-height slab has points at all) this carton's
+    # near-circle inliers occupy exactly 11 bins, i.e. it MEETS the new
+    # 11-bin threshold; what rejects it is the roundness residual, rms/radius
+    # 0.138 against the 0.08 gate.  On the two steep views the mid-height slab
+    # is empty and the round path never starts.
+    carton = _look_down_carton(wall_depth_m=wall_depth_m)
+    source = AntipodalGraspSource(max_candidates=8)
+    obb = source._fit_obb(carton, source.up_axis)
+    anchor = source._support_anchored_height(carton, _bench(), source.up_axis)
+
+    assert source._round_cross_section(carton, obb, source.up_axis) is None
+    assert source._round_cross_section(
+        carton, obb, source.up_axis, anchor_h=anchor
+    ) is None
+
+    # With the arc gate removed entirely (one bin) the carton is STILL not
+    # round, which is what makes 165 -> 110 safe: the box rejection never
+    # rested on this threshold.
+    open_gate = AntipodalGraspSource(max_candidates=8, symmetry_span_deg=10.0)
+    assert open_gate.symmetry_span_cos_bins == 1
+    assert open_gate._round_cross_section(
+        carton, obb, open_gate.up_axis, anchor_h=anchor
+    ) is None
+
+
+def test_a_carton_seen_from_above_is_also_anchored_to_the_bench():
+    # Boxes are dragged onto their top face by the same mechanism as cans, so
+    # the anchor must fix them too -- and must not move the closing axis.
+    carton = _look_down_carton(wall_depth_m=0.015, n_wall=3)
+    source = AntipodalGraspSource(max_candidates=8)
+
+    blind = source.generate(_context(carton))
+    assert abs(float(blind.grasps[0, 2, 3]) - 0.050) > 0.030
+
+    anchored = source.generate(_context(carton, scene_points=_bench()))
+    assert abs(float(anchored.grasps[0, 2, 3]) - 0.050) < 0.005
+    np.testing.assert_allclose(
+        anchored.grasps[0, :3, 0], blind.grasps[0, :3, 0], atol=1e-9
+    )
+
+
+def test_a_floor_mode_under_a_bench_edge_is_refused_as_a_support():
+    # The support is the densest horizontal layer near the object, and for an
+    # object at the bench's front edge that layer can be the FLOOR: 0.489 m
+    # below the bench top on this rig.  Anchoring to it puts the TCP at
+    # -0.185 m, i.e. 185 mm inside the flight case -- worse than the lid grasp.
+    can = _look_down_cylinder()
+    source = AntipodalGraspSource(max_candidates=8)
+    floor = _bench(z=-0.489353)
+
+    assert source._support_anchored_height(can, floor, source.up_axis) is None
+    # Only the band declines it; without one the anchor commands -0.185 m.
+    unguarded = AntipodalGraspSource(
+        max_candidates=8, support_max_object_height_m=10.0
+    )
+    assert unguarded._support_anchored_height(
+        can, floor, unguarded.up_axis
+    ) == pytest.approx(-0.1847, abs=0.001)
+    # A real bench under the same object is still accepted.
+    assert source._support_anchored_height(
+        can, _bench(), source.up_axis
+    ) == pytest.approx(0.060, abs=0.001)
