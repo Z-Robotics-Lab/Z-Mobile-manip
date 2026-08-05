@@ -12,6 +12,11 @@ from .placement import (
     PlannedPlacement,
     SupportPlane,
 )
+from .roboplan_ik import RoboplanIKSolver
+from .roboplan_planner import RoboplanJointPlanner
+from .roboplan_runtime import RoboplanConfig, RoboplanUnavailable, SceneHandle, scene_handle
+from .roboplan_timing import RetimingFailure, ToppraRetimer
+from .roboplan_wiring import RoboplanBackends, SceneVerifiedJointPlanner
 from .rrt_connect import JointSpaceRRTConnect, RRTConnectConfig
 from .standoff import (
     ReachabilityStandoffConfig,
@@ -70,6 +75,14 @@ __all__ = [
     "RRTConnectConfig",
     "ReachabilityStandoffConfig",
     "ReachabilityStandoffOptimizer",
+    "RetimingFailure",
+    "RoboplanBackends",
+    "RoboplanConfig",
+    "RoboplanIKSolver",
+    "RoboplanJointPlanner",
+    "RoboplanUnavailable",
+    "SceneHandle",
+    "SceneVerifiedJointPlanner",
     "SemanticPointSelection",
     "StandoffChoice",
     "SidePreference",
@@ -79,6 +92,7 @@ __all__ = [
     "SupportPlane",
     "TimedJointTrajectory",
     "TimeParameterizationConfig",
+    "ToppraRetimer",
     "WorkPoseCandidate",
     "WorkPoseChoice",
     "WorkPoseConfig",
@@ -88,6 +102,7 @@ __all__ = [
     "WorkPoseObservation",
     "WorkPoseOptimizationError",
     "retime_path",
+    "scene_handle",
     "select_semantic_target_points",
 ]
 

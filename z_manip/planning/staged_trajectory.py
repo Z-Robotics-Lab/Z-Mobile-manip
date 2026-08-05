@@ -437,7 +437,11 @@ class StagedGraspTrajectoryBuilder:
             path,
             self.velocity_limits,
             self.acceleration_limits,
-            self.time_config,
+            # This is the conservative STAGED fallback: every stage is meant to
+            # come to rest at its own boundary, and `_retime_direct_pair` is
+            # this builder's smooth path.  Keep the rest-to-rest shape here so
+            # the fallback stays exactly as conservative as its name promises.
+            replace(self.time_config, corner_acceleration_budget=0.0),
         )
 
     def _retime_direct_pair(

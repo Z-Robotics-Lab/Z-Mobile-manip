@@ -1264,6 +1264,29 @@ class PointCloudCollisionChecker:
             ):
                 continue
             distance = _segment_distance(first.start, first.end, second.start, second.end)
+            # ``clearance`` reaching SELF pairs is deliberate, not drift.  The
+            # normative threshold comment in ``control/whole_body_collision.py``
+            # recites a self pair as 0.050 + 0.015 + 0.010 clearance, 8c70a62
+            # recites "the arm is held to 60 mm", and ``_separable_pairs`` below
+            # re-derives the same sum -- change one without the other and the
+            # prefilter silently becomes an approximation
+            # (tests/test_collision_fast_paths.py pins that equivalence).
+            #
+            # What is NOT deliberate is that ONE knob does two jobs.  This is
+            # also the perception margin, and the supervised session ships
+            # ``--scene-clearance-m 0.001`` (go2w_planning_session.sh,
+            # go2w_interactive_sessions.py SUPERVISED_SCENE_CLEARANCE_M) while
+            # the ROS 2 node takes the 0.010 config default -- so the same robot
+            # runs its Mid-360 self keep-out at 1 mm one way and 10 mm the other,
+            # as a side effect of tuning perception.  2026-08-03: measured and
+            # recorded rather than changed, because the fix is a separate
+            # ``self_clearance_m``, and lowering THIS value to satisfy a self
+            # pair would loosen the head keep-out that caught a real strike.
+            # tests/test_lidar_keepout.py::
+            # test_home_is_a_legal_planning_start_only_because_two_masks_hold
+            # pins the consequence: the captured home clears ``mount``/``wrist``
+            # by 3.75 mm, so which side of this threshold the robot's own parked
+            # pose lands on is decided by that flag.
             threshold = first.spec.radius + second.spec.radius + self.config.clearance
             if distance <= threshold:
                 first_name, second_name = self._self_pairs[pair_index]

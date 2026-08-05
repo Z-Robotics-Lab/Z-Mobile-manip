@@ -289,7 +289,7 @@ start_planning_runner() {
     -v "$ROOT_DIR/scripts/runtime/piper_planning_dry_run.py:/usr/local/bin/z-manip-piper-planning-dry-run:ro" \
     -v "$ROOT_DIR/scripts/runtime/piper_planning_worker.py:/usr/local/bin/z-manip-piper-planning-worker:ro" \
     -v "$ROOT_DIR/z_manip:/opt/z_manip/python/z_manip:ro" \
-    -v "$ROOT_DIR/configs/go2w_piper.json:/opt/z_manip/configs/go2w_piper.json:ro" \
+    -v "${Z_MANIP_STACK_CONFIG_HOST:-$ROOT_DIR/configs/go2w_piper.json}:/opt/z_manip/configs/go2w_piper.json:ro" \
     -v "$ROOT_DIR/../go2W_Sim/assets:/robot_assets:ro" \
     -v "$PERCEPTION_RUNNER_ARTIFACT_ROOT:/workspace-artifacts:ro" \
     -v "$PLANNING_RUNNER_SCRATCH_ROOT:/workspace-planning-output" \

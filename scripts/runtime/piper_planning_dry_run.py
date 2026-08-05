@@ -1366,11 +1366,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             planner.chain.forward(raw_lift[-1]),
             tool_tip_pose(lift_target, config.grasp_plan.tool_from_tip),
         )
-        transit = planner._retime_joint_path(
-            raw_transit,
-            allow_stationary_hold=True,
-        )
-        approach = planner._retime_joint_path(raw_approach)
+        # One profile across transit+approach so the standoff is a via and not
+        # a halt; sliced back so the artifact keeps its three authorized stages.
+        transit, approach = planner.retime_reach(raw_transit, raw_approach)
         lift = planner._retime_joint_path(raw_lift)
         timings_s["retime"] = time.perf_counter() - retime_started
         # The transit and approach above were checked with an EMPTY gripper:

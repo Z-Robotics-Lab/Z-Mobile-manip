@@ -542,8 +542,12 @@ def test_phase_collision_callbacks_limit_contact_and_attach_lift_payload():
     )
 
     assert len(approach_calls) == 1
-    assert approach_calls[0].shape == (5, 2)
-    np.testing.assert_allclose(approach_calls[0][-1], result.approach_joints[-1])
+    # approach_steps=4 gives four waypoints, not five: _cartesian_ik already
+    # seeds its output with the pregrasp joints, so the validated path no
+    # longer repeats them and no longer opens with a zero-length edge.
+    assert approach_calls[0].shape == (4, 2)
+    # The validated path IS the planned approach, with nothing prepended.
+    np.testing.assert_allclose(approach_calls[0], result.approach_joints)
     assert len(lift_calls) == 3
     for _first, _second, attachment in lift_calls:
         np.testing.assert_allclose(attachment, result.approach_joints[-1])
@@ -605,7 +609,9 @@ def test_legacy_segment_callback_keeps_final_segment_contact_marker():
         control=PlanningControl(),
     )
 
-    assert contact_markers == [False, False, False, True]
+    # Three real segments now that the duplicated pregrasp row is gone, and
+    # the marker this test is named for is still on the last of them.
+    assert contact_markers == [False, False, True]
 
 
 def test_segment_and_path_approach_validators_are_mutually_exclusive():
@@ -825,7 +831,9 @@ def test_control_none_preserves_legacy_backend_signatures():
 
     assert result.candidate_index == 0
     assert planner.plan_calls == 1
-    assert planner.segment_calls == 4
+    # One approach segment fewer than before: the zero-length pregrasp-to-
+    # pregrasp edge is no longer built, so it is no longer checked.
+    assert planner.segment_calls == 3
 
 
 def test_bounded_refinement_selects_better_complete_plan():
@@ -907,7 +915,8 @@ def test_bounded_refinement_selects_better_complete_plan():
 
     assert len(planner.path_costs) == 2
     assert planner.path_costs[1] < planner.path_costs[0]
-    assert planner.segment_calls == 8
+    # Two plans, one zero-length pregrasp-to-pregrasp edge dropped from each.
+    assert planner.segment_calls == 6
     assert result.candidate_index == 1
 
 

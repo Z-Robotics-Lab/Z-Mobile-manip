@@ -51,6 +51,11 @@ from z_manip.collision import (
 )
 from z_manip.fixed_self_collision import FixedSelfCollisionGuard, _segment_distance
 from z_manip.kinematics import KinematicChain
+from z_manip.planning.rrt_connect import (
+    JointSpaceRRTConnect,
+    PlanningError,
+    RRTConnectConfig,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -290,7 +295,11 @@ def _mesh_backend_clear(_joints) -> CollisionResult:
     return CollisionResult(True, "mesh backend clear")
 
 
-def _pointcloud_checker(model: RobotCollisionModel) -> PointCloudCollisionChecker:
+def _pointcloud_checker(
+    model: RobotCollisionModel,
+    *,
+    mesh_backend=_mesh_backend_clear,
+) -> PointCloudCollisionChecker:
     chain = KinematicChain.from_urdf(URDF, "piper_base_link", "piper_gripper_base")
     checker = PointCloudCollisionChecker(
         chain=chain,
@@ -301,7 +310,7 @@ def _pointcloud_checker(model: RobotCollisionModel) -> PointCloudCollisionChecke
             point_radius=model.point_radius_m,
         ),
         now_fn=lambda: 10.0,
-        self_collision_checker=_mesh_backend_clear,
+        self_collision_checker=mesh_backend,
     )
     # A distant floor patch: perception must be fresh and populated or
     # check_state refuses to answer, and nothing here may be rejected because
@@ -471,3 +480,189 @@ def test_attached_object_threshold_does_not_silently_include_scene_clearance():
     puck = next(item for item in model.capsules if item.name == "mid360")
     assert puck.radius + model.point_radius_m == pytest.approx(0.053)
     assert model.scene_clearance_m == pytest.approx(0.01)
+
+
+# --------------------------------------------------------------------------
+# 5.  The other half of the same gate: which pairs a mesh backend keeps DORMANT.
+# --------------------------------------------------------------------------
+
+
+def test_arm_pairs_are_enforced_only_while_a_mesh_backend_owns_them():
+    """``mount``/``wrist`` rejects q = 0, so it is not a model of the hardware.
+
+    ``_mesh_backend_clear`` exists so the head capsules are exercised on the
+    production branch.  What it also hides is an arm pair.  Deployment pins
+    ``Z_MANIP_IK_BACKEND=pinocchio`` (``scripts/runtime/go2w_planning_session.sh``
+    passes it into the container; the other runtime entry points default to it),
+    so ``mesh_self_collision`` is set, ``_check_self_collision`` runs with
+    ``supplemental_only=True``, and the capsule pass never evaluates
+    ``mount``/``wrist`` at all -- the URDF meshes do.
+
+    Drop the backend and the pair wakes up.  ``online_planner.py`` sets
+    ``mesh_self_collision = None`` for both the ``robust`` default and the
+    roboplan backend, calling it a SUBSTITUTION; it is not.  Pinocchio judges the
+    arm on meshes, the capsule pass judges it on a 90 mm cylinder spanning
+    z = -0.06..0.10 on ``piper_base_link``, whose spherical end cap reaches
+    z = +0.19 while the wrist rides at z ~ 0.21 whenever the arm is folded.  The
+    overlap is the cap, not the metal.  So the pair rejects q = 0 by 27 mm, the
+    captured ``configs/piper_home.json`` by 6.25 mm, and ``CONTROL`` -- which
+    ``test_planner_gate_rejects_a_pose_inside_the_real_sensor_and_keeps_the_control``
+    asserts is valid, and which the robot demonstrably held during the live run
+    this file is about.  ``rrt_connect.py`` validates the start AND the goal with
+    the same predicate, so under those backends the arm can neither leave home
+    nor plan a path to it.
+
+    Pinned rather than fixed: the remedy (re-model ``mount``, or list the pair in
+    ``ignore_pairs``) edits the enforced file this header governs, and shrinking
+    ``mount`` would also loosen ``mount``/``palm`` and ``mount``/finger, which
+    are the pairs keeping the gripper out of its own base.
+    """
+
+    model = RobotCollisionModel.from_mapping(_raw())
+    mount = next(item for item in model.capsules if item.name == "mount")
+    wrist = next(item for item in model.capsules if item.name == "wrist")
+    rest = np.zeros(6)
+
+    assert _pointcloud_checker(model).check_state(rest).valid, (
+        "with a mesh backend the arm pairs belong to the mesh model"
+    )
+
+    bare = _pointcloud_checker(model, mesh_backend=None)
+    zero = bare.check_state(rest)
+    assert not zero.valid
+    assert zero.kind == "self"
+    assert zero.capsules == ("mount", "wrist")
+    assert not bare.check_state(np.asarray(CONTROL)).valid
+
+    # ``check_state`` reports the first violated pair, so ignoring it exposes
+    # the next.  Peel them all off to pin the WHOLE set q = 0 violates: it is
+    # arm-vs-arm and nothing else.  No supplemental fixture pair appears, so the
+    # Go2W head/chassis/Mid-360 envelope this file governs is intact and is not
+    # the thing to loosen when someone finally fixes the arm capsules.
+    raw, violated = _raw(), []
+    while not (result := _pointcloud_checker(
+        RobotCollisionModel.from_mapping(raw), mesh_backend=None
+    ).check_state(rest)).valid:
+        violated.append(result.capsules)
+        raw["self_collision"]["ignore_pairs"].append(list(result.capsules))
+    assert violated == [("mount", "wrist"), ("shoulder", "wrist")]
+
+    # ``scene_clearance_m`` DOES reach the self pass -- threshold is
+    # r1 + r2 + config.clearance -- unlike the attached-target pass above.
+    assert zero.threshold == pytest.approx(
+        mount.radius + wrist.radius + model.scene_clearance_m
+    )
+    # But the verdict does not depend on it: q = 0 is already 27 mm inside the
+    # bare radii, so no clearance tuning can make this pair satisfiable.
+    assert zero.distance < mount.radius + wrist.radius - 0.025
+
+
+# The captured software home, copied from ``configs/piper_home.json`` -- which
+# is gitignored, so this file cannot read it in CI.  ``_home_matches_capture``
+# below re-checks it whenever the real file IS present, because a silently
+# re-captured home that no longer matches this constant is exactly the drift
+# this module exists to prevent.
+HOME = np.asarray([
+    0.003543018381548489,
+    0.07997098632638018,
+    -0.14369295731669315,
+    -0.03166027263117714,
+    0.2632654643708247,
+    0.0,
+])
+
+
+def _home_matches_capture() -> bool:
+    captured = ROOT / "configs/piper_home.json"
+    if not captured.is_file():
+        return True
+    joints = json.loads(captured.read_text())["joint_radians"]
+    return bool(np.allclose(np.asarray(joints, dtype=float), HOME))
+
+
+def _plan_from_home(model: RobotCollisionModel, *, mesh_backend) -> None:
+    """Plan HOME -> HOME + 0.2 rad of base yaw with the deployed predicate.
+
+    Joint 1 is coaxial with the ``mount`` capsule, so yawing the base moves the
+    whole arm rigidly around it: the goal has the SAME self-collision geometry
+    as the start.  Any rejection here is therefore about home itself and not
+    about the goal or the swept path.
+    """
+
+    chain = KinematicChain.from_urdf(URDF, "piper_base_link", "piper_gripper_base")
+    checker = _pointcloud_checker(model, mesh_backend=mesh_backend)
+    planner = JointSpaceRRTConnect(
+        joint_names=[joint.name for joint in chain.joints if joint.joint_type != "fixed"],
+        lower_limits=chain.lower_limits,
+        upper_limits=chain.upper_limits,
+        state_valid=lambda joints: checker.check_state(joints).valid,
+        config=RRTConnectConfig(seed=17),
+    )
+    planner.plan_joint(HOME, HOME + np.asarray([0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+
+
+def test_home_is_a_legal_planning_start_only_because_two_masks_hold():
+    """The parked pose is 3.75 mm from being un-plannable-from, on one knob.
+
+    ``test_arm_pairs_are_enforced_only_while_a_mesh_backend_owns_them`` proves
+    ``mount``/``wrist`` rejects home by 6.25 mm on ``check_state``.  This test
+    pins the CONSEQUENCE, which was previously prose only: the deployment plans
+    FROM home on every Pick & Hold (``grasp_pipeline.py`` ``_plan_joint(current,
+    pregrasp)`` with ``current`` = the parked joints), ``rrt_connect.py``
+    validates that start with the same predicate, and there is no fallback --
+    the failure surfaces to the operator as "no grasp candidate survived
+    aperture/IK/planning", which points at the target and the perception rather
+    than at the robot's own parked pose.
+
+    Two independent masks are why the robot works today, and this branch
+    removes one of them:
+
+    1.  ``Z_MANIP_IK_BACKEND=pinocchio`` sets ``mesh_self_collision``, so the
+        capsule pass runs ``supplemental_only=True`` and never evaluates the
+        arm pair.  ``online_planner.py`` sets it to ``None`` for the roboplan
+        backend, so flipping ``roboplan.ik`` to true arms the trap.
+    2.  The supervised session ships ``--scene-clearance-m 0.001``
+        (``go2w_planning_session.sh``, ``go2w_interactive_sessions.py``
+        ``SUPERVISED_SCENE_CLEARANCE_M``), at which home clears anyway.  The
+        ROS 2 node takes the 0.010 config default and has neither mask.
+
+    Measured 2026-08-03 against the real model: home clears the bare radii by
+    +3.75 mm, and the margin moves ~5 mm per degree of J3, so this is a knife
+    edge and not a comfortable pass.  The remedy stays the one the sibling test
+    names -- re-model ``mount``, whose spherical cap reaches z = +0.19 where
+    there is no metal -- NOT lowering the clearance, which would also loosen
+    every Mid-360/NUC/chassis keep-out this file governs.
+    """
+
+    assert _home_matches_capture(), (
+        "configs/piper_home.json no longer matches the HOME constant above; "
+        "re-measure the margins in this test before updating it"
+    )
+
+    model = RobotCollisionModel.from_mapping(_raw())
+    mount = next(item for item in model.capsules if item.name == "mount")
+    wrist = next(item for item in model.capsules if item.name == "wrist")
+
+    # The knife edge, as a number: home is outside bare metal and inside the
+    # bare metal PLUS the perception clearance.
+    result = _pointcloud_checker(model, mesh_backend=None).check_state(HOME)
+    assert not result.valid
+    assert result.capsules == ("mount", "wrist")
+    bare = mount.radius + wrist.radius
+    assert bare < result.distance < bare + model.scene_clearance_m
+    assert result.distance - bare == pytest.approx(0.00375, abs=5e-5)
+
+    # Mask 1: the deployed pinocchio backend owns the arm pairs, so home plans.
+    _plan_from_home(model, mesh_backend=_mesh_backend_clear)
+
+    # Mask 2: at the supervised session's clearance home plans even bare.
+    supervised = _raw()
+    supervised["scene_clearance_m"] = 0.001
+    _plan_from_home(
+        RobotCollisionModel.from_mapping(supervised), mesh_backend=None
+    )
+
+    # Neither mask: the ROS 2 node's configuration on this branch.  The arm
+    # cannot leave its own parked pose.
+    with pytest.raises(PlanningError, match="start joint state is in collision"):
+        _plan_from_home(model, mesh_backend=None)

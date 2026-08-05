@@ -814,7 +814,14 @@ class GraspPlanGenerator:
         if pregrasp_solution is None:
             assert rejection is not None
             raise rejection
-        approach_path = np.vstack((pregrasp_solution.joints, approach_joints))
+        # _cartesian_ik already seeds its output with the pregrasp joints (see
+        # its "keep the waypoint for API/execution compatibility" comment at
+        # :631-633), so prepending them again produced a path whose first edge
+        # was zero length -- 12 rows for the 11 poses of a 0.10 m descent.
+        # Harmless to check and harmless to retime (retime_path drops
+        # zero-length edges), but every waypoint count read off this path was
+        # one too many.
+        approach_path = np.asarray(approach_joints, dtype=float)
         if self.approach_path_valid is not None:
             checkpoint(control, "grasp approach collision checking")
             width_kwargs = (

@@ -262,9 +262,9 @@
     ]
   },
   "roboplan": {
-    "enabled": false,
-    "ik": false,
-    "joint_planner": false,
+    "enabled": true,
+    "ik": true,
+    "joint_planner": true,
     "timing": false
   },
   "collision_model": "piper_collision_capsules.json",

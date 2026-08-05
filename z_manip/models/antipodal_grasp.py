@@ -169,9 +169,14 @@ class AntipodalGraspSource:
         gravity_snap_deg: float = 20.0,
         rotational_symmetry: bool = True,
         symmetry_closing_fan: int = 6,
-        symmetry_span_deg: float = 165.0,
+        symmetry_span_deg: float = 110.0,
         symmetry_rms_ratio: float = 0.08,
         symmetry_min_slab_points: int = 40,
+        round_diameter_band_max: float = 1.20,
+        support_radius_m: float = 0.25,
+        support_bin_m: float = 0.005,
+        support_clearance_m: float = 0.035,
+        support_max_object_height_m: float = 0.35,
         height_search: bool = True,
         height_slabs: int = 7,
         height_offset_cap_m: float = 0.06,
@@ -215,6 +220,43 @@ class AntipodalGraspSource:
         self.symmetry_span_cos_bins = max(1, int(round(float(symmetry_span_deg) / 10.0)))
         self.symmetry_rms_ratio = max(1e-3, float(symmetry_rms_ratio))
         self.symmetry_min_slab_points = max(12, int(symmetry_min_slab_points))
+        # How far the fitted circle may exceed the widest horizontal extent that
+        # was actually OBSERVED, and still be believed.  A real circle cannot be
+        # meaningfully wider than the footprint it was measured in; a misfit on
+        # a non-round object can, and does.  Measured over the single-view rig
+        # at 30 and 50 deg elevation, three seeds each, as diameter/extent:
+        #
+        #   true cylinder d85 / d80 / d66     1.04 1.05 1.04 1.06 1.03 1.05
+        #   carton, 4 mm and 8 mm fillet      1.31 1.39
+        #
+        # The inherited 1.4 sat above BOTH clusters, so it never separated them.
+        # 1.20 is near the log-midpoint of the gap and is the same statement as
+        # ``symmetry_span_deg``: for an arc of half-angle a the diameter is
+        # 1/sin(a) times the chord, so 1.20 admits arcs down to 111 deg and 110
+        # is the configured span floor.  Cylinders measure ~1.0 rather than the
+        # chord ratio because a look-down view sees the TOP DISC, which fills
+        # the footprint in both directions -- which is exactly the regime this
+        # robot works in.  Open this knob if a real cylinder is ever refused on
+        # hardware; the cost is that a badly-occluded box may be believed round.
+        self.round_diameter_band_max = max(1.0, float(round_diameter_band_max))
+        # Support-plane anchor.  ``support_radius_m`` is the neighbourhood the
+        # support is looked for in (0 disables the anchor entirely and restores
+        # the observed-cloud behaviour); ``support_clearance_m`` is the lowest
+        # the TCP may sit above it, i.e. the finger-pad-to-bench margin.
+        self.support_radius_m = max(0.0, float(support_radius_m))
+        self.support_bin_m = max(1e-3, float(support_bin_m))
+        self.support_clearance_m = max(0.0, float(support_clearance_m))
+        # Sanity band on the object height the anchor infers.  The mode is the
+        # densest horizontal layer under the object, and for an object near the
+        # bench's front edge that layer is the FLOOR, 0.489 m below the bench
+        # top on this rig (bench top sits at +0.1106 m in piper_base_link, the
+        # floor at -0.4894 m).  A can lid at +0.12 m over a floor mode then
+        # anchors the TCP at -0.185 m, i.e. 185 mm INSIDE the bench -- worse
+        # than the lid grasp it replaces.  0.35 m clears the tallest object on
+        # that bench (the 0.30 m bottle) by 50 mm and rejects the floor case by
+        # 139 mm.  Failing the band returns None, which is the pre-anchor
+        # behaviour, so a wrong support never moves the grasp.
+        self.support_max_object_height_m = max(0.0, float(support_max_object_height_m))
         self.height_search = bool(height_search)
         self.height_slabs = max(1, int(height_slabs))
         self.height_offset_cap_m = max(0.0, float(height_offset_cap_m))
@@ -296,6 +338,17 @@ class AntipodalGraspSource:
                 f"extent={obb.full_extent.round(3).tolist()}"
             )
 
+        # A wrist camera looking DOWN on a bench object sees its top face and,
+        # at a steep angle, little else, so the cloud's own vertical statistics
+        # are not the object's: on a 0.120 m can the observed vertical extent
+        # collapses from 0.117 m at eye level to 0.0037 m at 70 deg, and both
+        # the OBB mid-plane and ``median(heights)`` migrate onto the lid (+60.0
+        # mm and +59.1 mm of TCP error, i.e. exactly a lid pinch).  The TOP is
+        # observed at every elevation and the SUPPORT the object stands on is
+        # observed all around it, so anchor the grasp height between those two
+        # instead of on the occluded lower bound of the cloud.
+        anchor_h = self._support_anchored_height(points, context.scene_points, up)
+
         context.progress_cb("closing_axes", 0.15)
         # A single wrist view of a curved object exposes only its front arc, so
         # the raw OBB mislabels the front-to-back radius as a graspable width and
@@ -304,7 +357,7 @@ class AntipodalGraspSource:
         # be any horizontal direction; otherwise use the OBB faces (boxes).
         grasp_center = obb.center
         graspable: list[_ClosingAxis] = []
-        section = self._round_cross_section(points, obb, up)
+        section = self._round_cross_section(points, obb, up, anchor_h=anchor_h)
         if section is not None:
             graspable = [
                 candidate
@@ -313,6 +366,15 @@ class AntipodalGraspSource:
             ]
             if graspable:
                 grasp_center = section.center
+            else:
+                # The object IS round and its TRUE diameter does not fit.  The
+                # OBB path below would re-measure the visible arc's depth (19.2
+                # mm on an 85 mm bottle) and emit a grasp centred on the front
+                # surface, so refuse instead of falling through to it.
+                raise GraspGenerationError(
+                    f"round object diameter {section.diameter:.3f} m is outside "
+                    f"the usable aperture {self.graspable_extent_m:.3f} m"
+                )
         if not graspable:
             closing_axes = self._candidate_closing_axes(points, obb)
             graspable = [
@@ -321,6 +383,10 @@ class AntipodalGraspSource:
                 if self.min_aperture_m <= candidate.width <= self.graspable_extent_m
             ]
             grasp_center = obb.center
+            if anchor_h is not None:
+                grasp_center = grasp_center + (
+                    anchor_h - float(grasp_center @ up)
+                ) * up
             if not graspable:
                 raise GraspGenerationError(
                     "no graspable face fits the gripper aperture with clearance; "
@@ -459,6 +525,75 @@ class AntipodalGraspSource:
         snapped[others[1]] = horiz1
         return snapped, vertical_index
 
+    # -- support-plane anchor ---------------------------------------------
+
+    def _support_anchored_height(
+        self,
+        points: np.ndarray,
+        scene_points: Optional[object],
+        up: np.ndarray,
+    ) -> Optional[float]:
+        """Grasp height measured from the support the object stands on.
+
+        Returns the height (along ``up``) midway between the support and the
+        observed top, never closer to the support than ``support_clearance_m``
+        and never above the observed top, or ``None`` when no support is
+        visible (then the caller keeps the observed-cloud behaviour).
+        """
+
+        if scene_points is None or self.support_radius_m <= 0.0:
+            return None
+        scene = np.asarray(scene_points, dtype=np.float64)
+        if scene.ndim != 2 or scene.shape[1] != 3:
+            return None
+        scene = scene[np.isfinite(scene).all(axis=1)]
+        if len(scene) == 0:
+            return None
+        heights = scene @ up
+        object_heights = points @ up
+        centre = np.median(points - np.outer(object_heights, up), axis=0)
+        near = (
+            np.linalg.norm(
+                (scene - np.outer(heights, up)) - centre, axis=1
+            ) <= self.support_radius_m
+        ) & (heights <= float(np.median(object_heights)))
+        local = heights[near]
+        if len(local) < self.symmetry_min_slab_points:
+            return None
+        # The support is the flattest, densest thing under the object, so take
+        # the MODE of the neighbourhood height histogram: a neighbouring object
+        # standing on it and the floor beyond its edge are both minorities at
+        # other heights, and a median or a quantile blends them in (measured
+        # 59.1 mm of error on a median with a carton 20 mm away).
+        span = float(local.max() - local.min())
+        if span < self.support_bin_m:
+            support = float(np.median(local))
+        else:
+            counts, edges = np.histogram(
+                local, bins=max(2, int(math.ceil(span / self.support_bin_m)))
+            )
+            peak = int(np.argmax(counts))
+            inside = (local >= edges[peak]) & (local <= edges[peak + 1])
+            support = float(np.median(local[inside]))
+        top = float(np.quantile(object_heights, 0.99))
+        # The mode is the densest layer, not necessarily the layer this object
+        # stands on: near a bench edge it can be the floor 0.489 m below, and
+        # the anchor would then command the TCP 185 mm under the bench top.
+        # An object taller than the band, or a "support" above its own top, is
+        # a mis-detection -- decline and leave the caller on its existing path.
+        if not 0.0 < top - support <= self.support_max_object_height_m:
+            return None
+        middle = 0.5 * (support + top)
+        # Raise the grasp toward the finger-pad clearance floor, but never more
+        # than halfway from the object's middle to its top: on an object too
+        # short for that floor, obeying it would put the TCP back on the top
+        # face, which is the failure this anchor exists to remove.  Whether a
+        # short object is reachable at all stays the collision checker's call.
+        return min(
+            max(middle, support + self.support_clearance_m),
+            0.5 * (middle + top),
+        )
+
     # -- rotationally-symmetric (upright curved) completion ---------------
 
     @staticmethod
@@ -545,6 +680,7 @@ class AntipodalGraspSource:
         points: np.ndarray,
         obb: _OBB,
         up: object = None,
+        anchor_h: Optional[float] = None,
     ) -> Optional[_RoundSection]:
         """Recover a true upright round cross-section, or ``None`` for non-round.
 
@@ -564,7 +700,13 @@ class AntipodalGraspSource:
         e1, e2 = horizontal[0], horizontal[1]
         max_horizontal_extent = float(max(obb.full_extent[i] for i in range(3) if i != k))
         heights = points @ up
-        mass_center_h = float(np.median(heights))
+        # ``median(heights)`` is the visible cloud's centre of mass, which a
+        # look-down view drags onto the top face (-58 mm below the true top at
+        # 10 deg, -3 mm at 50 deg on the can).  The support-anchored height is
+        # the same quantity measured from a landmark the viewpoint cannot move.
+        mass_center_h = (
+            float(np.median(heights)) if anchor_h is None else float(anchor_h)
+        )
         vertical_extent = float(obb.full_extent[k])
         # A thick slab gives a robust roundness verdict at mid-height; a thinner
         # slab resolves how the cross-section varies along the axis (neck vs
@@ -593,7 +735,14 @@ class AntipodalGraspSource:
                 diameter_band=diameter_band,
             )
 
-        reference = fit_at(mass_center_h, detect_half, (0.6, 1.4))
+        # The upper band is what keeps a rounded-corner carton from being
+        # completed into an 87 mm "cylinder": its fitted circle overshoots the
+        # observed 67 mm footprint by 1.31x, a true cylinder by at most 1.06x.
+        # Since the caller now REFUSES a round object too wide for the jaw
+        # instead of falling through to the OBB faces, that misfit is no longer
+        # harmless -- it is a total grasp failure on the only objects on this
+        # bench the jaw can close around.
+        reference = fit_at(mass_center_h, detect_half, (0.6, self.round_diameter_band_max))
         if reference is None:
             return None
 
@@ -619,7 +768,7 @@ class AntipodalGraspSource:
                 # A validated round detection anchors the evaluation slabs, so
                 # a genuinely narrower neck (well under the body diameter) may
                 # pass; the centre-footprint and inlier floors still apply.
-                fit = fit_at(float(height), eval_half, (0.3, 1.4))
+                fit = fit_at(float(height), eval_half, (0.3, self.round_diameter_band_max))
                 if fit is None:
                     continue
                 cost = 2.0 * fit[2] + self.height_margin_weight * offset

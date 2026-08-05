@@ -41,8 +41,18 @@ from z_manip.planning.grasp_pipeline import (
     CandidateFailure,
     grasp_pregrasp_pose,
     GraspPlanGenerator,
+    JointPlanner,
     PlannedGrasp,
     tool_tip_pose,
+)
+from z_manip.planning.roboplan_ik import RoboplanIKSolver
+from z_manip.planning.roboplan_planner import RoboplanJointPlanner
+from z_manip.planning.roboplan_runtime import scene_handle
+from z_manip.planning.roboplan_timing import ToppraRetimer
+from z_manip.planning.roboplan_wiring import (
+    env_backend,
+    RoboplanBackends,
+    SceneVerifiedJointPlanner,
 )
 from z_manip.planning.rrt_connect import JointSpaceRRTConnect
 from z_manip.planning.standoff import ReachabilityStandoffOptimizer
@@ -455,9 +465,12 @@ class OnlinePlanner:
             base_link=config.robot.base_link,
             tip_link=config.robot.tip_link,
         )
+        # Default OFF twice over: a config without the section selects nothing,
+        # and a section that selects a subsystem must also set `enabled`.
+        self.roboplan = config.roboplan or RoboplanBackends()
         self.ik_backend = os.environ.get(
             'Z_MANIP_IK_BACKEND',
-            'robust',
+            'roboplan' if self.roboplan.ik else 'robust',
         ).strip().lower()
         if self.ik_backend == 'pinocchio':
             self.ik = PinocchioIKSolver(
@@ -472,10 +485,87 @@ class OnlinePlanner:
         elif self.ik_backend == 'robust':
             self.ik = RobustIKSolver(self.chain, config.ik)
             self.mesh_self_collision = None
+        elif self.ik_backend == 'roboplan':
+            self.ik = RoboplanIKSolver(
+                self.roboplan.runtime,
+                config.robot,
+                config.ik,
+            )
+            # None, like 'robust' and unlike 'pinocchio'.  Setting this is not
+            # an addition but a SUBSTITUTION: it demotes the point-cloud
+            # checker's own capsule self-collision to supplemental pairs only
+            # (_check_self_collision(supplemental_only=True)) and hands the arm
+            # pairs to the mesh backend.
+            # roboplan's Scene is built from the same ENFORCED capsule file, but
+            # it is NOT the same check, and routing the arm pairs through it
+            # would SHRINK the enforced envelope by 10 mm.  roboplan_scene.py
+            # emits each capsule at radius + rigidity inflation (measured: max
+            # 0.112 mm, on `wrist`; exactly 0 for the other 21), while the
+            # capsule pass thresholds a self pair at r1 + r2 + scene_clearance_m
+            # = r1 + r2 + 0.010 (pointcloud.py, `threshold =` in
+            # _check_self_collision).  The Scene's self envelope is therefore a
+            # strict SUBSET, ~10 mm tighter to the metal on every one of the 112
+            # pairs -- including mount/palm, mount/finger_* and the ten
+            # `shoulder` pairs that keep the gripper out of its own base.
+            # Measured 2026-08-03 against the Scene these adapters actually
+            # build: over 600 random in-limit arm configs the Scene rejected 0
+            # that the deployed checker accepted (the checker rejected 12 the
+            # Scene accepted), and the Scene accepts configs/piper_home.json,
+            # which the checker rejects on ('mount','wrist') by 6.25 mm
+            # (tests/test_lidar_keepout.py records the same pair and margin).
+            # So the point-cloud checker keeps the last word on self-collision
+            # and the Scene may only ever ADD a check.  a8ecd46 shrank the
+            # Mid-360 capsule on exactly this reasoning -- another model was
+            # believed to cover it.  The Scene still collision-checks inside the
+            # IK solver itself; this attribute only decides who owns
+            # self-collision for the point-cloud checker.
+            self.mesh_self_collision = None
         else:
             raise ValueError(
                 f'unsupported Z_MANIP_IK_BACKEND: {self.ik_backend!r}',
             )
+        # Ordering only: a cheap FK distance over canned seeds that decides
+        # which grasp candidate is tried first.  roboplan's SimpleIk has no
+        # such thing, and PinocchioIKSolver already answers this by delegating
+        # to a RobustIKSolver, so roboplan borrows the same one rather than
+        # changing which grasp wins when the backend changes.
+        self.ik_ranker = (
+            self.ik
+            if hasattr(self.ik, 'make_seed_pose_ranker')
+            else RobustIKSolver(self.chain, config.ik)
+        )
+        # Both default OFF.  The RRT knobs stay in `config.rrt` for both
+        # backends -- deliberately not remapped from RoboplanConfig.rrt_*, so
+        # step size and collision resolution cannot drift apart or get swapped.
+        self.joint_planner_backend = env_backend(
+            'Z_MANIP_JOINT_PLANNER_BACKEND',
+            'rrt',
+            self.roboplan.joint_planner,
+        )
+        self.timing_backend = env_backend(
+            'Z_MANIP_TIMING_BACKEND',
+            'quintic',
+            self.roboplan.timing,
+        )
+        # One Scene for both, so the 618 ms build is paid once.  Built here so
+        # a disabled or missing roboplan fails at construction with a named
+        # reason instead of somewhere inside the first plan.
+        scene = (
+            scene_handle(self.roboplan.runtime, config.robot)
+            if 'roboplan' in (self.joint_planner_backend, self.timing_backend)
+            else None
+        )
+        self._roboplan_planner = (
+            RoboplanJointPlanner(scene, config=config.rrt)
+            if self.joint_planner_backend == 'roboplan'
+            else None
+        )
+        # Same signature as retime_path, so both call sites stay one token.
+        self.retime = (
+            ToppraRetimer(scene).retime_path
+            if self.timing_backend == 'roboplan'
+            else retime_path
+        )
         self.standoff = ReachabilityStandoffOptimizer(config.standoff)
         self.work_pose = BoundedSE2WorkPoseOptimizer(config.work_pose)
         self.T_platform_piper = fixed_transform_from_urdf(
@@ -484,6 +574,25 @@ class OnlinePlanner:
             config.robot.base_link,
         )
         self.grasp_generate = grasp_generate
+
+    def _joint_planner(
+        self,
+        state_valid: Callable[[object], bool],
+    ) -> JointPlanner:
+        """Build the configured joint planner over one validity predicate."""
+
+        checked = JointSpaceRRTConnect(
+            joint_names=self.chain.joint_names,
+            lower_limits=self.chain.lower_limits,
+            upper_limits=self.chain.upper_limits,
+            state_valid=state_valid,
+            config=self.config.rrt,
+        )
+        if self._roboplan_planner is None:
+            return checked
+        # roboplan searches self-collision only; `checked` is the one that
+        # carries the perceived scene, so it verifies what roboplan returns.
+        return SceneVerifiedJointPlanner(self._roboplan_planner, checked)
 
     def _fixed_fixture_state_valid(self, joints: object) -> bool:
         """Planner callback for immutable robot-mounted fixture geometry."""
@@ -752,15 +861,12 @@ class OnlinePlanner:
                 and transit_checker.is_state_valid(joints)
             )
 
-        joint_planner = JointSpaceRRTConnect(
-            joint_names=self.chain.joint_names,
-            lower_limits=self.chain.lower_limits,
-            upper_limits=self.chain.upper_limits,
-            state_valid=transit_state_valid,
-            config=self.config.rrt,
-        )
+        joint_planner = self._joint_planner(transit_state_valid)
         if pose_ranker is None:
-            pose_ranker = self.ik.make_seed_pose_ranker(current_joints, control)
+            pose_ranker = self.ik_ranker.make_seed_pose_ranker(
+                current_joints,
+                control,
+            )
         planned = GraspPlanGenerator(
             self.ik,
             joint_planner,
@@ -1037,11 +1143,74 @@ class OnlinePlanner:
                     self.config.time_parameterization.min_segment_time_s,
                 )),
             )
-        return retime_path(
+        return self.retime(
             waypoints,
             self.chain.velocity_limits,
             np.asarray(self.config.robot.acceleration_limits, dtype=float),
             self.config.time_parameterization,
+        )
+
+    def retime_reach(
+        self,
+        transit_path: object,
+        approach_path: object,
+    ) -> tuple[TimedJointTrajectory, TimedJointTrajectory]:
+        """Retime transit+approach as ONE profile, sliced back at the standoff.
+
+        The standoff is the sharpest corner of the whole reach (measured 56.6
+        deg in joint space against 1.2 deg at every other approach vertex), so
+        retiming the two legs separately is what forces a full stop there and
+        another at each interior via.  Concatenating first makes the standoff
+        an interior via of one continuous profile; the dense samples are then
+        sliced back at that via so the staged artifact, its per-stage
+        authorization and its collision coverage are all unchanged.
+
+        The slice endpoints are pinned to the exact checked joints, so the
+        executor's transit-to-approach continuity assertion still holds.
+        """
+
+        transit = np.asarray(transit_path, dtype=float)
+        approach = np.asarray(approach_path, dtype=float)
+        if float(np.max(np.abs(approach[0] - transit[-1]))) > 1e-7:
+            raise PlanningError('approach does not start at the transit endpoint')
+        fused = np.vstack((transit, approach[1:]))
+        if len(fused) < 2 or np.all(
+            np.linalg.norm(np.diff(fused, axis=0), axis=1) < 1e-12
+        ):
+            # Nothing to fuse (a stationary hold); keep the per-leg behaviour.
+            return (
+                self._retime_joint_path(transit, allow_stationary_hold=True),
+                self._retime_joint_path(approach),
+            )
+        timed = self._retime_joint_path(fused)
+        via = int(np.argmin(
+            np.max(np.abs(timed.positions - transit[-1]), axis=1),
+        ))
+        # The retimer places a sample exactly on every vertex it was handed, so
+        # a via that is not ON the standoff means the profile no longer rides
+        # the checked polyline.  Fail here rather than ship a plan whose stage
+        # boundary is a joint the operator never authorized.
+        drift = float(np.max(np.abs(timed.positions[via] - transit[-1])))
+        if drift > 1e-6 or not 0 < via < len(timed.positions) - 1:
+            raise PlanningError(
+                'retimed reach does not pass through the pregrasp standoff '
+                f'(closest sample {via} off by {drift:.2e} rad)',
+            )
+        transit_positions = timed.positions[: via + 1].copy()
+        approach_positions = timed.positions[via:].copy()
+        transit_positions[0] = transit[0]
+        transit_positions[-1] = transit[-1]
+        approach_positions[0] = approach[0]
+        approach_positions[-1] = approach[-1]
+        return (
+            TimedJointTrajectory(
+                positions=transit_positions,
+                times_s=timed.times_s[: via + 1].copy(),
+            ),
+            TimedJointTrajectory(
+                positions=approach_positions,
+                times_s=timed.times_s[via:] - timed.times_s[via],
+            ),
         )
 
     def pregrasp_program(
@@ -1156,10 +1325,13 @@ class OnlinePlanner:
         transit_path = np.asarray(planned.transit.waypoints, dtype=float)
         approach_path = np.vstack((transit_path[-1], planned.approach_joints))
         lift_path = np.vstack((approach_path[-1], planned.lift_joints))
+        transit, approach = self.retime_reach(transit_path, approach_path)
         return MotionProgram(
             planned=planned,
-            transit=self._retime_joint_path(transit_path),
-            approach=self._retime_joint_path(approach_path),
+            transit=transit,
+            approach=approach,
+            # The lift starts after the gripper has closed, which is a real
+            # stop no retimer can remove, so it keeps its own profile.
             lift=self._retime_joint_path(lift_path),
         )
 
@@ -1543,13 +1715,7 @@ class OnlinePlanner:
                 and checker.is_state_valid(joints)
             )
 
-        planner = JointSpaceRRTConnect(
-            joint_names=self.chain.joint_names,
-            lower_limits=self.chain.lower_limits,
-            upper_limits=self.chain.upper_limits,
-            state_valid=attached_state_valid,
-            config=self.config.rrt,
-        )
+        planner = self._joint_planner(attached_state_valid)
         path = planner.plan_joint(
             current,
             goal,
@@ -1557,7 +1723,7 @@ class OnlinePlanner:
             control=control,
         )
         checkpoint(control, 'attached-object trajectory retiming')
-        return retime_path(
+        return self.retime(
             path.waypoints,
             self.chain.velocity_limits,
             self.config.robot.acceleration_limits,
