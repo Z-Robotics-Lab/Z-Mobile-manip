@@ -62,11 +62,13 @@ SOURCE_AGE_HARD_CAP_S = {
 }
 RECEIPT_MAX_AGE_S = 180.0
 OPEN_APERTURE_M = 0.07
-# The close/lift grasp predicates require a measured aperture at or below
-# OPEN_APERTURE_M - 0.005 (= 0.065 m).  A rigid object wider than that holds
-# the fingers above the gate forever, so planning must reject such widths up
-# front instead of guaranteeing an execution-time SafetyError; 3 mm of
-# measurement/compliance headroom below the gate.
+# Planning still refuses widths this large, but for a PHYSICAL reason now: the
+# fingers open to OPEN_APERTURE_M, so an object wider than this leaves almost no
+# closing travel to grip with.  It is no longer an execution gate -- the close
+# and lift predicates used to additionally require a measured aperture at or
+# below OPEN_APERTURE_M - 0.005 (= 0.065 m), which refused a 67.5 mm object the
+# fingers were demonstrably holding at -1.038 N (live 2026-08-05, orange can).
+# See grasp_contact_evident for what replaced it.
 MAX_PLANNED_GRASP_WIDTH_M = 0.062
 GRIPPER_CLOSE_STEPS = 8
 GRIPPER_CLOSE_INTERVAL_S = 0.20
@@ -80,6 +82,13 @@ GRIPPER_CLOSE_INTERVAL_S = 0.20
 # false-positive so an empty crush cannot pass.  The 0.114N plastic-bottle true
 # hold still passes because it shows a stall gap above the commanded target.
 EMPTY_CLOSE_RESCUE_FORCE_N = 0.30
+# Smallest finger travel, measured from the pre-close aperture, that proves the
+# close command actually took effect.  Only consulted when the motor reports
+# too little load to settle the question on its own.  Across the 148 verified
+# holds in artifacts/go2w_real/planning_sessions/execution-receipts the tightest
+# travel is 4.3 mm (0.0690 -> 0.0647 m), an order of magnitude above the ~0.1 mm
+# the aperture reading resolves, so 3 mm sits clear of both.
+GRIPPER_MIN_CLOSE_TRAVEL_M = 0.003
 GRIPPER_POST_CLOSE_SETTLE_S = 0.50
 DEFAULT_SPEED_PERCENT = 5
 MAX_SPEED_PERCENT = 50
@@ -362,6 +371,38 @@ def minimum_nonempty_aperture_m(required_width_m: float) -> float:
     if not math.isfinite(width) or width <= 0.0:
         raise SafetyError("required_width_m must be finite and positive")
     return max(0.004, min(width * 0.5, width - 0.002))
+
+
+def gripper_close_took_effect(
+    feedback: GripperFeedback,
+    *,
+    baseline_aperture_m: float,
+) -> bool:
+    """Did the close command reach the fingers?  NOT whether they hold anything.
+
+    The close and lift waits used to settle this with ``aperture <=
+    OPEN_APERTURE_M - 0.005``, on the reasoning that fingers still up near the
+    open width cannot have closed on anything.  That is false for an object
+    nearly as wide as the jaw opens: live 2026-08-05, an orange can stalled the
+    fingers at 67.5 mm under -1.038 N -- a saturated hold -- and the wait timed
+    out above the 65 mm ceiling while the arm sat there gripping it.  The can
+    had moved the fingers only 1.5 mm, so no travel threshold can cover it
+    either; what proves contact there is the load.
+
+    So: load, or measurable travel from where the fingers started.  Deciding
+    whether an object is actually HELD stays with ``verify_nonempty_grasp``,
+    which already weighs the stall gap against the motor load and, unlike a
+    wait timeout, says which one failed.  Keeping the two separate is what lets
+    a genuinely empty crush report itself as an empty crush.
+
+    Fails closed on the case the old ceiling really guarded: a close command
+    that never executed leaves the fingers where they were, under the open
+    gripper's own +0.002..+0.166 N of no-load noise.
+    """
+
+    if abs(feedback.force_n) >= EMPTY_CLOSE_RESCUE_FORCE_N:
+        return True
+    return baseline_aperture_m - feedback.aperture_m >= GRIPPER_MIN_CLOSE_TRAVEL_M
 
 
 def verify_nonempty_grasp(
@@ -2129,7 +2170,10 @@ def execute_stage(
                 lambda sample: (
                     sample.aperture_m
                     >= minimum_nonempty_aperture_m(artifact.required_width_m)
-                    and sample.aperture_m <= OPEN_APERTURE_M - 0.005
+                    and gripper_close_took_effect(
+                        sample,
+                        baseline_aperture_m=baseline.aperture_m,
+                    )
                 ),
                 after_timestamp=baseline.timestamp,
                 timeout_s=4.0,
@@ -2164,7 +2208,10 @@ def execute_stage(
                 lambda sample: (
                     sample.aperture_m
                     >= minimum_nonempty_aperture_m(artifact.required_width_m)
-                    and sample.aperture_m <= OPEN_APERTURE_M - 0.005
+                    and gripper_close_took_effect(
+                        sample,
+                        baseline_aperture_m=baseline.aperture_m,
+                    )
                 ),
                 after_timestamp=baseline.timestamp,
                 timeout_s=4.0,
@@ -2198,9 +2245,8 @@ def execute_stage(
                 sleep=sleep,
             )
             guard.path_motion_started = False
-            before_final_gripper = normalize_gripper_feedback(
-                effector.get_gripper_status(),
-            ).timestamp
+            baseline = normalize_gripper_feedback(effector.get_gripper_status())
+            before_final_gripper = baseline.timestamp
             guard.mark_before_command()
             effector.move_gripper_m(value=target, force=gripper_force_n)
             gripper_result = wait_for_gripper(
@@ -2208,7 +2254,10 @@ def execute_stage(
                 lambda sample: (
                     sample.aperture_m
                     >= minimum_nonempty_aperture_m(artifact.required_width_m)
-                    and sample.aperture_m <= OPEN_APERTURE_M - 0.005
+                    and gripper_close_took_effect(
+                        sample,
+                        baseline_aperture_m=baseline.aperture_m,
+                    )
                 ),
                 after_timestamp=before_final_gripper,
                 timeout_s=2.0,

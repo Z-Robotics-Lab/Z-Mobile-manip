@@ -1496,3 +1496,40 @@ def test_every_release_in_the_full_workflow_clears_the_holding_flag():
         "every leg that marks the guard as holding must clear it at its "
         "release; an unmatched set disarms the e-stop for the rest of the run"
     )
+
+
+def test_a_wide_object_the_fingers_are_gripping_is_not_called_empty():
+    """Live 2026-08-05: an orange can, held, refused because it was too wide.
+
+    The close/lift waits required ``aperture <= OPEN_APERTURE_M - 0.005`` on the
+    reasoning that fingers near the open width cannot have closed on anything.
+    The can stalled them at 67.5 mm under -1.038 N -- a saturated hold, the
+    strongest band in the 147 recorded holds -- and the wait timed out with
+    "timed out waiting for stable gripper feedback" while the arm gripped it.
+    """
+
+    baseline = 0.0690          # measured open aperture just before the close
+    held_can = EXECUTOR.GripperFeedback(0.0675, -1.038, 1.0, "width", True, True, True)
+
+    assert EXECUTOR.gripper_close_took_effect(held_can, baseline_aperture_m=baseline)
+    # ...and the authority on whether it is HELD agrees, which it always did.
+    EXECUTOR.verify_nonempty_grasp(
+        held_can, 0.062, minimum_force_n=0.0, commanded_close_target_m=0.030,
+    )
+    # The gate that used to reject it, spelled out so nobody reinstates it.
+    assert held_can.aperture_m > EXECUTOR.OPEN_APERTURE_M - 0.005
+
+    # The case the old ceiling really guarded: the close never reached the
+    # fingers.  Open aperture, and only the no-load noise an open gripper
+    # reports (+0.002..+0.166 N over 96 recorded pregrasp samples).
+    never_closed = EXECUTOR.GripperFeedback(0.0695, 0.120, 1.0, "width", True, True, True)
+    assert not EXECUTOR.gripper_close_took_effect(never_closed, baseline_aperture_m=baseline)
+
+    # A weak hold proves itself by travel instead of load, so deciding
+    # empty-vs-held stays with verify_nonempty_grasp and keeps its own message.
+    weak_but_travelled = EXECUTOR.GripperFeedback(0.0181, -0.180, 1.0, "width", True, True, True)
+    assert EXECUTOR.gripper_close_took_effect(weak_but_travelled, baseline_aperture_m=baseline)
+    with pytest.raises(EXECUTOR.SafetyError, match="empty close target"):
+        EXECUTOR.verify_nonempty_grasp(
+            weak_but_travelled, 0.020, minimum_force_n=0.0, commanded_close_target_m=0.0180,
+        )

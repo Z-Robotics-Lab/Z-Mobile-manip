@@ -443,6 +443,29 @@ remote_camera_device_ready() {
     >/dev/null 2>&1
 }
 
+# ``remote_camera_device_ready`` fails for two very different reasons: the D435
+# is off the NUC's USB bus, or the NUC itself was never reached.  Reporting the
+# first for the second is not cosmetic -- on 2026-08-04 it sent the operator to
+# reseat a USB cable through eight consecutive bringup attempts while the NUC
+# was simply off the network (no ICMP reply on any of its addresses, and the
+# workstation's TUN proxy answering the ssh TCP handshake itself, which makes
+# the failure look like a live host refusing the probe).  The status arm
+# already distinguishes them -- NUC_CAMERA_DEVICE defaults to "unreachable" and
+# is only overwritten by a snapshot that actually loaded -- so only the restart
+# and bringup arms need this.  Re-probe with a bare remote command to tell the
+# two apart, and name the host so the operator knows what to go and look at.
+report_camera_unavailable() {
+  local action="$1"
+  if remote_command true >/dev/null 2>&1; then
+    printf 'D435 USB device is absent on the NUC; reconnect its USB cable before %s\n' \
+      "$action" >&2
+  else
+    printf 'NUC %s is unreachable, so the D435 was never probed; check that it is powered and on the network before %s\n' \
+      "$NUC_HOST" "$action" >&2
+  fi
+  return 1
+}
+
 camera_artifact_fresh() {
   [[ -f "$CAMERA_ARTIFACT" ]] || return 1
   local modified now
@@ -553,7 +576,7 @@ restart_one() {
       ;;
     nuc-camera)
       if ! remote_camera_device_ready; then
-        printf 'D435 USB device is absent on the NUC; reconnect its USB cable before restarting the camera service\n' >&2
+        report_camera_unavailable "restarting the camera service"
         return 1
       fi
       remote_command 'systemctl --user restart d435i.service' || return 1
@@ -571,7 +594,7 @@ restart_one() {
       ;;
     rgbd)
       if ! remote_camera_device_ready; then
-        printf 'D435 USB device is absent on the NUC; reconnect it before restarting the RGB-D bridge\n' >&2
+        report_camera_unavailable "restarting the RGB-D bridge"
         return 1
       fi
       "$LAB_SCRIPT" restart-rgbd || return 1
@@ -606,7 +629,7 @@ restart_one() {
       ;;
     perception-all)
       if ! remote_camera_device_ready; then
-        printf 'D435 USB device is absent on the NUC; reconnect it before restarting perception-all\n' >&2
+        report_camera_unavailable "restarting perception-all"
         return 1
       fi
       restart_one grounding || return 1
@@ -645,8 +668,9 @@ bringup_rgbd_with_retry() {
   # camera must keep its fast, legible failure instead of hiding behind a
   # container restart.
   if ! remote_camera_device_ready; then
-    printf '[%s] cold bringup: D435 USB device is absent; skipping the RGB-D restart retry\n' \
+    printf '[%s] cold bringup: skipping the RGB-D restart retry\n' \
       "$(date --iso-8601=seconds)" >&2
+    report_camera_unavailable "retrying the RGB-D bridge"
     return 1
   fi
   printf '[%s] cold bringup self-heal: RGB-D not ready on first pass; trigger=rgbd_ready_timeout action=restart z-manip-rgbd container once and re-wait\n' \
@@ -681,7 +705,7 @@ cold_bringup_steps() {
   # registry only while the WebRTC owner is down.
   remote_command 'systemctl --user is-active --quiet z-mobile-manip-go2w-reactive-live.service || rm -rf /dev/shm/jack_db-1000' >/dev/null 2>&1 || true
   if ! remote_camera_device_ready; then
-    printf 'D435 USB device is absent on the NUC; reconnect its USB cable before bringup\n' >&2
+    report_camera_unavailable "bringup"
     return 1
   fi
   # A service may remain active after a USB disconnect while publishing zero
